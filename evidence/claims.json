@@ -960,10 +960,11 @@
     {
       "id": "TRK-4",
       "area": "tracking",
-      "claim": "A profile links its tracker with its GitHub account (proofkin tracker link, or the web UI's Tracker card), which checks the repository and the board (a project given by its address or owner/number) and shows the board's statuses, or why the board isn't used and the command that fixes it. Every request is GitHub GraphQL through the GitHub CLI, on stdin, with the token only in gh's environment. The board's items (or the open issues) are listed by status with their agent, assignees, sub-issue progress and closing pull requests, and Plan it starts a plan on an item with a step per open sub-issue; tracked steps, plans and runs link their issues, and the plan editor knows track: and issue=.",
+      "claim": "A profile links its tracker with its GitHub account (proofkin tracker link, or the web UI's Tracker card), which checks the repository and the board (a project given by its address or owner/number) and shows the board's statuses, or why the board isn't used and the command that fixes it. Every request is GitHub GraphQL through the GitHub CLI, on stdin, with the token only in gh's environment.       The board's items (or the open issues) are listed by status with their agent, assignees, sub-issue progress and closing pull requests, and Plan it starts a plan on an item with a step per open sub-issue; tracker add (or Add existing issues) puts the repository's issues and pull requests on the board with a status from their state (open issues to do, open pull requests in review, closed and merged ones done), keeping statuses already set. Tracked steps, plans and runs link their issues, and the plan editor knows track: and issue=.",
       "tests": [
         "github::linked_repositories_clone_share_sync_push_and_open_pull_requests",
         "lib::tracker::projects_refs_and_statuses_are_read_strictly",
+              "lib::tracker::existing_issues_and_pull_requests_go_on_the_board_with_a_status_from_their_state",
         "ui::the_plan_editor_keeps_plans_valid",
         "ui::the_page_follows_the_ux_guidelines"
       ]

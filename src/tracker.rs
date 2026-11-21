@@ -380,6 +380,15 @@ impl SelectField {
             .find(|(_, n)| n == name)
             .map(|(id, _)| id.as_str())
     }
+
+    /// The name of the option for `status`.
+    fn option_name(&self, status: Status) -> Option<String> {
+        let id = self.option(status)?;
+        self.options
+            .iter()
+            .find(|(o, _)| o == id)
+            .map(|(_, name)| name.clone())
+    }
 }
 
 /// The GitHub Project the tracker puts items on.
@@ -1068,6 +1077,246 @@ impl Tracker {
 }
 
 const ITEM_ISSUE: &str = "number title url state repository { nameWithOwner } assignees(first: 5) { nodes { login } } parent { number } subIssuesSummary { total completed } closedByPullRequestsReferences(first: 5) { nodes { number } }";
+
+/// Which of the repository's issues and pull requests [`Tracker::add_to_board`] puts
+/// on the board.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AddItems {
+    /// These issues or pull requests, by number.
+    #[serde(default)]
+    pub numbers: Vec<u64>,
+    /// Every open issue and pull request.
+    #[serde(default)]
+    pub open: bool,
+    /// Every closed issue and closed or merged pull request.
+    #[serde(default)]
+    pub closed: bool,
+}
+
+/// An issue or pull request [`Tracker::add_to_board`] put on the board, or found there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Added {
+    pub number: u64,
+    /// `issue` or `pull_request`.
+    pub kind: &'static str,
+    pub title: String,
+    /// Its status on the board: the one it had, else the one it was given.
+    pub status: Option<String>,
+    /// It was on the board already.
+    pub already: bool,
+}
+
+/// What [`Tracker::add_to_board`] did, and what it couldn't do.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AddResult {
+    pub added: Vec<Added>,
+    pub problems: Vec<String>,
+}
+
+/// An issue or pull request as [`Tracker::add_to_board`] reads it.
+struct Candidate {
+    id: String,
+    number: u64,
+    kind: &'static str,
+    title: String,
+    state: String,
+    item: Option<String>,
+    status: Option<String>,
+}
+
+impl Tracker {
+    /// The fields [`Tracker::add_to_board`] reads of an issue or pull request.
+    fn candidate_fields(board: &Board) -> String {
+        let status = board
+            .status
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .unwrap_or("Status");
+        format!(
+            "id number title state projectItems(first: 20) {{ nodes {{ id project {{ id }} fieldValueByName(name: {}) {{ ... on ProjectV2ItemFieldSingleSelectValue {{ name }} }} }} }}",
+            Value::String(status.to_owned())
+        )
+    }
+
+    fn candidate(v: &Value, board: &Board) -> Option<Candidate> {
+        let text = |key: &str| {
+            v.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let item = v
+            .pointer("/projectItems/nodes")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|i| i.pointer("/project/id").and_then(Value::as_str) == Some(&board.id))
+            .cloned();
+        Some(Candidate {
+            id: text("id"),
+            number: v.get("number")?.as_u64()?,
+            kind: match v.get("__typename").and_then(Value::as_str) {
+                Some("PullRequest") => "pull_request",
+                _ => "issue",
+            },
+            title: text("title"),
+            state: text("state"),
+            item: item
+                .as_ref()
+                .and_then(|i| i.get("id").and_then(Value::as_str).map(str::to_owned)),
+            status: item.as_ref().and_then(|i| {
+                i.pointer("/fieldValueByName/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        })
+    }
+
+    /// Puts issues and pull requests of the repository on the board (see
+    /// [`AddItems`]). Those not on it are added, and those without a status get one
+    /// from their state: open issues to do, open pull requests in review, closed and
+    /// merged ones done. Statuses already set stay.
+    pub async fn add_to_board(&self, which: &AddItems) -> Result<AddResult> {
+        let board = self
+            .board
+            .as_ref()
+            .with_context(|| match &self.board_problem {
+                Some(problem) => format!("the board isn't used: {problem}"),
+                None => "the tracker has no board: link it with a project (--project)".to_owned(),
+            })?;
+        let fields = Self::candidate_fields(board);
+        let (owner, name) = self.config.repo.split_once('/').unwrap_or_default();
+        let mut found: Vec<Candidate> = Vec::new();
+        if !which.numbers.is_empty() {
+            let wanted: std::collections::BTreeSet<u64> = which.numbers.iter().copied().collect();
+            let query = format!(
+                "query ItemsByNumber($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {} }} }}",
+                wanted
+                    .iter()
+                    .map(|n| format!(
+                        "n{n}: issueOrPullRequest(number: {n}) {{ __typename ... on Issue {{ {fields} }} ... on PullRequest {{ {fields} }} }}"
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let reply = self
+                .api
+                .graphql(&query, json!({ "owner": owner, "name": name }))
+                .await?;
+            for n in &wanted {
+                let candidate = reply
+                    .data
+                    .pointer(&format!("/repository/n{n}"))
+                    .and_then(|v| Self::candidate(v, board))
+                    .with_context(|| {
+                        format!(
+                            "there is no issue or pull request #{n} in {} ({})",
+                            self.config.repo,
+                            reply.error_for(&format!("n{n}"))
+                        )
+                    })?;
+                found.push(candidate);
+            }
+        }
+        let mut lists = Vec::new();
+        if which.open {
+            lists.extend([("issues", "OPEN"), ("pullRequests", "OPEN")]);
+        }
+        if which.closed {
+            lists.extend([("issues", "CLOSED"), ("pullRequests", "CLOSED, MERGED")]);
+        }
+        for (connection, states) in lists {
+            let query = format!(
+                "query RepoItems($owner: String!, $name: String!, $after: String) {{ repository(owner: $owner, name: $name) {{ list: {connection}(first: 100, after: $after, states: [{states}], orderBy: {{ field: CREATED_AT, direction: ASC }}) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ __typename {fields} }} }} }} }}"
+            );
+            let mut after = Value::Null;
+            for _ in 0..10 {
+                let data = self
+                    .api
+                    .graphql(
+                        &query,
+                        json!({ "owner": owner, "name": name, "after": after }),
+                    )
+                    .await?
+                    .ok()?;
+                let list = data
+                    .pointer("/repository/list")
+                    .cloned()
+                    .unwrap_or_default();
+                for node in list
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(c) = Self::candidate(node, board)
+                        && !found.iter().any(|f| f.number == c.number)
+                    {
+                        found.push(c);
+                    }
+                }
+                match list
+                    .pointer("/pageInfo/hasNextPage")
+                    .and_then(Value::as_bool)
+                {
+                    Some(true) => {
+                        after = list
+                            .pointer("/pageInfo/endCursor")
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                    _ => break,
+                }
+            }
+        }
+        found.sort_by_key(|c| c.number);
+        let already: Vec<bool> = found.iter().map(|c| c.item.is_some()).collect();
+        let mut result = AddResult::default();
+        let missing: Vec<usize> = (0..found.len()).filter(|i| !already[*i]).collect();
+        let ids: Vec<String> = missing.iter().map(|i| found[*i].id.clone()).collect();
+        for (i, item) in missing.into_iter().zip(self.board_add(&ids).await) {
+            match item {
+                Ok(item) => found[i].item = Some(item),
+                Err(e) => result.problems.push(format!("#{}: {e:#}", found[i].number)),
+            }
+        }
+        let field = board.status.as_ref();
+        let mut ops = Vec::new();
+        for (i, c) in found.iter().enumerate() {
+            let Some(item) = &c.item else {
+                continue;
+            };
+            let mut status = c.status.clone();
+            if status.is_none() {
+                let wanted = match (c.kind, c.state.as_str()) {
+                    ("issue", "OPEN") => Status::Todo,
+                    ("pull_request", "OPEN") => Status::InReview,
+                    _ => Status::Done,
+                };
+                if let Some(op) = self.status_op(item, wanted) {
+                    ops.push((c.number, op));
+                    status = field.and_then(|f| f.option_name(wanted));
+                }
+            }
+            result.added.push(Added {
+                number: c.number,
+                kind: c.kind,
+                title: c.title.clone(),
+                status,
+                already: already[i],
+            });
+        }
+        let (numbers, ops): (Vec<u64>, Vec<Op>) = ops.into_iter().unzip();
+        for (n, r) in numbers
+            .into_iter()
+            .zip(self.run_ops("BoardStatuses", ops).await)
+        {
+            if let Err(e) = r {
+                result.problems.push(format!("#{n}'s status: {e:#}"));
+            }
+        }
+        Ok(result)
+    }
+}
 
 /// A tracker's settings and whether its board works.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2220,6 +2469,9 @@ mod tests {
         parent: Option<u64>,
         item: Option<String>,
         status: Option<String>,
+        /// A pull request (merged, if closed and `merged`).
+        pr: bool,
+        merged: bool,
     }
 
     /// GitHub as far as tracking uses it: issues, sub-issues and a board, with every
@@ -2272,6 +2524,28 @@ mod tests {
 
         fn number(id: &str) -> u64 {
             id.trim_start_matches('I').parse().unwrap()
+        }
+
+        fn state(i: &FakeIssue) -> &'static str {
+            match (i.open, i.pr && i.merged) {
+                (true, _) => "OPEN",
+                (false, true) => "MERGED",
+                (false, false) => "CLOSED",
+            }
+        }
+
+        /// An issue or pull request as `issueOrPullRequest` and the lists answer.
+        fn item_json(&self, n: u64) -> Value {
+            let issues = self.issues.lock().unwrap();
+            let Some(i) = issues.get(&n) else {
+                return Value::Null;
+            };
+            json!({
+                "__typename": if i.pr { "PullRequest" } else { "Issue" },
+                "id": format!("I{n}"), "number": n, "title": i.body, "state": Fake::state(i),
+                "projectItems": { "nodes": i.item.iter().map(|item| json!({ "id": item, "project": { "id": "P1" },
+                    "fieldValueByName": i.status.as_ref().map(|s| json!({ "name": s })).unwrap_or(Value::Null) })).collect::<Vec<_>>() },
+            })
         }
 
         fn mutate(&self, field: &str, input: &Value) -> Value {
@@ -2400,6 +2674,38 @@ mod tests {
                         repo.insert(format!("n{n}"), self.issue_json(n));
                     }
                     json!({ "repository": repo })
+                }
+                "ItemsByNumber" => {
+                    let mut repo = serde_json::Map::new();
+                    for part in query.split(": issueOrPullRequest(number: ").skip(1) {
+                        let n: u64 = part.split(')').next().unwrap().parse().unwrap();
+                        repo.insert(format!("n{n}"), self.item_json(n));
+                    }
+                    json!({ "repository": repo })
+                }
+                "RepoItems" => {
+                    let prs = query.contains("list: pullRequests(");
+                    let states: Vec<String> = query
+                        .split("states: [")
+                        .nth(1)
+                        .unwrap()
+                        .split(']')
+                        .next()
+                        .unwrap()
+                        .split(", ")
+                        .map(str::to_owned)
+                        .collect();
+                    let numbers: Vec<u64> = self
+                        .issues
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .filter(|i| i.pr == prs && states.iter().any(|s| s == Fake::state(i)))
+                        .map(|i| i.number)
+                        .collect();
+                    let nodes: Vec<Value> =
+                        numbers.into_iter().map(|n| self.item_json(n)).collect();
+                    json!({ "repository": { "list": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": nodes } } })
                 }
                 _ if query.starts_with("mutation") => {
                     let mut data = serde_json::Map::new();
@@ -2840,6 +3146,114 @@ mod tests {
         let mut tracker = Tracker::connect(fake.clone(), config_now).await.unwrap();
         assert_eq!(tracker.settle().await.unwrap(), [10]);
         assert!(!fake.open(10) && fake.status(10).as_deref() == Some("Done"));
+    }
+
+    #[tokio::test]
+    async fn existing_issues_and_pull_requests_go_on_the_board_with_a_status_from_their_state() {
+        let issue = |number, open| FakeIssue {
+            number,
+            open,
+            body: format!("Item {number}"),
+            ..FakeIssue::default()
+        };
+        let fake = Fake::with(&[
+            FakeIssue {
+                pr: true,
+                merged: true,
+                ..issue(1, false)
+            },
+            issue(2, true),
+            FakeIssue {
+                item: Some("PVTI3".into()),
+                status: Some("🏗 In progress".into()),
+                ..issue(3, true)
+            },
+            issue(4, false),
+            FakeIssue {
+                pr: true,
+                ..issue(5, true)
+            },
+        ]);
+        let tracker = Tracker::connect(fake.clone(), config()).await.unwrap();
+        let open = tracker
+            .add_to_board(&AddItems {
+                open: true,
+                ..AddItems::default()
+            })
+            .await
+            .unwrap();
+        let summary = |r: &AddResult| {
+            r.added
+                .iter()
+                .map(|a| {
+                    (
+                        a.number,
+                        a.kind,
+                        a.status.clone().unwrap_or_default(),
+                        a.already,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // Open issues are to do and open pull requests in review; a status set stays.
+        assert_eq!(
+            summary(&open),
+            [
+                (2, "issue", "Todo".to_owned(), false),
+                (3, "issue", "🏗 In progress".to_owned(), true),
+                (5, "pull_request", "👀 In review".to_owned(), false),
+            ]
+        );
+        assert!(open.problems.is_empty(), "{:?}", open.problems);
+        assert_eq!(fake.status(2).as_deref(), Some("Todo"));
+        assert_eq!(fake.status(3).as_deref(), Some("🏗 In progress"));
+        // Closed issues and merged pull requests are done; numbers add to the lists.
+        let closed = tracker
+            .add_to_board(&AddItems {
+                closed: true,
+                numbers: vec![2],
+                ..AddItems::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            summary(&closed),
+            [
+                (1, "pull_request", "Done".to_owned(), false),
+                (2, "issue", "Todo".to_owned(), true),
+                (4, "issue", "Done".to_owned(), false),
+            ]
+        );
+        assert_eq!(fake.calls("addProjectV2ItemById").len(), 4);
+        // An unknown number says so; without the board it says why.
+        let err = tracker
+            .add_to_board(&AddItems {
+                numbers: vec![9],
+                ..AddItems::default()
+            })
+            .await;
+        assert!(err.is_err());
+        let no_board = Tracker::connect(
+            Arc::new(Fake {
+                no_project_scope: true,
+                ..Fake::default()
+            }),
+            config(),
+        )
+        .await
+        .unwrap();
+        let err = no_board
+            .add_to_board(&AddItems {
+                open: true,
+                ..AddItems::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the board isn't used") && err.contains("--scopes project"),
+            "{err}"
+        );
     }
 
     #[test]
