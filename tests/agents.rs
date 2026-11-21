@@ -1923,7 +1923,9 @@ async fn delegated_tasks_report_each_attempt_and_check() {
 }
 
 /// A task's commit has its title as the subject, whatever skills were put in front
-/// of the prompt, and says who asked and who did it.
+/// of the prompt, says who asked and who did it, and references the issues the task
+/// is for (only well-formed ones: they come from the peer), which the branch's pull
+/// request then closes.
 #[tokio::test]
 async fn a_task_with_skills_commits_with_its_title_as_the_subject() {
     let repo = git_repo();
@@ -1946,6 +1948,11 @@ async fn a_task_with_skills_commits_with_its_title_as_the_subject() {
     )
     .in_share("app");
     task.title = Some("create note.txt".into());
+    task.issues = vec![
+        "acme/app#24".into(),
+        "acme/app#25\nSigned-off-by: someone".into(),
+        "other/lib#3".into(),
+    ];
     let done = boss.delegate_verified(worker.id(), task).await.unwrap();
     assert!(done.ok && done.verified, "{}", done.output);
     let git_record = done.evidence.as_ref().unwrap().git.clone().unwrap();
@@ -1960,8 +1967,28 @@ async fn a_task_with_skills_commits_with_its_title_as_the_subject() {
     let message = message.trim_end();
     assert!(message.starts_with("create note.txt\n\nTask "), "{message}");
     assert!(
-        message.ends_with(" from boss, done by worker with Proofkin."),
+        message.ends_with(
+            " from boss, done by worker with Proofkin.\n\nRefs: acme/app#24\nRefs: other/lib#3"
+        ),
         "{message}"
+    );
+    let linked = proofkin::github::Repo {
+        name: "app".into(),
+        slug: "acme/app".into(),
+        host: "github.com".into(),
+        path: repo.path().to_path_buf(),
+        branch: "main".into(),
+    };
+    let branches = proofkin::github::task_branches(&linked).await.unwrap();
+    let branch = branches
+        .iter()
+        .find(|b| b.name == git_record.branch)
+        .unwrap();
+    assert_eq!(branch.issues, ["acme/app#24", "other/lib#3"]);
+    assert_eq!(branch.subject, "create note.txt");
+    assert_eq!(
+        proofkin::tracker::closing_lines(&branch.issues, &linked.slug),
+        "Closes #24\nCloses other/lib#3\n"
     );
 }
 
@@ -2182,7 +2209,7 @@ async fn team_steps_hand_work_down_a_level_and_prove_it_through_the_whole_tree()
     .unwrap();
     let ctx = RunContext {
         run_id: Some("boss-run".into()),
-        chain: Vec::new(),
+        ..RunContext::default()
     };
     let mut seen = Vec::new();
     let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, s| {

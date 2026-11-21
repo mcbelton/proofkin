@@ -94,6 +94,14 @@
         <div id="github"></div>
       </section>
 
+      <section class="card" aria-labelledby="tracker-h">
+        <div class="card-head">
+          <h2 id="tracker-h">Tracker</h2>
+          <button type="button" class="btn small" id="tracker-btn" hidden>Link</button>
+        </div>
+        <div id="tracker"></div>
+      </section>
+
       <section class="card" aria-labelledby="tools-h">
         <div class="card-head">
           <h2 id="tools-h">Plugins &amp; tools</h2>
@@ -558,6 +566,7 @@
         </span>
       </div>
       <p id="run-verdict" class="run-verdict"></p>
+      <p id="run-tracked" class="small" hidden></p>
       <ul id="run-signatures" class="signature-list"></ul>
       <div id="run-prototypes" class="task-actions"></div>
       <div id="run-report" class="result" tabindex="0"></div>
@@ -624,6 +633,32 @@
         <button type="submit" class="btn primary" id="repo-submit">Link</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="tracker-dialog" aria-labelledby="tracker-dialog-h">
+    <form method="dialog" id="tracker-form" novalidate>
+      <h2 id="tracker-dialog-h">Track plan runs on GitHub</h2>
+      <p class="muted small">Each plan run gets an issue in this repository and each step a sub-issue, assigned to your GitHub account. On the project's board their status follows the run, and pull requests from the steps' branches close them.</p>
+      <label class="field"><span>Repository for the issues</span><input id="tracker-repo" type="text" placeholder="owner/repo" spellcheck="false" autocomplete="off" required></label>
+      <label class="field"><span>Project board <span class="muted">(optional: its address)</span></span><input id="tracker-project" type="url" placeholder="https://github.com/users/you/projects/1" spellcheck="false" autocomplete="off"></label>
+      <p class="muted small">The board needs the <span class="mono">project</span> scope on your GitHub CLI token: <span class="mono">gh auth refresh --scopes project</span>. Without it, the runs are tracked as issues only.</p>
+      <p class="form-error" id="tracker-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="tracker-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="tracker-submit">Link</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="tracker-items-dialog" class="wide" aria-labelledby="tracker-items-h">
+    <div class="dialog-body">
+      <div class="card-head">
+        <h2 id="tracker-items-h">Board items</h2>
+        <span class="head-actions"><button type="button" class="btn small" id="tracker-items-close">Close</button></span>
+      </div>
+      <p class="muted small" id="tracker-items-desc"></p>
+      <ul class="tracker-groups" id="tracker-items" aria-live="polite"></ul>
+    </div>
   </dialog>
 
   <dialog id="pr-dialog" aria-labelledby="pr-h">

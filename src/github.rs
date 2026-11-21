@@ -128,7 +128,7 @@ pub fn gh_accounts() -> Vec<(String, String, bool)> {
 }
 
 /// The GitHub CLI (`PROOFKIN_GH` overrides it, e.g. for tests).
-fn gh_program() -> PathBuf {
+pub(crate) fn gh_program() -> PathBuf {
     crate::profile::env_setting_os("GH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("gh"))
@@ -343,6 +343,9 @@ pub struct TaskBranch {
     pub name: String,
     pub unix: u64,
     pub subject: String,
+    /// The issues its commit is for (its `Refs:` trailers, see [`crate::tracker`]): a
+    /// pull request from it closes them.
+    pub issues: Vec<String>,
 }
 
 /// The clone's `p2p/...` branches, newest first.
@@ -353,7 +356,7 @@ pub async fn task_branches(repo: &Repo) -> Result<Vec<TaskBranch>> {
         .args([
             "for-each-ref",
             "--sort=-committerdate",
-            "--format=%(refname:short)%09%(committerdate:unix)%09%(subject)",
+            "--format=%(refname:short)%09%(committerdate:unix)%09%(trailers:key=Refs,valueonly,separator=%x2C)%09%(subject)",
             "refs/heads/p2p/",
         ])
         .stdin(Stdio::null())
@@ -363,10 +366,17 @@ pub async fn task_branches(repo: &Repo) -> Result<Vec<TaskBranch>> {
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
-            let mut parts = l.splitn(3, '\t');
+            let mut parts = l.splitn(4, '\t');
             Some(TaskBranch {
                 name: parts.next()?.to_owned(),
                 unix: parts.next()?.parse().ok()?,
+                issues: parts
+                    .next()?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|r| crate::tracker::valid_ref(r))
+                    .map(str::to_owned)
+                    .collect(),
                 subject: parts.next().unwrap_or_default().to_owned(),
             })
         })

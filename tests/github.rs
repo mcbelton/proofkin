@@ -1,7 +1,8 @@
 //! Linked repositories: clone with the profile's GitHub account (token only in the
 //! environment), share with a worktree per task, sync, push task branches and open
-//! pull requests. A local bare repository stands in for GitHub, and a fake `gh`
-//! records how the pull request was requested.
+//! pull requests; and the tracker's GraphQL requests. A local bare repository stands
+//! in for GitHub, and a fake `gh` records how the pull request and the requests were
+//! made.
 
 use std::path::Path;
 use std::process::Command;
@@ -340,6 +341,63 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
     ] {
         assert!(call.contains(part), "{part:?} in {call}");
     }
+
+    // The tracker's GraphQL goes through gh too: the request on stdin, the token in
+    // its environment (never on the command line).
+    let calls = tmp.path().join("gh-graphql.txt");
+    let answer = r#"{"data":{"viewer":{"id":"U1","login":"alice"},"repository":{"id":"R1","url":"https://github.com/acme/app"},"repositoryOwner":{"projectV2":{"id":"P1","title":"Tracker","url":"https://github.com/users/alice/projects/4","fields":{"nodes":[{"id":"F1","name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"o1","name":"Todo"},{"id":"o2","name":"Done"}]},{"id":"F2","name":"Agent","dataType":"TEXT"}]}}}}}"#;
+    if cfg!(windows) {
+        std::fs::write(
+            &fake,
+            format!("@echo off\r\necho %*>> \"{0}\"\r\necho token=%GH_TOKEN% host=%GH_HOST%>> \"{0}\"\r\nfindstr \"^\" >> \"{0}\"\r\necho.>> \"{0}\"\r\necho {answer}\r\n", calls.display()),
+        )
+        .unwrap();
+    } else {
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$@\" >> '{0}'\necho \"token=$GH_TOKEN host=$GH_HOST\" >> '{0}'\ncat >> '{0}'\necho >> '{0}'\necho '{answer}'\n", calls.display()),
+        )
+        .unwrap();
+    }
+    let config = proofkin::tracker::TrackerConfig {
+        repo: "acme/app".into(),
+        host: "github.com".into(),
+        project: Some(
+            proofkin::tracker::parse_project(
+                "https://github.com/users/alice/projects/4",
+                "github.com",
+            )
+            .unwrap(),
+        ),
+        open_runs: Vec::new(),
+    };
+    let tracker = proofkin::tracker::Tracker::connect(
+        std::sync::Arc::new(proofkin::tracker::GhApi::new(creds.clone())),
+        config,
+    )
+    .await
+    .unwrap();
+    let info = tracker.info();
+    assert_eq!(info.login, "alice");
+    let board = info.board.expect("the board");
+    assert_eq!(board.title, "Tracker");
+    assert_eq!(board.statuses, ["Todo", "Done"]);
+    assert!(board.agent_field && info.board_problem.is_none());
+    let sent = std::fs::read_to_string(&calls).unwrap();
+    for part in [
+        "api graphql --hostname github.com --input -",
+        "token=t0k3n-never-stored host=github.com",
+        "query Repo(",
+        "query Board(",
+        r#""number":4"#,
+    ] {
+        assert!(sent.contains(part), "{part:?} in {sent}");
+    }
+    assert_eq!(
+        sent.matches("t0k3n-never-stored").count(),
+        2,
+        "the token is only in gh's environment: {sent}"
+    );
 
     let shares = unlink(&profile, "app", true).unwrap();
     assert!(shares.get("app").is_none() && !repo.path.exists());

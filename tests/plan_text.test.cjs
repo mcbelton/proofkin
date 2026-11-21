@@ -157,6 +157,13 @@ cases.push(
     needs(planText.parsePlan("claim: C-1 x\nbuild team @alice:app claims=C-1 Build it")), ""],
   ["no checks on a team step", part("build team @alice:app Build| it", "verify=test"), `error: ${ERRORS.teamOption}`],
   ["a team step's timeout", part("build team @alice:app Build| it", "timeout=30m"), "build team @alice:app timeout=30m Build it[]"],
+  // How the run is tracked on GitHub: one track: line, kept as written; issue= is a step's.
+  ["a tracked plan comes back as it was", text(planText.parsePlan("// The feature\ntrack: #12\nclaim: C-1 x\na @x issue=#15 Do it")),
+    "// The feature\ntrack: #12\n\nclaim: C-1 x\n\na @x issue=#15 Do it"],
+  ["track: is no step", needs(planText.parsePlan("track: Ship it\na @x Do it")), ""],
+  ["tracking a plan", line("a @x Do| it", "track"), "track: #[1]\na @x Do it"],
+  ["a plan tracked already", line("track: #4\na @x Do| it", "track"), "track: [#4]\na @x Do it"],
+  ["a step's one issue", part("a @x issue=#3 Do| it", "issue=#5"), "a @x issue=#5 Do it[]"],
 );
 
 const failed = cases.filter(([, got, want]) => got !== want);

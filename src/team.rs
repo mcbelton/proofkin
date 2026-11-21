@@ -187,6 +187,13 @@ impl TeamRunner {
         let ctx = RunContext {
             run_id: Some(run_id.clone()),
             chain,
+            // The team's commits reference the issues of the step they do together.
+            issues: plan
+                .steps
+                .iter()
+                .map(|s| (s.id.clone(), task.issues.clone()))
+                .filter(|(_, issues)| !issues.is_empty())
+                .collect(),
         };
         let finals = crate::plan::run_plan_with(agent, &squads, &ready, &ctx, |id, state| {
             states.insert(id.to_owned(), state.clone());

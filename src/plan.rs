@@ -26,6 +26,11 @@
 //! others are given once. `approve @person` (or `@me`) asks a
 //! team member to sign off instead of running a model. See [`crate::runs`] for the
 //! verdicts.
+//!
+//! With a tracker linked (see [`crate::tracker`]), each run is tracked as a GitHub
+//! issue and each step as a sub-issue: `track: #12` works on issue 12, `track: <title>`
+//! names a new issue and `track: off` leaves the run untracked; `issue=#15` makes a
+//! step work on an existing issue.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -191,6 +196,10 @@ pub struct Step {
     /// cancelled, on every level below too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// The issue of the tracker's repository the step works on (`issue=#15`), instead
+    /// of a sub-issue made for it (see [`crate::tracker`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
 }
 
 impl Step {
@@ -219,11 +228,59 @@ pub struct ClaimDef {
     pub text: String,
 }
 
+/// How a plan's run is tracked when the profile has a tracker (`track:` line).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Track {
+    /// `track: #12`: the run works on issue 12.
+    Issue(u64),
+    /// `track: <title>`: a new issue with this title tracks the run.
+    New(String),
+    /// `track: off`: the run isn't tracked.
+    Off,
+}
+
+/// The longest title of a new issue (GitHub's limit).
+const MAX_ISSUE_TITLE: usize = 256;
+
+/// An issue number written `12` or `#12`.
+pub fn issue_number(text: &str) -> Option<u64> {
+    text.strip_prefix('#')
+        .unwrap_or(text)
+        .parse()
+        .ok()
+        .filter(|n| *n > 0)
+}
+
+fn parse_track(rest: &str) -> Result<Track> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        bail!("track: needs #<issue number>, a title for a new issue, or off");
+    }
+    if rest.eq_ignore_ascii_case("off") {
+        return Ok(Track::Off);
+    }
+    if let Some(n) = issue_number(rest) {
+        return Ok(Track::Issue(n));
+    }
+    if rest.starts_with('#') {
+        bail!("track: #N needs an issue number, got {rest:?}");
+    }
+    if rest.chars().count() > MAX_ISSUE_TITLE {
+        bail!("track: an issue's title has at most {MAX_ISSUE_TITLE} characters");
+    }
+    Ok(Track::New(rest.to_owned()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     #[serde(default)]
     pub claims: Vec<ClaimDef>,
     pub steps: Vec<Step>,
+    /// How its run is tracked (`track:`); by default, as a new issue when the profile
+    /// has a tracker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<Track>,
 }
 
 impl Plan {
@@ -232,15 +289,23 @@ impl Plan {
     pub fn parse(text: &str) -> Result<Self> {
         let mut steps = Vec::new();
         let mut claims = Vec::new();
+        let mut track = None;
         let mut errors = Vec::new();
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("//") {
                 continue;
             }
-            let parsed = match line.strip_prefix("claim:") {
-                Some(rest) => parse_claim(rest).map(|c| claims.push(c)),
-                None => parse_step(line).map(|s| steps.push(s)),
+            let parsed = if let Some(rest) = line.strip_prefix("claim:") {
+                parse_claim(rest).map(|c| claims.push(c))
+            } else if let Some(rest) = line.strip_prefix("track:") {
+                if track.is_some() {
+                    Err(anyhow!("track: is given twice; a plan has one"))
+                } else {
+                    parse_track(rest).map(|t| track = Some(t))
+                }
+            } else {
+                parse_step(line).map(|s| steps.push(s))
             };
             if let Err(e) = parsed {
                 errors.push(format!("line {}: {e}", n + 1));
@@ -249,9 +314,18 @@ impl Plan {
         if !errors.is_empty() {
             bail!("{}", errors.join("\n"));
         }
-        let plan = Plan { claims, steps };
+        let plan = Plan {
+            claims,
+            steps,
+            track,
+        };
         plan.validate()?;
         Ok(plan)
+    }
+
+    /// Whether the plan names issues of a tracker (`track: #N` or `issue=`).
+    pub fn names_issues(&self) -> bool {
+        matches!(self.track, Some(Track::Issue(_))) || self.steps.iter().any(|s| s.issue.is_some())
     }
 
     /// Unique ids, known dependencies and claims, sensible options and no cycles.
@@ -269,6 +343,22 @@ impl Plan {
         for step in &self.steps {
             if seen.insert(step.id.as_str(), step).is_some() {
                 bail!("step '{}' is defined twice", step.id);
+            }
+        }
+        let mut issues = HashMap::new();
+        for step in &self.steps {
+            let Some(n) = step.issue else { continue };
+            if self.track == Some(Track::Issue(n)) {
+                bail!(
+                    "step '{}' works on #{n}, the run's own issue (track: #{n}); its steps get sub-issues",
+                    step.id
+                );
+            }
+            if let Some(other) = issues.insert(n, step.id.as_str()) {
+                bail!(
+                    "steps '{other}' and '{}' both work on issue #{n}; a step has its own issue",
+                    step.id
+                );
             }
         }
         for step in &self.steps {
@@ -483,7 +573,7 @@ const TODO_CLAIM: &str = "What must be true at the end";
 /// Step options (`name=value`, before what to do).
 const STEP_OPTIONS: &[&str] = &[
     "verify", "attempts", "claims", "claim", "apply", "context", "skill", "skills", "mcp", "save",
-    "agent", "levels", "timeout",
+    "agent", "levels", "timeout", "issue",
 ];
 
 /// The longest `timeout=` a step may have (a week).
@@ -591,7 +681,7 @@ fn parse_step(line: &str) -> Result<Step> {
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
     let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
     let mut agent = None;
-    let (mut levels, mut timeout) = (None, None);
+    let (mut levels, mut timeout, mut issue) = (None, None, None);
     let mut once = std::collections::HashSet::new();
     loop {
         match words.peek().copied() {
@@ -605,7 +695,7 @@ fn parse_step(line: &str) -> Result<Step> {
                 let (key, value) = word.split_once('=').expect("contains '='");
                 if matches!(
                     key,
-                    "attempts" | "apply" | "save" | "agent" | "levels" | "timeout"
+                    "attempts" | "apply" | "save" | "agent" | "levels" | "timeout" | "issue"
                 ) && !once.insert(key)
                 {
                     bail!("{key}= is given twice; a step has one");
@@ -654,6 +744,11 @@ fn parse_step(line: &str) -> Result<Step> {
                         levels = Some(n);
                     }
                     "timeout" => timeout = Some(parse_timeout(value)?),
+                    "issue" => {
+                        issue = Some(issue_number(value).ok_or_else(|| {
+                            anyhow!("issue= needs an issue number, e.g. issue=#12, got {value:?}")
+                        })?);
+                    }
                     _ => break,
                 }
                 words.next();
@@ -688,6 +783,7 @@ fn parse_step(line: &str) -> Result<Step> {
         agent,
         team: team.then(|| levels.unwrap_or(1)),
         timeout,
+        issue,
     })
 }
 
@@ -1324,7 +1420,7 @@ pub struct ReadyRun {
     ready: Plan,
     squads: SquadStore,
     kb: KnowledgeBase,
-    runs_dir: std::path::PathBuf,
+    profile: crate::profile::Profile,
 }
 
 /// Checks plan `text` as `/plan` and the web UI do (preflight against connected
@@ -1353,20 +1449,49 @@ pub fn start(agent: &Agent, profile: &crate::profile::Profile, text: &str) -> Re
         ready,
         squads,
         kb,
-        runs_dir: profile.runs_dir(),
+        profile: profile.clone(),
     })
 }
 
 impl ReadyRun {
-    /// Runs it, then saves its evidence record and the knowledge its verified steps
-    /// produced. Returns the run (saved unless saving failed, which is printed).
+    /// Runs it (tracked on GitHub if the profile has a tracker), then saves its
+    /// evidence record and the knowledge its verified steps produced. Returns the run
+    /// (saved unless saving failed, which is printed, like tracking problems).
     pub async fn run(
         self,
         agent: &Agent,
-        on_update: impl FnMut(&str, &StepState),
+        mut on_update: impl FnMut(&str, &StepState),
     ) -> crate::runs::RunRecord {
         let started = crate::runs::unix_now();
-        let states = run_plan(agent, &self.squads, &self.ready, on_update).await;
+        let run_id = crate::runs::new_run_id();
+        let tracking =
+            match crate::tracker::start(&self.profile, &self.plan, &run_id, agent.name()).await {
+                Ok(tracking) => tracking,
+                Err(e) => {
+                    eprintln!("the run isn't tracked on GitHub: {e:#}");
+                    None
+                }
+            };
+        if let Some(t) = &tracking {
+            for line in t.tracked.describe() {
+                eprintln!("{line}");
+            }
+        }
+        let ctx = RunContext {
+            run_id: Some(run_id.clone()),
+            chain: Vec::new(),
+            issues: tracking
+                .as_ref()
+                .map(|t| t.refs.clone())
+                .unwrap_or_default(),
+        };
+        let states = run_plan_with(agent, &self.squads, &self.ready, &ctx, |step, state| {
+            if let Some(t) = &tracking {
+                t.update(step, state);
+            }
+            on_update(step, state);
+        })
+        .await;
         let mut run = crate::runs::RunRecord::new(
             agent.name(),
             &agent.id().to_string(),
@@ -1375,8 +1500,17 @@ impl ReadyRun {
             &states,
             started,
         );
+        run.id = run_id;
         run.peer_ids = crate::runs::peer_ids(agent);
-        if let Err(e) = run.save(&self.runs_dir) {
+        if let Some(t) = tracking {
+            let known = t.tracked.problems.len();
+            let tracked = t.finish(&run).await;
+            for problem in tracked.problems.iter().skip(known) {
+                eprintln!("tracker: {problem}");
+            }
+            run.tracked = Some(tracked);
+        }
+        if let Err(e) = run.save(&self.profile.runs_dir()) {
             eprintln!("could not save the run: {e:#}");
         }
         save_knowledge(&self.kb, &self.plan, &states, &run.id);
@@ -1403,6 +1537,9 @@ pub struct RunContext {
     /// The agents the work came down from, top first: no step runs on one of them, and
     /// team steps pass the chain on (with this agent added), so work never loops.
     pub chain: Vec<EndpointId>,
+    /// The issues each step's task carries, by step (`owner/repo#N`, see
+    /// [`crate::tracker`]): its commit references them, a pull request closes them.
+    pub issues: HashMap<String, Vec<String>>,
 }
 
 /// Runs `plan` with `agent`, reporting every state change to `on_update`, and
@@ -1613,6 +1750,7 @@ pub async fn run_plan_with(
                         .with_checks(step.checks.clone(), step.attempts);
                     task.mcp = step.mcp.clone();
                     task.title = Some(crate::llm::title_of(step.own_text()));
+                    task.issues = ctx.issues.get(&step.id).cloned().unwrap_or_default();
                     if let Some(share) = &step.share {
                         task = task.in_share(share.clone());
                     }
@@ -1888,6 +2026,42 @@ mod tests {
         );
         fails("a approve @me save=notes ok?", "no result to save");
         fails("a @x save=../up do", "save= needs a topic name");
+    }
+
+    #[test]
+    fn a_plan_says_how_its_run_is_tracked_and_its_steps_name_their_issues() {
+        let plan = Plan::parse("track: #12\na @x issue=#15 Do it\nb after a @y issue=16 Then this")
+            .unwrap();
+        assert_eq!(plan.track, Some(Track::Issue(12)));
+        assert_eq!(plan.steps[0].issue, Some(15));
+        assert_eq!(plan.steps[1].issue, Some(16));
+        assert_eq!(plan.steps[1].prompt, "Then this");
+        assert!(plan.names_issues());
+        let track = |text: &str| Plan::parse(text).unwrap().track;
+        assert_eq!(
+            track("track: Ship the tracker\na @x Do it"),
+            Some(Track::New("Ship the tracker".into()))
+        );
+        assert_eq!(track("track: OFF\na @x Do it"), Some(Track::Off));
+        assert!(!Plan::parse("a @x Do it").unwrap().names_issues());
+        for (text, expected) in [
+            ("track: #x\na @x Do it", "track: #N needs an issue number"),
+            ("track:\na @x Do it", "track: needs #<issue number>"),
+            (
+                "track: #1\ntrack: #2\na @x Do it",
+                "line 2: track: is given twice",
+            ),
+            ("a @x issue=abc Do it", "issue= needs an issue number"),
+            ("a @x issue=#1 issue=#2 Do it", "issue= is given twice"),
+            (
+                "a @x issue=#3 Do it\nb @y issue=3 Do that",
+                "both work on issue #3",
+            ),
+            ("track: #4\na @x issue=#4 Do it", "the run's own issue"),
+        ] {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{text:?}: {err}");
+        }
     }
 
     #[test]

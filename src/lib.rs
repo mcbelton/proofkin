@@ -32,6 +32,7 @@ pub mod spec;
 pub mod spec_import;
 pub mod store;
 pub mod team;
+pub mod tracker;
 pub mod trust;
 pub mod ui;
 pub mod workers;

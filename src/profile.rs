@@ -581,6 +581,12 @@ impl Profile {
         self.dir.join("repos.json")
     }
 
+    /// Where this profile tracks its plan runs: an issue repository and a GitHub
+    /// Project (see [`crate::tracker`]).
+    pub fn tracker_path(&self) -> PathBuf {
+        self.dir.join("tracker.json")
+    }
+
     /// The GitHub account for repositories (a digital worker uses its owner's).
     pub fn github(&self) -> Result<crate::github::GithubCredentials> {
         if self.config.owner.is_some() {

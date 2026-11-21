@@ -340,6 +340,16 @@ const planBuilder = (() => {
     limit.addEventListener("change", () => { planText.setValues(s, "timeout", limit.value || null); changed(); });
     items.push(field(`${k}-timeout`, "Cancel it after", limit, "It fails then, and steps waiting for it are skipped"));
     set += Boolean(timeout);
+    // The GitHub issue it works on, when this agent tracks its runs (Settings: Tracker).
+    const issue = el("input", { type: "text", inputmode: "numeric", placeholder: "#12", autocomplete: "off", spellcheck: "false" });
+    issue.value = planText.valuesOf(s, "issue")[0] ?? "";
+    issue.addEventListener("change", () => {
+      const n = issue.value.trim().replace(/^#/, "");
+      planText.setValues(s, "issue", n ? `#${n}` : null);
+      changed();
+    });
+    items.push(field(`${k}-issue`, "Its issue", issue, "An issue of the tracker's repository it works on; without one, a tracked run gives it a sub-issue"));
+    set += Boolean(issue.value);
     if (s.team) {
       const levels = el("select", {}, ...[1, 2, 3].map((n) => el("option", {
         value: String(n), text: n === 1 ? "Their team does it" : `It may go ${n} levels down (their team's own team steps)`,
