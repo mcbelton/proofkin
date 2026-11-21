@@ -493,6 +493,24 @@
     </form>
   </dialog>
 
+  <dialog id="team-dialog" aria-labelledby="team-h">
+    <form method="dialog" id="team-form" novalidate>
+      <h2 id="team-h">Team plan</h2>
+      <p class="muted small" id="team-intro"></p>
+      <label class="field">
+        <span>Team plan</span>
+        <textarea id="team-plan" class="mono" rows="8" spellcheck="false" aria-describedby="team-hint"></textarea>
+        <span class="muted small" id="team-hint">One claim or step per line. <span class="mono">{task}</span> is where the task of the peer's step goes (in claims, a one-line brief of it).</span>
+      </label>
+      <p class="form-error" id="team-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn danger" id="team-remove">Remove team plan</button>
+        <button type="button" class="btn" id="team-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="team-save">Save team plan</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="worker-dialog" aria-labelledby="worker-h">
     <form method="dialog" id="worker-form" novalidate>
       <h2 id="worker-h">New digital worker</h2>

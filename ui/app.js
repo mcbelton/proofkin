@@ -388,7 +388,14 @@ function renderMe() {
               ? "Preview this folder's review decks, design documents and prototype in a sandboxed tab"
               : "Preview prototype/index.html of this folder in a sandboxed tab",
             onclick: (e) => openPreview({ share: s.name }, e.currentTarget),
-          }, s.preview === "review pack" ? "Preview review pack" : "Preview prototype") : null))));
+          }, s.preview === "review pack" ? "Preview review pack" : "Preview prototype") : null,
+          s.name === "data" ? null : el("div", { class: "share-team" },
+            el("button", {
+              type: "button", class: "btn small", "aria-label": `Team plan for ${s.name}`,
+              title: "Set what this agent's team does when a peer hands this folder a team step",
+              onclick: (e) => openTeamDialog(s, e.currentTarget),
+            }, "Team plan…"),
+            s.team ? el("span", { class: "small muted", text: `Takes team steps (${teamStepCount(s.team)} ${teamStepCount(s.team) === 1 ? "step" : "steps"})` }) : null)))));
     }
   } else {
     fact("Providers", "None (delegates only)");
@@ -808,6 +815,75 @@ function renderSquads() {
         onclick: () => removeSquad(s.name),
       }, icon(ICONS.trash))));
   }
+}
+
+/** The steps of a team plan: its lines that are neither blank, comments nor claims. */
+function teamStepCount(plan) {
+  return plan.split("\n").map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("//") && !l.startsWith("claim:")).length;
+}
+
+let teamFolder = null;
+
+function openTeamDialog(share, opener) {
+  teamFolder = share.name;
+  const me = state.me.name;
+  $("#team-h").textContent = `Team plan for ${share.name}`;
+  $("#team-intro").textContent = `Peers with edit access hand this folder team steps (name team @${me}:${share.name} what to do). `
+    + "This agent's team runs the plan on its own peers, digital workers and squads. "
+    + "{task} is where their task goes (in claims, a one-line brief of it).";
+  const plan = $("#team-plan");
+  plan.value = share.team ?? "";
+  plan.placeholder = `claim: T-1 {task} passes the tests\nbuild @alice:${share.name} verify=test claims=T-1 {task}`;
+  $("#team-error").textContent = "";
+  $("#team-remove").hidden = !share.team;
+  $("#team-dialog").addEventListener("close", () => {
+    if (opener.isConnected) opener.focus();
+  }, { once: true });
+  $("#team-dialog").showModal();
+  plan.focus();
+}
+
+/// Runs a team plan request with `button` disabled and saying `busy`; on success closes
+/// the dialog and refreshes the card, on an error shows the server's words and keeps the text.
+async function sendTeamPlan(button, busy, request, done) {
+  const buttons = [...$("#team-form").querySelectorAll("button")];
+  const label = button.textContent;
+  $("#team-error").textContent = "";
+  for (const b of buttons) b.disabled = true;
+  button.textContent = busy;
+  const folder = teamFolder;
+  try {
+    await request(`/api/shares/${encodeURIComponent(folder)}/team`);
+    $("#team-dialog").close();
+    toast(done(folder));
+    await loadState();
+  } catch (err) {
+    $("#team-error").textContent = err.message;
+  } finally {
+    for (const b of buttons) b.disabled = false;
+    button.textContent = label;
+  }
+}
+
+function submitTeamPlan(e) {
+  e.preventDefault();
+  return sendTeamPlan($("#team-save"), "Saving…",
+    (url) => api(url, { method: "PUT", body: JSON.stringify({ plan: $("#team-plan").value }) }),
+    (folder) => `Saved the team plan for ${folder}`);
+}
+
+async function removeTeamPlan() {
+  const folder = teamFolder;
+  const ok = await confirmDialog({
+    title: `Remove the team plan for ${folder}?`,
+    body: "Peers can no longer hand this folder team steps. The folder, its checks and its other settings stay.",
+    confirm: "Remove team plan",
+    danger: true,
+  });
+  if (!ok) return;
+  await sendTeamPlan($("#team-remove"), "Removing…", (url) => api(url, { method: "DELETE" }),
+    (name) => `Removed the team plan for ${name}`);
 }
 
 function openSquadDialog() {
@@ -2496,6 +2572,9 @@ function init() {
   $("#squad-cancel").addEventListener("click", () => $("#squad-dialog").close());
   $("#squad-dialog").addEventListener("close", () => $("#add-squad-btn").focus());
   $("#squad-form").addEventListener("submit", submitSquad);
+  $("#team-cancel").addEventListener("click", () => $("#team-dialog").close());
+  $("#team-form").addEventListener("submit", submitTeamPlan);
+  $("#team-remove").addEventListener("click", removeTeamPlan);
   $("#clear-tasks-btn").addEventListener("click", clearTasks);
   $("#add-monitor-btn").addEventListener("click", openMonitorDialog);
   $("#monitor-cancel").addEventListener("click", () => $("#monitor-dialog").close());
@@ -2546,7 +2625,7 @@ function init() {
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
-    "#monitor-dialog"]) guardDialog($(id));
+    "#monitor-dialog", "#team-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });

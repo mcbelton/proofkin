@@ -2037,6 +2037,7 @@ async fn the_page_follows_the_ux_guidelines() {
         "clear-tasks-btn",
         "add-monitor-btn",
         "monitor-dialog",
+        "team-dialog",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }
@@ -2162,6 +2163,139 @@ fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     found
+}
+
+/// An owner sets, replaces and removes a shared folder's team plan through the API;
+/// the running agent and `shares.json` follow, and bad plans change nothing.
+#[tokio::test]
+async fn the_owner_sets_and_removes_a_folders_team_plan_through_the_api() {
+    let home = tempfile::tempdir().unwrap();
+    let app = tempfile::tempdir().unwrap();
+    let profile = Profile::open_in(home.path(), "owner").unwrap();
+    let mut shares = profile.shares().unwrap();
+    shares.add("app", app.path(), Access::ReadOnly).unwrap();
+    shares.save(&profile.shares_path()).unwrap();
+    let mut config = AgentConfig::new("owner", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.shares = shares;
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: profile.clone(),
+        network: Network::Local,
+        serving: true,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let call = |method: &'static str, path: &'static str, body: Value| {
+        let (host, token) = (host.clone(), token.to_owned());
+        async move {
+            let body = (!body.is_null()).then(|| body.to_string());
+            request(port, method, path, &host, Some(&token), body.as_deref()).await
+        }
+    };
+    let plan_of = |shares: Vec<proofkin::shares::Share>| {
+        shares
+            .into_iter()
+            .find(|s| s.name == "app")
+            .and_then(|s| s.team)
+    };
+    let in_state = || async {
+        let state = call("GET", "/api/state", Value::Null).await.json();
+        state["me"]["shares"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "app")
+            .map(|s| s["team"].clone())
+            .unwrap()
+    };
+    let team = "/api/shares/app/team";
+
+    let set = call(
+        "PUT",
+        team,
+        serde_json::json!({ "plan": "build @bob {task}" }),
+    )
+    .await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(set.json(), serde_json::json!({ "name": "app", "steps": 1 }));
+    assert_eq!(in_state().await, "build @bob {task}");
+    assert_eq!(
+        plan_of(profile.shares().unwrap().shares).as_deref(),
+        Some("build @bob {task}")
+    );
+    assert_eq!(
+        plan_of(agent.shares().shares).as_deref(),
+        Some("build @bob {task}")
+    );
+
+    let two = "build @bob {task}\ncheck @bob review {task}";
+    let replaced = call("PUT", team, serde_json::json!({ "plan": two })).await;
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    assert_eq!(replaced.json()["steps"], 2);
+    assert_eq!(in_state().await, two);
+
+    let no_task = call("PUT", team, serde_json::json!({ "plan": "build @bob now" })).await;
+    assert_eq!(no_task.status, 400, "{}", no_task.body);
+    assert!(
+        no_task.json()["error"].as_str().unwrap().contains("{task}"),
+        "{}",
+        no_task.body
+    );
+    let blank = call("PUT", team, serde_json::json!({ "plan": "  " })).await;
+    assert_eq!(blank.status, 400, "{}", blank.body);
+    let data = call(
+        "PUT",
+        "/api/shares/data/team",
+        serde_json::json!({ "plan": "build @bob {task}" }),
+    )
+    .await;
+    assert_eq!(data.status, 400, "{}", data.body);
+    assert!(
+        data.json()["error"].as_str().unwrap().contains("data"),
+        "{}",
+        data.body
+    );
+    assert_eq!(in_state().await, two);
+    assert_eq!(
+        plan_of(profile.shares().unwrap().shares).as_deref(),
+        Some(two)
+    );
+
+    let unknown = call(
+        "PUT",
+        "/api/shares/nope/team",
+        serde_json::json!({ "plan": "build @bob {task}" }),
+    )
+    .await;
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
+    assert!(unknown.json()["error"].is_string());
+    let unknown = call("DELETE", "/api/shares/nope/team", Value::Null).await;
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
+
+    let removed = call("DELETE", team, Value::Null).await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert_eq!(removed.json(), serde_json::json!({ "name": "app" }));
+    assert!(in_state().await.is_null());
+    assert_eq!(plan_of(profile.shares().unwrap().shares), None);
+    assert_eq!(plan_of(agent.shares().shares), None);
 }
 
 /// A team step in the web UI: the boss's task shows the lead's team run and its
