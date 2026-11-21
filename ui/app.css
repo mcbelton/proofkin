@@ -490,7 +490,7 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .skills-box summary { cursor: pointer; font-weight: 600; font-size: 13px; }
 .skills-box li .muted { margin-top: 2px; }
 .repo { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; margin-top: 8px; background: var(--surface); }
-.repo-actions { display: flex; gap: 6px; margin-top: 6px; }
+.repo-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .branch-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .branch { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
 .branch .btn { margin-left: auto; }

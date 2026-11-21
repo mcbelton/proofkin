@@ -2261,7 +2261,28 @@ async function loadTracker() {
   }
   box.append(el("div", { class: "repo-actions" },
     el("button", { type: "button", class: "btn small", onclick: openTrackerItems }, t.board ? "Board items" : "Open issues"),
+    t.board ? el("button", { type: "button", class: "btn small", onclick: (e) => addAllToBoard(t, e.currentTarget) }, "Add existing issues") : null,
     el("button", { type: "button", class: "btn small danger", onclick: unlinkTracker }, "Stop tracking")));
+}
+
+/** Puts every issue and pull request of the tracker's repository on its board. */
+async function addAllToBoard(t, button) {
+  const ok = await confirmDialog({
+    title: `Put ${t.repo}'s issues on the board?`,
+    body: "Every issue and pull request goes on it: open issues to do, open pull requests in review, closed and merged ones done. Statuses already set stay.",
+    confirm: "Put them on the board",
+  });
+  if (!ok) return;
+  button.disabled = true;
+  try {
+    const res = await api("/api/tracker/add", { method: "POST", body: JSON.stringify({ open: true, closed: true }) });
+    const added = res.added.filter((a) => !a.already).length;
+    toast(`Put ${added} on ${t.board.title}; ${res.added.length - added} were on it already${res.problems.length ? ` (${nOf(res.problems.length, "problem")}: see the activity feed)` : ""}`);
+  } catch (err) {
+    toast(err.message, "error");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 /** Why the board isn't updated, with the command that fixes it to copy. */

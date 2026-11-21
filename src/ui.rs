@@ -925,6 +925,7 @@ pub async fn start(
             get(tracker_state).put(link_tracker).delete(unlink_tracker),
         )
         .route("/api/tracker/items", get(tracker_items))
+        .route("/api/tracker/add", post(add_to_board))
         .route("/api/tracker/sync", post(sync_tracker))
         .route("/api/skills", get(list_skills).post(tools::add_skill))
         .route(
@@ -2480,6 +2481,36 @@ async fn tracker_items(State(s): State<AppState>) -> Result<Json<Value>, ApiErro
         "board": tracker.board.as_ref().map(|b| json!({ "title": b.title, "url": b.url })),
         "repo": tracker.config.repo,
     })))
+}
+
+/// Puts the repository's issues and pull requests on the tracker's board.
+async fn add_to_board(
+    State(s): State<AppState>,
+    Json(body): Json<crate::tracker::AddItems>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let tracker = crate::tracker::open(&profile)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?
+        .ok_or_else(|| bad_request("this agent has no tracker"))?;
+    let result = tracker
+        .add_to_board(&body)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let new = result.added.iter().filter(|a| !a.already).count();
+    s.system(
+        "info",
+        format!(
+            "Put {new} issue{} and pull request{} on the board ({} on it already)",
+            if new == 1 { "" } else { "s" },
+            if new == 1 { "" } else { "s" },
+            result.added.len() - new
+        ),
+    );
+    for problem in &result.problems {
+        s.system("warn", format!("Tracker: {problem}"));
+    }
+    Ok(Json(json!(result)))
 }
 
 /// Closes the run issues whose sub-issues are all closed.

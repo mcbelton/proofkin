@@ -424,6 +424,25 @@ on issue 15. The board needs the account's project scope:
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Put the repository's issues and pull requests on the board, with a status from
+    /// their state (open issues to do, open pull requests in review, closed and merged
+    /// ones done); statuses already set stay.
+    #[command(after_help = "\
+examples:
+  proofkin tracker add --open --closed --profile boss   every issue and pull request
+  proofkin tracker add 12 '#15' --profile boss          these ones")]
+    Add {
+        /// Issue or pull request numbers (12 or #12).
+        numbers: Vec<String>,
+        /// Every open issue and pull request.
+        #[arg(long)]
+        open: bool,
+        /// Every closed issue and closed or merged pull request.
+        #[arg(long)]
+        closed: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Close the run issues whose sub-issues are all closed (their pull requests merged).
     Sync {
         #[command(flatten)]
@@ -2016,6 +2035,56 @@ async fn run_tracker(command: TrackerCommand) -> Result<()> {
                         format!("  ({})", extra.join("; "))
                     }
                 );
+            }
+        }
+        TrackerCommand::Add {
+            numbers,
+            open,
+            closed,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let numbers = numbers
+                .iter()
+                .map(|n| {
+                    proofkin::plan::issue_number(n)
+                        .with_context(|| format!("{n:?} is not an issue or pull request number"))
+                })
+                .collect::<Result<Vec<u64>>>()?;
+            if numbers.is_empty() && !open && !closed {
+                bail!("say which to put on the board: numbers, --open or --closed");
+            }
+            let tracker = proofkin::tracker::open(&profile)
+                .await?
+                .with_context(|| format!("profile '{}' has no tracker", profile.name))?;
+            let result = tracker
+                .add_to_board(&proofkin::tracker::AddItems {
+                    numbers,
+                    open,
+                    closed,
+                })
+                .await?;
+            for a in &result.added {
+                println!(
+                    "  #{:<6} {:<13} {:<14} {}{}",
+                    a.number,
+                    a.kind.replace('_', " "),
+                    a.status.as_deref().unwrap_or("-"),
+                    a.title,
+                    if a.already {
+                        "  (on the board already)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            let new = result.added.iter().filter(|a| !a.already).count();
+            println!(
+                "{new} put on the board, {} on it already",
+                result.added.len() - new
+            );
+            for problem in &result.problems {
+                println!("problem: {problem}");
             }
         }
         TrackerCommand::Sync { profile } => {

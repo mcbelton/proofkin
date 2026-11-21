@@ -985,6 +985,7 @@ gh auth refresh --hostname github.com --scopes project
 proofkin tracker link acme/shop --project https://github.com/users/alice/projects/4 --profile boss
 proofkin tracker status --profile boss   # the board's statuses, or why it isn't updated
 proofkin tracker items --profile boss    # what is on the board, by status, with agents and pull requests
+proofkin tracker add --open --closed --profile boss   # put the repository's existing issues and pull requests on the board
 proofkin tracker sync --profile boss     # close run issues whose pull requests have all merged
 ```
 
@@ -1004,7 +1005,10 @@ named after its first claim). Step `api` works on #15, made a sub-issue of #12 i
 one; `ui` and `signoff` get new sub-issues. A later run with `track: #12` takes up its
 steps' open sub-issues again. In the web UI the **Tracker** card links and shows the
 tracker, and **Board items** lists what is open by status; **Plan it** starts a plan on an
-item, with a step per open sub-issue. Tracked steps link their issue, and a plan its run's.
+item, with a step per open sub-issue. **Add existing issues** (`tracker add`) puts the
+repository's issues and pull requests on the board, with a status from their state (open
+issues to do, open pull requests in review, closed and merged ones done; statuses already
+set stay). Tracked steps link their issue, and a plan its run's.
 
 Without the `project` scope tracking keeps to the issues (the `repo` scope is enough) and
 says how to grant it. Tracking never fails or holds up a plan: it runs beside it, and what
@@ -1303,7 +1307,7 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
 `proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|status|logout`,
-`proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
+`proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
 tasks wait for a peer that dropped off to come back (default 60, see
@@ -1339,7 +1343,8 @@ proofkin --name me --providers copilot --serve --ui
   fills in `Closes #N` for them.
 - **Tracker**: link the repository (and project board) your plan runs are tracked on, see
   the board's statuses or why it isn't updated (with the command that fixes it, to copy),
-  and **Board items**: what is open, by status, with **Plan it**. A tracked plan's card
+  **Board items** (what is open, by status, with **Plan it**) and **Add existing issues**
+  (the repository's issues and pull requests onto the board). A tracked plan's card
   links its issue, and each step its sub-issue (see
   [tracked work](#tracked-work)).
 - **Task cards** show up to four lines of the task; **Show all** / **Show less** expands a
