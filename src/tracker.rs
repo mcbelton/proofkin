@@ -17,8 +17,9 @@
 //! - each step's task carries its issue and those of the steps whose work it applies
 //!   ([`crate::plan::RunContext::issues`]): the worker's commit references them
 //!   (`Refs: owner/repo#N`) and a pull request from its branch closes them, so the
-//!   issues show the pull request. A run issue whose work waits for pull requests is
-//!   closed by [`Tracker::settle`] once all its sub-issues are.
+//!   issues show the pull request. The issue of a run that passed stays open while some
+//!   of its sub-issues are (waiting for pull requests, or other work) and is closed by
+//!   [`Tracker::settle`] once all of them are.
 //!
 //! Everything goes through GitHub's GraphQL API with the GitHub CLI (`gh api graphql`,
 //! the request on stdin and the profile's token in `GH_TOKEN`). Issues need the
@@ -67,8 +68,9 @@ pub struct TrackerConfig {
     pub host: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<ProjectRef>,
-    /// Run issues left open while their work waits for pull requests; closed by
-    /// [`Tracker::settle`] once all their sub-issues are.
+    /// Issues of runs that passed, left open while some of their sub-issues are
+    /// (waiting for pull requests, or other work); closed by [`Tracker::settle`] once
+    /// all their sub-issues are.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_runs: Vec<u64>,
 }
@@ -1658,7 +1660,10 @@ impl Run {
             }
         };
         let ours: HashSet<u64> = self.steps.values().map(|s| s.number).collect();
-        let mut keep_open = false;
+        // A run that passed leaves its issue open only while some of its sub-issues are:
+        // in review if they are all its own steps' (waiting for pull requests), else
+        // back where it was (other work). Either way it is closed once they all are.
+        let keep_open = succeeded && !open_subs.is_empty();
         let status = if succeeded && open_subs.is_empty() {
             ops.push(op(
                 "closeIssue",
@@ -1667,7 +1672,6 @@ impl Run {
             ));
             Some(Status::Done)
         } else if succeeded && open_subs.iter().all(|n| ours.contains(n)) {
-            keep_open = true;
             Some(Status::InReview)
         } else {
             None
@@ -2782,6 +2786,60 @@ mod tests {
         );
         // The run's issue goes back to where it was, and isn't left for settling.
         assert!(fake.open(10) && fake.status(10).as_deref() == Some("Todo"));
+    }
+
+    #[tokio::test]
+    async fn a_passed_runs_issue_waits_for_its_other_open_work_then_closes() {
+        let fake = Fake::with(&[
+            FakeIssue {
+                number: 10,
+                open: true,
+                body: "The epic".into(),
+                status: Some("Todo".into()),
+                item: Some("PVTI10".into()),
+                ..FakeIssue::default()
+            },
+            FakeIssue {
+                number: 13,
+                open: true,
+                body: "Another part".into(),
+                parent: Some(10),
+                ..FakeIssue::default()
+            },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.json");
+        config().save(&path).unwrap();
+        let text = "track: #10\nnotes @worker Write the release notes";
+        let plan = Plan::parse(text).unwrap();
+        let tracking = start_with(
+            fake.clone(),
+            config(),
+            &plan,
+            "r4",
+            "boss",
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+        tracking.update("notes", &done("worker", None));
+        let states = BTreeMap::from([("notes".to_owned(), done("worker", None))]);
+        let mut record = RunRecord::new("boss", "id", text, &plan, &states, 0);
+        record.id = "r4".into();
+        let tracked = tracking.finish(&record).await;
+        assert!(tracked.problems.is_empty(), "{:?}", tracked.problems);
+        // Its step changed no files, so its new sub-issue is done; #13 is other work,
+        // so #10 goes back where it was and waits for it.
+        assert_eq!(tracked.steps["notes"].number, 14);
+        assert!(!fake.open(14));
+        assert!(fake.open(10) && fake.status(10).as_deref() == Some("Todo"));
+        let config_now = TrackerConfig::load(&path).unwrap().unwrap();
+        assert_eq!(config_now.open_runs, [10]);
+        // Once that work is closed too, settling closes it.
+        fake.issues.lock().unwrap().get_mut(&13).unwrap().open = false;
+        let mut tracker = Tracker::connect(fake.clone(), config_now).await.unwrap();
+        assert_eq!(tracker.settle().await.unwrap(), [10]);
+        assert!(!fake.open(10) && fake.status(10).as_deref() == Some("Done"));
     }
 
     #[test]

@@ -974,8 +974,9 @@ is tracked on GitHub, where your team already tracks work:
   worker's commit references them (`Refs: acme/shop#15` trailers), `repo branches` and the
   web UI show them, and a pull request from the branch **closes** them (`Closes #15`), so
   GitHub links the pull request to the issues and closes them when it merges. The run's
-  issue waits *In review* until then and is closed once all its sub-issues are (checked
-  every 10 minutes by a running agent, or now with `tracker sync`).
+  issue waits *In review* until then (or, if it has other open sub-issues, where it was)
+  and is closed once all its sub-issues are (checked every 10 minutes by a running
+  agent, or now with `tracker sync`).
 
 ```powershell
 proofkin github login --gh-user alice --profile boss
