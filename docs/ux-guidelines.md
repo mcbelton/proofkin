@@ -157,6 +157,9 @@ status), not every update.
 - All peer-provided text is rendered with `textContent` (never `innerHTML`);
   Markdown goes through the escaping renderer.
 - Prototypes and review packs open sandboxed in a new tab, detached from this page.
+- Links that leave Proofkin (issues, boards and pull requests on GitHub) open in a new
+  tab with `rel="noopener"`, and their accessible name says where they go and that a
+  new tab opens.
 - Show provenance next to anything a peer or a plugin provides (source, commit,
   "from plugin x"), and the access a peer's task needs.
 

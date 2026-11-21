@@ -626,6 +626,7 @@ function taskNode(t) {
   const node = el("li", { class: `task ${t.status}`, "data-task": t.id, tabindex: "-1" },
     el("div", { class: "task-top" },
       el("span", { class: "task-title", text: title }),
+      t.issue ? externalLink(t.issue.url, `#${t.issue.number}`, `Its issue, #${t.issue.number}, on GitHub`, { class: "issue-link" }) : null,
       t.evidence ? el("span", {
         class: `badge evidence ${t.evidence}`,
         title: t.evidence === "verified"
@@ -748,9 +749,11 @@ function planNode(planId, steps) {
       el("span", { class: "chip-who", text: s.target }))))));
   const active = steps.find((s) => s.status === "running" || s.status === "waiting");
   const runId = steps.find((s) => s.run)?.run;
+  const planIssue = steps.find((s) => s.plan_issue)?.plan_issue;
   const head = el("div", { class: "plan-head" },
     el("span", { class: "task-title", text: lead ? `Team run for ${lead}'s team step` : `Plan · started ${stamp(steps[0].started_ms)}` }),
     el("span", { class: "head-actions" },
+      planIssue ? externalLink(planIssue.url, `Issue #${planIssue.number}`, `The plan's issue, #${planIssue.number}, on GitHub`, { class: "btn small" }) : null,
       runId ? el("button", { type: "button", class: "btn small", "aria-label": "Open the plan's evidence run", onclick: () => openRun(runId) }, "Evidence run") : null,
       active && !lead ? el("button", {
         type: "button", class: "btn small", "aria-label": "Cancel the plan", onclick: (e) => cancelTask(active, e.currentTarget),
@@ -1348,6 +1351,15 @@ async function openRun(id) {
     $("#run-download").onclick = (e) => downloadRun(id, e.currentTarget);
     $("#run-verdict").textContent = run.verdict;
     $("#run-verdict").dataset.pass = String(run.summary.passed);
+    const tracked = run.tracked;
+    $("#run-tracked").hidden = !tracked?.issue;
+    $("#run-tracked").replaceChildren(...(tracked?.issue ? [
+      "Tracked on GitHub as ",
+      externalLink(tracked.issue.url, `issue #${tracked.issue.number}`),
+      ...Object.entries(tracked.steps).flatMap(([step, issue], i) => [i ? ", " : ", its steps as ",
+        externalLink(issue.url, `#${issue.number}`, `Step ${step}'s issue, #${issue.number}`), ` (${step})`]),
+      tracked.problems?.length ? ` · ${nOf(tracked.problems.length, "tracking problem")}: ${tracked.problems.join("; ")}` : "",
+    ] : []));
     $("#run-signatures").replaceChildren(...run.signatures.map((s) => el("li", { class: s.ok ? "ok" : "bad" },
       el("strong", { text: `${s.ok ? "✓" : "✗"} ${s.step}: ` }), s.text)));
     $("#run-prototypes").replaceChildren(...(run.previews ?? []).map((p) =>
@@ -1769,7 +1781,8 @@ function renderPalette() {
       line("Claim", "claim", "Something the run must prove (goes with the other claims)"),
       line("Step", "step", "A new step after the cursor's line: who does what, and how it is checked"),
       line("Sign-off", "signoff", "You sign off on the step at the cursor (or the last step); your answer is signed evidence"),
-    ]),
+      tracker?.linked ? line("Track on an issue", "track", "The run works on this issue of your tracker, its steps as sub-issues (type its number)") : null,
+    ].filter(Boolean)),
     section("Who runs it", "Peers, the folders they share with you, and squads", [
       ...workers.flatMap((p) => [
         part(`@${p.name}`, `${p.name}, in its data folder`),
@@ -2039,6 +2052,7 @@ async function loadGithub() {
     const branches = r.branches.slice(0, 5).map((b) => el("li", { class: "branch" },
       el("span", { class: "mono small", text: b.name }),
       el("span", { class: "muted small", text: ` ${stamp(b.unix * 1000)} · ${b.subject}` }),
+      b.issues?.length ? el("span", { class: "muted small", text: ` · closes ${shortRefs(b.issues, r.slug).join(", ")}` }) : null,
       el("button", { type: "button", class: "btn small", onclick: () => openPr(r, b) }, "Open PR")));
     box.append(el("div", { class: "repo" },
       el("div", { class: "task-top" },
@@ -2078,6 +2092,7 @@ async function submitGithubLogin(e) {
     $("#github-dialog").close();
     toast("Signed in to GitHub");
     await loadGithub();
+    loadTracker().catch(() => {});
   } catch (err) {
     $("#github-error").textContent = err.message;
   }
@@ -2153,7 +2168,9 @@ async function openPr(r, b) {
   prTarget = { repo: r, branch: b.name };
   $("#pr-desc").textContent = `${b.name} → ${r.branch} in ${r.slug}`;
   $("#pr-title").value = b.subject.replace(/^(proofkin|p2pagents): /, "");
-  $("#pr-body").value = "Made with Proofkin.";
+  // The issues the commit is for: the pull request closes them when it merges.
+  const closes = shortRefs(b.issues ?? [], r.slug).map((ref) => `Closes ${ref}`);
+  $("#pr-body").value = [...closes, ...(closes.length ? [""] : []), "Made with Proofkin."].join("\n");
   $("#pr-error").textContent = "";
   // The proof comes from the commit's signed record, checked by the server.
   $("#pr-proof").checked = false;
@@ -2193,6 +2210,192 @@ async function submitPr(e) {
   } finally {
     button.disabled = false;
   }
+}
+
+/** Issue references as the repository `slug` writes them: `#N` for its own. */
+function shortRefs(refs, slug) {
+  return refs.map((r) => {
+    const [repo, n] = r.split("#");
+    return repo.toLowerCase() === slug.toLowerCase() ? `#${n}` : r;
+  });
+}
+
+/** A link that leaves Proofkin (to GitHub): it opens a new tab, and says so. */
+function externalLink(href, text, label = text, attrs = {}) {
+  return el("a", { href, target: "_blank", rel: "noopener", "aria-label": `${label} (opens a new tab)`, ...attrs }, text);
+}
+
+// ---------- tracker ----------
+let tracker = null;
+async function loadTracker() {
+  tracker = await api("/api/tracker");
+  const box = $("#tracker");
+  box.replaceChildren();
+  const btn = $("#tracker-btn");
+  btn.hidden = !tracker.signed_in;
+  btn.textContent = tracker.linked ? "Change" : "Link";
+  btn.setAttribute("aria-label", tracker.linked ? "Change the tracker" : "Link a tracker");
+  if (!tracker.linked) {
+    box.append(el("p", { class: "muted small", text: "Track each plan run as a GitHub issue with a sub-issue per step, on your project's board: their status follows the run, and pull requests from the steps' branches close them." }));
+    if (!tracker.signed_in) box.append(el("p", { class: "muted small", text: "Sign in to GitHub first (above)." }));
+    return;
+  }
+  const t = tracker.tracker;
+  const link = (href, text) => externalLink(href, text);
+  box.append(el("p", { class: "small" }, "Issues in ", link(t.repo_url || `https://${t.host}/${t.repo}`, t.repo),
+    t.login ? `, assigned to ${t.login}` : ""));
+  if (tracker.error) {
+    box.append(el("p", { class: "warn-text small", text: `GitHub can't be reached with it now: ${tracker.error}` }));
+  } else if (t.board) {
+    box.append(el("p", { class: "small" }, "On the board ", link(t.board.url, t.board.title),
+      t.board.statuses.length ? ` (${t.board.statuses.join(", ")})` : ""));
+  } else if (t.board_problem) {
+    box.append(boardProblem(t.board_problem));
+  } else {
+    box.append(el("p", { class: "muted small", text: "No board: issues only. Choose Change to add your project's address." }));
+  }
+  if (t.open_runs?.length) {
+    box.append(el("p", { class: "muted small" },
+      `Waiting for pull requests: ${t.open_runs.map((n) => `#${n}`).join(", ")}. `,
+      el("button", { type: "button", class: "btn small", onclick: (e) => syncTracker(e.currentTarget) }, "Check now")));
+  }
+  box.append(el("div", { class: "repo-actions" },
+    el("button", { type: "button", class: "btn small", onclick: openTrackerItems }, t.board ? "Board items" : "Open issues"),
+    el("button", { type: "button", class: "btn small danger", onclick: unlinkTracker }, "Stop tracking")));
+}
+
+/** Why the board isn't updated, with the command that fixes it to copy. */
+function boardProblem(problem) {
+  const command = problem.match(/`([^`]+)`/)?.[1];
+  return el("div", { class: "tracker-problem small", role: "status" },
+    el("p", { text: `The board isn't updated: ${command ? problem.replace(/`[^`]+`/, "the command below") : problem}` }),
+    command ? el("p", { class: "command" }, el("code", { class: "mono", text: command }),
+      el("button", { type: "button", class: "btn small", onclick: () => copy(command, "Command") }, icon(ICONS.copy), "Copy")) : null);
+}
+
+function openTrackerDialog() {
+  $("#tracker-error").textContent = "";
+  const t = tracker?.linked ? tracker.tracker : null;
+  $("#tracker-repo").value = t?.repo ?? github?.repos?.[0]?.slug ?? "";
+  $("#tracker-project").value = t?.board?.url ?? (t?.project ? `https://${t.host}/users/${t.project.owner}/projects/${t.project.number}` : "");
+  $("#tracker-dialog").showModal();
+  $("#tracker-repo").focus();
+}
+
+async function submitTracker(e) {
+  e.preventDefault();
+  const button = $("#tracker-submit");
+  button.disabled = true;
+  $("#tracker-error").textContent = "Checking with GitHub…";
+  try {
+    const res = await api("/api/tracker", {
+      method: "PUT",
+      body: JSON.stringify({ repo: $("#tracker-repo").value.trim(), project: $("#tracker-project").value.trim() || null }),
+    });
+    $("#tracker-dialog").close();
+    toast(res.tracker.board ? `Plan runs are tracked on ${res.tracker.board.title}` : `Plan runs are tracked as issues of ${res.tracker.repo}`);
+    await loadTracker();
+  } catch (err) {
+    $("#tracker-error").textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function unlinkTracker() {
+  const ok = await confirmDialog({
+    title: "Stop tracking plan runs?",
+    body: "New plan runs won't get issues. The issues made so far stay on GitHub.",
+    confirm: "Stop tracking",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api("/api/tracker", { method: "DELETE" });
+    await loadTracker();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function syncTracker(button) {
+  button.disabled = true;
+  try {
+    const res = await api("/api/tracker/sync", { method: "POST" });
+    toast(res.closed.length ? `Closed ${res.closed.map((n) => `#${n}`).join(", ")}: their pull requests are merged` : "Still waiting for their pull requests");
+    await loadTracker();
+  } catch (err) {
+    toast(err.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function openTrackerItems() {
+  const list = $("#tracker-items");
+  list.replaceChildren(el("li", { class: "muted small", text: "Loading…" }));
+  $("#tracker-items-desc").textContent = "";
+  $("#tracker-items-dialog").showModal();
+  $("#tracker-items-close").focus();
+  try {
+    const res = await api("/api/tracker/items");
+    const open = res.items.filter((i) => i.open);
+    $("#tracker-items-h").textContent = res.board ? "Board items" : "Open issues";
+    $("#tracker-items-desc").textContent = res.board
+      ? `${nOf(open.length, "open item")} on ${res.board.title}. Plan it starts a plan that works on the issue, a step per open sub-issue.`
+      : `${nOf(open.length, "open issue")} of ${res.repo} (no board). Plan it starts a plan that works on the issue, a step per open sub-issue.`;
+    const groups = new Map();
+    for (const i of open) {
+      const key = res.board ? i.status || "No status" : "Open";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(i);
+    }
+    list.replaceChildren(...(groups.size ? [...groups].map(([status, items]) => el("li", { class: "tracker-group" },
+      el("h3", { text: `${status} (${items.length})` }),
+      el("ul", { class: "list" }, ...items.map((i) => trackerItemNode(i, res.items)))))
+      : [el("li", { class: "muted small", text: "Nothing open." })]));
+  } catch (err) {
+    list.replaceChildren(el("li", { class: "form-error", role: "alert", text: err.message }));
+  }
+}
+
+function trackerItemNode(i, all) {
+  const facts = [
+    i.kind === "pull_request" ? "pull request" : i.kind === "draft" ? "draft" : "",
+    i.repo ?? "",
+    i.agent ? `agent ${i.agent}` : "",
+    i.assignees.length ? `assigned to ${i.assignees.join(", ")}` : "",
+    i.sub_issues ? `${i.sub_issues[0]} of ${i.sub_issues[1]} sub-issues done` : "",
+    i.parent ? `part of #${i.parent}` : "",
+    i.pull_requests.length ? `closed by ${i.pull_requests.map((n) => `#${n}`).join(", ")} when merged` : "",
+  ].filter(Boolean).join(" · ");
+  const name = `${i.number ? `#${i.number} ` : ""}${i.title}`;
+  return el("li", { class: "tracker-item" },
+    el("div", { class: "task-top" },
+      i.url ? externalLink(i.url, name, name, { class: "task-title" }) : el("span", { class: "task-title", text: name }),
+      i.kind === "issue" && !i.repo ? el("button", {
+        type: "button", class: "btn small", "aria-label": `Plan #${i.number}`, onclick: () => planFromItem(i, all),
+      }, "Plan it") : null),
+    facts ? el("p", { class: "muted small", text: facts }) : null);
+}
+
+/** A plan that works on issue `item`: a step per open sub-issue (or one for it). */
+function planFromItem(item, all) {
+  const workers = state.peers.filter((p) => p.capabilities.length);
+  const share = workers.flatMap((p) => (p.shares ?? []).map((s) => ({ peer: p.name, ...s }))).find((s) => s.name !== "data");
+  const target = share ? `@${share.peer}:${share.name}` : workers[0] ? `@${workers[0].name}` : "@peer:folder";
+  const subs = all.filter((i) => i.kind === "issue" && !i.repo && i.open && i.parent === item.number);
+  const lines = [`track: #${item.number}`, ...(subs.length
+    ? subs.map((s) => `i${s.number} ${target} issue=#${s.number} ${s.title}`)
+    : [`do ${target} ${item.title}`])];
+  $("#tracker-items-dialog").close();
+  document.querySelector('[data-mode="plan"]')?.click();
+  $("#composer-input").value = lines.join("\n");
+  state.playbook = null;
+  renderPlanExplain();
+  schedulePlanCheck();
+  $("#composer-input").focus();
+  toast(`A plan for #${item.number}: check who does each step and how it is checked, then run it`);
 }
 
 // ---------- audit log ----------
@@ -2584,6 +2787,12 @@ function init() {
   loadPlaybooks().catch((err) => toast(err.message, "error"));
   loadSkills().catch((err) => toast(err.message, "error"));
   loadGithub().catch((err) => toast(err.message, "error"));
+  loadTracker().catch((err) => toast(err.message, "error"));
+  $("#tracker-btn").addEventListener("click", openTrackerDialog);
+  $("#tracker-form").addEventListener("submit", submitTracker);
+  $("#tracker-cancel").addEventListener("click", () => $("#tracker-dialog").close());
+  $("#tracker-dialog").addEventListener("close", () => $("#tracker-btn").focus());
+  $("#tracker-items-close").addEventListener("click", () => $("#tracker-items-dialog").close());
   $("#link-repo-btn").addEventListener("click", openRepoDialog);
   $("#repo-form").addEventListener("submit", submitRepo);
   $("#repo-cancel").addEventListener("click", () => $("#repo-dialog").close());
@@ -2650,7 +2859,7 @@ function init() {
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
-    "#monitor-dialog", "#team-dialog"]) guardDialog($(id));
+    "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });

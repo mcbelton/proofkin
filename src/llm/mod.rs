@@ -123,6 +123,10 @@ pub struct LlmTask {
     /// uses it as the subject of its commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Issues the work is for (`owner/repo#N`, see [`crate::tracker`]): the worker's
+    /// commit references them, and a pull request from its branch closes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<String>,
 }
 
 /// The first line of `text`, at most 100 characters: a task's title.
@@ -149,6 +153,7 @@ impl LlmTask {
             mcp: Vec::new(),
             team: None,
             title: None,
+            issues: Vec::new(),
         }
     }
 

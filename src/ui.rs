@@ -120,6 +120,11 @@ struct TaskView {
     /// For a step of a team run this agent leads: the peer whose team step it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     for_peer: Option<String>,
+    /// For a tracked plan step: its issue, and its run's (see [`crate::tracker`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue: Option<crate::tracker::IssueRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_issue: Option<crate::tracker::IssueRef>,
 }
 
 /// A team step's team run as the page shows it.
@@ -185,6 +190,10 @@ struct StoredTask {
     team: Option<TeamView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     for_peer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issue: Option<crate::tracker::IssueRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_issue: Option<crate::tracker::IssueRef>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -220,6 +229,8 @@ impl From<&TaskView> for StoredTask {
             run: t.run.clone(),
             team: t.team.clone(),
             for_peer: t.for_peer.clone(),
+            issue: t.issue.clone(),
+            plan_issue: t.plan_issue.clone(),
         }
     }
 }
@@ -261,6 +272,8 @@ impl StoredTask {
             progress: None,
             team: self.team,
             for_peer: self.for_peer,
+            issue: self.issue,
+            plan_issue: self.plan_issue,
         }
     }
 }
@@ -554,6 +567,8 @@ impl Shared {
                 progress: None,
                 team: None,
                 for_peer: Some(from.to_owned()),
+                issue: None,
+                plan_issue: None,
             };
             self.add_task(view.clone());
             self.send(json!({ "type": "task", "task": view }));
@@ -740,6 +755,7 @@ pub async fn start(
     }
     keep_tasks(&shared);
     start_scheduler(&shared);
+    settle_tracked_runs(&shared);
     watch_workers(&shared);
 
     let pump = shared.clone();
@@ -904,6 +920,12 @@ pub async fn start(
         .route("/api/repos/{name}/sync", post(sync_repo))
         .route("/api/repos/{name}/pr", post(open_pr))
         .route("/api/repos/{name}/proof", get(branch_proof))
+        .route(
+            "/api/tracker",
+            get(tracker_state).put(link_tracker).delete(unlink_tracker),
+        )
+        .route("/api/tracker/items", get(tracker_items))
+        .route("/api/tracker/sync", post(sync_tracker))
         .route("/api/skills", get(list_skills).post(tools::add_skill))
         .route(
             "/api/skills/{name}",
@@ -1392,6 +1414,8 @@ fn start_task(
         progress: None,
         team: None,
         for_peer: None,
+        issue: None,
+        plan_issue: None,
     };
     s.add_task(view.clone());
     s.send(json!({ "type": "task", "task": view }));
@@ -1675,6 +1699,36 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
     }
 }
 
+/// Shows a tracked run's issues on its steps' tasks, and its tracking problems from
+/// the `known`-th on in the feed.
+fn show_tracked(
+    shared: &Shared,
+    step_ids: &HashMap<String, u64>,
+    tracked: &crate::tracker::TrackedRun,
+    known: usize,
+) {
+    if known == 0
+        && let Some(issue) = &tracked.issue
+    {
+        shared.system(
+            "info",
+            format!(
+                "Tracking the run on GitHub: issue #{} ({}), a sub-issue per step",
+                issue.number, issue.url
+            ),
+        );
+    }
+    for (step, id) in step_ids {
+        shared.update_task(*id, |t| {
+            t.issue = tracked.steps.get(step).cloned();
+            t.plan_issue = tracked.issue.clone();
+        });
+    }
+    for problem in tracked.problems.iter().skip(known) {
+        shared.system("warn", format!("Tracker: {problem}"));
+    }
+}
+
 /// Starts plan `text` (`via`: another agent started it, over MCP or A2A).
 fn start_plan(
     s: &AppState,
@@ -1732,6 +1786,8 @@ fn start_plan(
             progress: None,
             team: None,
             for_peer: None,
+            issue: None,
+            plan_issue: None,
         };
         s.add_task(view.clone());
         s.send(json!({ "type": "task", "task": view }));
@@ -1743,9 +1799,27 @@ fn start_plan(
         let started = crate::runs::unix_now();
         // The run's id is known from the start: each step's peer is told it.
         let run_id = crate::runs::new_run_id();
+        // Tracked runs get their issues before their steps start.
+        let tracking =
+            match crate::tracker::start(&shared.info.profile, &plan, &run_id, shared.agent.name())
+                .await
+            {
+                Ok(tracking) => tracking,
+                Err(e) => {
+                    shared.system("warn", format!("The run isn't tracked on GitHub: {e:#}"));
+                    None
+                }
+            };
+        if let Some(t) = &tracking {
+            show_tracked(&shared, &step_ids, &t.tracked, 0);
+        }
         let ctx = crate::plan::RunContext {
             run_id: Some(run_id.clone()),
             chain: Vec::new(),
+            issues: tracking
+                .as_ref()
+                .map(|t| t.refs.clone())
+                .unwrap_or_default(),
         };
         let agent = shared.agent.clone();
         let states = crate::plan::run_plan_with(&agent, &squads, &ready, &ctx, |step, state| {
@@ -1754,6 +1828,9 @@ fn start_plan(
                 shared.running.lock().unwrap().remove(&id);
             }
             shared.update_task(id, |t| apply_state(&shared, t, state));
+            if let Some(t) = &tracking {
+                t.update(step, state);
+            }
         })
         .await;
         let mut run = RunRecord::new(
@@ -1766,6 +1843,12 @@ fn start_plan(
         );
         run.id = run_id;
         run.peer_ids = crate::runs::peer_ids(&shared.agent);
+        if let Some(t) = tracking {
+            let known = t.tracked.problems.len();
+            let tracked = t.finish(&run).await;
+            show_tracked(&shared, &step_ids, &tracked, known);
+            run.tracked = Some(tracked);
+        }
         let saved_run = match run.save(&shared.info.profile.runs_dir()) {
             Ok(_) => {
                 shared.system(
@@ -2314,6 +2397,142 @@ struct GithubLoginBody {
     host: String,
 }
 
+/// The profile's tracker (see [`crate::tracker`]) and whether its board works.
+async fn tracker_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let signed_in = profile.github().is_ok();
+    let Some(config) =
+        crate::tracker::TrackerConfig::load(&profile.tracker_path()).map_err(internal)?
+    else {
+        return Ok(Json(json!({ "linked": false, "signed_in": signed_in })));
+    };
+    Ok(Json(match crate::tracker::open(&profile).await {
+        Ok(Some(tracker)) => {
+            json!({ "linked": true, "signed_in": true, "tracker": tracker.info() })
+        }
+        Ok(None) => json!({ "linked": false, "signed_in": signed_in }),
+        // Linked, but GitHub can't be reached with it now: say why, keep the settings.
+        Err(e) => json!({
+            "linked": true, "signed_in": signed_in, "error": format!("{e:#}"),
+            "tracker": { "repo": config.repo, "host": config.host, "project": config.project, "open_runs": config.open_runs },
+        }),
+    }))
+}
+
+#[derive(Deserialize)]
+struct TrackerBody {
+    repo: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+async fn link_tracker(
+    State(s): State<AppState>,
+    Json(body): Json<TrackerBody>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let tracker = crate::tracker::link(&profile, &body.repo, body.project.as_deref())
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let info = tracker.info();
+    s.system(
+        "info",
+        format!(
+            "Plan runs are tracked as issues of {}{}",
+            info.repo,
+            match (&info.board, &info.board_problem) {
+                (Some(b), _) => format!(" on the board {}", b.title),
+                (None, Some(_)) => " (the board isn't updated yet: see Settings)".to_owned(),
+                (None, None) => String::new(),
+            }
+        ),
+    );
+    Ok(Json(
+        json!({ "linked": true, "signed_in": true, "tracker": info }),
+    ))
+}
+
+async fn unlink_tracker(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let path = s.info.profile.tracker_path();
+    if path.is_file() {
+        std::fs::remove_file(&path).map_err(internal)?;
+        s.system(
+            "info",
+            "Plan runs are no longer tracked on GitHub (their issues stay there)",
+        );
+    }
+    Ok(Json(json!({ "linked": false })))
+}
+
+/// The tracker board's items (or the repository's open issues, without a board).
+async fn tracker_items(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let tracker = crate::tracker::open(&profile)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?
+        .ok_or_else(|| bad_request("this agent has no tracker"))?;
+    let items = tracker
+        .items()
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(json!({
+        "items": items,
+        "board": tracker.board.as_ref().map(|b| json!({ "title": b.title, "url": b.url })),
+        "repo": tracker.config.repo,
+    })))
+}
+
+/// Closes the run issues whose sub-issues are all closed.
+async fn sync_tracker(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let closed = crate::tracker::settle(&profile)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    for n in &closed {
+        s.system(
+            "info",
+            format!("Run issue #{n} is closed: all its sub-issues are"),
+        );
+    }
+    Ok(Json(json!({ "closed": closed })))
+}
+
+/// Every 10 minutes (`PROOFKIN_TRACKER_SETTLE_SECS`), closes the tracked run issues
+/// whose pull requests have all merged (see [`crate::tracker::settle`]).
+fn settle_tracked_runs(shared: &AppState) {
+    let secs = crate::profile::env_setting("TRACKER_SETTLE_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let weak = Arc::downgrade(shared);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(s) = weak.upgrade() else { break };
+            let profile = s.info.profile.clone();
+            let waiting = crate::tracker::TrackerConfig::load(&profile.tracker_path())
+                .ok()
+                .flatten()
+                .is_some_and(|c| !c.open_runs.is_empty());
+            if !waiting {
+                continue;
+            }
+            match crate::tracker::settle(&profile).await {
+                Ok(closed) => {
+                    for n in closed {
+                        s.system(
+                            "info",
+                            format!("Run issue #{n} is closed: all its sub-issues are"),
+                        );
+                    }
+                }
+                Err(e) => eprintln!("settling tracked runs: {e:#}"),
+            }
+        }
+    });
+}
+
 async fn github_sign_in(
     State(s): State<AppState>,
     Json(body): Json<GithubLoginBody>,
@@ -2696,6 +2915,7 @@ fn run_details(s: &Shared, id: &str) -> Result<Value> {
         "report": run.render_markdown(),
         "signatures": checks,
         "previews": previews,
+        "tracked": run.tracked,
     }))
 }
 
@@ -2884,6 +3104,8 @@ mod tests {
             progress: None,
             team: None,
             for_peer: None,
+            issue: None,
+            plan_issue: None,
         }
     }
 

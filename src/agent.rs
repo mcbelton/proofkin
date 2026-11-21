@@ -1960,10 +1960,24 @@ impl Inner {
                 .map(crate::llm::title_of)
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| crate::llm::title_of(first));
-            let message = format!(
+            let mut message = format!(
                 "{subject}\n\nTask {task_id} from {from}, done by {} with Proofkin.",
                 self.name
             );
+            // The issues it is for (checked: they come from the peer), as trailers a
+            // pull request from the branch closes them by.
+            let refs: Vec<&String> = task
+                .issues
+                .iter()
+                .filter(|r| crate::tracker::valid_ref(r))
+                .take(20)
+                .collect();
+            if !refs.is_empty() {
+                message += "\n";
+                for r in refs {
+                    message += &format!("\nRefs: {r}");
+                }
+            }
             let (commit, text) = wt.commit(&message).await?;
             evidence.git = Some(commit);
             patch = text;

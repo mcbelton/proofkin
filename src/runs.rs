@@ -65,6 +65,9 @@ pub struct RunRecord {
     /// steps ran on, so re-verification knows whose key must have signed each step.
     #[serde(default)]
     pub peer_ids: BTreeMap<String, String>,
+    /// The GitHub issues the run was tracked on (see [`crate::tracker`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked: Option<crate::tracker::TrackedRun>,
 }
 
 /// How far (seconds) evidence timestamps may lie outside the run, for clock skew.
@@ -203,6 +206,7 @@ impl RunRecord {
             plan_text: plan_text.to_owned(),
             claims: plan.claims.clone(),
             peer_ids: BTreeMap::new(),
+            tracked: None,
             steps: plan
                 .steps
                 .iter()
@@ -355,6 +359,7 @@ impl RunRecord {
             agent: None,
             team: None,
             timeout: None,
+            issue: None,
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims
@@ -379,6 +384,7 @@ impl RunRecord {
         let plan = Plan {
             claims,
             steps: vec![step.clone()],
+            track: None,
         };
         let state = StepState::from_delivered(peer.to_owned(), &step, delivered);
         let states = BTreeMap::from([("task".to_owned(), state)]);

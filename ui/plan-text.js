@@ -10,7 +10,7 @@ const planText = (() => {
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
     ["context", "context"], ["claims", "claims"], ["claim", "claims"]]);
-  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout"]);
+  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue"]);
   // A sign-off is a person's decision: no checks, retries, patches, saved result or agent.
   const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels"]);
   // A team step is done and proven by the lead's team plan.
@@ -52,10 +52,12 @@ const planText = (() => {
     });
   }
 
-  /// How the parser reads a line: "empty", "comment", "claim" or "step".
+  /// How the parser reads a line: "empty", "comment", "claim", "track" (how the run is
+  /// tracked on GitHub) or "step".
   function kindOf(line) {
     const t = line.trim();
-    return !t ? "empty" : t.startsWith("//") ? "comment" : t.startsWith("claim:") ? "claim" : "step";
+    return !t ? "empty" : t.startsWith("//") ? "comment" : t.startsWith("claim:") ? "claim"
+      : t.startsWith("track:") ? "track" : "step";
   }
 
   /// Sets an option on `step`: a list option adds its values (skill=a, then skill=b,
@@ -202,6 +204,16 @@ const planText = (() => {
       const line = [...head, todo].filter(Boolean).join(" ");
       return [line, [line.length - todo.length, line.length]];
     };
+    if (what === "track") {
+      // One per plan, at the top: select its issue number to type over.
+      const lines = linesOf(text);
+      const have = lines.find((l) => kindOf(l.line) === "track");
+      if (have) {
+        const start = have.line.indexOf("track:") + "track:".length;
+        return change(have.start, have.start, "", have.start, [start + (have.line[start] === " " ? 1 : 0), have.line.length]);
+      }
+      return change(0, 0, `track: #1\n`, 0, [8, 9]);
+    }
     if (what === "claim") {
       const [line, select] = make(["claim:", freeId(claims, (n) => `C-${n}`, claims.length + 1)],
         "What must be true at the end");
@@ -278,10 +290,11 @@ const planText = (() => {
   }
 
   /// The plan as the builder edits it: notes (comments before the first claim or step,
-  /// and after the last), claims and steps, each with the comments just above it.
-  /// Lenient, like the palette: a half-written line is a step with parts missing.
+  /// and after the last), how its run is tracked (`track:`, kept as written), claims
+  /// and steps, each with the comments just above it. Lenient, like the palette: a
+  /// half-written line is a step with parts missing.
   function parsePlan(text) {
-    const plan = { notes: [], claims: [], steps: [] };
+    const plan = { notes: [], track: null, claims: [], steps: [] };
     let comments = [];
     for (const line of text.split("\n")) {
       const t = line.trim();
@@ -289,6 +302,12 @@ const planText = (() => {
       if (kind === "empty") continue;
       if (kind === "comment") {
         comments.push(t.replace(/^\/\/ ?/, ""));
+        continue;
+      }
+      if (kind === "track") {
+        plan.track = t.slice("track:".length).trim();
+        plan.notes.push(...comments);
+        comments = [];
         continue;
       }
       if (!plan.claims.length && !plan.steps.length) {
@@ -322,6 +341,7 @@ const planText = (() => {
     const note = (n, item) => add(`// ${n}`.trimEnd(), item);
     const gap = () => lines.length && lines.at(-1) !== "" && add("");
     plan.notes.forEach((n) => note(n));
+    if (plan.track) add(`track: ${plan.track}`);
     if (plan.claims.length) gap();
     for (const c of plan.claims) {
       c.notes?.forEach((n) => note(n, { claim: c.id }));

@@ -108,6 +108,10 @@ enum Command {
     /// Link GitHub repositories: clone, share with peers, sync, open pull requests.
     #[command(subcommand)]
     Repo(RepoCommand),
+    /// Track plan runs on GitHub: an issue per run and a sub-issue per step, on a
+    /// GitHub Project's board whose status follows the run.
+    #[command(subcommand)]
+    Tracker(TrackerCommand),
     /// Monitors: a folder's check run on a schedule; failures open incidents that
     /// TSGs or the debugging agent try to fix.
     #[command(subcommand)]
@@ -359,9 +363,10 @@ pull request with repo pr.")]
         profile: ProfileArg,
     },
     /// Push a task branch and open a pull request into the repository's branch. Its
-    /// description ends with the proof the branch's commit carries: the record its agent
-    /// signed (who made it, the checks that ran on it) and the claims of your evidence
-    /// run that has it.
+    /// description closes the issues the branch's commit is for (its `Refs:` lines)
+    /// and ends with the proof the commit carries: the record its agent signed (who
+    /// made it, the checks that ran on it) and the claims of your evidence run that
+    /// has it.
     Pr {
         name: String,
         branch: String,
@@ -372,6 +377,9 @@ pull request with repo pr.")]
         /// Leave the proof out of the description.
         #[arg(long)]
         no_proof: bool,
+        /// Don't close the issues the commit is for.
+        #[arg(long)]
+        no_close: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -380,6 +388,49 @@ pull request with repo pr.")]
         name: String,
         #[arg(long)]
         delete: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrackerCommand {
+    /// Track the profile's plan runs as issues of a repository and, with --project, on
+    /// a GitHub Project's board (with the profile's GitHub account).
+    #[command(after_help = "\
+examples:
+  proofkin github login --gh-user alice --profile boss
+  proofkin tracker link acme/shop --project https://github.com/users/alice/projects/4 --profile boss
+Then every plan run gets an issue and each step a sub-issue; in plan text, track: #12
+works on issue 12, track: off doesn't track the run and issue=#15 makes a step work
+on issue 15. The board needs the account's project scope:
+  gh auth refresh --hostname github.com --scopes project")]
+    Link {
+        /// owner/repo (or its URL) the issues go to.
+        repo: String,
+        /// The GitHub Project's URL (or owner/number).
+        #[arg(long)]
+        project: Option<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Show the tracker and whether its board works.
+    Status {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// The board's items (without a board, the repository's open issues).
+    Items {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Close the run issues whose sub-issues are all closed (their pull requests merged).
+    Sync {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Stop tracking plan runs (their issues stay on GitHub).
+    Unlink {
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1207,6 +1258,7 @@ async fn main() -> Result<()> {
         Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command),
         Some(Command::Repo(command)) => run_repo(command).await,
+        Some(Command::Tracker(command)) => run_tracker(command).await,
         Some(Command::Monitor(command)) => run_monitor(command),
         Some(Command::Schedule(command)) => run_schedule(command),
         Some(Command::Ops(command)) => run_ops(command),
@@ -1817,22 +1869,29 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
             title,
             mut body,
             no_proof,
+            no_close,
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
             let repo = RepoStore::load(&profile.repos_path())?.get(&name)?.clone();
             let creds = profile.github()?;
+            let found = task_branches(&repo)
+                .await?
+                .into_iter()
+                .find(|b| b.name == branch);
             let title = match title {
                 Some(t) => t,
-                None => task_branches(&repo)
-                    .await?
-                    .into_iter()
-                    .find(|b| b.name == branch)
-                    .map(|b| b.subject)
-                    .with_context(|| {
-                        format!("{name} has no branch {branch} (see repo branches)")
-                    })?,
+                None => found.as_ref().map(|b| b.subject.clone()).with_context(|| {
+                    format!("{name} has no branch {branch} (see repo branches)")
+                })?,
             };
+            if !no_close && let Some(b) = &found {
+                let closes = proofkin::tracker::closing_lines(&b.issues, &repo.slug);
+                if !closes.is_empty() {
+                    println!("closes: {}", b.issues.join(", "));
+                    body = format!("{closes}\n{body}");
+                }
+            }
             creds.push(&repo, &branch).await?;
             if !no_proof {
                 match creds.pr_proof(&repo, &branch, &profile).await {
@@ -1854,6 +1913,133 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
             let profile = Profile::open(&profile.name)?;
             unlink(&profile, &name, delete)?;
             println!("profile '{}': unlinked {name}", profile.name);
+        }
+    }
+    Ok(())
+}
+
+fn print_tracker(info: &proofkin::tracker::TrackerInfo) {
+    println!(
+        "issues: {} ({}), as {}",
+        info.repo, info.repo_url, info.login
+    );
+    match (&info.board, &info.board_problem) {
+        (Some(b), _) => println!(
+            "board: {} ({}), status {}{}",
+            b.title,
+            b.url,
+            if b.statuses.is_empty() {
+                "field missing".to_owned()
+            } else {
+                b.statuses.join(" / ")
+            },
+            if b.agent_field {
+                ", Agent field"
+            } else {
+                ", no Agent field"
+            }
+        ),
+        (None, Some(problem)) => println!("board: not updated: {problem}"),
+        (None, None) => println!("board: none (add one with --project)"),
+    }
+    if !info.open_runs.is_empty() {
+        let runs: Vec<String> = info.open_runs.iter().map(|n| format!("#{n}")).collect();
+        println!("run issues waiting for pull requests: {}", runs.join(", "));
+    }
+}
+
+async fn run_tracker(command: TrackerCommand) -> Result<()> {
+    use proofkin::tracker::TrackerConfig;
+    match command {
+        TrackerCommand::Link {
+            repo,
+            project,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let tracker = proofkin::tracker::link(&profile, &repo, project.as_deref()).await?;
+            println!("profile '{}' tracks its plan runs on GitHub", profile.name);
+            print_tracker(&tracker.info());
+        }
+        TrackerCommand::Status { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            match proofkin::tracker::open(&profile).await? {
+                Some(tracker) => print_tracker(&tracker.info()),
+                None => println!(
+                    "profile '{}' has no tracker; link one with: proofkin tracker link <owner/repo> --project <url> --profile {}",
+                    profile.name, profile.name
+                ),
+            }
+        }
+        TrackerCommand::Items { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let tracker = proofkin::tracker::open(&profile)
+                .await?
+                .with_context(|| format!("profile '{}' has no tracker", profile.name))?;
+            if let Some(problem) = &tracker.board_problem {
+                println!("(the repository's open issues: the board isn't used: {problem})");
+            }
+            for item in tracker.items().await? {
+                let number = item
+                    .number
+                    .map(|n| format!("{}#{n}", item.repo.as_deref().unwrap_or_default()))
+                    .unwrap_or_else(|| "draft".into());
+                let mut extra = Vec::new();
+                if let Some((done, all)) = item.sub_issues {
+                    extra.push(format!("{done}/{all} sub-issues"));
+                }
+                if let Some(parent) = item.parent {
+                    extra.push(format!("part of #{parent}"));
+                }
+                if let Some(agent) = &item.agent {
+                    extra.push(format!("agent {agent}"));
+                }
+                if !item.assignees.is_empty() {
+                    extra.push(format!("assigned to {}", item.assignees.join(", ")));
+                }
+                if !item.pull_requests.is_empty() {
+                    let prs: Vec<String> =
+                        item.pull_requests.iter().map(|n| format!("#{n}")).collect();
+                    extra.push(format!("closed by {}", prs.join(", ")));
+                }
+                if !item.open {
+                    extra.push("closed".into());
+                }
+                println!(
+                    "  {:<8} {:<14} {}{}",
+                    number,
+                    item.status.as_deref().unwrap_or("-"),
+                    item.title,
+                    if extra.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({})", extra.join("; "))
+                    }
+                );
+            }
+        }
+        TrackerCommand::Sync { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let closed = proofkin::tracker::settle(&profile).await?;
+            if closed.is_empty() {
+                println!("no run issue to close");
+            }
+            for n in closed {
+                println!("closed run issue #{n}: all its sub-issues are closed");
+            }
+        }
+        TrackerCommand::Unlink { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let path = profile.tracker_path();
+            if TrackerConfig::load(&path)?.is_none() {
+                println!("profile '{}' has no tracker", profile.name);
+            } else {
+                std::fs::remove_file(&path)?;
+                println!(
+                    "profile '{}' no longer tracks its plan runs (their issues stay on GitHub)",
+                    profile.name
+                );
+            }
         }
     }
     Ok(())

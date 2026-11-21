@@ -576,6 +576,9 @@ report after api,tests @helper Write a one-paragraph status report
 - Every step is an ordinary delegated task, so each peer's allowlist, folder grants, hourly
   limit, access level and audit log apply. Squads live only in the boss's profile
   (`squads.json`); members just see tasks from the boss.
+- With a [tracker](#tracked-work) linked, each run is a GitHub issue and each step a
+  sub-issue on your project's board, which follows the run: `track: #12` works on issue 12,
+  `issue=#15` makes a step work on issue 15, and `track: off` leaves a run untracked.
 
 Run it with `/plan plan.txt`, or in the web UI's **Plan** mode. The web UI shows the plan as
 one card: a bar of its steps (done, running, failed), the steps in the order they can run
@@ -951,6 +954,78 @@ commit's record, and only that one, to the repository's notes ref
 request still opens and the proof says the record stays on your machine. Only that pull
 request's record is published; other records in the clone stay local.
 
+<a id="tracked-work"></a>
+
+**Tracked work: issues and a GitHub Project.** Link a tracker and every plan run you start
+is tracked on GitHub, where your team already tracks work:
+
+- the run gets an **issue**, and each step a **sub-issue** of it, assigned to your GitHub
+  account. A step's issue is *blocked by* the issues of the steps it runs after;
+- on the project's **board**, each item says which agent does it (an `Agent` text field,
+  added if the board has none), and its **Status** follows the run: *In progress* while the
+  step runs, *In review* while its commit waits for a pull request (or a sign-off waits for
+  its person), *Done* once closed. A step that changed no files is closed when it is done;
+  a failed or skipped step goes back to *Todo*. Status options are matched by name
+  (`Todo`/`Ready`/`Backlog`, `In progress`/`Doing`, `In review`/`Review`, `Done`, with or
+  without emoji); without a review column, work waiting for review stays in progress;
+- results and failures are **commented** on the issues with their signed evidence (signer,
+  checks, commit and branch), and the run's issue gets the run's verdict and claims;
+- each step's task carries its issue (and those of the steps whose work it applies). The
+  worker's commit references them (`Refs: acme/shop#15` trailers), `repo branches` and the
+  web UI show them, and a pull request from the branch **closes** them (`Closes #15`), so
+  GitHub links the pull request to the issues and closes them when it merges. The run's
+  issue waits *In review* until then (or, if it has other open sub-issues, where it was)
+  and is closed once all its sub-issues are (checked every 10 minutes by a running
+  agent, or now with `tracker sync`).
+
+```powershell
+proofkin github login --gh-user alice --profile boss
+# once, with alice as the GitHub CLI's active account: the board needs the project scope
+gh auth refresh --hostname github.com --scopes project
+proofkin tracker link acme/shop --project https://github.com/users/alice/projects/4 --profile boss
+proofkin tracker status --profile boss   # the board's statuses, or why it isn't updated
+proofkin tracker items --profile boss    # what is on the board, by status, with agents and pull requests
+proofkin tracker sync --profile boss     # close run issues whose pull requests have all merged
+```
+
+In plan text, `track:` says what the run works on, and `issue=` what a step works on:
+
+```text
+track: #12
+claim: C-1 Customers can export orders as CSV
+api @alice:shop verify=test claims=C-1 issue=#15 Add the CSV export endpoint
+ui after api @alice:shop apply=api verify=test claims=C-1 Add an Export button to the orders page
+signoff after ui approve @me claims=C-1 Try the export and approve it
+```
+
+Here the run works on issue #12 (`track: <title>` makes a new issue with that title,
+`track: off` leaves the run untracked; without a `track:` line the run gets a new issue
+named after its first claim). Step `api` works on #15, made a sub-issue of #12 if it isn't
+one; `ui` and `signoff` get new sub-issues. A later run with `track: #12` takes up its
+steps' open sub-issues again. In the web UI the **Tracker** card links and shows the
+tracker, and **Board items** lists what is open by status; **Plan it** starts a plan on an
+item, with a step per open sub-issue. Tracked steps link their issue, and a plan its run's.
+
+Without the `project` scope tracking keeps to the issues (the `repo` scope is enough) and
+says how to grant it. Tracking never fails or holds up a plan: it runs beside it, and what
+goes wrong is reported with the run. The issues get the steps' own words and results
+(redacted, and cut to a few thousand characters), so track private work in a private
+repository.
+
+GitHub's own tools work with the same issues and boards. The GitHub CLI has
+`gh project item-list|item-add|item-edit|field-list` (`item-edit --url <issue> --field
+Status --value Done`) and `gh issue create|edit` with `--parent`, `--add-sub-issue`,
+`--blocked-by` and `--add-assignee`. The
+[GitHub MCP server](https://github.com/github/github-mcp-server)'s `projects` toolset
+(`projects_list`, `projects_get`, `projects_write`) and `issues` toolset (`issue_read`,
+`issue_write`, `sub_issue_write`) give a model the same, for example as a folder's MCP
+server for agents that plan or triage work:
+
+```powershell
+proofkin mcp add shop github --url https://api.githubcopilot.com/mcp/x/projects `
+  --header "Authorization=Bearer <token with the project scope>" --description "GitHub Projects" --profile alice
+```
+
 **Knowledge base.** Each profile has a private knowledge base of Markdown topics.
 
 - A step with `save=topic` stores its result there. Only verified results are stored, with
@@ -1228,7 +1303,7 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
 `proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|status|logout`,
-`proofkin repo link|list|sync|branches|pr|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
+`proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
 tasks wait for a peer that dropped off to come back (default 60, see
@@ -1260,7 +1335,13 @@ proofkin --name me --providers copilot --serve --ui
   [team plan](#team-steps-handing-work-down-a-level).
 - **GitHub**: **Sign in to GitHub** with a GitHub CLI account; once signed in, **Change
   account** next to "Signed in as …" switches to another one (the account in use is
-  preselected).
+  preselected). Task branches show the issues their pull request closes, and **Open PR**
+  fills in `Closes #N` for them.
+- **Tracker**: link the repository (and project board) your plan runs are tracked on, see
+  the board's statuses or why it isn't updated (with the command that fixes it, to copy),
+  and **Board items**: what is open, by status, with **Plan it**. A tracked plan's card
+  links its issue, and each step its sub-issue (see
+  [tracked work](#tracked-work)).
 - **Task cards** show up to four lines of the task; **Show all** / **Show less** expands a
   longer one.
 - **Activity feed**: chat with all connected peers, joins and leaves, refused connections
@@ -1291,7 +1372,8 @@ proofkin --name me --providers copilot --serve --ui
     squads), what to do, the [agent](#agents) it acts as (with what that agent brings),
     skills (picked from a list with what each is for), the checks
     the folder offers (and the built-in ones), the claims it proves, the steps it waits
-    for, and more options (tries, model, knowledge, MCP servers, when to cancel it, and how
+    for, and more options (tries, model, knowledge, MCP servers, when to cancel it, its
+    issue when runs are [tracked](#tracked-work), and how
     far down a team task may go). It can't hold the
     usual mistakes: a task proves claims only once it has a check, a step can't wait for
     one that waits for it, renaming or removing a step or claim updates what refers to
@@ -1762,6 +1844,7 @@ Workflow for a change:
 - [src/ops.rs](src/ops.rs): monitors, metrics, incidents, TSG auto-fix, the debugging agent and ops reports
 - [src/skills.rs](src/skills.rs) and [skills/](skills): built-in and profile skills (instructions for plan steps)
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)
+- [src/tracker.rs](src/tracker.rs): tracked work: plan runs as GitHub issues and sub-issues on a GitHub Project's board (GraphQL through `gh`)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
