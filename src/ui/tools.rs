@@ -575,6 +575,81 @@ pub(super) async fn offer_mcp(
 }
 
 #[derive(Deserialize)]
+pub(super) struct TeamBody {
+    #[serde(default)]
+    plan: String,
+}
+
+fn no_share(name: &str) -> ApiError {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("this agent shares no folder named '{name}'") })),
+    )
+}
+
+/// Sets the team plan of a shared folder.
+pub(super) async fn set_team(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<TeamBody>,
+) -> Result<Json<Value>, ApiError> {
+    let steps = if name == DATA_SHARE {
+        0
+    } else {
+        crate::team::validate_template(&body.plan)
+            .map_err(err400)?
+            .steps
+            .len()
+    };
+    let (found, shares) = s
+        .info
+        .profile
+        .update_shares(|shares| {
+            if name != DATA_SHARE && shares.get(&name).is_none() {
+                return Ok(false);
+            }
+            shares.set_team(&name, Some(body.plan.clone()))?;
+            Ok(true)
+        })
+        .map_err(err400)?;
+    if !found {
+        return Err(no_share(&name));
+    }
+    shares_changed(
+        &s,
+        shares,
+        format!(
+            "'{name}' takes team steps (a team plan of {steps} step{})",
+            if steps == 1 { "" } else { "s" }
+        ),
+    );
+    Ok(Json(json!({ "name": name, "steps": steps })))
+}
+
+/// Removes the team plan of a shared folder.
+pub(super) async fn remove_team(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (found, shares) = s
+        .info
+        .profile
+        .update_shares(|shares| {
+            if shares.get(&name).is_none() {
+                return Ok(false);
+            }
+            shares.set_team(&name, None)?;
+            Ok(true)
+        })
+        .map_err(err400)?;
+    if !found {
+        return Err(no_share(&name));
+    }
+    shares_changed(&s, shares, format!("'{name}' no longer takes team steps"));
+    Ok(Json(json!({ "name": name })))
+}
+
+#[derive(Deserialize)]
 pub(super) struct OfferEdit {
     #[serde(default)]
     access: Option<Access>,

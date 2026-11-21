@@ -616,6 +616,8 @@ review after build @carol:app apply=build verify=test claims=T-1 Review the chan
 proofkin share team app team.plan --profile alice   # --clear removes it; share list shows it
 ```
 
+The owner can also set or remove a folder's team plan in the web UI (This agent > Shared
+folders > Team plan…).
 The boss gives a step to the lead with `team`:
 
 ```text
@@ -1240,7 +1242,8 @@ proofkin --name me --providers copilot --serve --ui
   pick; start and stop them, choose whether they start with this agent, read why one
   stopped on its own, and delete them (they leave your allowlist and squads).
 - **Your ticket** with a copy button, plus this agent's profile, network, providers, accounts,
-  access level and workspace.
+  access level and workspace, and its shared folders, each with a **Team plan…** button to set
+  or remove the folder's [team plan](#team-steps-handing-work-down-a-level).
 - **Activity feed**: chat with all connected peers, joins and leaves, refused connections
   (with **Allowlist…** for a teammate who allowlisted you first: their endpoint id is
   filled in; only add people you know), tasks peers delegate to you.
@@ -1427,6 +1430,9 @@ A worker decides exactly what each peer can see:
 - `proofkin share team <folder> <file>` gives a folder a **team plan**, so peers with edit
   access can hand it [team steps](#team-steps-handing-work-down-a-level) that your agent
   runs with your own team. Peers see only that the folder takes team steps, not the plan.
+  The web UI sets and removes it too, under **This agent > Shared folders > Team plan…**
+  (and through its API: `PUT /api/shares/<folder>/team` with
+  `{"plan": "..."}` and `DELETE /api/shares/<folder>/team`).
 
 | | `data` (built in) | A folder you add |
 | --- | --- | --- |

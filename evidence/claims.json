@@ -915,7 +915,8 @@
       "claim": "The web UI shows a plan as one card (a bar of its steps' states, the steps in the order they can run, Cancel plan and its evidence run), with what each running step's peer is doing now. A team step is labelled as one and shows its lead's team steps live, then the team run it came back with; the lead's page shows the team run as a plan of its own, for the peer whose step it is. The plan editor checks team steps as they are written (team, levels=, timeout=, and the options a team step can't take).",
       "tests": [
         "ui::team_runs_show_on_the_bosss_step_and_the_leads_page",
-        "ui::the_plan_editor_keeps_plans_valid"
+        "ui::the_plan_editor_keeps_plans_valid",
+        "ui::the_owner_sets_and_removes_a_folders_team_plan_through_the_api"
       ]
     }
   ]

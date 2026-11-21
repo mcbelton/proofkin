@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
@@ -929,6 +929,10 @@ pub async fn start(
         .route(
             "/api/mcp/{share}/{name}",
             delete(tools::remove_mcp).patch(tools::edit_mcp),
+        )
+        .route(
+            "/api/shares/{name}/team",
+            put(tools::set_team).delete(tools::remove_team),
         )
         .route("/api/squads", post(save_squad))
         .route("/api/squads/{name}", delete(remove_squad))
