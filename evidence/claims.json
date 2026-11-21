@@ -829,7 +829,7 @@
     {
       "id": "INT-2",
       "area": "integrations",
-      "claim": "Other agents connect over A2A 1.0: an agent card (only while connecting is on) with the JSON-RPC interface and the bearer scheme; SendMessage runs a task on a peer or a plan, waiting for the result unless returnImmediately is set, with the peer's output, each step's output and the evidence verdict as artifacts; GetTask, ListTasks (by context, artifacts on request) and CancelTask; other versions, files, streaming, an extended card, finished and unknown tasks get A2A's errors, and work that can't start comes back as a rejected task.",
+      "claim": "Other agents connect over A2A 1.0: an agent card (only while connecting is on) with the JSON-RPC interface and the bearer scheme; SendMessage runs a task on a peer or a plan, waiting for the result unless returnImmediately is set, with the peer's output, each step's output and the evidence verdict as artifacts; GetTask, ListTasks (by context, artifacts on request) and CancelTask; SendStreamingMessage and SubscribeToTask stream a task live as server-sent events (the task, a status update with the progress each time it changes, and the finished task last; a finished task can't be subscribed to); other versions, files, an extended card, finished and unknown tasks get A2A's errors, and work that can't start comes back as a rejected task (an error when streaming).",
       "tests": [
         "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a"
       ],

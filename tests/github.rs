@@ -196,6 +196,20 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
     // Opening a pull request pushes the notes ref with the record, and the proof says
     // who asked, what it was part of and where the record is.
     assert_eq!(git(&seed, &["ls-remote", "origin", "refs/notes/*"]), "");
+    // Another task commit in the clone, whose branch gets no pull request, has a record too.
+    let other = Worktree::create(&repo.path, &root, "p2p/boss/2-1")
+        .await
+        .unwrap();
+    std::fs::write(other.path.join("other.txt"), "other\n").unwrap();
+    let (other_made, _) = other
+        .commit("proofkin: task 2 from boss\n\nAnother change")
+        .await
+        .unwrap();
+    other
+        .note(other_made.commit.as_deref().unwrap(), "{\"other\":true}")
+        .await
+        .unwrap();
+    drop(other);
     let proof = creds
         .pr_proof(&repo, "p2p/boss/1-1", &profile)
         .await
@@ -248,13 +262,19 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
     );
     let note: Evidence = serde_json::from_str(&note).unwrap();
     note.verify_record().unwrap();
-
+    assert_eq!(
+        git(&fetched, &["notes", "--ref=proofkin", "list"])
+            .lines()
+            .count(),
+        1,
+        "only the pull request's record was published"
+    );
     // If the notes can't be pushed, the proof still comes and says the record stays here.
     git(
         &repo.path,
         &["remote", "set-url", "origin", "/no/such/repository.git"],
     );
-    assert!(creds.push_notes(&repo).await.is_err());
+    assert!(creds.push_notes(&repo, "p2p/boss/1-1").await.is_err());
     let proof = creds
         .pr_proof(&repo, "p2p/boss/1-1", &profile)
         .await

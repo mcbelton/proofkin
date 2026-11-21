@@ -1601,6 +1601,14 @@ struct StartedPlan {
     done: tokio::task::JoinHandle<crate::schedule::Outcome>,
 }
 
+/// Names `peer` in the target of a plan step, keeping the folder the target already has.
+fn step_target(target: &str, peer: &str) -> String {
+    match target.split_once(':') {
+        Some((_, folder)) => format!("{peer}:{folder}"),
+        None => peer.to_owned(),
+    }
+}
+
 /// Shows plan step `state` on its task `t` (a step of a plan run here, or of a team
 /// run this agent leads): its peer, what it is doing, and its result and evidence.
 fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
@@ -1612,15 +1620,7 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
                 t.started_ms = now_ms();
             }
             t.status = "running";
-            // The target shown while waiting names the step's folder: keep it.
-            let folder = t
-                .target
-                .split_once(':')
-                .map(|(_, folder)| folder.to_owned());
-            t.target = match folder {
-                Some(folder) => format!("{peer}:{folder}"),
-                None => peer.clone(),
-            };
+            t.target = step_target(&t.target, peer);
             t.progress = progress.clone();
         }
         StepState::Done {
@@ -1631,7 +1631,7 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
             patch,
         } => {
             t.status = "done";
-            t.target = peer.clone();
+            t.target = step_target(&t.target, peer);
             t.output = Some(output.clone());
             t.finished_ms = Some(now_ms());
             t.progress = None;
@@ -1656,7 +1656,7 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
         } => {
             t.status = "failed";
             if let Some(peer) = peer {
-                t.target = peer.clone();
+                t.target = step_target(&t.target, peer);
             }
             t.output = Some(error.clone());
             t.finished_ms = Some(now_ms());

@@ -944,10 +944,12 @@ start), what the work was part of if your audit log has the task (for example "a
 their results (never their commands). If your profile has the evidence run that holds the
 record (a plan or task you ran), its verdict and claims are added. The web UI's pull
 request form shows the proof before you open it (**Add the proof**, on by default);
-`repo pr ... --no-proof` leaves it out. Opening the pull request also pushes the notes ref
+`repo pr ... --no-proof` leaves it out. Opening the pull request also publishes its head
+commit's record, and only that one, to the repository's notes ref
 (`refs/notes/proofkin`) to the repository, so others can fetch the record and re-check it:
 `git fetch origin refs/notes/proofkin:refs/notes/proofkin`. If that push fails, the pull
-request still opens and the proof says the record stays on your machine.
+request still opens and the proof says the record stays on your machine. Only that pull
+request's record is published; other records in the clone stay local.
 
 **Knowledge base.** Each profile has a private knowledge base of Markdown topics.
 
@@ -1392,9 +1394,18 @@ for a peer; say where in the message's `metadata` or a data part: `peer`, `folde
 `provider`, `mcp`, and `kind` to force `task` or `plan`). It waits for the result unless
 `configuration.returnImmediately` is set; the task's artifacts are the peer's output, each
 step's output and the evidence verdict. `GetTask`, `ListTasks` and `CancelTask` work on the
-tasks other agents started. Streaming and push notifications aren't offered (use
-`GetTask`); work that can't start (an unknown peer, a plan with problems) comes back as a
-`TASK_STATE_REJECTED` task saying why.
+tasks other agents started. `SendStreamingMessage` takes the same params and starts the
+work the same way, but answers as a Server-Sent Events stream (the agent card says
+`capabilities.streaming: true`): each event's data is a JSON-RPC response whose result is
+first `{"task"}`, then a `{"statusUpdate"}` each time the task's state or what its steps'
+peers say they are doing changes (the message's text is the progress, e.g. `api on worker:
+running check test (3 of 4)`), and last `{"task"}` again, finished and with its artifacts,
+after which the stream closes. `SubscribeToTask` with an `id` follows a running task the
+same way, starting with its current task; a finished task is refused
+(`UnsupportedOperationError`), an unknown one is `TaskNotFoundError`. Problems found before
+a stream starts (bad params, an unknown peer) are plain JSON-RPC errors. Push notifications
+aren't offered (use `GetTask`); work that can't start with `SendMessage` (an unknown peer,
+a plan with problems) comes back as a `TASK_STATE_REJECTED` task saying why.
 
 **Security.** The token is per profile, kept in the profile's secret store, and works only
 for `/mcp` and `/a2a`; the web UI's own token doesn't work there, and the integration token
