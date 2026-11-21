@@ -384,7 +384,8 @@ mod tests {
         use crate::evidence::{CheckResult, Evidence, EvidenceKind};
         let repo = repo().await;
         let root = tempfile::tempdir().unwrap();
-        let runs = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let profile = crate::Profile::open_in(home.path(), "alice").unwrap();
         let key = iroh::SecretKey::generate();
         let wt = Worktree::create(repo.path(), root.path(), "p2p/boss/7-1")
             .await
@@ -409,11 +410,18 @@ mod tests {
             .unwrap();
         drop(wt);
 
-        let proof = crate::github::branch_proof(repo.path(), "p2p/boss/7-1", runs.path())
+        let proof = crate::github::branch_proof(repo.path(), "p2p/boss/7-1", &profile, true)
             .await
             .unwrap()
             .expect("the head commit has its record");
-        assert_eq!(proof.summary, "Signed by worker: ✓ test");
+        assert!(
+            proof.summary.starts_with(&format!(
+                "Signed by worker for {}: ✓ test",
+                &key.public().to_string()[..10]
+            )),
+            "{}",
+            proof.summary
+        );
         let md = &proof.markdown;
         assert!(
             md.contains(&format!("Commit `{}` (1 file)", &commit[..12])),
@@ -446,8 +454,8 @@ mod tests {
         );
         run.peer_ids
             .insert("worker".into(), key.public().to_string());
-        run.save(runs.path()).unwrap();
-        let proof = crate::github::branch_proof(repo.path(), "p2p/boss/7-1", runs.path())
+        run.save(&profile.runs_dir()).unwrap();
+        let proof = crate::github::branch_proof(repo.path(), "p2p/boss/7-1", &profile, true)
             .await
             .unwrap()
             .unwrap();
@@ -475,8 +483,8 @@ mod tests {
         let (other, _) = wt.commit("task 8").await.unwrap();
         drop(wt);
         let proof = |branch: &'static str| {
-            let (repo, runs) = (repo.path().to_owned(), runs.path().to_owned());
-            async move { crate::github::branch_proof(&repo, branch, &runs).await }
+            let (repo, profile) = (repo.path().to_owned(), profile.clone());
+            async move { crate::github::branch_proof(&repo, branch, &profile, true).await }
         };
         assert_eq!(proof("p2p/boss/8-1").await.unwrap(), None);
         // A record copied to another commit doesn't cover it.

@@ -119,6 +119,21 @@ pub struct LlmTask {
     /// a model (see [`crate::team`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<crate::team::TeamRequest>,
+    /// The first line of the task's own words (at most 100 characters); the worker
+    /// uses it as the subject of its commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// The first line of `text`, at most 100 characters: a task's title.
+pub fn title_of(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(100)
+        .collect()
 }
 
 impl LlmTask {
@@ -133,6 +148,7 @@ impl LlmTask {
             patch: None,
             mcp: Vec::new(),
             team: None,
+            title: None,
         }
     }
 

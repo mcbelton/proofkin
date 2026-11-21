@@ -55,6 +55,11 @@ impl Executor for FakeExecutor {
             .rsplit("Your task:\n")
             .next()
             .unwrap_or(&task.prompt);
+        // Skills put in front of the task's own words.
+        let own = match own.rsplit_once("\n---\n") {
+            Some((_, text)) if own.starts_with("Follow these instructions:") => text,
+            _ => own,
+        };
         if let Some(file) = task
             .prompt
             .strip_prefix("write ")
@@ -1281,7 +1286,13 @@ async fn checks_run_by_the_worker_prove_results_and_failures_are_retried() {
     assert!(evidence.checks_passed());
     assert_eq!(evidence.signer_id, worker.id().to_string());
     evidence.verify(&worker.id(), &second.output).unwrap();
-    assert!(second.output.starts_with("fixed it"));
+    assert!(
+        second.output.starts_with(
+            "first try\n\nAttempt 2 of 2, after these checks failed: fixed\n\nfixed it"
+        ),
+        "{}",
+        second.output
+    );
     assert!(
         second.output.contains("✅ `fixed`: passed"),
         "{}",
@@ -1838,6 +1849,7 @@ async fn delegated_tasks_report_their_place_in_the_queue_and_the_worker_its_load
 #[tokio::test]
 async fn delegated_tasks_report_each_attempt_and_check() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
     let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
     let mut boss = Node::new("boss");
     worker
@@ -1846,7 +1858,11 @@ async fn delegated_tasks_report_each_attempt_and_check() {
             "app",
             dir.path(),
             Access::Full,
-            parse_checks(&[format!("fixed={}", exists_check("fixed.txt"))]).unwrap(),
+            parse_checks(&[
+                format!("base={}", exists_check("base.txt")),
+                format!("fixed={}", exists_check("fixed.txt")),
+            ])
+            .unwrap(),
             false,
         )
         .unwrap();
@@ -1859,7 +1875,7 @@ async fn delegated_tasks_report_each_attempt_and_check() {
 
     let task = LlmTask::new(Provider::Copilot, "fix-on-retry")
         .in_share("app")
-        .with_checks(vec!["fixed".into()], Some(2));
+        .with_checks(vec!["base".into(), "fixed".into()], Some(2));
     let mut seen = Vec::new();
     let delivered = boss
         .send_task(worker.id(), task, None)
@@ -1868,6 +1884,13 @@ async fn delegated_tasks_report_each_attempt_and_check() {
         .await
         .unwrap();
     assert!(delivered.ok && delivered.verified, "{delivered:?}");
+    assert!(
+        delivered.output.starts_with(
+            "first try\n\nAttempt 2 of 2, after these checks failed: fixed\n\nfixed it"
+        ),
+        "{}",
+        delivered.output
+    );
     assert_eq!(
         seen,
         [
@@ -1875,13 +1898,70 @@ async fn delegated_tasks_report_each_attempt_and_check() {
                 Phase::Running,
                 "attempt 1 of 2: the model is working".to_owned()
             ),
-            (Phase::Checking, "running check fixed".to_owned()),
+            (
+                Phase::Checking,
+                "attempt 1 of 2: running check base (1 of 2)".to_owned()
+            ),
+            (
+                Phase::Checking,
+                "attempt 1 of 2: running check fixed (2 of 2); base passed".to_owned()
+            ),
             (
                 Phase::Running,
-                "attempt 2 of 2: the model is working, told what failed".to_owned()
+                "attempt 2 of 2: the model is working, told what failed (fixed)".to_owned()
             ),
-            (Phase::Checking, "running check fixed".to_owned()),
+            (
+                Phase::Checking,
+                "attempt 2 of 2: running check base (1 of 2)".to_owned()
+            ),
+            (
+                Phase::Checking,
+                "attempt 2 of 2: running check fixed (2 of 2); base passed".to_owned()
+            ),
         ]
+    );
+}
+
+/// A task's commit has its title as the subject, whatever skills were put in front
+/// of the prompt, and says who asked and who did it.
+#[tokio::test]
+async fn a_task_with_skills_commits_with_its_title_as_the_subject() {
+    let repo = git_repo();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    worker
+        .shares
+        .add_with("app", repo.path(), Access::Full, Default::default(), true)
+        .unwrap();
+    mutual(&mut worker, &mut boss);
+    worker.grant("boss", Access::WorkspaceWrite, &["data", "app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let mut task = LlmTask::new(
+        Provider::Copilot,
+        "Follow these instructions:\nBe careful.\n---\ncreate note.txt",
+    )
+    .in_share("app");
+    task.title = Some("create note.txt".into());
+    let done = boss.delegate_verified(worker.id(), task).await.unwrap();
+    assert!(done.ok && done.verified, "{}", done.output);
+    let git_record = done.evidence.as_ref().unwrap().git.clone().unwrap();
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["log", "-1", "--format=%B", &git_record.branch])
+        .output()
+        .unwrap();
+    assert!(log.status.success());
+    let message = String::from_utf8_lossy(&log.stdout).replace("\r\n", "\n");
+    let message = message.trim_end();
+    assert!(message.starts_with("create note.txt\n\nTask "), "{message}");
+    assert!(
+        message.ends_with(" from boss, done by worker with Proofkin."),
+        "{message}"
     );
 }
 

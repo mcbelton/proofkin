@@ -389,7 +389,7 @@ function renderMe() {
               : "Preview prototype/index.html of this folder in a sandboxed tab",
             onclick: (e) => openPreview({ share: s.name }, e.currentTarget),
           }, s.preview === "review pack" ? "Preview review pack" : "Preview prototype") : null,
-          s.name === "data" ? null : el("div", { class: "share-team" },
+          s.name === "data" || !["workspace-write", "full"].includes(s.max_access) ? null : el("div", { class: "share-team" },
             el("button", {
               type: "button", class: "btn small", "aria-label": `Team plan for ${s.name}`,
               title: "Set what this agent's team does when a peer hands this folder a team step",
@@ -559,6 +559,23 @@ function copyTicket() {
 }
 
 const openResults = new Map();
+const expandedPrompts = new Set();
+const PROMPT_LINES = 4;
+
+function promptNode(t) {
+  const text = el("p", { class: "task-prompt", text: t.prompt });
+  const long = t.prompt.split("\n").length > PROMPT_LINES || t.prompt.length > PROMPT_LINES * 80;
+  if (!expandedPrompts.has(t.id)) text.classList.add("clamped");
+  if (!long) return text;
+  const more = el("button", { type: "button", class: "btn small link" },
+    expandedPrompts.has(t.id) ? "Show less" : "Show all");
+  more.addEventListener("click", () => {
+    const open = text.classList.toggle("clamped") === false;
+    if (open) expandedPrompts.add(t.id); else expandedPrompts.delete(t.id);
+    more.textContent = open ? "Show less" : "Show all";
+  });
+  return el("div", { class: "task-prompt-box" }, text, more);
+}
 const openPlans = new Map();
 const STATUS_TEXT = {
   running: "Running", done: "Done", failed: "Failed", cancelled: "Cancelled", waiting: "Waiting", skipped: "Skipped",
@@ -617,7 +634,7 @@ function taskNode(t) {
         text: t.evidence === "verified" ? "Signed ✓" : "Unverified ✗",
       }) : null,
       statusNode(t.status)),
-    el("p", { class: "task-prompt", text: t.prompt }),
+    promptNode(t),
     meta);
   // What its peer last said it is doing (queued, attempt 2 of 3, running a check…).
   if (t.status === "running" && t.progress?.text) {
@@ -830,8 +847,7 @@ function openTeamDialog(share, opener) {
   const me = state.me.name;
   $("#team-h").textContent = `Team plan for ${share.name}`;
   $("#team-intro").textContent = `Peers with edit access hand this folder team steps (name team @${me}:${share.name} what to do). `
-    + "This agent's team runs the plan on its own peers, digital workers and squads. "
-    + "{task} is where their task goes (in claims, a one-line brief of it).";
+    + "This agent's team runs the plan on its own peers, digital workers and squads.";
   const plan = $("#team-plan");
   plan.value = share.team ?? "";
   plan.placeholder = `claim: T-1 {task} passes the tests\nbuild @alice:${share.name} verify=test claims=T-1 {task}`;
@@ -858,6 +874,9 @@ async function sendTeamPlan(button, busy, request, done) {
     $("#team-dialog").close();
     toast(done(folder));
     await loadState();
+    // The card was rebuilt: focus the new button of the same folder.
+    [...document.querySelectorAll("button[aria-label]")]
+      .find((b) => b.getAttribute("aria-label") === `Team plan for ${folder}`)?.focus();
   } catch (err) {
     $("#team-error").textContent = err.message;
   } finally {
@@ -2011,7 +2030,8 @@ async function loadGithub() {
     return;
   }
   box.append(el("p", { class: "small" }, github.account.user
-    ? ["Signed in as ", el("strong", { text: `${github.account.user}@${github.account.host}` })]
+    ? ["Signed in as ", el("strong", { text: `${github.account.user}@${github.account.host}` }), " ",
+      el("button", { type: "button", class: "btn small", onclick: openGithubLogin }, "Change account")]
     : `Uses ${github.account.owner}'s GitHub account (digital worker)`));
   if (!github.serving) box.append(el("p", { class: "muted small", text: "This agent doesn't run peers' tasks (start it with --serve) so linked repositories are for your own use." }));
   if (!github.repos.length) box.append(el("p", { class: "muted small", text: "No linked repositories yet." }));
@@ -2035,9 +2055,14 @@ async function loadGithub() {
 function openGithubLogin() {
   $("#github-error").textContent = "";
   const accounts = github?.accounts ?? [];
+  // Preselect one: the profile's account, else gh's active one on github.com, else the first.
+  const current = github?.account?.user
+    ? accounts.findIndex((a) => a.login === github.account.user && a.host === github.account.host) : -1;
+  const active = accounts.findIndex((a) => a.active && a.host === "github.com");
+  const picked = current >= 0 ? current : active >= 0 ? active : 0;
   $("#github-accounts").replaceChildren(...(accounts.length
     ? accounts.map((a, i) => el("label", { class: "check" },
-      el("input", { type: "radio", name: "gh-account", value: `${a.login}@${a.host}`, checked: (a.active || i === 0) || undefined }),
+      el("input", { type: "radio", name: "gh-account", value: `${a.login}@${a.host}`, checked: i === picked || undefined }),
       el("span", { text: `${a.login} on ${a.host}${a.active ? " (active)" : ""}` })))
     : [el("span", { class: "muted small", text: "No GitHub CLI account found. Run gh auth login in a terminal, then try again." })]));
   $("#github-dialog").showModal();

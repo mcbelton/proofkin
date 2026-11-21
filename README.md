@@ -588,8 +588,9 @@ Every peer working for you says what it is doing, and the UI and CLI show it as 
 
 - **Queued**: "waiting for a free slot on worker (2 tasks ahead)". A serving agent runs 2
   tasks at a time and queues the rest.
-- **Working**: "the model is working", "attempt 2 of 3: the model tries again (told what
-  failed)", "running check test (1 of 2)", "committing the work".
+- **Working**: "the model is working", "attempt 2 of 3: the model is working, told what
+  failed (fmt)", "attempt 1 of 3: running check test (3 of 4); fmt failed, clippy passed",
+  "committing the work". The attempt comes first when a task has more than one.
 - **Team**: a team step's lead reports each step of its team run (below), with the same
   status for each one, nested level by level.
 - **Reconnecting**, and **moved here** for a squad step that went to another member.
@@ -739,7 +740,11 @@ option that takes a list adds to it: `skill=adr skill=api-contract` is
   `~/.proofkin-worktrees/<profile>`, with git hooks disabled. The work is committed there and
   returned as a patch whose hash is signed. Your checkout is never touched and parallel
   tasks never collide. Review or merge the branch (`git log p2p/boss/...`) when you're
-  happy. Removed worktrees keep their branch.
+  happy. Removed worktrees keep their branch. The commit's subject is the task's title (the
+  first line of its own words, at most 100 characters), followed by who asked and who did it.
+- **Retries**: when a task took more than one attempt, its output is the first attempt's
+  report, then, for each later attempt, a line "Attempt 2 of 3, after these checks failed:
+  fmt, clippy" and that attempt's report.
 - **Approvals**: the approver sees the request in their web UI (**Waiting for your
   approval**) or terminal (`/approvals`, then `/approve <n> [note]` or `/reject <n> <why>`).
   The answer is signed with their key. Approvers only need to be allowlisted; they need no
@@ -932,11 +937,17 @@ keeps the evidence record it signed for the commit with the commit itself, as a 
 (`refs/notes/proofkin`; `git notes --ref=proofkin show <branch>`). Opening a pull request
 from that branch checks the record (its signature, and that it is for the branch's
 head commit) and ends the description with a **Proof** section: which agent made the
-commit and for whom, its key, and the checks its runtime ran on the change with their
-results (never their commands). If your profile has the evidence run that holds the
+commit and for whom (the name your allowlist has for the requester, with its key's
+start), what the work was part of if your audit log has the task (for example "as step
+`ui` of boss's evidence run ..."; ask that agent for the run and re-check it with
+`proofkin runs verify --file`), its key, and the checks its runtime ran on the change with
+their results (never their commands). If your profile has the evidence run that holds the
 record (a plan or task you ran), its verdict and claims are added. The web UI's pull
 request form shows the proof before you open it (**Add the proof**, on by default);
-`repo pr ... --no-proof` leaves it out. Notes stay in your clone: they aren't pushed.
+`repo pr ... --no-proof` leaves it out. Opening the pull request also pushes the notes ref
+(`refs/notes/proofkin`) to the repository, so others can fetch the record and re-check it:
+`git fetch origin refs/notes/proofkin:refs/notes/proofkin`. If that push fails, the pull
+request still opens and the proof says the record stays on your machine.
 
 **Knowledge base.** Each profile has a private knowledge base of Markdown topics.
 
@@ -1242,8 +1253,14 @@ proofkin --name me --providers copilot --serve --ui
   pick; start and stop them, choose whether they start with this agent, read why one
   stopped on its own, and delete them (they leave your allowlist and squads).
 - **Your ticket** with a copy button, plus this agent's profile, network, providers, accounts,
-  access level and workspace, and its shared folders, each with a **Team plan…** button to set
-  or remove the folder's [team plan](#team-steps-handing-work-down-a-level).
+  access level and workspace, and its shared folders, each with a **Team plan…** button (for
+  folders with edit or full access) to set or remove the folder's
+  [team plan](#team-steps-handing-work-down-a-level).
+- **GitHub**: **Sign in to GitHub** with a GitHub CLI account; once signed in, **Change
+  account** next to "Signed in as …" switches to another one (the account in use is
+  preselected).
+- **Task cards** show up to four lines of the task; **Show all** / **Show less** expands a
+  longer one.
 - **Activity feed**: chat with all connected peers, joins and leaves, refused connections
   (with **Allowlist…** for a teammate who allowlisted you first: their endpoint id is
   filled in; only add people you know), tasks peers delegate to you.

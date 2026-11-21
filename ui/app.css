@@ -292,7 +292,8 @@ textarea { resize: vertical; }
 .task { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; background: var(--surface); }
 .task-top { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .task-title { font-weight: 600; font-size: 13px; }
-.task-prompt { margin: 6px 0; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.task-prompt { margin: 6px 0; overflow-wrap: anywhere; }
+.task-prompt.clamped { display: -webkit-box; -webkit-line-clamp: 4; line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 .task-meta { font-size: 12px; color: var(--muted); }
 .status { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; }
 .status.running { background: var(--accent-soft); color: var(--accent); }

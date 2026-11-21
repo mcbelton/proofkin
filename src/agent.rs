@@ -1844,13 +1844,18 @@ impl Inner {
             .collect();
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();
-        let (mut output, mut results, mut used) = (String::new(), Vec::new(), 0);
+        let mut results = Vec::<crate::evidence::CheckResult>::new();
+        let (mut reports, mut used) = (Vec::<String>::new(), 0);
+        let mut failed_before = Vec::<String>::new();
         while used < attempts {
             used += 1;
             let text = match (attempts, used) {
                 (1, _) => "the model is working".to_owned(),
                 (n, 1) => format!("attempt 1 of {n}: the model is working"),
-                (n, k) => format!("attempt {k} of {n}: the model is working, told what failed"),
+                (n, k) => format!(
+                    "attempt {k} of {n}: the model is working, told what failed ({})",
+                    failed_before.join(", ")
+                ),
             };
             self.send_progress(
                 id,
@@ -1861,13 +1866,26 @@ impl Inner {
                     ..Progress::new(Phase::Running, text)
                 },
             );
-            output = executor.execute(&prompt, &ctx).await?;
+            reports.push(executor.execute(&prompt, &ctx).await?);
             results.clear();
             for (i, (name, command)) in checks.iter().enumerate() {
-                let text = match checks.len() {
+                let mut text = match attempts {
+                    1 => String::new(),
+                    n => format!("attempt {used} of {n}: "),
+                };
+                text += &match checks.len() {
                     1 => format!("running check {name}"),
                     n => format!("running check {name} ({} of {n})", i + 1),
                 };
+                if !results.is_empty() {
+                    let earlier: Vec<String> = results
+                        .iter()
+                        .map(|r| {
+                            format!("{} {}", r.name, if r.passed { "passed" } else { "failed" })
+                        })
+                        .collect();
+                    text += &format!("; {}", earlier.join(", "));
+                }
                 self.send_progress(
                     id,
                     task_id,
@@ -1885,7 +1903,31 @@ impl Inner {
             if results.iter().all(|r| r.passed) {
                 break;
             }
+            failed_before = results
+                .iter()
+                .filter(|r| !r.passed)
+                .map(|r| r.name.clone())
+                .collect();
+            if used < attempts {
+                reports.push(format!(
+                    "Attempt {} of {attempts}, after these checks failed: {}",
+                    used + 1,
+                    failed_before.join(", ")
+                ));
+            }
             prompt.prompt = retry_prompt(&task.prompt, &results);
+        }
+        // Each later attempt's report follows a line saying why it was made.
+        let mut output = String::new();
+        for (i, part) in reports.iter().enumerate() {
+            if i > 0 {
+                output += "\n\n";
+            }
+            output += if i == 0 {
+                part.as_str()
+            } else {
+                part.trim_end()
+            };
         }
         // Results leave this machine: secrets the model or a check printed stay here.
         output = crate::redact::redact_with_note(&output, &self.name);
@@ -1912,9 +1954,15 @@ impl Inner {
                 Progress::new(Phase::Committing, "committing the work"),
             );
             let first = task.prompt.lines().next().unwrap_or_default();
+            let subject = task
+                .title
+                .as_deref()
+                .map(crate::llm::title_of)
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| crate::llm::title_of(first));
             let message = format!(
-                "proofkin: task {task_id} from {from}\n\n{}",
-                first.chars().take(200).collect::<String>()
+                "{subject}\n\nTask {task_id} from {from}, done by {} with Proofkin.",
+                self.name
             );
             let (commit, text) = wt.commit(&message).await?;
             evidence.git = Some(commit);

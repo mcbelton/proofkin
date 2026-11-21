@@ -147,6 +147,10 @@ pub struct Step {
     pub share: Option<String>,
     pub provider: Provider,
     pub prompt: String,
+    /// The step's own words, kept when skills and knowledge are put in front of
+    /// `prompt`; empty until then.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub brief: String,
     /// Owner-defined checks the peer's runtime runs after the model (`verify=a,b`).
     #[serde(default)]
     pub checks: Vec<String>,
@@ -187,6 +191,25 @@ pub struct Step {
     /// cancelled, on every level below too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+}
+
+impl Step {
+    /// The step's own words: what it was written with, before anything was put in
+    /// front of its prompt.
+    pub fn own_text(&self) -> &str {
+        if self.brief.is_empty() {
+            &self.prompt
+        } else {
+            &self.brief
+        }
+    }
+
+    /// Remembers the step's own words before its prompt is changed.
+    fn keep_brief(&mut self) {
+        if self.brief.is_empty() {
+            self.brief = self.prompt.clone();
+        }
+    }
 }
 
 /// A statement the plan must prove with evidence (`claim: ID text`).
@@ -373,6 +396,7 @@ impl Plan {
             instructions += &skills
                 .instructions(&step.skills)
                 .with_context(|| format!("step '{}'", step.id))?;
+            step.keep_brief();
             step.prompt = format!(
                 "Follow these instructions:\n{instructions}\n---\n{}",
                 step.prompt
@@ -391,6 +415,7 @@ impl Plan {
             }
             check_topics(kb, &step.context).with_context(|| format!("step '{}'", step.id))?;
             let knowledge = kb.context(&step.context)?;
+            step.keep_brief();
             step.prompt = format!(
                 "Knowledge about this system (from earlier, verified work):\n{knowledge}\n---\n{}",
                 step.prompt
@@ -650,6 +675,7 @@ fn parse_step(line: &str) -> Result<Step> {
         share,
         provider,
         prompt,
+        brief: String::new(),
         checks,
         attempts,
         claims,
@@ -1261,6 +1287,20 @@ pub fn step_prompt(step: &Step, deps: &[(&str, &str, &str)]) -> String {
     crate::boundary::guard(&prompt)
 }
 
+/// What a person reads in an approval: the prompt without the rule for models and
+/// without the `<external_content>` envelope lines around earlier results.
+fn approval_text(prompt: &str) -> String {
+    let tag = crate::boundary::TAG;
+    let (open, close) = (format!("<{tag} source="), format!("</{tag}>"));
+    prompt
+        .strip_prefix(crate::boundary::DIRECTIVE)
+        .unwrap_or(prompt)
+        .lines()
+        .filter(|l| !l.starts_with(&open) && l.trim_end() != close)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The steps `id` waits for, directly or through others.
 fn ancestors(plan: &Plan, id: &str) -> std::collections::BTreeSet<String> {
     let mut found = std::collections::BTreeSet::new();
@@ -1540,10 +1580,7 @@ pub async fn run_plan_with(
                         Ok((approver, name)) => {
                             let (agent, title) = (agent.clone(), format!("Plan step {}", step.id));
                             // A person reads it: the rule for models is left out.
-                            let text = prompt
-                                .strip_prefix(crate::boundary::DIRECTIVE)
-                                .unwrap_or(&prompt)
-                                .to_owned();
+                            let text = approval_text(&prompt);
                             (
                                 name,
                                 Box::pin(async move {
@@ -1575,6 +1612,7 @@ pub async fn run_plan_with(
                     let mut task = LlmTask::new(step.provider, prompt.clone())
                         .with_checks(step.checks.clone(), step.attempts);
                     task.mcp = step.mcp.clone();
+                    task.title = Some(crate::llm::title_of(step.own_text()));
                     if let Some(share) = &step.share {
                         task = task.in_share(share.clone());
                     }
@@ -1596,7 +1634,7 @@ pub async fn run_plan_with(
                         task.team = Some(crate::team::TeamRequest {
                             levels,
                             chain: chain.clone(),
-                            brief: step.prompt.clone(),
+                            brief: step.own_text().to_owned(),
                         });
                     }
                     let origin = Origin {
@@ -1853,6 +1891,24 @@ mod tests {
     }
 
     #[test]
+    fn an_approvals_text_has_no_external_content_wrappers() {
+        let step = Step {
+            prompt: "Approve the facts".into(),
+            ..Plan::parse("a @x Approve the facts").unwrap().steps[0].clone()
+        };
+        let prompt = step_prompt(&step, &[("find", "worker", "the facts\nsecond line")]);
+        assert!(prompt.contains("<external_content source="), "{prompt}");
+        let text = approval_text(&prompt);
+        assert!(!text.contains("external_content"), "{text}");
+        assert!(!text.contains("Rule for external content"), "{text}");
+        assert!(
+            text.contains("### Step find (done by worker)\nthe facts\nsecond line\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("Your task:\nApprove the facts"), "{text}");
+    }
+
+    #[test]
     fn steps_use_and_grow_the_knowledge_base() {
         let dir = tempfile::tempdir().unwrap();
         let kb = KnowledgeBase::new(dir.path());
@@ -1998,6 +2054,22 @@ mod tests {
                 .to_string()
                 .contains("step 'a'")
         );
+    }
+
+    #[test]
+    fn prepare_keeps_the_steps_own_text_as_its_brief() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let plan = Plan::parse("review @x skill=code-review Review the diff").unwrap();
+        assert_eq!(plan.steps[0].brief, "");
+        let ready = plan.prepare(&kb, &skills).unwrap();
+        assert_eq!(ready.steps[0].brief, "Review the diff");
+        assert_eq!(ready.steps[0].own_text(), "Review the diff");
+        assert_ne!(ready.steps[0].prompt, "Review the diff");
+        let plain = Plan::parse("a @x Do it").unwrap();
+        let plain = plain.prepare(&kb, &skills).unwrap();
+        assert_eq!(plain.steps[0].own_text(), "Do it");
     }
 
     #[test]
