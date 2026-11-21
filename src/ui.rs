@@ -1308,6 +1308,7 @@ fn start_task(
         return Err(bad_request("prompt is empty"));
     }
     let mut task = LlmTask::new(body.provider, prompt.clone());
+    task.title = Some(crate::llm::title_of(&prompt));
     if body.target != "local" {
         task.mcp = body.mcp;
     }
@@ -1611,7 +1612,15 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
                 t.started_ms = now_ms();
             }
             t.status = "running";
-            t.target = peer.clone();
+            // The target shown while waiting names the step's folder: keep it.
+            let folder = t
+                .target
+                .split_once(':')
+                .map(|(_, folder)| folder.to_owned());
+            t.target = match folder {
+                Some(folder) => format!("{peer}:{folder}"),
+                None => peer.clone(),
+            };
             t.progress = progress.clone();
         }
         StepState::Done {
@@ -2443,17 +2452,17 @@ async fn open_pr(
     }
     let mut text = body.body;
     let mut proven = false;
-    if body.proof
-        && let Ok(Some(proof)) =
-            crate::github::branch_proof(&repo.path, &body.branch, &s.info.profile.runs_dir()).await
-    {
-        text += &proof.markdown;
-        proven = true;
-    }
     creds
         .push(&repo, &body.branch)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?;
+    if body.proof {
+        let profile = s.info.profile.reload().map_err(internal)?;
+        if let Ok(Some(proof)) = creds.pr_proof(&repo, &body.branch, &profile).await {
+            text += &proof.markdown;
+            proven = true;
+        }
+    }
     let url = creds
         .create_pr(&repo, &body.branch, body.title.trim(), &text)
         .await
@@ -2481,9 +2490,10 @@ async fn branch_proof(
     Query(q): Query<ProofQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let (repo, _) = linked(&s, &name)?;
-    let runs = s.info.profile.runs_dir();
+    let profile = s.info.profile.reload().map_err(internal)?;
     Ok(Json(
-        match crate::github::branch_proof(&repo.path, &q.branch, &runs).await {
+        // The preview assumes the notes ref will reach the repository.
+        match crate::github::branch_proof(&repo.path, &q.branch, &profile, true).await {
             Ok(Some(proof)) => json!({ "proof": proof }),
             Ok(None) => json!({
                 "proof": null,

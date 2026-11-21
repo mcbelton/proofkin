@@ -342,6 +342,7 @@ impl RunRecord {
             share: task.share.clone(),
             provider: task.provider,
             prompt: task.prompt.clone(),
+            brief: String::new(),
             checks: task.checks.clone(),
             attempts: task.attempts,
             claims: claims.iter().map(|c| c.id.clone()).collect(),

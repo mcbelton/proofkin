@@ -894,6 +894,87 @@ async fn ui_runs_plans_and_shows_squads() {
 }
 
 #[tokio::test]
+async fn a_running_plan_step_keeps_its_folder_in_its_target() {
+    let home = tempfile::tempdir().unwrap();
+    let docs = tempfile::tempdir().unwrap();
+    let (boss_key, worker_key) = (SecretKey::generate(), SecretKey::generate());
+    let trust = |name: &str, key: &SecretKey, delegate: bool| TrustedPeer {
+        name: name.into(),
+        id: key.public(),
+        addrs: Default::default(),
+        can_delegate: delegate,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec!["data".into(), "docs".into()],
+    };
+    let mut worker = AgentConfig::new("worker", worker_key.clone());
+    worker.network = Network::Local;
+    worker.bind = Some("127.0.0.1:0".parse().unwrap());
+    worker.trust.allow(trust("boss", &boss_key, true));
+    worker.executor = Some(Arc::new(Echo));
+    worker.shares = ShareStore::with_data(home.path().join("data"));
+    worker
+        .shares
+        .add("docs", docs.path(), Access::ReadOnly)
+        .unwrap();
+    let (worker, _we) = Agent::bind(worker).await.unwrap();
+
+    let mut config = AgentConfig::new("boss", boss_key);
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.trust.allow(trust("worker", &worker_key, false));
+    let (boss, events) = Agent::bind(config).await.unwrap();
+    boss.connect(worker.addr()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while boss.peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(home.path(), "boss").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(boss, events, info, None, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+
+    let text = serde_json::json!({ "text": "hold @worker:docs hang" }).to_string();
+    let started = request(port, "POST", "/api/plans", &host, Some(token), Some(&text)).await;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let target = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            let running = state["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["status"] == "running");
+            if let Some(t) = running {
+                return t["target"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the step started");
+    assert_eq!(target, "worker:docs");
+}
+
+#[tokio::test]
 async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     use proofkin::ops::{IncidentEvent, IncidentKind, Monitor, MonitorStore, Sample};
     let home = tempfile::tempdir().unwrap();

@@ -306,8 +306,8 @@
     {
       "id": "SQD-3",
       "area": "web ui",
-      "claim": "The boss runs plans and sees squads (members, online, running tasks) in the web UI.",
-      "tests": ["ui::ui_runs_plans_and_shows_squads"]
+      "claim": "The boss runs plans and sees squads (members, online, running tasks) in the web UI; a step's card keeps its folder (worker:docs) while it runs.",
+      "tests": ["ui::ui_runs_plans_and_shows_squads", "ui::a_running_plan_step_keeps_its_folder_in_its_target"]
     },
     {
       "id": "EDD-1",
@@ -338,7 +338,9 @@
       "tests": [
         "lib::worktree::tasks_commit_on_their_own_branch_and_patches_apply_elsewhere",
         "lib::shares::data_folder_is_built_in_read_only_and_per_profile",
-        "agents::worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch"
+        "agents::worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch",
+        "agents::a_task_with_skills_commits_with_its_title_as_the_subject",
+        "lib::plan::prepare_keeps_the_steps_own_text_as_its_brief"
       ],
       "live": ["worker committed the task on its own branch and returned the patch"]
     },
@@ -592,6 +594,7 @@
       "tests": [
         "lib::boundary::external_content_cannot_close_or_reopen_its_envelope",
         "lib::plan::steps_use_and_grow_the_knowledge_base",
+        "lib::plan::an_approvals_text_has_no_external_content_wrappers",
         "agents::plans_run_dependent_steps_across_squads",
         "ui::ui_runs_plans_and_shows_squads",
         "lib::llm::copilot::mcp_results_reach_the_model_in_an_envelope"
@@ -856,9 +859,13 @@
     {
       "id": "PR-1",
       "area": "github",
-      "claim": "Pull requests carry their proof: the runtime that commits a task's work keeps the evidence record it signed as a git note on the commit (refs/notes/proofkin), and opening a pull request from the branch (repo pr, or the web UI, on by default) checks the record's signature and that it covers the branch's head, then adds who made the commit, for whom, its key and the checks run on the change with their results (never their commands), plus the verdict and claims of this profile's evidence run that holds the record. A missing, moved or forged record adds nothing, and the text is redacted before it leaves the machine.",
+      "claim": "Pull requests carry their proof: the runtime that commits a task's work keeps the evidence record it signed as a git note on the commit (refs/notes/proofkin), and opening a pull request from the branch (repo pr, or the web UI, on by default) checks the record's signature and that it covers the branch's head, then adds who made the commit, for whom (by the name this agent's allowlist has for the requester) and what the task was part of (from its audit log), its key and the checks run on the change with their results (never their commands), plus the verdict and claims of this profile's evidence run that holds the record. Opening the pull request also pushes the notes ref to the repository (best effort: if that fails the pull request still opens and the proof says the record stays on this machine), and the proof says how to fetch it. A missing, moved or forged record adds nothing, and the text is redacted before it leaves the machine.",
       "tests": [
         "lib::worktree::a_commits_signed_record_travels_with_it_into_its_pull_request",
+        "lib::github::the_proof_names_who_asked_what_it_was_part_of_and_where_the_record_is",
+        "lib::github::the_proof_without_a_name_or_origin_falls_back_and_admits_an_unpushed_record",
+        "lib::github::the_task_a_record_is_for_is_the_latest_one_that_started_before_its_commit",
+        "github::linked_repositories_clone_share_sync_push_and_open_pull_requests",
         "ui::the_page_follows_the_ux_guidelines"
       ],
       "live": ["worker2 kept the record it signed with its commit, for a pull request from the branch"]

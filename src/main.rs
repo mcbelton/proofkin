@@ -1833,9 +1833,9 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
                         format!("{name} has no branch {branch} (see repo branches)")
                     })?,
             };
+            creds.push(&repo, &branch).await?;
             if !no_proof {
-                match proofkin::github::branch_proof(&repo.path, &branch, &profile.runs_dir()).await
-                {
+                match creds.pr_proof(&repo, &branch, &profile).await {
                     Ok(Some(proof)) => {
                         println!("with its proof: {}", proof.summary);
                         body += &proof.markdown;
@@ -1844,7 +1844,6 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
                     Err(e) => println!("without proof: {e:#}"),
                 }
             }
-            creds.push(&repo, &branch).await?;
             println!("{}", creds.create_pr(&repo, &branch, &title, &body).await?);
         }
         RepoCommand::Unlink {
@@ -3870,6 +3869,7 @@ fn parse_task(rest: &str) -> Result<(LlmTask, Option<String>)> {
     };
     let provider = Provider::from_str(provider, true).map_err(|e| anyhow!("{e}"))?;
     let mut task = LlmTask::new(provider, prompt.trim());
+    task.title = Some(proofkin::llm::title_of(prompt.trim()));
     if let Some(share) = share {
         task = task.in_share(share);
     }

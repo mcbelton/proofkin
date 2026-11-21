@@ -218,6 +218,29 @@ impl GithubCredentials {
             .map(drop)
     }
 
+    /// Pushes the notes ref the commits' signed records are kept in.
+    pub async fn push_notes(&self, repo: &Repo) -> Result<()> {
+        let notes = format!("refs/notes/{}", crate::worktree::NOTES_REF);
+        self.git(
+            Some(&repo.path),
+            &["push", "-q", "origin", &format!("{notes}:{notes}")],
+        )
+        .await
+        .map(drop)
+    }
+
+    /// [`branch_proof`] for a pull request about to be opened: pushes the notes ref
+    /// first (best effort) so the proof can say where the record is.
+    pub async fn pr_proof(
+        &self,
+        repo: &Repo,
+        branch: &str,
+        profile: &crate::Profile,
+    ) -> Result<Option<Proof>> {
+        let pushed = self.push_notes(repo).await.is_ok();
+        branch_proof(&repo.path, branch, profile, pushed).await
+    }
+
     /// Opens a pull request from `head` into the repository's branch; returns its URL.
     pub async fn create_pr(
         &self,
@@ -416,12 +439,51 @@ pub struct Proof {
     pub markdown: String,
 }
 
+/// Who asked for the work and what it was part of, and whether the record was pushed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProofContext {
+    /// The name this agent's allowlist has for the record's requester.
+    pub requester: Option<String>,
+    /// What the task was part of on the requester's side (its audit entry's origin),
+    /// e.g. "step ui of run 20261121-183724-726e7".
+    pub origin: Option<String>,
+    /// Whether the notes ref was pushed to the repository with the branch.
+    pub notes_pushed: bool,
+}
+
+/// The audit entry's origin of the task record `e` is for: the latest entry of the same
+/// requester and task id that started no later than the second of its commit (commit
+/// times have whole-second resolution).
+fn task_origin(
+    entries: &[crate::audit::AuditEntry],
+    requester_id: &str,
+    task_id: u64,
+    commit_unix: u64,
+) -> Option<String> {
+    entries
+        .iter()
+        .filter(|a| {
+            a.peer_id == requester_id
+                && a.task_id == task_id
+                && a.ts_ms < commit_unix.saturating_add(1).saturating_mul(1000)
+        })
+        .max_by_key(|a| a.ts_ms)
+        .and_then(|a| a.origin.clone())
+}
+
 /// The proof for a pull request from task branch `branch` of the clone at `repo`:
 /// the record the agent that made its head commit signed for it (kept as a git note
-/// on the commit, see [`crate::worktree::NOTES_REF`]), checked here, with the claims
-/// of this profile's evidence run that has the record (in `runs_dir`), if any. None
-/// if the head commit has no record (a task of an older version, or someone else's).
-pub async fn branch_proof(repo: &Path, branch: &str, runs_dir: &Path) -> Result<Option<Proof>> {
+/// on the commit, see [`crate::worktree::NOTES_REF`]), checked here, with who asked
+/// for the work (by `profile`'s allowlist and audit log) and the claims of this
+/// profile's evidence run that has the record, if any. `notes_pushed` says whether the
+/// notes ref went to the repository. None if the head commit has no record (a task of
+/// an older version, or someone else's).
+pub async fn branch_proof(
+    repo: &Path,
+    branch: &str,
+    profile: &crate::Profile,
+    notes_pushed: bool,
+) -> Result<Option<Proof>> {
     use crate::evidence::Evidence;
     if !branch.starts_with("p2p/") {
         bail!("only branches agents' tasks made (p2p/...) carry proof");
@@ -452,7 +514,37 @@ pub async fn branch_proof(repo: &Path, branch: &str, runs_dir: &Path) -> Result<
         .as_ref()
         .filter(|g| g.commit.as_deref() == Some(head.as_str()))
         .with_context(|| format!("the signed record is for another commit than {branch}'s"))?;
-    let run = crate::runs::RunRecord::with_evidence(runs_dir, &evidence.signature);
+    let run = crate::runs::RunRecord::with_evidence(&profile.runs_dir(), &evidence.signature);
+    // Names and origins only decorate the proof: without them it says less, not nothing.
+    let requester = profile.trust().ok().and_then(|t| {
+        t.peers
+            .iter()
+            .find(|p| p.id.to_string() == evidence.requester_id)
+            .map(|p| p.name.clone())
+    });
+    let commit_unix = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", "-s", "--format=%ct", &head])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        });
+    let origin = commit_unix.and_then(|unix| {
+        let entries = crate::audit::AuditLog::read(&profile.audit_path(), 100_000).ok()?;
+        task_origin(&entries, &evidence.requester_id, evidence.task_id, unix)
+    });
+    let ctx = ProofContext {
+        requester,
+        origin,
+        notes_pushed,
+    };
     let checks = if evidence.checks.is_empty() {
         "no checks ran".to_owned()
     } else {
@@ -465,14 +557,51 @@ pub async fn branch_proof(repo: &Path, branch: &str, runs_dir: &Path) -> Result<
     };
     Ok(Some(Proof {
         summary: format!(
-            "Signed by {}: {checks}{}",
+            "Signed by {} for {}: {checks}{}{}{}",
             evidence.signer,
+            requester_label(&evidence, &ctx),
             run.as_ref()
                 .map(|r| format!("; evidence run {}: {}", r.id, r.verdict_line()))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            ctx.origin
+                .as_ref()
+                .map(|o| format!("; as {o}"))
+                .unwrap_or_default(),
+            if ctx.notes_pushed {
+                ""
+            } else {
+                "; the record stays on this agent's machine"
+            }
         ),
-        markdown: crate::redact::redact(&proof_markdown(&evidence, git, run.as_ref())).0,
+        markdown: crate::redact::redact(&proof_markdown(&evidence, git, run.as_ref(), &ctx)).0,
     }))
+}
+
+/// How to name the requester of `e`: its allowlisted name, else the key's start.
+fn requester_label(e: &crate::evidence::Evidence, ctx: &ProofContext) -> String {
+    let prefix: String = e.requester_id.chars().take(10).collect();
+    match ctx.requester.as_deref() {
+        Some(name) => format!("{} ({prefix})", clean_name(name)),
+        None => prefix,
+    }
+}
+
+fn clean_name(name: &str) -> String {
+    name.replace(['`', '*', '\r', '\n'], "")
+}
+
+/// "step ui of boss's evidence run R (ask boss for it: ...)" for origin "step ui of run R".
+fn origin_sentence(origin: &str, requester: Option<&str>) -> String {
+    let who = match requester {
+        Some(n) => clean_name(n),
+        None => "the requester".to_owned(),
+    };
+    match origin.split_once(" of run ") {
+        Some((what, run)) => format!(
+            "as {what} of {who}'s evidence run {run} (ask {who} for it: `proofkin runs verify --file`)"
+        ),
+        None => format!("as {origin}"),
+    }
 }
 
 /// The pull request section for commit record `e` and the evidence run that has it.
@@ -480,21 +609,33 @@ fn proof_markdown(
     e: &crate::evidence::Evidence,
     git: &crate::evidence::GitCommit,
     run: Option<&crate::runs::RunRecord>,
+    ctx: &ProofContext,
 ) -> String {
     let code = |text: &str| text.replace('`', "'");
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     let commit = git.commit.as_deref().unwrap_or_default();
+    let prefix: String = e.requester_id.chars().take(10).collect();
+    let requester = match ctx.requester.as_deref() {
+        Some(name) => format!("**{}** ({prefix})", clean_name(name)),
+        None => format!("agent `{prefix}`"),
+    };
     let mut md = format!(
-        "\n\n---\n\n### Proof\n\nCommit `{}` ({} file{}) was made by the agent **{}**{} for agent `{}`, \
+        "\n\n---\n\n### Proof\n\nCommit `{}` ({} file{}) was made by the agent **{}**{} for {requester}, \
          and signed with its key `{}`.\n\n",
         commit.chars().take(12).collect::<String>(),
         git.files.len(),
         plural(git.files.len()),
         code(&e.signer),
         e.provider.map(|p| format!(" ({p})")).unwrap_or_default(),
-        e.requester_id.chars().take(10).collect::<String>(),
         e.signer_id
     );
+    if let Some(origin) = &ctx.origin {
+        md += &format!(
+            "The task was done {}.\n\n",
+            origin_sentence(origin, ctx.requester.as_deref())
+        );
+    }
+
     if e.checks.is_empty() {
         md += "No checks ran after the model: the change rests on the model's word and your review.\n";
     } else {
@@ -535,8 +676,15 @@ fn proof_markdown(
             }
         }
     }
-    md += "\n<sub>Proofkin checked the record's Ed25519 signature before attaching it. The record is the git note \
-           `refs/notes/proofkin` on the commit.</sub>\n";
+    md += if ctx.notes_pushed {
+        "\n<sub>Proofkin checked the record's Ed25519 signature before attaching it. The record is the git note \
+         `refs/notes/proofkin` on the commit in this repository; fetch it with \
+         `git fetch origin refs/notes/proofkin:refs/notes/proofkin`.</sub>\n"
+    } else {
+        "\n<sub>Proofkin checked the record's Ed25519 signature before attaching it. The record is the git note \
+         `refs/notes/proofkin` on the commit, but pushing it to this repository failed: it stays on this \
+         agent's machine.</sub>\n"
+    };
     md
 }
 
@@ -576,5 +724,115 @@ mod tests {
             token: "s3cret".into(),
         };
         assert!(!format!("{creds:?}").contains("s3cret"));
+    }
+
+    fn record() -> (crate::evidence::Evidence, crate::evidence::GitCommit) {
+        let key = iroh::SecretKey::generate();
+        let requester = iroh::SecretKey::generate();
+        let e = crate::evidence::Evidence::new(
+            crate::evidence::EvidenceKind::Task,
+            "worker",
+            key.public(),
+            requester.public(),
+            7,
+        );
+        let git = crate::evidence::GitCommit {
+            branch: "p2p/boss/7-1".into(),
+            base: "abc".into(),
+            commit: Some("0123456789abcdef".into()),
+            files: vec!["a.txt".into()],
+            patch_sha256: None,
+        };
+        (e, git)
+    }
+
+    #[test]
+    fn the_proof_names_who_asked_what_it_was_part_of_and_where_the_record_is() {
+        let (e, git) = record();
+        let prefix: String = e.requester_id.chars().take(10).collect();
+        let ctx = ProofContext {
+            requester: Some("boss".into()),
+            origin: Some("step ui of run 20261121-183724-726e7".into()),
+            notes_pushed: true,
+        };
+        let md = proof_markdown(&e, &git, None, &ctx);
+        assert!(md.contains(&format!("for **boss** ({prefix})")), "{md}");
+        assert!(
+            md.contains(
+                "as step ui of boss's evidence run 20261121-183724-726e7 \
+                 (ask boss for it: `proofkin runs verify --file`)"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("on the commit in this repository")
+                && md.contains("git fetch origin refs/notes/proofkin:refs/notes/proofkin"),
+            "{md}"
+        );
+        assert!(!md.contains("stays on this agent's machine"), "{md}");
+    }
+
+    #[test]
+    fn the_proof_without_a_name_or_origin_falls_back_and_admits_an_unpushed_record() {
+        let (e, git) = record();
+        let prefix: String = e.requester_id.chars().take(10).collect();
+        let md = proof_markdown(&e, &git, None, &ProofContext::default());
+        assert!(md.contains(&format!("for agent `{prefix}`")), "{md}");
+        assert!(!md.contains("The task was done"), "{md}");
+        assert!(
+            md.contains("it stays on this agent's machine") && !md.contains("git fetch"),
+            "{md}"
+        );
+        // An origin that isn't an evidence run has nothing to ask for.
+        let ctx = ProofContext {
+            origin: Some("task #3".into()),
+            ..ProofContext::default()
+        };
+        let md = proof_markdown(&e, &git, None, &ctx);
+        assert!(md.contains("The task was done as task #3."), "{md}");
+        let ctx = ProofContext {
+            origin: Some("step fix of run r1".into()),
+            ..ProofContext::default()
+        };
+        assert!(
+            proof_markdown(&e, &git, None, &ctx).contains("ask the requester for it"),
+            "unnamed requester"
+        );
+    }
+
+    #[test]
+    fn the_task_a_record_is_for_is_the_latest_one_that_started_before_its_commit() {
+        let entry =
+            |peer_id: &str, task_id: u64, ts_ms: u64, origin: &str| crate::audit::AuditEntry {
+                ts_ms,
+                peer: "boss".into(),
+                peer_id: peer_id.into(),
+                task_id,
+                provider: crate::llm::Provider::Copilot,
+                share: String::new(),
+                access: None,
+                outcome: crate::audit::Outcome::Done,
+                duration_ms: 1,
+                prompt_sha256: String::new(),
+                prompt_chars: 0,
+                error: None,
+                origin: Some(origin.into()),
+                team: false,
+            };
+        let entries = [
+            entry("a", 7, 1_000_000, "step old of run r0"),
+            entry("a", 7, 2_000_000, "step ui of run r1"),
+            entry("a", 7, 3_001_500, "step later of run r2"),
+            entry("b", 7, 2_500_000, "step other of run r3"),
+            entry("a", 8, 2_500_000, "step other of run r4"),
+        ];
+        let origin = |id: &str, task: u64, commit: u64| task_origin(&entries, id, task, commit);
+        assert_eq!(origin("a", 7, 3_000).as_deref(), Some("step ui of run r1"));
+        assert_eq!(
+            origin("a", 7, 4_000).as_deref(),
+            Some("step later of run r2")
+        );
+        assert_eq!(origin("a", 7, 500), None);
+        assert_eq!(origin("c", 7, 4_000), None);
     }
 }
