@@ -119,8 +119,8 @@ pub struct LlmTask {
     /// a model (see [`crate::team`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<crate::team::TeamRequest>,
-    /// The first line of the task's own words (at most 100 characters); the worker
-    /// uses it as the subject of its commit.
+    /// The task's own first line, cut at a sentence or a word (see [`title_of`], at most
+    /// 100 characters); the worker uses it as the subject of its commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Issues the work is for (`owner/repo#N`, see [`crate::tracker`]): the worker's
@@ -129,15 +129,42 @@ pub struct LlmTask {
     pub issues: Vec<String>,
 }
 
-/// The first line of `text`, at most 100 characters: a task's title.
+/// A task's title: the first line of `text`, trimmed. It ends at the first sentence end
+/// (`.`, `?` or `!` followed by a space) that comes after at least 20 and within the first
+/// 100 characters, without the punctuation. Otherwise a line over 100 characters is cut at
+/// its last space within 99 characters (at the 99th character if that space is before the
+/// 50th) and gets an ellipsis. Shorter lines stay as they are.
 pub fn title_of(text: &str) -> String {
-    text.lines()
+    let chars: Vec<char> = text
+        .lines()
         .next()
         .unwrap_or_default()
         .trim()
         .chars()
-        .take(100)
-        .collect()
+        .collect();
+    let ends_sentence = |i: usize| matches!(chars[i], '.' | '?' | '!') && chars[i + 1] == ' ';
+    let last = chars.len().saturating_sub(1).min(100);
+    if let Some(end) = (20..last).find(|&i| ends_sentence(i)) {
+        return chars[..end]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+    }
+    if chars.len() <= 100 {
+        return chars.into_iter().collect();
+    }
+    let cut = match chars[..99].iter().rposition(|&c| c == ' ') {
+        Some(space) if space >= 49 => space,
+        _ => 99,
+    };
+    let mut title: String = chars[..cut]
+        .iter()
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    title.push('…');
+    title
 }
 
 impl LlmTask {
@@ -337,6 +364,28 @@ pub fn with_role(role: Option<&str>, task: &LlmTask) -> LlmTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles_end_at_a_sentence_or_a_word_never_mid_word() {
+        assert_eq!(
+            title_of("Fix the login redirect. It loops forever when the cookie is missing."),
+            "Fix the login redirect"
+        );
+        assert_eq!(
+            title_of("Use e.g. a retry loop around the flaky network call. Then log it."),
+            "Use e.g. a retry loop around the flaky network call"
+        );
+        let words = "word ".repeat(30);
+        let long = title_of(&words);
+        assert_eq!(long.chars().count(), 95);
+        assert!(long.ends_with("word…"));
+        let one = "x".repeat(150);
+        assert_eq!(title_of(&one), format!("{}…", "x".repeat(99)));
+        let early = format!("{} {}", "a".repeat(10), "b".repeat(140));
+        assert_eq!(title_of(&early), format!("{}…", &early[..99]));
+        assert_eq!(title_of("  Add a flag  \nmore"), "Add a flag");
+        assert_eq!(title_of(""), "");
+    }
 
     #[test]
     fn role_guides_the_prompt() {
