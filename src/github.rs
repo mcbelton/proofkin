@@ -218,26 +218,71 @@ impl GithubCredentials {
             .map(drop)
     }
 
-    /// Pushes the notes ref the commits' signed records are kept in.
-    pub async fn push_notes(&self, repo: &Repo) -> Result<()> {
+    /// Publishes the signed record of `branch`'s head commit, and only that one, to the
+    /// repository's notes ref: it is added to a copy of the repository's notes, kept in
+    /// a separate local ref, which is then pushed.
+    pub async fn push_notes(&self, repo: &Repo, branch: &str) -> Result<()> {
+        let dir = Some(repo.path.as_path());
         let notes = format!("refs/notes/{}", crate::worktree::NOTES_REF);
+        let published = format!("{notes}-published");
+        let head = self
+            .git(
+                dir,
+                &["rev-parse", &format!("refs/heads/{branch}^{{commit}}")],
+            )
+            .await?;
+        let record = self
+            .git(dir, &["notes", "--ref", &notes, "list", &head])
+            .await
+            .with_context(|| format!("{branch}'s head commit has no record"))?;
+        if self
+            .git(dir, &["ls-remote", "origin", &notes])
+            .await?
+            .is_empty()
+        {
+            self.git(dir, &["update-ref", "-d", &published]).await.ok();
+        } else {
+            self.git(
+                dir,
+                &["fetch", "-q", "origin", &format!("+{notes}:{published}")],
+            )
+            .await?;
+        }
         self.git(
-            Some(&repo.path),
-            &["push", "-q", "origin", &format!("{notes}:{notes}")],
+            dir,
+            &[
+                "-c",
+                "user.name=proofkin",
+                "-c",
+                "user.email=proofkin@localhost",
+                "notes",
+                "--ref",
+                &published,
+                "add",
+                "-f",
+                "-C",
+                &record,
+                &head,
+            ],
+        )
+        .await?;
+        self.git(
+            dir,
+            &["push", "-q", "origin", &format!("{published}:{notes}")],
         )
         .await
         .map(drop)
     }
 
-    /// [`branch_proof`] for a pull request about to be opened: pushes the notes ref
-    /// first (best effort) so the proof can say where the record is.
+    /// [`branch_proof`] for a pull request about to be opened: publishes the branch's
+    /// record first (best effort) so the proof can say where it is.
     pub async fn pr_proof(
         &self,
         repo: &Repo,
         branch: &str,
         profile: &crate::Profile,
     ) -> Result<Option<Proof>> {
-        let pushed = self.push_notes(repo).await.is_ok();
+        let pushed = self.push_notes(repo, branch).await.is_ok();
         branch_proof(&repo.path, branch, profile, pushed).await
     }
 

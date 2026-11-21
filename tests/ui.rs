@@ -972,6 +972,30 @@ async fn a_running_plan_step_keeps_its_folder_in_its_target() {
     .await
     .expect("the step started");
     assert_eq!(target, "worker:docs");
+
+    // A finished step keeps its folder too.
+    let text = serde_json::json!({ "text": "fin @worker:docs hello" }).to_string();
+    let started = request(port, "POST", "/api/plans", &host, Some(token), Some(&text)).await;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let target = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            let done = state["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["status"] == "done");
+            if let Some(t) = done {
+                return t["target"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the step finished");
+    assert_eq!(target, "worker:docs");
 }
 
 #[tokio::test]

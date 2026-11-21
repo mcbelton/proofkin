@@ -19,6 +19,9 @@ use tokio::net::TcpStream;
 
 struct Echo;
 
+/// Lets the task "gated" finish (it waits for this).
+static GATE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 #[async_trait]
 impl Executor for Echo {
     fn providers(&self) -> Vec<Provider> {
@@ -28,6 +31,9 @@ impl Executor for Echo {
     async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<String> {
         if task.prompt == "hang" {
             std::future::pending::<()>().await;
+        }
+        if task.prompt == "gated" {
+            GATE.notified().await;
         }
         Ok(format!("echo: {}", task.prompt))
     }
@@ -79,6 +85,108 @@ async fn request(
 /// A JSON-RPC request.
 fn rpc(method: &str, params: Value) -> String {
     json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string()
+}
+
+/// Sends an A2A streaming request, lets the gated task finish once `until` has
+/// arrived, and returns the response head and the events of the stream to its end.
+async fn follow_stream(
+    port: u16,
+    auth: &str,
+    method: &str,
+    params: Value,
+    until: &str,
+) -> (String, Vec<Value>) {
+    let body = rpc(method, params);
+    let req = format!(
+        "POST /a2a HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+         Authorization: {auth}\r\nA2A-Version: 1.0\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !String::from_utf8_lossy(&raw)
+            .split_once("statusUpdate")
+            .is_some_and(|(_, update)| update.contains(until))
+        {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "the stream ended before {until:?}");
+            raw.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {until:?} in {}", String::from_utf8_lossy(&raw)));
+    GATE.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("the stream closes when the task ends")
+        .unwrap();
+    let raw = String::from_utf8(raw).unwrap();
+    let (head, body) = raw.split_once("\r\n\r\n").expect("HTTP response");
+    let mut text = String::new();
+    if head.to_lowercase().contains("transfer-encoding: chunked") {
+        let mut rest = body;
+        while let Some((size, after)) = rest.split_once("\r\n") {
+            let size = usize::from_str_radix(size.trim(), 16).unwrap();
+            if size == 0 {
+                break;
+            }
+            text += &after[..size];
+            rest = &after[size + 2..];
+        }
+    } else {
+        text = body.to_owned();
+    }
+    let events = text
+        .split("\n\n")
+        .flat_map(|event| event.lines())
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| serde_json::from_str(data.trim()).expect("JSON event"))
+        .collect();
+    (head.to_owned(), events)
+}
+
+/// Checks a followed task: it starts as the task, says what it is doing, and ends as
+/// the finished task, with nothing after. Returns the task's id.
+fn assert_followed(head: &str, events: &[Value], result: &str) -> String {
+    assert!(
+        head.to_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+    assert!(events.iter().all(|e| e["jsonrpc"] == "2.0" && e["id"] == 1));
+    let first = &events[0]["result"]["task"];
+    assert_eq!(first["status"]["state"], "TASK_STATE_WORKING", "{first}");
+    let id = first["id"].as_str().unwrap().to_owned();
+    let doing = events.iter().any(|e| {
+        let update = &e["result"]["statusUpdate"];
+        update["taskId"] == id.as_str()
+            && update["status"]["state"] == "TASK_STATE_WORKING"
+            && update["status"]["message"]["role"] == "ROLE_AGENT"
+            && update["status"]["message"]["parts"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("worker: the model is working"))
+    });
+    assert!(
+        doing,
+        "a status update says what the peer is doing: {events:?}"
+    );
+    let last = &events.last().unwrap()["result"]["task"];
+    assert_eq!(last["id"], id.as_str());
+    assert_eq!(last["status"]["state"], "TASK_STATE_COMPLETED", "{last}");
+    assert_eq!(last["artifacts"][0]["parts"][0]["text"], result);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["result"].get("task").is_some())
+            .count(),
+        2,
+        "only the first and the last event are the task"
+    );
+    id
 }
 
 /// A request of MCP's stateless revision: the version in `_meta`, mirrored in headers.
@@ -595,8 +703,51 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
         .push(json!({ "url": "https://example.com/a.txt" }));
     let file = a2a("SendMessage", file, Some("1.0")).await;
     assert_eq!(file["error"]["code"], -32005);
-    let stream = a2a("SendStreamingMessage", message("x", json!({})), Some("1.0")).await;
-    assert_eq!(stream["error"]["code"], -32004);
+
+    // Streaming: the task, then what the peer is doing, then the finished task.
+    assert_eq!(card["capabilities"]["streaming"], true);
+    let (head, events) = follow_stream(
+        port,
+        &auth,
+        "SendStreamingMessage",
+        message("gated", json!({ "peer": "worker" })),
+        "the model is working",
+    )
+    .await;
+    let streamed = assert_followed(&head, &events, "echo: gated");
+    // The same task is looked up as usual, and there is nothing left to subscribe to.
+    let got = a2a("GetTask", json!({ "id": streamed }), Some("1.0")).await;
+    assert_eq!(got["result"]["status"]["state"], "TASK_STATE_COMPLETED");
+    let over = a2a("SubscribeToTask", json!({ "id": streamed }), Some("1.0")).await;
+    assert_eq!(over["error"]["code"], -32004, "{over}");
+    assert_eq!(over["error"]["data"][0]["reason"], "UNSUPPORTED_OPERATION");
+    let unknown = a2a("SubscribeToTask", json!({ "id": "t-nope" }), Some("1.0")).await;
+    assert_eq!(unknown["error"]["code"], -32001);
+    // A running task is followed from where it is.
+    let mut gated = message("gated", json!({ "peer": "worker" }));
+    gated["configuration"] = json!({ "returnImmediately": true });
+    let gated = a2a("SendMessage", gated, Some("1.0")).await;
+    let gated_id = gated["result"]["task"]["id"].clone();
+    let (head, events) = follow_stream(
+        port,
+        &auth,
+        "SubscribeToTask",
+        json!({ "id": gated_id }),
+        "the model is working",
+    )
+    .await;
+    let subscribed = assert_followed(&head, &events, "echo: gated");
+    assert_eq!(gated_id, subscribed.as_str());
+    // Problems found before a stream would start are plain errors.
+    let no_message = a2a("SendStreamingMessage", json!({}), Some("1.0")).await;
+    assert_eq!(no_message["error"]["code"], -32602);
+    let no_peer = a2a(
+        "SendStreamingMessage",
+        message("x", json!({ "peer": "nobody" })),
+        Some("1.0"),
+    )
+    .await;
+    assert_eq!(no_peer["error"]["code"], -32602, "{no_peer}");
     // The card says it has no extended card, so asking for one is unsupported.
     let extended = a2a("GetExtendedAgentCard", json!({}), Some("1.0")).await;
     assert_eq!(extended["error"]["code"], -32004);

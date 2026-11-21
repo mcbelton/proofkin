@@ -8,9 +8,11 @@
 //! checked against the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers;
 //! `server/discover`), and the `initialize`-based revisions before it. A2A: version
 //! 1.0 (`A2A-Version: 1.0`): `SendMessage` (waits for the result unless
-//! `returnImmediately`), `GetTask`, `ListTasks` and `CancelTask`.
+//! `returnImmediately`), `SendStreamingMessage` and `SubscribeToTask` (server-sent
+//! events), `GetTask`, `ListTasks` and `CancelTask`.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,9 +22,13 @@ use axum::body::Bytes;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
     ApiError, AppState, Shared, TaskBody, TaskView, cancel_running, internal, now_ms, plan_check,
@@ -40,6 +46,8 @@ const DEFAULT_WAIT: Duration = Duration::from_secs(30);
 const MAX_WAIT: Duration = Duration::from_secs(300);
 /// How long a blocking A2A `SendMessage` waits at most.
 const MAX_BLOCK: Duration = Duration::from_secs(24 * 3600);
+/// How often an A2A stream says it is still open while nothing changes.
+const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// Work remembered for `get_task`, `GetTask` and `ListTasks` (oldest forgotten first).
 const MAX_JOBS: usize = 500;
 /// Longest text (a prompt, a plan) other agents may send.
@@ -1039,7 +1047,7 @@ pub(super) async fn agent_card(State(s): State<AppState>, headers: HeaderMap) ->
         "provider": { "organization": "Proofkin", "url": "https://github.com/mcbelton/proofkin" },
         "version": env!("CARGO_PKG_VERSION"),
         "documentationUrl": "https://github.com/mcbelton/proofkin#connect-other-agents-mcp-and-a2a",
-        "capabilities": { "streaming": false, "pushNotifications": false, "extendedAgentCard": false },
+        "capabilities": { "streaming": true, "pushNotifications": false, "extendedAgentCard": false },
         "securitySchemes": {
             "bearer": { "httpAuthSecurityScheme": {
                 "scheme": "Bearer",
@@ -1177,18 +1185,22 @@ pub(super) async fn a2a(
         return reply(StatusCode::OK, error.json(&id));
     }
     let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+    let streamed = match method {
+        "SendStreamingMessage" => Some(start_message(&s, &params, true)),
+        "SubscribeToTask" => Some(subscribe_job(&s, &params)),
+        _ => None,
+    };
+    if let Some(started) = streamed {
+        return match started {
+            Ok(job) => stream_job(&s, id, job),
+            Err(error) => reply(StatusCode::OK, error.json(&id)),
+        };
+    }
     let result = match method {
         "SendMessage" => send_message(&s, &params).await,
         "GetTask" => a2a_get_task(&s, &params),
         "ListTasks" => list_tasks(&s, &params),
         "CancelTask" => a2a_cancel_task(&s, &params),
-        "SendStreamingMessage" | "SubscribeToTask" => Err(A2aError {
-            code: -32004,
-            message:
-                "Streaming is not supported: use SendMessage (it waits for the result) and GetTask"
-                    .into(),
-            reason: Some("UNSUPPORTED_OPERATION"),
-        }),
         "CreateTaskPushNotificationConfig"
         | "GetTaskPushNotificationConfig"
         | "ListTaskPushNotificationConfigs"
@@ -1220,6 +1232,25 @@ pub(super) async fn a2a(
 }
 
 async fn send_message(s: &AppState, params: &Value) -> Result<Value, A2aError> {
+    let job = start_message(s, params, false)?;
+    let config = params.get("configuration");
+    let immediately = config
+        .and_then(|c| c.get("returnImmediately"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !immediately {
+        wait(s, &job, MAX_BLOCK).await;
+    }
+    let history = config
+        .and_then(|c| c.get("historyLength"))
+        .and_then(Value::as_i64);
+    Ok(json!({ "task": a2a_task(s, &job, history, true) }))
+}
+
+/// Starts the work a `SendMessage` or `SendStreamingMessage` asks for. Work that can't
+/// start comes back as a rejected task, but for a stream (`streaming`) as an error, as
+/// no stream is started for it.
+fn start_message(s: &AppState, params: &Value, streaming: bool) -> Result<Job, A2aError> {
     let message = params
         .get("message")
         .filter(|m| m.is_object())
@@ -1297,21 +1328,83 @@ async fn send_message(s: &AppState, params: &Value) -> Result<Value, A2aError> {
         start_delegation(s, &ask, "A2A")
     }
     .unwrap_or_else(Work::Rejected);
+    if streaming && let Work::Rejected(why) = &work {
+        return Err(A2aError::invalid(why.clone()));
+    }
     let context_id = opt_text(message, "contextId");
     let job = new_job(work, "A2A", context_id, Some(message.clone()));
     s.connect.add(job.clone());
-    let config = params.get("configuration");
-    let immediately = config
-        .and_then(|c| c.get("returnImmediately"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !immediately {
-        wait(s, &job, MAX_BLOCK).await;
+    Ok(job)
+}
+
+/// The task a `SubscribeToTask` follows: one that is still running.
+fn subscribe_job(s: &Shared, params: &Value) -> Result<Job, A2aError> {
+    let id = task_id(params)?;
+    let job = lookup(s, &id).ok_or_else(|| A2aError::not_found(&id))?;
+    if job_state(s, &job) != JobState::Working {
+        return Err(A2aError {
+            code: -32004,
+            message: format!("Task {id} has ended: GetTask shows its result"),
+            reason: Some("UNSUPPORTED_OPERATION"),
+        });
     }
-    let history = config
-        .and_then(|c| c.get("historyLength"))
-        .and_then(Value::as_i64);
-    Ok(json!({ "task": a2a_task(s, &job, history, true) }))
+    Ok(job)
+}
+
+/// Answers with `job` as a stream of server-sent events (see [`follow`]), which ends
+/// when the work does or the client goes away.
+fn stream_job(s: &AppState, id: Value, job: Job) -> Response {
+    let (tx, rx) = mpsc::channel(16);
+    let shared = s.clone();
+    tokio::spawn(async move { follow(&shared, &id, &job, tx).await });
+    let events = ReceiverStream::new(rx)
+        .map(|event: Value| Ok::<_, Infallible>(SseEvent::default().data(event.to_string())));
+    Sse::new(events)
+        .keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
+        .into_response()
+}
+
+/// Sends `job`'s task, then its status each time it changes (its state, or what its
+/// steps' peers say they are doing), and last the finished task. Returns when that is
+/// sent, or the client has gone away (`tx` closed).
+async fn follow(s: &Shared, id: &Value, job: &Job, tx: mpsc::Sender<Value>) {
+    let first = a2a_task(s, job, None, true);
+    if tx.send(rpc_ok(id, json!({ "task": first }))).await.is_err() {
+        return;
+    }
+    let mut seen: Option<(Value, Value)> = None;
+    let mut count = 0;
+    loop {
+        // Made before looking, so a change in between still wakes it.
+        let changed = s.changed.notified();
+        tokio::pin!(changed);
+        let task = a2a_task(s, job, None, true);
+        let status = task["status"].clone();
+        let now = (status["state"].clone(), status["message"]["parts"].clone());
+        if seen.as_ref() != Some(&now) {
+            seen = Some(now);
+            count += 1;
+            let mut status = status;
+            status["timestamp"] = iso(now_ms());
+            if status.get("message").is_some() {
+                status["message"]["messageId"] = json!(format!("{}-{count}", job.id));
+            }
+            let update = json!({ "statusUpdate": {
+                "taskId": job.id, "contextId": job.context_id, "status": status,
+            }});
+            if tx.send(rpc_ok(id, update)).await.is_err() {
+                return;
+            }
+        }
+        if task["status"]["state"] != JobState::Working.a2a() {
+            let _ = tx.send(rpc_ok(id, json!({ "task": task }))).await;
+            return;
+        }
+        tokio::select! {
+            _ = &mut changed => {}
+            _ = tx.closed() => return,
+        }
+    }
 }
 
 fn iso(ms: u128) -> Value {
