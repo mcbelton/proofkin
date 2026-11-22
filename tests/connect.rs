@@ -28,7 +28,7 @@ impl Executor for Echo {
         vec![Provider::Copilot]
     }
 
-    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<proofkin::Ran> {
         if task.prompt == "hang" {
             std::future::pending::<()>().await;
         }
@@ -38,7 +38,11 @@ impl Executor for Echo {
         if task.prompt == "gated" {
             GATE.notified().await;
         }
-        Ok(format!("echo: {}", task.prompt))
+        // The model it ran on, as a provider says: the one the task asked for, if any.
+        Ok(proofkin::Ran::new(
+            format!("echo: {}", task.prompt),
+            task.model.clone(),
+        ))
     }
 }
 
@@ -420,6 +424,29 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
     assert_eq!(result["output"], "echo: hello");
     assert_eq!(result["peer"], "worker");
     assert_eq!(result["evidence"], "verified", "signed by the worker");
+    assert!(
+        result.get("model").is_none(),
+        "no model was asked for or said"
+    );
+    // A delegate tool call can pick the model; the result names it.
+    let chosen = mcp(
+        vec![],
+        rpc(
+            "tools/call",
+            json!({ "name": "delegate", "arguments": { "prompt": "pick one", "peer": "worker", "model": "echo-big", "wait_seconds": 20 } }),
+        ),
+    )
+    .await
+    .json();
+    let chosen = &chosen["result"]["structuredContent"];
+    assert_eq!(chosen["model"], "echo-big", "{chosen}");
+    assert!(
+        chosen["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("echo: pick one"),
+        "{chosen}"
+    );
     // It shows up in the owner's Tasks, marked as asked by another agent.
     let state = admin("GET", "/api/state", None).await.json();
     assert!(

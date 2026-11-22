@@ -266,6 +266,7 @@ textarea { resize: vertical; }
 .task-opts[hidden] { display: none; }
 .field-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); min-width: 0; max-width: 100%; }
 .field-inline select { min-width: 0; max-width: 100%; text-overflow: ellipsis; }
+.field-inline .model-name { width: 18ch; min-width: 0; max-width: 100%; font-size: 13px; padding: 4px 6px; }
 .mcp-options { display: inline-flex; flex-wrap: wrap; gap: 6px; }
 .mcp-chip {
   display: inline-flex; align-items: center; gap: 6px; min-height: 28px; max-width: 320px;

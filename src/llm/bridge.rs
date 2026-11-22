@@ -11,11 +11,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Access, LlmTask, Provider};
+use super::{Access, LlmTask, Provider, Ran};
 use crate::mcp::McpServer;
 use crate::profile::INHERITED_CREDENTIAL_VARS;
 
-type Pending = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<Result<String, String>>>>>>;
+type Pending = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<Result<Ran, String>>>>>>;
 
 #[derive(Serialize)]
 struct Request<'a> {
@@ -38,6 +38,9 @@ struct Response {
     text: String,
     #[serde(default)]
     error: String,
+    /// The model that answered, if the SDK says.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Client for `bridge/index.mjs`, a long-lived Node process that runs tasks
@@ -98,7 +101,7 @@ impl Bridge {
                     .and_then(|p| p.remove(&resp.id));
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(if resp.ok {
-                        Ok(resp.text)
+                        Ok(Ran::new(resp.text, resp.model))
                     } else {
                         Err(resp.error)
                     });
@@ -129,7 +132,7 @@ impl Bridge {
         })
     }
 
-    pub async fn run(&self, task: &LlmTask, cwd: &Path, access: Access) -> Result<String> {
+    pub async fn run(&self, task: &LlmTask, cwd: &Path, access: Access) -> Result<Ran> {
         self.run_with(task, cwd, access, &BTreeMap::new()).await
     }
 
@@ -140,7 +143,7 @@ impl Bridge {
         cwd: &Path,
         access: Access,
         mcp: &BTreeMap<String, McpServer>,
-    ) -> Result<String> {
+    ) -> Result<Ran> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -186,7 +189,7 @@ impl Bridge {
         let result = rx.await;
         guard.armed = false;
         match result {
-            Ok(Ok(text)) => Ok(text),
+            Ok(Ok(ran)) => Ok(ran),
             Ok(Err(error)) => Err(anyhow!(error)),
             Err(_) => Err(anyhow!("bridge process exited")),
         }

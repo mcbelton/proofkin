@@ -443,6 +443,7 @@ mod tests {
             patch: None,
             verified: true,
             refused: false,
+            model: None,
         };
         let mut run = crate::runs::RunRecord::for_task(
             "boss",

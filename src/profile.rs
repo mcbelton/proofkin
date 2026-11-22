@@ -246,6 +246,10 @@ pub struct ProfileConfig {
     /// survive signing out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workiq_budget: Option<WorkIqBudget>,
+    /// Per provider: the model tasks that name none run on, and the models tasks may ask
+    /// for (see [`crate::models`] and `proofkin models`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: crate::models::Models,
 }
 
 /// Held while an agent runs with a profile, so a profile runs in one agent at a

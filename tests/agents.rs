@@ -14,8 +14,8 @@ use proofkin::protocol::Phase;
 use proofkin::runs::{RunRecord, Verdict};
 use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
 use proofkin::{
-    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, SecretKey,
-    TaskContext, TrustStore, TrustedPeer,
+    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, Ran,
+    SecretKey, TaskContext, TrustStore, TrustedPeer,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
@@ -48,7 +48,20 @@ impl Executor for FakeExecutor {
         self.providers.clone()
     }
 
-    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<Ran> {
+        // The model it ran on, as a provider says; "which model": a provider that says
+        // which model answered a task that named none.
+        let model = task.model.clone().or_else(|| {
+            task.prompt
+                .ends_with("which model")
+                .then(|| "fake-model-7".to_owned())
+        });
+        Ok(Ran::new(self.answer(task, ctx).await?, model))
+    }
+}
+
+impl FakeExecutor {
+    async fn answer(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
         // "create <file>" as a plan step's own task (after the earlier steps' results).
         let own = task
             .prompt
@@ -116,6 +129,8 @@ struct Node {
     /// How long its tasks wait for a dropped peer (short, so tests don't wait long).
     grace: Duration,
     team: Option<Arc<proofkin::team::TeamRunner>>,
+    /// Its providers' default models and the ones tasks may ask for.
+    models: proofkin::models::Models,
 }
 
 impl Node {
@@ -132,6 +147,7 @@ impl Node {
             role: None,
             grace: Duration::from_secs(2),
             team: None,
+            models: Default::default(),
         }
     }
 
@@ -171,6 +187,7 @@ impl Node {
         config.shares = self.shares;
         config.owner = self.owner;
         config.role = self.role;
+        config.models = self.models;
         config.task_grace = self.grace;
         config.team = self.team;
         config.worktrees_dir = std::env::temp_dir()
@@ -515,6 +532,100 @@ async fn delegates_tasks_to_a_peer_that_serves_the_provider() {
             && !leaked.output.contains("Zx9Zx9"),
         "{}",
         leaked.output
+    );
+}
+
+#[tokio::test]
+async fn the_worker_says_which_model_did_the_work() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    worker.audit = Some(Arc::new(AuditLog::new(audit_path.clone())));
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    // The result names the model, and so does its signed output (so older requesters,
+    // which don't read the field, verify it as before).
+    let done = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "which model"))
+        .await
+        .unwrap();
+    assert_eq!(done.model.as_deref(), Some("fake-model-7"));
+    assert!(done.verified, "{done:?}");
+    assert_eq!(
+        done.output,
+        "copilot did: which model\n\n---\n**Model** `fake-model-7` (copilot)\n"
+    );
+    // A provider that doesn't say leaves it out, and the output as it was.
+    let plain = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(plain.model, None);
+    assert_eq!(plain.output, "copilot did: hello");
+    // The worker's audit log records it.
+    let entries = AuditLog::read(&audit_path, 10).unwrap();
+    assert_eq!(entries[0].model.as_deref(), Some("fake-model-7"));
+    assert_eq!(entries[1].model, None);
+    // A plan step keeps it with its result.
+    let plan = Plan::parse("a @worker which model").unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert_eq!(states["a"].model(), Some("fake-model-7"));
+}
+
+#[tokio::test]
+async fn owners_set_the_default_model_and_which_ones_tasks_may_ask_for() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    proofkin::models::set_allowed(
+        &mut worker.models,
+        Provider::Copilot,
+        &["fake-small".into(), "fake-big".into()],
+    )
+    .unwrap();
+    proofkin::models::set_default(&mut worker.models, Provider::Copilot, Some("fake-big")).unwrap();
+    // Models of a provider it doesn't serve aren't told.
+    proofkin::models::set_default(&mut worker.models, Provider::Claude, Some("x")).unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    // Peers learn them from the worker's hello.
+    let peer = boss.peers().into_iter().next().unwrap();
+    assert_eq!(peer.models.keys().collect::<Vec<_>>(), [&Provider::Copilot]);
+    assert_eq!(
+        peer.models[&Provider::Copilot].default.as_deref(),
+        Some("fake-big")
+    );
+    assert_eq!(
+        peer.models[&Provider::Copilot].allowed,
+        ["fake-small", "fake-big"]
+    );
+    // A task that names no model runs on the default.
+    let plain = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(plain.model.as_deref(), Some("fake-big"));
+    // One that asks for an allowed model runs on it.
+    let mut small = LlmTask::new(Provider::Copilot, "hello");
+    small.model = Some("fake-small".into());
+    let done = boss.delegate_verified(worker.id(), small).await.unwrap();
+    assert_eq!(done.model.as_deref(), Some("fake-small"));
+    // Another is refused (so a squad step can go to another member), naming the allowed.
+    let mut other = LlmTask::new(Provider::Copilot, "hello");
+    other.model = Some("o9".into());
+    let refused = boss.delegate_verified(worker.id(), other).await.unwrap();
+    assert!(refused.refused && !refused.ok, "{refused:?}");
+    assert_eq!(
+        refused.output,
+        "worker refused the task: o9 isn't a model allowed here: fake-small, fake-big"
     );
 }
 

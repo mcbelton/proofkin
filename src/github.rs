@@ -860,6 +860,7 @@ mod tests {
                 error: None,
                 origin: Some(origin.into()),
                 team: false,
+                model: None,
             };
         let entries = [
             entry("a", 7, 1_000_000, "step old of run r0"),

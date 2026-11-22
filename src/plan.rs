@@ -235,6 +235,11 @@ pub struct Step {
     /// go in front of its task.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workiq: Vec<String>,
+    /// The model the step's task runs on (`model=name`; with `agent=`, the agent's, if it
+    /// names one): the peer refuses it if its owner doesn't allow it (see
+    /// [`crate::models`]). None: the peer's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The `workiq=` sources, and the Work IQ capability each one names.
@@ -657,6 +662,10 @@ impl Plan {
             if let Some(agent) = &agent {
                 step.skills = union(&agent.skills, &step.skills);
                 step.mcp = union(&agent.mcp, &step.mcp);
+                // The agent's model, unless the step names one.
+                if step.model.is_none() && !step.approve && step.team.is_none() {
+                    step.model = agent.model.clone();
+                }
             }
             if step.skills.is_empty() && agent.is_none() {
                 continue;
@@ -930,7 +939,7 @@ const TODO_CLAIM: &str = "What must be true at the end";
 /// Step options (`name=value`, before what to do).
 const STEP_OPTIONS: &[&str] = &[
     "verify", "attempts", "claims", "claim", "apply", "context", "skill", "skills", "mcp", "save",
-    "agent", "levels", "timeout", "issue", "workiq",
+    "agent", "levels", "timeout", "issue", "workiq", "model",
 ];
 
 /// The longest `timeout=` a step may have (a week).
@@ -1114,6 +1123,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
     let mut agent = None;
     let mut workiq = Vec::new();
+    let mut model = None;
     let (mut levels, mut timeout, mut issue) = (None, None, None);
     let mut once = std::collections::HashSet::new();
     loop {
@@ -1128,13 +1138,28 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                 let (key, value) = word.split_once('=').expect("contains '='");
                 if matches!(
                     key,
-                    "attempts" | "apply" | "save" | "agent" | "levels" | "timeout" | "issue"
+                    "attempts"
+                        | "apply"
+                        | "save"
+                        | "agent"
+                        | "levels"
+                        | "timeout"
+                        | "issue"
+                        | "model"
                 ) && !once.insert(key)
                 {
                     bail!("{key}= is given twice; a step has one");
                 }
                 match key {
                     "verify" => add(&mut checks, value),
+                    "model" => {
+                        crate::models::check_name(value).map_err(|_| {
+                            anyhow!(
+                                "model= needs a model's name, e.g. model=claude-sonnet-5.5, got {value:?}"
+                            )
+                        })?;
+                        model = Some(value.to_owned());
+                    }
                     "attempts" => {
                         let n: u32 = value
                             .parse()
@@ -1218,6 +1243,18 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     if levels.is_some() && !team {
         bail!("levels= is for team steps (name team @lead ...)");
     }
+    if model.is_some() && (approve || team || target == Target::Workiq) {
+        bail!(
+            "model= is for steps a model runs; step '{id}' {}",
+            if approve {
+                "is a person's sign-off"
+            } else if team {
+                "is a team step: its lead's team plan says who runs what"
+            } else {
+                "is answered by Work IQ"
+            }
+        );
+    }
     let step = Step {
         id,
         after,
@@ -1241,6 +1278,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         issue,
         m365: None,
         workiq,
+        model,
     };
     if let Some(why) = step.workiq_refusal() {
         bail!("{why}");
@@ -1284,7 +1322,8 @@ fn union(first: &[String], then: &[String]) -> Vec<String> {
     all
 }
 
-/// The step as it runs as its agent: the agent's skills and MCP servers come first.
+/// The step as it runs as its agent: the agent's skills and MCP servers come first, and
+/// its model is the step's unless the step names one.
 fn with_agent(step: &Step, skills: &Skills) -> Result<Step> {
     let mut step = step.clone();
     if step.is_workiq() {
@@ -1294,6 +1333,9 @@ fn with_agent(step: &Step, skills: &Skills) -> Result<Step> {
         let agent = skills.agent(name)?;
         step.skills = union(&agent.skills, &step.skills);
         step.mcp = union(&agent.mcp, &step.mcp);
+        if step.model.is_none() && !step.approve && step.team.is_none() {
+            step.model = agent.model.clone();
+        }
     }
     Ok(step)
 }
@@ -1320,6 +1362,9 @@ pub enum StepState {
         /// The step's commit as a patch (kept out of JSON; saved next to run reports).
         #[serde(skip)]
         patch: Option<String>,
+        /// The model that did the work, as `peer` said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Failed {
         peer: Option<String>,
@@ -1328,6 +1373,8 @@ pub enum StepState {
         evidence: Option<Evidence>,
         #[serde(default)]
         verified: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Skipped {
         reason: String,
@@ -1345,6 +1392,15 @@ impl StepState {
             error,
             evidence: None,
             verified: false,
+            model: None,
+        }
+    }
+
+    /// The model that did the step's work, if its peer said.
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            StepState::Done { model, .. } | StepState::Failed { model, .. } => model.as_deref(),
+            _ => None,
         }
     }
 
@@ -1365,6 +1421,7 @@ impl StepState {
                 evidence: d.evidence,
                 verified: d.verified,
                 patch: d.patch,
+                model: d.model,
             };
         }
         StepState::Failed {
@@ -1375,6 +1432,7 @@ impl StepState {
             },
             evidence: d.evidence,
             verified: d.verified,
+            model: d.model,
         }
     }
 }
@@ -1881,6 +1939,29 @@ pub fn preflight(
                 _ => reasons,
             };
             report(Some(step), true, message);
+        }
+        // A model none of its peers allows: each would refuse the step (they say which
+        // models they allow in their hello; peers that don't say allow any).
+        if let Some(model) = &step.model {
+            let refusing: Vec<String> = candidates
+                .iter()
+                .filter_map(|p| {
+                    let choice = p.models.get(&step.provider)?;
+                    (!choice.allows(model))
+                        .then(|| format!("{} allows only {}", p.name, choice.allowed.join(", ")))
+                })
+                .collect();
+            if !refusing.is_empty() && refusing.len() == candidates.len() {
+                report(
+                    Some(step),
+                    false,
+                    format!(
+                        "model={model} would be refused for {}: {}",
+                        step.provider,
+                        refusing.join("; ")
+                    ),
+                );
+            }
         }
     }
     // Each claim needs a step that can prove it: one with checks, or a sign-off.
@@ -2442,6 +2523,7 @@ fn ask_workiq(
             patch: None,
             verified: false,
             refused: false,
+            model: None,
         })
     }
 }
@@ -2649,6 +2731,7 @@ pub async fn run_plan_with(
                     let mut task = LlmTask::new(step.provider, prompt.clone())
                         .with_checks(step.checks.clone(), step.attempts);
                     task.mcp = step.mcp.clone();
+                    task.model = step.model.clone();
                     task.title = Some(crate::llm::title_of(step.own_text()));
                     task.issues = ctx.issues.get(&step.id).cloned().unwrap_or_default();
                     if let Some(share) = &step.share {
@@ -3021,6 +3104,7 @@ mod tests {
             evidence: None,
             verified,
             patch: None,
+            model: None,
         };
         let states: BTreeMap<String, StepState> = [
             ("design".to_owned(), done(true)),
@@ -3080,6 +3164,84 @@ mod tests {
         fails("a @x agent=sec agent=sec do", "agent= is given twice");
         fails("a @x agent=../up do", "agent= needs an agent's name");
         fails("a approve @me agent=sec ok?", "can't act as an agent");
+    }
+
+    #[test]
+    fn steps_name_their_model_or_take_their_agents_and_the_check_warns_when_peers_refuse_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        skills
+            .add_agent(
+                "arch",
+                "---\ndescription: Architect\nmodel: claude-opus-5.5\n---\nDesign it.",
+            )
+            .unwrap();
+        let plan = Plan::parse(
+            "a @x model=gpt-5.5 Build it\nb @x agent=arch Design it\nc @x agent=arch model=gpt-5.5 Design it fast\nd @x Plain",
+        )
+        .unwrap();
+        assert_eq!(plan.steps[0].model.as_deref(), Some("gpt-5.5"));
+        // A step with an agent and no model of its own runs on the agent's.
+        let ready = plan.prepare(&kb, &skills).unwrap();
+        let models: Vec<Option<&str>> = ready.steps.iter().map(|s| s.model.as_deref()).collect();
+        assert_eq!(
+            models,
+            [
+                Some("gpt-5.5"),
+                Some("claude-opus-5.5"),
+                Some("gpt-5.5"),
+                None
+            ]
+        );
+        let fails = |text: &str, expected: &str| {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{text}: {err}");
+        };
+        fails("a @x model=a model=b do", "model= is given twice");
+        fails("a @x model=`x` do", "model= needs a model's name");
+        fails("ok approve @me model=x Fine", "is a person's sign-off");
+        fails("t team @lead:app model=x Do", "is a team step");
+        fails("w @workiq model=x Ask", "is answered by Work IQ");
+
+        // The check warns when the step's peer says it doesn't allow the model.
+        let mut models = crate::models::Models::new();
+        crate::models::set_allowed(&mut models, Provider::Copilot, &["gpt-5.5".into()]).unwrap();
+        let peer = PeerInfo {
+            name: "x".into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: vec![Provider::Copilot],
+            shares: vec![ShareInfo {
+                name: "data".into(),
+                access: Access::ReadOnly,
+                ..Default::default()
+            }],
+            owner: None,
+            role: None,
+            load: None,
+            models,
+        };
+        let problems = preflight(
+            &plan,
+            &[peer],
+            &SquadStore::default(),
+            &kb,
+            &skills,
+            &Recipients::default(),
+        );
+        let about_models: Vec<(Option<&str>, bool, &str)> = problems
+            .iter()
+            .filter(|p| p.message.contains("model="))
+            .map(|p| (p.step.as_deref(), p.error, p.message.as_str()))
+            .collect();
+        assert_eq!(
+            about_models,
+            [(
+                Some("b"),
+                false,
+                "model=claude-opus-5.5 would be refused for copilot: x allows only gpt-5.5"
+            )]
+        );
     }
 
     #[test]
@@ -3249,6 +3411,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let peers = vec![
             peer("alice", vec![share("app", Access::Full, &["test"], true)]),
@@ -3544,6 +3707,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let dir = tempfile::tempdir().unwrap();
         let kb = KnowledgeBase::new(dir.path().join("kb"));
@@ -3588,6 +3752,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let peers = vec![
             peer("alice", vec![Provider::Copilot], &["data", "code"]),
@@ -3735,6 +3900,7 @@ mod tests {
             evidence: None,
             verified: true,
             patch: None,
+            model: None,
         };
         let states: BTreeMap<String, StepState> = [
             ("a".to_owned(), done("Bands are fixed.")),
@@ -3840,6 +4006,7 @@ mod tests {
                 evidence: None,
                 verified: false,
                 patch: None,
+                model: None,
             },
         )]
         .into();
@@ -3873,6 +4040,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let mut trust = TrustStore::default();
         trust.allow(crate::trust::TrustedPeer {
@@ -4027,6 +4195,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let peers = vec![peer("open"), peer("plain"), peer("wide"), peer("helper")];
         let grants = [
@@ -4148,6 +4317,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let granted = |labels: &[&str]| {
             Some(M365Grant {

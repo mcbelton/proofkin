@@ -1248,6 +1248,50 @@
         "ui::the_workiq_import_route_saves_a_marked_topic_and_needs_replace_to_overwrite",
         "ui::the_workiq_import_route_writes_nothing_when_every_result_was_withheld"
       ]
+    },
+    {
+      "id": "MDL-1",
+      "area": "models",
+      "claim": "Every task result names the model that did the work, as its provider says: Copilot from the CLI's usage events of the session's own agent (else the model the task asked for), Claude from the Agent SDK's init message, Codex from the thread's model or the top-level model of the profile's own config.toml. A worker sends it with the result (a field older peers ignore) and names it in the signed output's evidence summary, so the record vouches for it and older requesters verify it as before; names are cleaned to the characters model names use before they are shown. The web UI's task and step cards (after the provider), the worker's audit log, run records and reports, the tracker's step comments and the CLI's printed results show it; without a model the result is as before.",
+      "tests": [
+        "lib::llm::copilot::the_models_that_answered_come_from_the_agents_own_usage_events",
+        "lib::llm::model_names_keep_only_what_model_names_use",
+        "lib::protocol::progress_load_and_origins_keep_older_peers_working",
+        "lib::runs::tasks_on_their_own_keep_what_proves_them_as_one_step_runs",
+        "lib::tracker::a_tracked_run_has_an_issue_with_a_sub_issue_per_step_and_the_board_follows_it",
+        "agents::the_worker_says_which_model_did_the_work",
+        "bridge::sends_task_fields_and_returns_text",
+        "bridge::claude_tool_policy_confines_paths_and_tools",
+        "ui::ui_requires_token_and_local_host_and_runs_tasks"
+      ]
+    },
+    {
+      "id": "MDL-2",
+      "area": "models",
+      "claim": "A profile's owner sets each provider's default model and the models tasks may ask for (proofkin models default <provider> <model>|none and models allow <provider> <list>|any), kept in profile.json and left out when unset. A default must be allowed; with a list and no default, tasks that name none run on the first in the list. models list prints the models Copilot offers the account and marks the default and the allowed ones. A task that names no model runs on the default, an agent's executor limits Copilot sessions to the list, and its hello tells peers the defaults and lists of the providers it serves (older peers' hellos read as saying nothing), cleaned of malformed names. An agent definition's model: is kept (inherit and names that aren't model names are left out).",
+      "tests": [
+        "lib::models::a_default_must_be_allowed_and_allowing_keeps_the_default",
+        "lib::models::a_task_runs_on_the_model_it_asks_for_if_allowed_else_the_default",
+        "lib::models::settings_round_trip_in_profile_json_and_are_left_out_when_unset",
+        "lib::models::what_copilot_says_about_a_model_is_read_leniently",
+        "lib::protocol::hello_with_addresses_round_trips",
+        "lib::skills::agent_files_name_their_skills_and_mcp_servers_in_any_list_form",
+        "agents::owners_set_the_default_model_and_which_ones_tasks_may_ask_for"
+      ]
+    },
+    {
+      "id": "MDL-3",
+      "area": "models",
+      "claim": "A task chooses its model: a plan step's model= option (given once, a model's name, not on sign-offs, team steps or @workiq steps; a step with agent= and no model= takes the agent's model), /ask and /delegate --model right after the target, the web UI's Run task form (a Model list of the default and the models the chosen peer or this agent allows, or a name when any is allowed) and the model argument of the MCP and A2A delegate; the plan editor and builder read and write model=. The step's task carries it, the plan check warns when every peer a step may go to says it doesn't allow the model, the worker refuses a task asking for a model its owner doesn't allow (a refusal naming the allowed ones) and runs an allowed one, and the result, get_task and the A2A metadata name the model that did the work.",
+      "tests": [
+        "lib::plan::steps_name_their_model_or_take_their_agents_and_the_check_warns_when_peers_refuse_it",
+        "lib::models::a_task_runs_on_the_model_it_asks_for_if_allowed_else_the_default",
+        "bin::delegated_tasks_may_name_their_model_right_after_the_target",
+        "agents::owners_set_the_default_model_and_which_ones_tasks_may_ask_for",
+        "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a",
+        "ui::the_plan_editor_keeps_plans_valid",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
     }
   ]
 }

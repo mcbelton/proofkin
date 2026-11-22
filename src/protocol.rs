@@ -32,6 +32,10 @@ pub enum Message {
         /// What this agent is for, as set by its owner.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
+        /// Per provider it serves: the model tasks that name none run on, and the models
+        /// tasks may ask for (left out when unset; older peers don't send it).
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        models: crate::models::Models,
     },
     Peers {
         addrs: Vec<EndpointAddr>,
@@ -62,6 +66,10 @@ pub enum Message {
         /// so another worker may take it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         refused: bool,
+        /// The model that did the work, as its provider said (older peers don't say).
+        /// The worker also names it in the signed output's evidence summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// Where a task the receiver delegated is now (sent while it runs, when it moves on).
     TaskProgress {
@@ -267,8 +275,8 @@ mod tests {
         );
     }
 
-    /// Progress, load and origins are new: older peers skip them (an unknown message
-    /// type, unknown fields), and phases from newer peers still read.
+    /// Progress, load, origins and models are new: older peers skip them (an unknown
+    /// message type, unknown fields), and phases from newer peers still read.
     #[test]
     fn progress_load_and_origins_keep_older_peers_working() {
         let msg = Message::TaskProgress {
@@ -303,12 +311,28 @@ mod tests {
             origin.and_then(|o| o.describe()).as_deref(),
             Some("step a of run r")
         );
-        // What an older peer sends still reads (no origin, not refused, no `yours`).
+        // What an older peer sends still reads (no origin, not refused, no `yours`, no model).
         let old = r#"{"type":"task_result","task_id":1,"ok":false,"output":"no"}"#;
         assert!(matches!(
             serde_json::from_str::<Message>(old).unwrap(),
-            Message::TaskResult { refused: false, .. }
+            Message::TaskResult {
+                refused: false,
+                model: None,
+                ..
+            }
         ));
+        let with_model = Message::TaskResult {
+            task_id: 2,
+            ok: true,
+            output: "done".into(),
+            evidence: None,
+            patch: None,
+            refused: false,
+            model: Some("claude-sonnet-5.5".into()),
+        };
+        let json = serde_json::to_string(&with_model).unwrap();
+        assert!(json.contains(r#""model":"claude-sonnet-5.5""#), "{json}");
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), with_model);
         let load = r#"{"type":"load","running":2,"queued":1,"slots":2}"#;
         assert_eq!(
             serde_json::from_str::<Message>(load).unwrap(),
@@ -325,6 +349,14 @@ mod tests {
     fn hello_with_addresses_round_trips() {
         let id = iroh::SecretKey::generate().public();
         let addr = EndpointAddr::new(id).with_ip_addr("127.0.0.1:4000".parse().unwrap());
+        let mut models = crate::models::Models::new();
+        models.insert(
+            Provider::Claude,
+            crate::models::ModelChoice {
+                default: Some("claude-sonnet-5.5".into()),
+                allowed: vec!["claude-sonnet-5.5".into(), "claude-opus-5.5".into()],
+            },
+        );
         let msg = Message::Hello {
             name: "a".into(),
             addr,
@@ -332,8 +364,19 @@ mod tests {
             shares: Vec::new(),
             owner: Some("alice".into()),
             role: None,
+            models,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
+        // An older peer's hello has no models: it reads as saying nothing about them.
+        let older = json.replace(
+            r#","models":{"claude":{"default":"claude-sonnet-5.5","allowed":["claude-sonnet-5.5","claude-opus-5.5"]}}"#,
+            "",
+        );
+        assert_ne!(older, json);
+        let Message::Hello { models, .. } = serde_json::from_str(&older).unwrap() else {
+            panic!("a hello");
+        };
+        assert!(models.is_empty());
     }
 }

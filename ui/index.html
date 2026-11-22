@@ -154,6 +154,16 @@
               <span>Run on</span>
               <select id="target"></select>
             </label>
+            <label class="field-inline" id="model-field" hidden
+                   title="The model it runs on: the default, or one of those its agent allows (it refuses others)">
+              <span>Model</span>
+              <select id="model"></select>
+            </label>
+            <label class="field-inline" id="model-name-field" hidden
+                   title="The model it runs on, by name (e.g. claude-sonnet-5.5); empty: the default">
+              <span>Model</span>
+              <input id="model-name" type="text" class="mono model-name" placeholder="Default" spellcheck="false" autocomplete="off">
+            </label>
             <label class="field-inline" id="share-field" hidden>
               <span>Folder</span>
               <select id="share"></select>

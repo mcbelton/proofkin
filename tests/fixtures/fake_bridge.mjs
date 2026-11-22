@@ -10,7 +10,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     cancelled.push(message.cancel);
     return;
   }
-  const { id, provider, prompt, access, cwd } = message;
+  const { id, provider, prompt, access, cwd, model } = message;
   if (prompt === "exit") process.exit(0);
   if (prompt === "hang") return;
   if (prompt === "cancelled?") {
@@ -27,7 +27,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   setTimeout(() => {
     const reply = prompt === "fail"
       ? { id, ok: false, error: "boom" }
-      : { id, ok: true, text: `${provider}|${access}|${cwd.length > 0}|${prompt}` };
+      : { id, ok: true, text: `${provider}|${access}|${cwd.length > 0}|${prompt}`, model: model ?? `${provider}-default-model` };
     process.stdout.write(JSON.stringify(reply) + "\n");
   }, delay);
 });

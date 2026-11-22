@@ -526,9 +526,11 @@ function teamResult(t) {
 
 function taskNode(t) {
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
+  // The model that did the work, after the provider, once its provider (or peer) said.
+  const runs = (label) => t.model ? `${label} · ${t.model}` : label;
   const title = t.step
-    ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : providerLabel(t.provider)} → ${t.target}`
-    : `#${t.id} · ${providerLabel(t.provider)} → ${t.target}`;
+    ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : runs(providerLabel(t.provider))} → ${t.target}`
+    : `#${t.id} · ${runs(providerLabel(t.provider))} → ${t.target}`;
   // Started by another agent (over MCP or A2A), not in this UI; or a step of a team
   // run this agent leads for a peer.
   const via = t.via ? ` · asked by another agent (${t.via})` : t.for_peer ? ` · for ${t.for_peer}'s team step` : "";
@@ -2564,7 +2566,7 @@ async function loadAudit() {
     const access = e.access ? ACCESS_SHORT[e.access] ?? e.access : "no access";
     list.append(el("li", { class: "audit-item" },
       el("div", { class: "task-top" },
-        el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${e.team ? "Team step" : providerLabel(e.provider)}` }),
+        el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${e.team ? "Team step" : providerLabel(e.provider)}${e.model ? ` · ${e.model}` : ""}` }),
         el("span", { class: `status ${OUTCOME_CLASS[e.outcome] ?? ""}`, text: OUTCOME_TEXT[e.outcome] ?? e.outcome })),
       el("div", { class: "task-meta", text: `${stamp(e.ts_ms)} · ${access} · ${duration(e.duration_ms)} · ${e.prompt_chars} chars, sha256 ${e.prompt_sha256.slice(0, 10)}` }),
       e.origin ? el("div", { class: "task-meta", text: `Part of ${e.origin} on ${e.peer}` }) : null,
@@ -2597,7 +2599,33 @@ function renderTaskOptions() {
   targetSel.replaceChildren(...targets.map(([v, label]) => el("option", { value: v, text: label })));
   if (targets.some(([v]) => v === prevTarget)) targetSel.value = prevTarget;
   renderShareOptions();
+  renderModelOptions();
   updateComposer();
+}
+
+/** The model a task runs on: the default, or one its agent allows (it says which: a
+ * peer in its hello, this agent in its own settings); a name of your own when it allows
+ * any. With "Any peer" the default: it isn't known which peer takes it. */
+function renderModelOptions() {
+  const provider = $("#provider").value;
+  const target = $("#target").value;
+  const said = target === "local" ? state.me?.models?.[provider]
+    : state.peers.find((p) => p.id === target)?.models?.[provider];
+  const list = said?.allowed ?? [];
+  const deflt = said?.default ? `Default (${said.default})` : "Default";
+  const sel = $("#model");
+  const prev = sel.value;
+  sel.replaceChildren(el("option", { value: "", text: deflt }), ...list.map((m) => el("option", { value: m, text: m })));
+  if (list.includes(prev)) sel.value = prev;
+  $("#model-field").hidden = !target || target === "auto" || !list.length;
+  $("#model-name-field").hidden = !target || target === "auto" || Boolean(list.length);
+  $("#model-name").placeholder = deflt;
+}
+
+function selectedModel() {
+  if (!$("#model-field").hidden) return $("#model").value || null;
+  if (!$("#model-name-field").hidden) return $("#model-name").value.trim() || null;
+  return null;
 }
 
 /** Folder picker for a peer target: the folders that peer shares with this agent. */
@@ -2720,6 +2748,7 @@ async function submitComposer(e) {
           mcp: selectedMcp(),
           checks,
           attempts: checks.length ? Number($("#attempts").value) : null,
+          model: selectedModel(),
           prompt: text,
         }),
       });
@@ -3012,7 +3041,7 @@ function init() {
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
-  $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
+  $("#target").addEventListener("change", () => { renderShareOptions(); renderModelOptions(); updateComposer(); });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
   $("#copy-ticket").addEventListener("click", copyTicket);

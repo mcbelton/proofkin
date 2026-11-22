@@ -325,6 +325,32 @@ proofkin auth logout workiq --profile me   # removes the Work IQ account and its
 
 `auth status` also shows each profile's Work IQ account: user, tenant and connection.
 
+### Models
+
+Unless a task names a model, each provider runs on its own default (Copilot's is whatever
+the CLI picks for the account). A profile's owner can set each provider's **default model**
+and **which models tasks may ask for**:
+
+```powershell
+proofkin models list --profile worker1                     # Copilot lists the models the account may use
+proofkin models allow copilot claude-sonnet-5.5,gpt-6-sol --profile worker1
+proofkin models default copilot claude-sonnet-5.5 --profile worker1
+proofkin models default copilot none --profile worker1     # back to the provider's own
+proofkin models allow copilot any --profile worker1        # any model again
+```
+
+A default must be one of the allowed models. With a list and no default, tasks that name
+none run on the first in the list (a provider's own default may not be allowed). A task
+asking for another model is refused, with the ones allowed, so a squad step can go to
+another member; Copilot sessions are also limited to the list. Peers learn the defaults and
+the lists from the agent's hello when they connect. The settings are kept in
+`profile.json`; a running agent uses them once it restarts.
+
+A task picks its model with `model=` in a plan step (or its agent's `model:`), `/delegate
+--model <name>`, the **Model** field of the web UI's Run task form (the models the chosen
+peer allows, or a name when it allows any) or the `model` argument of the MCP and A2A
+`delegate`. The result names the model that did the work.
+
 ### Example: two workers on two accounts
 
 ```powershell
@@ -495,8 +521,8 @@ In terminal 2, once `+ worker` appears:
 | Command | Description |
 | --- | --- |
 | `<text>` | Broadcast a chat message |
-| `/ask <provider> <prompt>` | Run a task locally (needs `--providers`) |
-| `/delegate <provider>[@peer[:folder]] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder) |
+| `/ask <provider> [--model <name>] <prompt>` | Run a task locally (needs `--providers`), on that model if given |
+| `/delegate <provider>[@peer[:folder]] [--model <name>] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder); `--model` picks one of the [models](#models) the peer allows (default: its default) |
 | `/plan <file>` | Run a [plan](#squads-and-plans): steps on peers (`@name`) or squads (`#squad`), in dependency order |
 | `/squads` | List your squads and which members are online |
 | `/runs` | List saved evidence runs ([EDD with agents](#evidence-driven-development-with-agents)) |
@@ -853,7 +879,8 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `claims=ID,...` | The claims this step's evidence counts towards. Claims must be defined with a `claim:` line first. |
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
-| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own. Not on sign-offs. |
+| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step names one). Not on sign-offs. |
+| `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (default: the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
@@ -866,7 +893,7 @@ A step line is `name [after steps] [team] @peer[:folder] or #squad [options] wha
 go before the task text (the plan check warns about one typed after it, but not text in
 backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
-`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout` and `issue` are given once.
+`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout`, `issue` and `model` are given once.
 
 A step's task text can go on over the lines after it: lines indented more than the step line continue
 it, with their common indentation removed (deeper indentation is kept, so nested lists work), and a
@@ -887,6 +914,13 @@ review @alice:app verify=test Check the change:
   number of attempts, the commit, and hashes of the prompt and output. The worker **signs**
   it with its identity key. The boss accepts it only if it is signed by the peer the task
   was sent to, for exactly the output received. Results show `Signed ✓` in the web UI.
+- Every result **names the model** that did the work, as its provider says (Copilot: the
+  models the session's usage events name; Claude: the Agent SDK's init message; Codex: the
+  thread's model, else `model` at the top of the profile's own `config.toml`). The web UI
+  shows it on the task card after the provider (`Step md · Copilot · claude-sonnet-5.5 →
+  worker`), and so do the worker's audit log, run records and reports, tracker comments and
+  the CLI. A worker also writes it in the signed output's summary
+  (``**Model** `claude-sonnet-5.5` (copilot)``), so the record vouches for it.
 - An `apply=` patch may not create symlinks or touch files the model itself may not write
   (credentials, git and editor config, agent settings).
 - **Worktrees** (`share add --worktrees`, for a git repository): each editing task runs on
@@ -1504,7 +1538,7 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
-`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
