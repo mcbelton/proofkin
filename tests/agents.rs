@@ -157,6 +157,7 @@ impl Node {
             tasks_per_hour: delegate.unwrap_or(0),
             access: Access::ReadOnly,
             shares: vec![DATA_SHARE.to_owned()],
+            m365: None,
         });
     }
 
@@ -1707,6 +1708,88 @@ async fn plans_save_verified_results_as_knowledge_and_use_it_later() {
         other => panic!("{other:?}"),
     }
     let _ = worker;
+}
+
+#[tokio::test]
+async fn a_step_with_microsoft_365_content_is_checked_again_when_its_task_is_sent() {
+    use proofkin::knowledge::{KnowledgeBase, with_mark};
+    use proofkin::plan::Recipients;
+    use proofkin::{M365Grant, TrustedPeer};
+
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let grant = |labels: &[&str]| {
+        Some(M365Grant {
+            labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+            tools: false,
+        })
+    };
+    boss.trust.peers[0].m365 = grant(&["General", "HR"]);
+    let worker_id = worker.id();
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let home = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::new(home.path());
+    kb.write("hr-notes", &with_mark("Pay bands", &["HR".into()]), "")
+        .unwrap();
+    let plan = Plan::parse("a @worker context=hr-notes Summarize\nb after a @worker Review it")
+        .unwrap()
+        .with_knowledge(&kb)
+        .unwrap();
+
+    // Granted when the plan is checked and when it runs.
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert!(
+        states.values().all(|s| matches!(s, StepState::Done { .. })),
+        "{states:?}"
+    );
+
+    // The owner takes HR out of the grant while the plan is waiting to run.
+    boss.allow(TrustedPeer {
+        name: "worker".into(),
+        id: worker_id,
+        addrs: BTreeSet::new(),
+        can_delegate: true,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec![DATA_SHARE.to_owned()],
+        m365: grant(&["General"]),
+    });
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    let expected = Recipients::new(boss.trusted(), Vec::new())
+        .refusal(&plan.steps[0], "worker", &worker_id)
+        .expect("the grant no longer covers HR");
+    match &states["a"] {
+        StepState::Failed { peer, error, .. } => {
+            assert_eq!(peer.as_deref(), Some("worker"));
+            assert_eq!(error, &expected);
+            assert!(
+                error.contains("step 'a'") && error.contains("labels: HR"),
+                "{error}"
+            );
+            assert!(error.contains("--m365 General,HR"), "{error}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        matches!(states["b"], StepState::Skipped { .. }),
+        "{:?}",
+        states["b"]
+    );
+
+    // The owner's own digital workers may have all of it.
+    let ctx = RunContext {
+        recipients: Recipients::new(TrustStore::default(), vec![worker_id]),
+        ..RunContext::default()
+    };
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    assert!(
+        states.values().all(|s| matches!(s, StepState::Done { .. })),
+        "{states:?}"
+    );
 }
 
 #[tokio::test]

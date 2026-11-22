@@ -215,6 +215,7 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
         tasks_per_hour: 0,
         access: Access::ReadOnly,
         shares: Vec::new(),
+        m365: None,
     });
     let (stranger, _stranger_events) = Agent::bind(stranger).await.unwrap();
     let _ = stranger.connect(agent.addr()).await;
@@ -510,6 +511,7 @@ async fn ui_runs_plans_and_shows_squads() {
         tasks_per_hour: 100,
         access: Access::ReadOnly,
         shares: vec!["data".into()],
+        m365: None,
     };
     let mut worker = AgentConfig::new("worker", worker_key.clone());
     worker.network = Network::Local;
@@ -906,6 +908,7 @@ async fn a_running_plan_step_keeps_its_folder_in_its_target() {
         tasks_per_hour: 100,
         access: Access::ReadOnly,
         shares: vec!["data".into(), "docs".into()],
+        m365: None,
     };
     let mut worker = AgentConfig::new("worker", worker_key.clone());
     worker.network = Network::Local;
@@ -2424,6 +2427,7 @@ async fn team_runs_show_on_the_bosss_step_and_the_leads_page() {
             tasks_per_hour: 100,
             access,
             shares: shares.iter().map(|s| (*s).to_owned()).collect(),
+            m365: None,
         }
     };
     let local = |config: &mut AgentConfig| {

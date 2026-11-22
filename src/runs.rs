@@ -360,6 +360,7 @@ impl RunRecord {
             team: None,
             timeout: None,
             issue: None,
+            m365: None,
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims

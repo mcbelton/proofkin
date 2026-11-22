@@ -409,6 +409,7 @@ impl Shared {
                     "tasks_per_hour": t.tasks_per_hour,
                     "access": t.access,
                     "shares": t.shares,
+                    "m365": t.m365,
                     "connected": peers.iter().any(|p| p.id == t.id),
                 })
             })
@@ -1740,15 +1741,22 @@ fn start_plan(
     let kb = s.info.profile.knowledge();
     let skills = s.info.profile.skills();
     let squads_now = s.squads.lock().unwrap().clone();
-    let errors: Vec<String> =
-        crate::plan::preflight(&plan, &s.agent.peers(), &squads_now, &kb, &skills)
-            .into_iter()
-            .filter(|p| p.error)
-            .map(|p| match p.step {
-                Some(step) => format!("step {step}: {}", p.message),
-                None => p.message,
-            })
-            .collect();
+    let recipients = crate::plan::Recipients::of(&s.agent, &s.info.profile);
+    let errors: Vec<String> = crate::plan::preflight(
+        &plan,
+        &s.agent.peers(),
+        &squads_now,
+        &kb,
+        &skills,
+        &recipients,
+    )
+    .into_iter()
+    .filter(|p| p.error)
+    .map(|p| match p.step {
+        Some(step) => format!("step {step}: {}", p.message),
+        None => p.message,
+    })
+    .collect();
     if !errors.is_empty() {
         return Err(format!("the plan was not started:\n{}", errors.join("\n")));
     }
@@ -1821,6 +1829,7 @@ fn start_plan(
                 .as_ref()
                 .map(|t| t.refs.clone())
                 .unwrap_or_default(),
+            recipients,
         };
         let agent = shared.agent.clone();
         let states = crate::plan::run_plan_with(&agent, &squads, &ready, &ctx, |step, state| {
@@ -2340,12 +2349,14 @@ fn plan_check(s: &Shared, text: &str) -> Value {
         }
     };
     let squads = s.squads.lock().unwrap().clone();
+    let recipients = crate::plan::Recipients::of(&s.agent, &s.info.profile);
     let problems = crate::plan::preflight(
         &plan,
         &s.agent.peers(),
         &squads,
         &s.info.profile.knowledge(),
         &s.info.profile.skills(),
+        &recipients,
     );
     json!({
         "ok": !problems.iter().any(|p| p.error),
@@ -3047,6 +3058,7 @@ async fn allow_peer(
             "this agent shares no folder named '{missing}'"
         )));
     }
+    let m365 = s.agent.trusted().m365_of(&ticket.addr.id, &name);
     s.agent.allow(TrustedPeer {
         name: name.clone(),
         id: ticket.addr.id,
@@ -3061,6 +3073,7 @@ async fn allow_peer(
             Access::ReadOnly
         },
         shares: shares.clone(),
+        m365,
     });
     s.save_trust()?;
     s.system(

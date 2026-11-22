@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use proofkin::audit::{AuditLog, Outcome};
 use proofkin::auth::{LoginMethod, ProviderTools};
-use proofkin::plan::{Plan, SquadStore, StepState, run_plan};
+use proofkin::plan::{Plan, SquadStore, StepState, run_plan_with};
 use proofkin::profile::DEFAULT_GITHUB_HOST;
 use proofkin::trust::DEFAULT_TASKS_PER_HOUR;
 use proofkin::{
@@ -72,7 +72,10 @@ enum Command {
     /// their owner's accounts.
     #[command(subcommand)]
     Worker(WorkerCommand),
-    /// Group peers into squads that plans can assign steps to.
+    /// Work IQ (Microsoft 365 work context): its call usage and budgets.
+    #[command(subcommand)]
+    Workiq(WorkiqCommand),
+    /// Group peers into squads that plans can assign steps to. into squads that plans can assign steps to.
     #[command(subcommand)]
     Squad(SquadCommand),
     /// Evidence runs: saved plan runs with a verdict per claim and signed evidence.
@@ -178,6 +181,32 @@ examples:
 enum ProfileCommand {
     /// Delete a profile: its identity key, stored credentials, allowlist and provider sign-ins.
     Delete {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkiqCommand {
+    /// Print today's Work IQ calls against the budgets (from the profile's audit file).
+    Usage {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Change how many Work IQ calls this profile may make (a limit you leave out is kept).
+    #[command(after_help = "\
+examples:
+  proofkin workiq budget --per-day 500 --profile alice
+  proofkin workiq budget --per-run 40 --profile alice
+Without a budget, 200 calls a day and 25 calls per run are allowed. A call over a budget
+is not sent; it fails and is recorded as refused in workiq-audit.jsonl.")]
+    Budget {
+        /// Most calls a day (the local date).
+        #[arg(long)]
+        per_day: Option<u32>,
+        /// Most calls in one run.
+        #[arg(long)]
+        per_run: Option<u32>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1108,6 +1137,14 @@ agent's own --access.")]
             requires = "delegate"
         )]
         share: Vec<String>,
+        /// Microsoft 365 content this peer may receive: sensitivity label names, e.g.
+        /// General,Public,unlabeled (`unlabeled` allows content without a label), or `off`
+        /// to remove the grant. Without it, a grant already set is kept.
+        #[arg(long)]
+        m365: Option<String>,
+        /// Also let this peer's tasks use this agent's Work IQ (read only).
+        #[arg(long, requires = "m365")]
+        m365_tools: bool,
     },
     /// List allowlisted peers.
     List {
@@ -1302,6 +1339,7 @@ async fn main() -> Result<()> {
         Some(Command::Mcp(command)) => run_mcp(command),
         Some(Command::Plugin(command)) => run_plugin(command).await,
         Some(Command::Worker(command)) => run_worker(command),
+        Some(Command::Workiq(command)) => run_workiq(command),
         Some(Command::Squad(command)) => run_squad(command),
         Some(Command::Runs(command)) => run_runs(command),
         Some(Command::Kb(command)) => run_kb(command),
@@ -1422,6 +1460,32 @@ fn civil_date(days: u64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn run_workiq(command: WorkiqCommand) -> Result<()> {
+    use proofkin::workiq::audit::{Audit, set_budget};
+    match command {
+        WorkiqCommand::Usage { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let report = Audit::for_profile(&profile).report()?;
+            print!("{}", report.describe(&profile.name));
+        }
+        WorkiqCommand::Budget {
+            per_day,
+            per_run,
+            profile,
+        } => {
+            let mut profile = Profile::open(&profile.name)?;
+            let budget = set_budget(&mut profile, per_day, per_run)?;
+            println!(
+                "profile '{}': Work IQ budget is {} calls a day and {} calls per run",
+                profile.name,
+                budget.per_day(),
+                budget.per_run()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_worker(command: WorkerCommand) -> Result<()> {
@@ -3461,8 +3525,14 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             tasks_per_hour,
             access,
             share,
+            m365,
+            m365_tools,
         } => {
             let profile = Profile::open(&profile.name)?;
+            let grant = m365
+                .as_deref()
+                .map(|spec| proofkin::M365Grant::parse(spec, m365_tools))
+                .transpose()?;
             let ticket = Ticket::parse(&target)?;
             let name = name
                 .or_else(|| Some(ticket.name.clone()).filter(|n| !n.is_empty()))
@@ -3480,6 +3550,14 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 );
             }
             let mut trust = profile.trust()?;
+            let m365 = match grant {
+                Some(grant) => grant,
+                None => trust.m365_of(&ticket.addr.id, &name),
+            };
+            let m365_note = m365
+                .as_ref()
+                .map(|g| format!("; Microsoft 365 {}", g.describe()))
+                .unwrap_or_default();
             trust.allow(TrustedPeer {
                 name: name.clone(),
                 id: ticket.addr.id,
@@ -3488,6 +3566,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 tasks_per_hour,
                 access,
                 shares: share.clone(),
+                m365,
             });
             trust.save(&profile.trust_path())?;
             let rights = if delegate {
@@ -3499,7 +3578,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 "chat only, may not delegate".into()
             };
             println!(
-                "profile '{}': allowed {name} ({}), {rights}",
+                "profile '{}': allowed {name} ({}), {rights}{m365_note}",
                 profile.name,
                 ticket.addr.id.fmt_short()
             );
@@ -3521,7 +3600,11 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 } else {
                     "no delegation".into()
                 };
-                println!("  {:<16} {}  {rights}", p.name, p.id);
+                let m365 = match &p.m365 {
+                    Some(g) => format!("; Microsoft 365 {}", g.describe()),
+                    None => String::new(),
+                };
+                println!("  {:<16} {}  {rights}{m365}", p.name, p.id);
             }
         }
         PeersCommand::Remove { peer, profile } => {
@@ -4019,10 +4102,17 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 let kb = profile.knowledge();
                 let skills = profile.skills();
                 let squads_now = SquadStore::load(&profile.squads_path()).unwrap_or_default();
+                let recipients = proofkin::plan::Recipients::of(&agent, &profile);
                 let parsed = text.and_then(|text| {
                     let plan = Plan::parse(&text)?;
-                    let problems =
-                        proofkin::plan::preflight(&plan, &agent.peers(), &squads_now, &kb, &skills);
+                    let problems = proofkin::plan::preflight(
+                        &plan,
+                        &agent.peers(),
+                        &squads_now,
+                        &kb,
+                        &skills,
+                        &recipients,
+                    );
                     for p in &problems {
                         println!(
                             "  {} {}{}",
@@ -4046,11 +4136,16 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                         let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                         let agent = agent.clone();
                         let runs_dir = profile.runs_dir();
+                        let ctx = proofkin::plan::RunContext {
+                            recipients,
+                            ..Default::default()
+                        };
                         let n = tasks.spawn(
                             format!("plan {file} ({} steps)", plan.steps.len()),
                             async move {
                                 let started = proofkin::runs::unix_now();
-                                let states = run_plan(&agent, &squads, &ready, print_step).await;
+                                let states =
+                                    run_plan_with(&agent, &squads, &ready, &ctx, print_step).await;
                                 let mut run = proofkin::runs::RunRecord::new(
                                     agent.name(),
                                     &agent.id().to_string(),

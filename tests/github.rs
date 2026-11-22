@@ -156,6 +156,7 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
             tasks_per_hour: 20,
             access: Access::Full,
             shares: vec![],
+            m365: None,
         }],
     }
     .save(&profile.trust_path())

@@ -146,8 +146,9 @@ impl TeamRunner {
         let kb = self.profile.knowledge();
         let skills = self.profile.skills();
         let squads = SquadStore::load(&self.profile.squads_path()).unwrap_or_default();
+        let recipients = crate::plan::Recipients::of(agent, &self.profile);
         let errors: Vec<String> =
-            crate::plan::preflight(&plan, &agent.peers(), &squads, &kb, &skills)
+            crate::plan::preflight(&plan, &agent.peers(), &squads, &kb, &skills, &recipients)
                 .into_iter()
                 .filter(|p| p.error)
                 .map(|p| match p.step {
@@ -194,6 +195,7 @@ impl TeamRunner {
                 .map(|s| (s.id.clone(), task.issues.clone()))
                 .filter(|(_, issues)| !issues.is_empty())
                 .collect(),
+            recipients,
         };
         let finals = crate::plan::run_plan_with(agent, &squads, &ready, &ctx, |id, state| {
             states.insert(id.to_owned(), state.clone());

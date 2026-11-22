@@ -1048,6 +1048,60 @@
         "workiq_login::an_error_in_the_browser_redirect_is_explained_too",
         "workiq_login::a_sign_in_work_iq_refuses_is_signed_out_again"
       ]
+    },
+    {
+      "id": "WIQ-7",
+      "area": "work-iq",
+      "claim": "The Work IQ content policy (src/workiq/content.rs, docs/work-iq.md section 3) reads retrieve results from structuredContent under application/vnd.ms-workiq.retrieval, never from the MCP content array, and fails on isError, stoppedReason error or a missing structuredContent. Only results whose contentProtection is exactly allowed (after trimming) are kept; the rest, a missing value included, are withheld and counted as missing, blocked or other. A Local audience gets every label; a Peer gets only the labels in its allowlist (compared without case), and unlabeled allows results without a label; results withheld by label are counted too. Markdown, titles and links are redacted, results are kept by relevance up to a character cap (16000 by default), and each result is wrapped in the external-content envelope, followed by a Sources list (also wrapped) and a line with the withheld counts, under the heading saying the context is cited and unverified. An ask answer and its citations are read the same way; an answer whose citations have no label metadata is local only, and a Peer gets nothing from it.",
+      "tests": [
+        "lib::workiq::content::allowed_results_are_kept_and_shown_with_their_sources",
+        "lib::workiq::content::results_that_are_not_exactly_allowed_are_withheld_and_counted",
+        "lib::workiq::content::a_peer_gets_only_the_labels_it_may_have_and_local_gets_all",
+        "lib::workiq::content::results_without_a_label_go_to_a_peer_only_when_unlabeled_is_allowed",
+        "lib::workiq::content::no_results_give_an_empty_section",
+        "lib::workiq::content::a_result_that_stopped_with_an_error_or_has_no_structured_content_fails",
+        "lib::workiq::content::the_cap_keeps_the_most_relevant_results",
+        "lib::workiq::content::secrets_are_redacted_in_results_titles_and_answers",
+        "lib::workiq::content::content_cannot_close_the_envelope_early",
+        "lib::workiq::content::an_answer_without_label_metadata_is_local_only",
+        "lib::workiq::content::an_answer_goes_to_a_peer_when_every_citation_has_an_allowed_label"
+      ]
+    },
+    {
+      "id": "WIQ-8",
+      "area": "work-iq",
+      "claim": "A peer's Microsoft 365 grant (docs/work-iq.md section 4) is the optional m365 field of its entry in peers.json, left out when absent, with labels (the label names it may receive; unlabeled allows content without a label) and tools (its tasks may use this agent's Work IQ gateway, read only). Absent means nothing is allowed. proofkin peers allow <peer> --m365 General,Public,unlabeled [--m365-tools] sets it (names trimmed and without duplicates), --m365 off removes it, and running peers allow again without --m365 keeps the current grant; peers list shows it, and the web UI's peer JSON includes it read-only. The audience for content sent to a peer is Local for the owner's own digital workers, a Peer audience with the grant's labels for a granted peer, and none (refuse) for any other peer.",
+      "tests": [
+        "lib::trust::nothing_is_allowed_by_default_and_absent_grants_stay_out_of_the_file",
+        "lib::trust::m365_labels_are_stored_and_read_back",
+        "lib::trust::m365_off_removes_the_grant_and_bad_specs_are_refused",
+        "lib::trust::allowing_again_keeps_the_grant_unless_replaced",
+        "lib::trust::the_audience_is_local_for_digital_workers_and_the_grant_for_peers"
+      ]
+    },
+    {
+      "id": "WIQ-9",
+      "area": "work-iq",
+      "claim": "Microsoft 365 content keeps its origin (docs/work-iq.md section 4) and plans don't send it to peers not allowed to receive it. A knowledge topic with front matter origin: workiq and labels: (comma-separated) is marked (parse_mark, with_mark and KnowledgeBase::marks in src/knowledge.rs); a mark can be written into a topic with or without troubleshooting-guide front matter, a guide stays a guide, and a topic can have both. A step (Step.m365, a field the workiq= option and @workiq steps will set too) is marked when a context= topic is marked, with the union of the labels (context=all included), when a step it runs after is marked because it gets that step's output, and the steps that save= from a marked step write the mark into the topic, so a later step that uses it is marked. The plan check (preflight, with the allowlist and the owner's digital workers as Recipients) gives an error for a marked step whose target (a peer, a squad member the squad may pick, or the person asked to approve) has no Microsoft 365 grant or whose grant lacks one of the labels, naming the step, the peer, the labels and the proofkin peers allow command that grants them; a granted peer (labels compared without case) and the owner's digital workers get none. When the plan runs, the same check is made against the allowlist as it is then before each task is sent, and the step fails with the same message if the grant changed.",
+      "tests": [
+        "lib::knowledge::a_topics_microsoft_365_mark_round_trips_with_and_without_guide_front_matter",
+        "lib::plan::steps_with_microsoft_365_content_are_marked_through_context_and_after",
+        "lib::plan::save_writes_a_marked_steps_mark_into_its_topic",
+        "lib::plan::the_plan_check_stops_marked_steps_for_peers_that_may_not_have_them",
+        "agents::a_step_with_microsoft_365_content_is_checked_again_when_its_task_is_sent"
+      ]
+    },
+    {
+      "id": "WIQ-10",
+      "area": "work-iq",
+      "claim": "Every Work IQ call through Client::call_tool_in (done, failed or refused) appends one JSON line to <profile>/workiq-audit.jsonl (append only, behind a lock, a write error only warns): time, tool, purpose (step with the run id and step, knowledge import, gateway, doctor or command), audience (local or the peer's name), the query's SHA-256 and length and never its text, outcome (ok, refused, or the error class), the results and withheld counts and the labels seen when the result has them, the request, x-ms-request, client-request and correlation ids, and the duration. Budgets in profile.json (workiq_budget: calls_per_day, default 200; calls_per_run, default 25) are checked before a call is sent: a call over a budget fails with an over-budget error that names the budget and the proofkin workiq budget command that raises it, is not sent, and is audited as refused (refused calls don't count). Usage today and per run is counted from the log, the day being the local date from an injectable clock, so a new day resets the daily count. proofkin workiq usage --profile P prints today's use against the budgets and proofkin workiq budget --per-day N --per-run N --profile P changes them (a limit left out is kept; zero is refused).",
+      "tests": [
+        "lib::workiq::client::every_call_is_one_audit_line_and_none_holds_the_query_text",
+        "lib::workiq::client::the_daily_budget_refuses_the_next_call_before_it_is_sent",
+        "lib::workiq::client::the_per_run_budget_refuses_the_next_call_of_that_run_only",
+        "lib::workiq::client::a_new_day_resets_the_daily_count",
+        "lib::workiq::audit::budgets_are_saved_in_profile_json_and_a_limit_left_out_keeps_its_value"
+      ]
     }
   ]
 }

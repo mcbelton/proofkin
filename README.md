@@ -424,7 +424,7 @@ with `/ticket`.
 | Peers command | Description |
 | --- | --- |
 | `proofkin peers id --profile P` | Show P's endpoint id and ticket |
-| `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
+| `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N] [--m365 LABELS\|off [--m365-tools]]` | Allowlist a peer (re-run to change its rights). `--m365 General,Public,unlabeled` lets it receive Microsoft 365 content with those labels, `--m365-tools` lets its tasks use your Work IQ (read only), `--m365 off` removes the grant; without `--m365` a grant is kept |
 | `proofkin share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--check NAME=COMMAND ...]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
 | `proofkin peers list --profile P` | List allowlisted peers and their rights |
 | `proofkin peers remove <name-or-id> --profile P` | Remove a peer |
@@ -532,6 +532,27 @@ time (UTC)           peer            task provider access           outcome   se
 ```
 
 `--limit N` shows more entries and `--json` prints the raw lines.
+
+#### Work IQ audit file and budgets
+
+Every call to [Work IQ](docs/work-iq.md) (Microsoft 365 work context), whether it is done,
+failed or refused, is one line in the profile's `workiq-audit.jsonl`: time, tool, purpose (a
+step of a run with the run id, a knowledge import, a gateway task, `doctor` or a command),
+audience (`local` or the peer's name), the query's SHA-256 and length (never its text),
+outcome (`ok`, `refused`, or the error's class), the counts of results and withheld results
+and the sensitivity labels seen when known, the request and correlation ids, and the
+duration. A write error only warns.
+
+Calls are limited to 200 a day (the local date) and 25 per run. A call over a budget is not
+sent: it fails saying which budget is used up and how to raise it, and is recorded as
+`refused` (refused calls don't count). Use comes from the log.
+
+```text
+> proofkin workiq usage --profile alice
+> proofkin workiq budget --per-day 500 --per-run 40 --profile alice
+```
+
+`budget` keeps a limit you leave out, and saves them in `profile.json` (`workiq_budget`).
 
 ### Cancelling tasks
 
@@ -1539,6 +1560,22 @@ can't be connected to; they take work from their owner only.
   raise its access: each task gets the **lower** of the peer's grant
   (`peers allow ... --delegate --access <level>`, default `read-only`) and the folder's
   maximum (`share add ... --access <level>`). Your own tasks get `--access` in `--workspace`.
+- Microsoft 365 content is off for every peer until you grant it:
+  `peers allow ... --m365 General,Public,unlabeled` lets a peer receive Work IQ context
+  with only those sensitivity labels (`unlabeled` allows content without a label), and
+  `--m365-tools` also lets its tasks use your Work IQ, read only. `--m365 off` removes the
+  grant; allowing the peer again without `--m365` keeps it. Your own digital workers get
+  everything you can read.
+- Microsoft 365 content keeps its origin. A knowledge topic with `origin: workiq` and
+  `labels: General, HR` in its front matter is Microsoft 365 content (a troubleshooting guide
+  can be one too). A plan step that uses such a topic with `context=` is marked with its
+  labels, and so is every step that runs `after` a marked step, because it gets that step's
+  output; a marked step's `save=` writes the mark into the topic it makes. The plan check
+  gives an error for a marked step whose peer (or any peer its squad may pick) has no grant
+  or no grant for one of its labels, naming the step, the peer, the labels and the
+  `peers allow ... --m365` command that grants them. The check is made again before each task
+  is sent, and the step fails with the same message if the grant changed. Your own digital
+  workers are never refused.
 - Results are signed by the agent that produced them, and checks a peer asks for run only
   with `full` access ([EDD with agents](#evidence-driven-development-with-agents)).
   Approval requests need only the allowlist, and each peer may have at most 20 open.
@@ -1876,7 +1913,7 @@ Workflow for a change:
 - [src/skills.rs](src/skills.rs) and [skills/](skills): built-in and profile skills (instructions for plan steps)
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)
 - [src/tracker.rs](src/tracker.rs): tracked work: plan runs as GitHub issues and sub-issues on a GitHub Project's board (GraphQL through `gh`)
-- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait; see [docs/work-iq.md](docs/work-iq.md)
+- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait, and the content policy (`content.rs`: only `allowed` results, label allowlist per audience, redaction, size cap, envelope); see [docs/work-iq.md](docs/work-iq.md)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases

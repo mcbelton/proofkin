@@ -22,6 +22,19 @@
 //! When monitor `api-health` fails with output matching `match` (a
 //! case-insensitive substring), the monitor's agent runs the folder owner's check
 //! `fix`, then `verify` (default: the monitor's own check). See [`crate::ops`].
+//!
+//! Topics made from Microsoft 365 content (Work IQ) keep their origin in the same front
+//! matter, and a topic can be both that and a guide:
+//!
+//! ```text
+//! ---
+//! origin: workiq
+//! labels: General, Confidential
+//! ---
+//! ```
+//!
+//! See [`parse_mark`] and [`with_mark`]; plans use the mark to keep the content from peers
+//! that may not have it (docs/work-iq.md, section 4).
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -42,6 +55,9 @@ pub struct Topic {
     /// For troubleshooting guides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tsg: Option<Tsg>,
+    /// For topics made from Microsoft 365 content: its sensitivity labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workiq: Option<Vec<String>>,
 }
 
 /// A troubleshooting guide's machine-readable part.
@@ -88,10 +104,73 @@ impl Tsg {
     }
 }
 
+/// The front matter of `text` (the lines between the `---` lines) and what follows its
+/// closing `---`.
+fn front_matter(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("---")?.trim_start_matches(['\r', '\n']);
+    rest.split_once("\n---")
+}
+
+/// `labels` and `more` together, without repeats (compared without case), in order.
+pub fn union_labels(labels: &[String], more: &[String]) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    for label in labels.iter().chain(more) {
+        let label = label.trim();
+        if !label.is_empty() && !all.iter().any(|l| l.eq_ignore_ascii_case(label)) {
+            all.push(label.to_owned());
+        }
+    }
+    all
+}
+
+/// The Microsoft 365 mark in a topic's front matter (`origin: workiq`): its labels
+/// (`labels: a, b`, none if the line is missing), or `None` if the topic isn't marked.
+pub fn parse_mark(text: &str) -> Option<Vec<String>> {
+    let (head, _) = front_matter(text)?;
+    let (mut marked, mut labels) = (false, Vec::new());
+    for line in head.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "origin" => marked |= value.trim().eq_ignore_ascii_case("workiq"),
+            "labels" => {
+                let listed: Vec<String> = value.split(',').map(str::to_owned).collect();
+                labels = union_labels(&[], &listed);
+            }
+            _ => {}
+        }
+    }
+    marked.then_some(labels)
+}
+
+/// `text` marked as Microsoft 365 content with `labels`: the `origin` and `labels` lines go
+/// into its front matter (replacing a mark it has, keeping its other lines, a guide's
+/// included), or into new front matter.
+pub fn with_mark(text: &str, labels: &[String]) -> String {
+    let labels: Vec<String> = labels
+        .iter()
+        .map(|l| l.replace([',', '\r', '\n'], " "))
+        .collect();
+    let mark = format!(
+        "origin: workiq\nlabels: {}",
+        union_labels(&[], &labels).join(", ")
+    );
+    let Some((head, after)) = front_matter(text) else {
+        return format!("---\n{mark}\n---\n{text}");
+    };
+    let is_mark = |line: &&str| {
+        let key = line.split_once(':').map(|(k, _)| k.trim());
+        matches!(key, Some("origin" | "labels"))
+    };
+    let mut lines: Vec<&str> = head.lines().filter(|l| !is_mark(l)).collect();
+    lines.push(&mark);
+    format!("---\n{}\n---{after}", lines.join("\n"))
+}
+
 /// Parses a topic's TSG front matter, if it has any.
 pub fn parse_tsg(topic: &str, text: &str) -> Option<Tsg> {
-    let rest = text.strip_prefix("---")?.trim_start_matches(['\r', '\n']);
-    let (head, _) = rest.split_once("\n---")?;
+    let (head, _) = front_matter(text)?;
     let mut tsg = Tsg {
         topic: topic.to_owned(),
         monitor: None,
@@ -203,6 +282,7 @@ impl KnowledgeBase {
                 chars: text.chars().count(),
                 modified_unix,
                 tsg: parse_tsg(name, &text),
+                workiq: parse_mark(&text),
             });
         }
         topics.sort_by(|a, b| a.name.cmp(&b.name));
@@ -211,6 +291,21 @@ impl KnowledgeBase {
 
     pub fn tsgs(&self) -> Vec<Tsg> {
         self.list().into_iter().filter_map(|t| t.tsg).collect()
+    }
+
+    /// The labels of the Microsoft 365 content in `topics` (`all`: every topic), or `None`
+    /// if none of them is marked. Topics that don't exist are left out.
+    pub fn marks(&self, topics: &[String]) -> Option<Vec<String>> {
+        let all = topics.iter().any(|t| t == "all");
+        let mut labels: Option<Vec<String>> = None;
+        for topic in self.list() {
+            if let Some(found) = topic.workiq
+                && (all || topics.contains(&topic.name))
+            {
+                labels = Some(union_labels(labels.as_deref().unwrap_or_default(), &found));
+            }
+        }
+        labels
     }
 
     /// Topics whose name or text contains every word of `query` (case-insensitive).
@@ -346,5 +441,55 @@ mod tests {
             "drafts don't run"
         );
         assert_eq!(parse_tsg("x", "---\ntsg: x\nmatch: y\n---\nno fix"), None);
+    }
+
+    #[test]
+    fn a_topics_microsoft_365_mark_round_trips_with_and_without_guide_front_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path());
+        let labels = vec!["General".to_owned(), "Highly Confidential".to_owned()];
+
+        kb.write("notes", &with_mark("# Notes\nBody", &labels), "")
+            .unwrap();
+        let text = kb.read("notes").unwrap();
+        assert!(
+            text.starts_with(
+                "---\norigin: workiq\nlabels: General, Highly Confidential\n---\n# Notes\nBody"
+            ),
+            "{text}"
+        );
+        assert_eq!(parse_mark(&text), Some(labels.clone()));
+        assert_eq!(parse_tsg("notes", &text), None);
+
+        // A topic can be a guide and Microsoft 365 content at once.
+        let tsg = Tsg {
+            topic: "api-down".into(),
+            monitor: Some("api-health".into()),
+            matches: Some("refused".into()),
+            fix: "restart".into(),
+            verify: None,
+            status: "active".into(),
+        };
+        let guide = with_mark(&tsg.render("# API down\nRestart it."), &labels);
+        kb.write("api-down", &guide, "").unwrap();
+        let text = kb.read("api-down").unwrap();
+        assert_eq!(parse_mark(&text), Some(labels.clone()));
+        assert_eq!(kb.tsgs(), std::slice::from_ref(&tsg));
+        assert!(text.contains("---\n# API down\nRestart it."), "{text}");
+        let again = with_mark(&text, &["Public".to_owned()]);
+        assert_eq!(parse_mark(&again), Some(vec!["Public".to_owned()]));
+        assert_eq!(parse_tsg("api-down", &again), Some(tsg.clone()));
+        assert_eq!(again.matches("origin:").count(), 1, "{again}");
+
+        // What isn't marked.
+        assert_eq!(parse_mark(&tsg.render("x")), None);
+        assert_eq!(parse_mark("origin: workiq\nlabels: A"), None);
+        assert_eq!(parse_mark("---\norigin: other\nlabels: A\n---\nx"), None);
+        assert_eq!(parse_mark("---\norigin: workiq\n---\nx"), Some(vec![]));
+
+        let listed = kb.list();
+        assert_eq!(listed[0].workiq, Some(labels.clone()));
+        assert_eq!(kb.marks(&["notes".into(), "api-down".into()]), Some(labels));
+        assert_eq!(kb.marks(&["missing".into()]), None);
     }
 }

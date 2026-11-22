@@ -240,6 +240,7 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
         tasks_per_hour: 100,
         access: Access::ReadOnly,
         shares: vec!["data".into()],
+        m365: None,
     };
     let mut worker = AgentConfig::new("worker", worker_key.clone());
     worker.network = Network::Local;
@@ -825,6 +826,7 @@ async fn mcp_clients_follow_a_task_with_progress_notifications() {
         tasks_per_hour: 100,
         access: Access::ReadOnly,
         shares: vec!["data".into()],
+        m365: None,
     };
     let mut worker = AgentConfig::new("slowworker", worker_key.clone());
     worker.network = Network::Local;

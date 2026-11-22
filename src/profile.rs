@@ -185,6 +185,31 @@ pub struct WorkIqAccount {
     pub added: u64,
 }
 
+/// Most Work IQ calls a day, when the profile sets none.
+pub const DEFAULT_WORKIQ_CALLS_PER_DAY: u32 = 200;
+/// Most Work IQ calls in one run, when the profile sets none.
+pub const DEFAULT_WORKIQ_CALLS_PER_RUN: u32 = 25;
+
+/// A profile's Work IQ call budgets (see docs/work-iq.md, section 9). A limit that is not
+/// set has its default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkIqBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls_per_day: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls_per_run: Option<u32>,
+}
+
+impl WorkIqBudget {
+    pub fn per_day(&self) -> u32 {
+        self.calls_per_day.unwrap_or(DEFAULT_WORKIQ_CALLS_PER_DAY)
+    }
+
+    pub fn per_run(&self) -> u32 {
+        self.calls_per_run.unwrap_or(DEFAULT_WORKIQ_CALLS_PER_RUN)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,6 +242,10 @@ pub struct ProfileConfig {
     /// For a digital worker: its owner turned on its use of the owner's Work IQ account.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workiq_from_owner: bool,
+    /// Limits on the Work IQ calls this profile makes. Kept apart from the account so they
+    /// survive signing out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workiq_budget: Option<WorkIqBudget>,
 }
 
 /// Held while an agent runs with a profile, so a profile runs in one agent at a

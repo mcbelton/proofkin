@@ -160,7 +160,9 @@ local.
 - **Origin**: content from Work IQ is marked, and so is everything made from it: a step that
   got work context or used the gateway, its output, a `@workiq` step's answer, and a
   knowledge topic imported or saved from them (front matter `origin: workiq` and `labels:`).
-  Dependents (`after`) and `context=` inherit the mark.
+  Dependents (`after`) and `context=` inherit the mark. A step's mark is the union of the
+  labels it got (`Step.m365`; the `workiq=` option and `@workiq` steps set the same field);
+  a mark without labels counts as `unlabeled`.
 - **Checked twice**: the plan check fails a step that would send marked content to a peer
   without a grant, or above its labels, naming the step, the peer and the grant to add. The
   runner checks again when it sends each task, and filters by labels then.
@@ -234,8 +236,10 @@ skills and plugins with Work IQ's `discover` and add them through the usual plug
 Every call is a line in `<profile>/workiq-audit.jsonl`: time, tool, purpose (a run's step,
 knowledge import, a gateway task, doctor), audience, the query's SHA-256 and length (not its
 text), outcome class, results and withheld counts, labels, request and correlation ids, and
-duration. Budgets in `profile.json` (`workiq.calls_per_day`, default 200;
-`workiq.calls_per_run`, default 25) stop calls with a clear error. The web UI shows today's
+duration. Budgets in `profile.json` (`workiq_budget.calls_per_day`, default 200;
+`workiq_budget.calls_per_run`, default 25) stop calls with a clear error before they are
+sent, and the call is audited as refused; `proofkin workiq usage` and `proofkin workiq
+budget` show and change them. The web UI shows today's
 use.
 
 ### 10. Diagnostics and the web UI
