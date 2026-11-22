@@ -814,8 +814,9 @@
     {
       "id": "INT-1",
       "area": "integrations",
-      "claim": "Other agents connect over MCP (Streamable HTTP: the stateless 2026-07-28 revision, whose headers must match the body, with server/discover; and the initialize-based revisions before it) with the profile's integration token: off until the owner turns it on, valid only for MCP and A2A (and the web UI's token not there), refused from other sites' pages, and dead as soon as it's turned off. Their tools list peers, delegate tasks to peers (never this machine), check and run plans and return their evidence reports, and their work shows up as the owner's tasks; what they send is size-capped, and only the latest finished tasks are kept (the oldest go first, a plan's steps together).",
+      "claim": "Other agents connect over MCP (Streamable HTTP: the stateless 2026-07-28 revision, whose headers must match the body, with server/discover; and the initialize-based revisions before it) with the profile's integration token: off until the owner turns it on, valid only for MCP and A2A (and the web UI's token not there), refused from other sites' pages, and dead as soon as it's turned off. Their       tools list peers, delegate tasks to peers (never this machine), check and run plans and return their evidence reports, and their work shows up as the owner's tasks; a delegate, run_plan or get_task call that waits and comes with a progress token and Accept: text/event-stream is answered as a stream of notifications/progress (the work's status each time it changes, with an increasing progress) and then its result, on both revisions, while any other request gets one JSON body; what they send is size-capped, and only the latest finished tasks are kept (the oldest go first, a plan's steps together).",
       "tests": [
+              "connect::mcp_clients_follow_a_task_with_progress_notifications",
         "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a",
         "lib::ui::connect::secrets_compare_whole_and_headers_decode",
         "lib::ui::the_oldest_finished_tasks_go_first_and_a_plans_steps_together",

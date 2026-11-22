@@ -1476,6 +1476,17 @@ version in each request's `_meta`, which the `MCP-Protocol-Version`, `Mcp-Method
 `Mcp-Name` headers must match; `server/discover`) and the `initialize`-based revisions
 2025-03-26 to 2025-11-25. It keeps no sessions, so `GET /mcp` answers 405.
 
+**MCP progress:** a `tools/call` of `delegate`, `run_plan` or `get_task` that waits
+(`wait_seconds` above 0, 30 if left out) and has a progress token (`params._meta.progressToken`,
+a string or a number) and `text/event-stream` in its `Accept` header is answered as a
+Server-Sent Events stream, on both revisions. Each time the work's status changes (its state,
+or what a step's peer says it is doing, e.g. `Running on worker: running check test`) the
+server sends `notifications/progress` with your `progressToken`, an increasing `progress`
+(1, 2, 3...) and the status as `message`. Last comes the tool call's response, the same
+result as without streaming, and the stream closes; if `wait_seconds` runs out first, the
+response says the work is still running (call `get_task`). Every other request gets one JSON
+body, as before.
+
 **A2A 1.0:** `SendMessage` with the work as text (a plan if it parses as one, else a task
 for a peer; say where in the message's `metadata` or a data part: `peer`, `folder`,
 `provider`, `mcp`, and `kind` to force `task` or `plan`). It waits for the result unless
