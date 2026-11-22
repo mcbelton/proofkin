@@ -1263,6 +1263,10 @@
         "bridge::sends_task_fields_and_returns_text",
         "bridge::claude_tool_policy_confines_paths_and_tools",
         "ui::ui_requires_token_and_local_host_and_runs_tasks"
+      ],
+      "live": [
+        "worker1 result back at boss",
+        "boss's plan ran a dependent step with its prerequisite's result"
       ]
     },
     {
