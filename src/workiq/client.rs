@@ -762,18 +762,27 @@ impl Client {
         })
     }
 
-    /// Cited search over Microsoft 365.
+    /// Cited search over Microsoft 365. `strategy` is `grounding` (Work IQ's default when
+    /// `None`) or `copilot`; `capabilities` are Work IQ capability names (`Email`, `Meetings`,
+    /// `OneDriveAndSharePoint`, `TeamsMessages`, `People`, `GraphConnectors`), none for all.
     pub async fn retrieve(
         &self,
         query: &str,
-        strategy: &str,
+        strategy: Option<&str>,
         capabilities: &[&str],
     ) -> Result<ToolResult> {
-        self.call_offered(
-            "retrieve",
-            json!({ "query": query, "strategy": strategy, "capabilities": capabilities }),
-        )
-        .await
+        let mut arguments = json!({ "query": query });
+        if let Some(strategy) = strategy {
+            arguments["strategy"] = json!(strategy);
+        }
+        if !capabilities.is_empty() {
+            let capabilities: Vec<Value> = capabilities
+                .iter()
+                .map(|name| json!({ "name": name }))
+                .collect();
+            arguments["capabilities"] = json!(capabilities);
+        }
+        self.call_offered("retrieve", arguments).await
     }
 
     /// An answer from Microsoft 365 Copilot, or from the declarative agent `agent_id`.
@@ -793,8 +802,10 @@ impl Client {
         self.call_offered("ask", arguments).await
     }
 
-    pub async fn fetch(&self, paths: &[&str]) -> Result<ToolResult> {
-        self.call_offered("fetch", json!({ "paths": paths })).await
+    /// Entities by their Work IQ paths (Microsoft Graph paths such as `/me/messages`).
+    pub async fn fetch(&self, entity_urls: &[&str]) -> Result<ToolResult> {
+        self.call_offered("fetch", json!({ "entityUrls": entity_urls }))
+            .await
     }
 
     pub async fn list_agents(&self) -> Result<ToolResult> {
@@ -1426,7 +1437,11 @@ mod tests {
         let (_fake, url) = start().await;
         let client = client(&url);
         let result = client
-            .retrieve("budget", "grounding", &["email", "files"])
+            .retrieve(
+                "budget",
+                Some("grounding"),
+                &["Email", "OneDriveAndSharePoint"],
+            )
             .await
             .unwrap();
 
@@ -1436,7 +1451,21 @@ mod tests {
         assert_eq!(call["name"], "retrieve");
         assert_eq!(call["arguments"]["query"], "budget");
         assert_eq!(call["arguments"]["strategy"], "grounding");
-        assert_eq!(call["arguments"]["capabilities"], json!(["email", "files"]));
+        assert_eq!(
+            call["arguments"]["capabilities"],
+            json!([{ "name": "Email" }, { "name": "OneDriveAndSharePoint" }])
+        );
+
+        let plain = client.retrieve("budget", None, &[]).await.unwrap();
+        assert_eq!(
+            plain.structured_content.unwrap()["arguments"],
+            json!({ "query": "budget" })
+        );
+        let fetched = client.fetch(&["/me/events"]).await.unwrap();
+        assert_eq!(
+            fetched.structured_content.unwrap()["arguments"],
+            json!({ "entityUrls": ["/me/events"] })
+        );
     }
 
     #[tokio::test]
@@ -1595,6 +1624,10 @@ mod tests {
         }
     }
 
+    /// The request timeout of [`run_with`]'s client, and a reply delay beyond it.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    const TIMED_OUT_MS: u64 = 7_000;
+
     async fn run(tool: &str, canned: Vec<Canned>) -> Run {
         run_with(tool, canned, false).await
     }
@@ -1608,7 +1641,9 @@ mod tests {
             refreshes: AtomicUsize::new(0),
             refresh_fails: AtomicBool::new(refresh_fails),
         });
-        let transport = HttpTransport::with_timeout(&url, Duration::from_millis(1500)).unwrap();
+        // Long enough that a request to the local fake server never times out under a loaded
+        // test run; the timeout tests delay their reply beyond it.
+        let transport = HttpTransport::with_timeout(&url, TEST_TIMEOUT).unwrap();
         let client = Client::with_transport(Arc::new(transport), tokens.clone())
             .with_sleeper(recorder.clone());
         let outcome = client.call_tool(tool, json!({})).await;
@@ -1853,7 +1888,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_that_timed_out_is_retried() {
-        let run = run("retrieve", vec![Canned::ok().delayed(3000), Canned::ok()]).await;
+        let run = run(
+            "retrieve",
+            vec![Canned::ok().delayed(TIMED_OUT_MS), Canned::ok()],
+        )
+        .await;
 
         assert!(run.outcome.is_ok());
         assert_eq!(run.sent(), 2);
@@ -1871,9 +1910,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_change_that_timed_out_is_sent_exactly_once_and_reported_uncertain() {
-        for tool in CHANGE_TOOLS {
-            let run = run(tool, vec![Canned::ok().delayed(3000), Canned::ok()]).await;
-
+        // At once, so the test waits for one timeout rather than one per tool.
+        let runs = futures_util::future::join_all(
+            CHANGE_TOOLS
+                .map(|tool| run(tool, vec![Canned::ok().delayed(TIMED_OUT_MS), Canned::ok()])),
+        )
+        .await;
+        for (tool, run) in CHANGE_TOOLS.into_iter().zip(runs) {
             assert_eq!(run.sent(), 1, "{tool}");
             assert!(run.slept().is_empty(), "{tool}");
             let error = run.error();
