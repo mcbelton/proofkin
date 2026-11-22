@@ -108,6 +108,10 @@ enum Command {
     /// Sign a profile in to GitHub (an account of the GitHub CLI) for repositories.
     #[command(subcommand)]
     Github(GithubCommand),
+    /// Models: each provider's default model (tasks that name none run on it) and the
+    /// models tasks may ask for. Peers learn them when they connect.
+    #[command(subcommand)]
+    Models(ModelsCommand),
     /// Link GitHub repositories: clone, share with peers, sync, open pull requests.
     #[command(subcommand)]
     Repo(RepoCommand),
@@ -411,6 +415,44 @@ enum GithubCommand {
         profile: ProfileArg,
     },
     Logout {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCommand {
+    /// The models each provider the profile is signed in to offers it (Copilot lists
+    /// them), with the default and the allowed ones marked.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Set the model tasks that name none run on (`none`: the provider's own default).
+    #[command(after_help = "\
+examples:
+  proofkin models default copilot claude-sonnet-5.5 --profile worker
+  proofkin models default claude none --profile worker")]
+    Default {
+        #[arg(value_enum)]
+        provider: Provider,
+        /// A model's name (see `models list`), or `none`.
+        model: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Set the models tasks may ask for: a comma-separated list, or `any`. A task asking
+    /// for another is refused, and with a list tasks that name none run on the default,
+    /// else the first in the list.
+    #[command(after_help = "\
+examples:
+  proofkin models allow copilot claude-sonnet-5.5,gpt-5.5 --profile worker
+  proofkin models allow copilot any --profile worker")]
+    Allow {
+        #[arg(value_enum)]
+        provider: Provider,
+        #[arg(value_delimiter = ',', required = true)]
+        models: Vec<String>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1414,6 +1456,7 @@ async fn main() -> Result<()> {
         Some(Command::Spec(command)) => run_spec(command),
         Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command).await,
+        Some(Command::Models(command)) => run_models(command).await,
         Some(Command::Repo(command)) => run_repo(command).await,
         Some(Command::Tracker(command)) => run_tracker(command).await,
         Some(Command::Monitor(command)) => run_monitor(command),
@@ -2036,6 +2079,138 @@ async fn device_flow(
         eprintln!("{note}");
     }
     Ok(ended)
+}
+
+/// What `provider`'s models are set to, in words.
+fn describe_models(choice: &proofkin::models::ModelChoice) -> String {
+    let default = match (&choice.default, choice.allowed.first()) {
+        (Some(model), _) => format!("tasks that name no model run on {model}"),
+        (None, Some(first)) => {
+            format!("tasks that name no model run on {first} (the first allowed)")
+        }
+        (None, None) => "tasks that name no model run on the provider's own default".to_owned(),
+    };
+    let allowed = if choice.allowed.is_empty() {
+        "any model may be asked for".to_owned()
+    } else {
+        format!("only {} may be asked for", choice.allowed.join(", "))
+    };
+    format!("{default}; {allowed}")
+}
+
+async fn run_models(command: ModelsCommand) -> Result<()> {
+    use proofkin::models::{choice, set_allowed, set_default};
+    let apply_note = |profile: &Profile| {
+        if profile.is_running() {
+            println!(
+                "(its agent is running: restart it to apply; peers learn them when they connect)"
+            );
+        }
+    };
+    match command {
+        ModelsCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let accounts = profile.account_profile()?;
+            let mut any = false;
+            for provider in [Provider::Copilot, Provider::Claude, Provider::Codex] {
+                if !accounts.is_configured(provider) {
+                    continue;
+                }
+                any = true;
+                let set = choice(&profile.config.models, provider);
+                println!("{provider}: {}", describe_models(&set));
+                if provider != Provider::Copilot {
+                    println!("  (its SDK takes any model name it knows; there is no list to show)");
+                    continue;
+                }
+                let backend =
+                    proofkin::llm::CopilotBackend::start(profile.copilot_credentials()?).await?;
+                let offered = backend.list_models().await;
+                backend.stop().await;
+                let offered = offered?;
+                let width = offered.iter().map(|m| m.id.len()).max().unwrap_or(0);
+                for m in &offered {
+                    let mut marks = Vec::new();
+                    if set
+                        .default
+                        .as_deref()
+                        .is_some_and(|d| d.eq_ignore_ascii_case(&m.id))
+                    {
+                        marks.push("default");
+                    }
+                    if !set.allowed.is_empty() {
+                        marks.push(if set.allows(&m.id) {
+                            "allowed"
+                        } else {
+                            "not allowed"
+                        });
+                    }
+                    let mut about = vec![m.name.clone()];
+                    about.extend(m.vendor.clone());
+                    about.extend(m.multiplier.map(|x| format!("{x}x")));
+                    about.extend(m.policy.as_ref().map(|p| format!("policy: {p}")));
+                    println!(
+                        "  {:width$}  {}{}",
+                        m.id,
+                        about.join(" · "),
+                        if marks.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  [{}]", marks.join(", "))
+                        }
+                    );
+                }
+                for missing in set
+                    .allowed
+                    .iter()
+                    .chain(&set.default)
+                    .filter(|a| !offered.iter().any(|m| m.id.eq_ignore_ascii_case(a)))
+                {
+                    println!("  {missing}: set here, but not offered to this Copilot account");
+                }
+            }
+            if !any {
+                println!(
+                    "profile '{}' isn't signed in to a provider: proofkin auth login <provider> --profile {}",
+                    profile.name, profile.name
+                );
+            }
+        }
+        ModelsCommand::Default {
+            provider,
+            model,
+            profile,
+        } => {
+            let mut profile = Profile::open(&profile.name)?;
+            let model = Some(model.trim()).filter(|m| !m.eq_ignore_ascii_case("none"));
+            set_default(&mut profile.config.models, provider, model)?;
+            profile.save()?;
+            println!(
+                "profile '{}': {provider}: {}",
+                profile.name,
+                describe_models(&choice(&profile.config.models, provider))
+            );
+            apply_note(&profile);
+        }
+        ModelsCommand::Allow {
+            provider,
+            models,
+            profile,
+        } => {
+            let mut profile = Profile::open(&profile.name)?;
+            let any = models.len() == 1 && models[0].trim().eq_ignore_ascii_case("any");
+            let list = if any { Vec::new() } else { models };
+            set_allowed(&mut profile.config.models, provider, &list)?;
+            profile.save()?;
+            println!(
+                "profile '{}': {provider}: {}",
+                profile.name,
+                describe_models(&choice(&profile.config.models, provider))
+            );
+            apply_note(&profile);
+        }
+    }
+    Ok(())
 }
 
 async fn run_github(command: GithubCommand) -> Result<()> {
@@ -4039,6 +4214,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.trust = profile.trust()?;
         config.owner = profile.config.owner.clone();
         config.role = profile.config.role.clone();
+        config.models = profile.config.models.clone();
         config.worktrees_dir = profile.worktrees_dir();
         if let Some(secs) =
             proofkin::profile::env_setting("TASK_GRACE_SECS").and_then(|v| v.parse::<u64>().ok())

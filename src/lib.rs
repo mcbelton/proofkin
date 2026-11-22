@@ -15,6 +15,7 @@ pub mod github;
 pub mod knowledge;
 pub mod llm;
 pub mod mcp;
+pub mod models;
 pub mod ops;
 pub mod plan;
 pub mod playbooks;

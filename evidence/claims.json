@@ -1264,6 +1264,20 @@
         "bridge::claude_tool_policy_confines_paths_and_tools",
         "ui::ui_requires_token_and_local_host_and_runs_tasks"
       ]
+    },
+    {
+      "id": "MDL-2",
+      "area": "models",
+      "claim": "A profile's owner sets each provider's default model and the models tasks may ask for (proofkin models default <provider> <model>|none and models allow <provider> <list>|any), kept in profile.json and left out when unset. A default must be allowed; with a list and no default, tasks that name none run on the first in the list. models list prints the models Copilot offers the account and marks the default and the allowed ones. A task that names no model runs on the default, an agent's executor limits Copilot sessions to the list, and its hello tells peers the defaults and lists of the providers it serves (older peers' hellos read as saying nothing), cleaned of malformed names. An agent definition's model: is kept (inherit and names that aren't model names are left out).",
+      "tests": [
+        "lib::models::a_default_must_be_allowed_and_allowing_keeps_the_default",
+        "lib::models::a_task_runs_on_the_model_it_asks_for_if_allowed_else_the_default",
+        "lib::models::settings_round_trip_in_profile_json_and_are_left_out_when_unset",
+        "lib::models::what_copilot_says_about_a_model_is_read_leniently",
+        "lib::protocol::hello_with_addresses_round_trips",
+        "lib::skills::agent_files_name_their_skills_and_mcp_servers_in_any_list_form",
+        "agents::owners_set_the_default_model_and_which_ones_tasks_may_ask_for"
+      ]
     }
   ]
 }

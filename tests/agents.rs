@@ -49,11 +49,13 @@ impl Executor for FakeExecutor {
     }
 
     async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<Ran> {
-        // "which model": the provider says which model answered (the others don't).
-        let model = task
-            .prompt
-            .ends_with("which model")
-            .then(|| "fake-model-7".to_owned());
+        // The model it ran on, as a provider says; "which model": a provider that says
+        // which model answered a task that named none.
+        let model = task.model.clone().or_else(|| {
+            task.prompt
+                .ends_with("which model")
+                .then(|| "fake-model-7".to_owned())
+        });
         Ok(Ran::new(self.answer(task, ctx).await?, model))
     }
 }
@@ -127,6 +129,8 @@ struct Node {
     /// How long its tasks wait for a dropped peer (short, so tests don't wait long).
     grace: Duration,
     team: Option<Arc<proofkin::team::TeamRunner>>,
+    /// Its providers' default models and the ones tasks may ask for.
+    models: proofkin::models::Models,
 }
 
 impl Node {
@@ -143,6 +147,7 @@ impl Node {
             role: None,
             grace: Duration::from_secs(2),
             team: None,
+            models: Default::default(),
         }
     }
 
@@ -182,6 +187,7 @@ impl Node {
         config.shares = self.shares;
         config.owner = self.owner;
         config.role = self.role;
+        config.models = self.models;
         config.task_grace = self.grace;
         config.team = self.team;
         config.worktrees_dir = std::env::temp_dir()
@@ -569,6 +575,58 @@ async fn the_worker_says_which_model_did_the_work() {
     let plan = Plan::parse("a @worker which model").unwrap();
     let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
     assert_eq!(states["a"].model(), Some("fake-model-7"));
+}
+
+#[tokio::test]
+async fn owners_set_the_default_model_and_which_ones_tasks_may_ask_for() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    proofkin::models::set_allowed(
+        &mut worker.models,
+        Provider::Copilot,
+        &["fake-small".into(), "fake-big".into()],
+    )
+    .unwrap();
+    proofkin::models::set_default(&mut worker.models, Provider::Copilot, Some("fake-big")).unwrap();
+    // Models of a provider it doesn't serve aren't told.
+    proofkin::models::set_default(&mut worker.models, Provider::Claude, Some("x")).unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    // Peers learn them from the worker's hello.
+    let peer = boss.peers().into_iter().next().unwrap();
+    assert_eq!(peer.models.keys().collect::<Vec<_>>(), [&Provider::Copilot]);
+    assert_eq!(
+        peer.models[&Provider::Copilot].default.as_deref(),
+        Some("fake-big")
+    );
+    assert_eq!(
+        peer.models[&Provider::Copilot].allowed,
+        ["fake-small", "fake-big"]
+    );
+    // A task that names no model runs on the default.
+    let plain = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(plain.model.as_deref(), Some("fake-big"));
+    // One that asks for an allowed model runs on it.
+    let mut small = LlmTask::new(Provider::Copilot, "hello");
+    small.model = Some("fake-small".into());
+    let done = boss.delegate_verified(worker.id(), small).await.unwrap();
+    assert_eq!(done.model.as_deref(), Some("fake-small"));
+    // Another is refused (so a squad step can go to another member), naming the allowed.
+    let mut other = LlmTask::new(Provider::Copilot, "hello");
+    other.model = Some("o9".into());
+    let refused = boss.delegate_verified(worker.id(), other).await.unwrap();
+    assert!(refused.refused && !refused.ok, "{refused:?}");
+    assert_eq!(
+        refused.output,
+        "worker refused the task: o9 isn't a model allowed here: fake-small, fake-big"
+    );
 }
 
 #[tokio::test]

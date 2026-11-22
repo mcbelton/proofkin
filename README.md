@@ -325,6 +325,27 @@ proofkin auth logout workiq --profile me   # removes the Work IQ account and its
 
 `auth status` also shows each profile's Work IQ account: user, tenant and connection.
 
+### Models
+
+Unless a task names a model, each provider runs on its own default (Copilot's is whatever
+the CLI picks for the account). A profile's owner can set each provider's **default model**
+and **which models tasks may ask for**:
+
+```powershell
+proofkin models list --profile worker1                     # Copilot lists the models the account may use
+proofkin models allow copilot claude-sonnet-5.5,gpt-6-sol --profile worker1
+proofkin models default copilot claude-sonnet-5.5 --profile worker1
+proofkin models default copilot none --profile worker1     # back to the provider's own
+proofkin models allow copilot any --profile worker1        # any model again
+```
+
+A default must be one of the allowed models. With a list and no default, tasks that name
+none run on the first in the list (a provider's own default may not be allowed). A task
+asking for another model is refused, with the ones allowed, so a squad step can go to
+another member; Copilot sessions are also limited to the list. Peers learn the defaults and
+the lists from the agent's hello when they connect. The settings are kept in
+`profile.json`; a running agent uses them once it restarts.
+
 ### Example: two workers on two accounts
 
 ```powershell
@@ -1511,7 +1532,7 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
-`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long

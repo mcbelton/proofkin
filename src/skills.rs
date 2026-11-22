@@ -294,6 +294,10 @@ pub struct AgentDef {
     pub skills: Vec<String>,
     pub mcp: Vec<String>,
     pub instructions: String,
+    /// The model its file names (`model:`), for steps with it that name none (if their
+    /// peer allows it); `inherit`, and names that aren't model names, are left out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// `profile` or `plugin`.
     pub source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -338,9 +342,15 @@ pub fn parse_agent(text: &str, fallback: &str) -> Result<AgentDef> {
             "its tools list is left out: what a step may do is set by the folder's owner".into(),
         );
     }
-    if fields.contains_key("model") {
-        notes.push("its model is left out: the peer picks its model".into());
-    }
+    let model = match one("model").trim() {
+        "" => None,
+        m if m.eq_ignore_ascii_case("inherit") => None,
+        m if crate::models::check_name(m).is_ok() => Some(m.to_owned()),
+        m => {
+            notes.push(format!("its model {m:?} isn't a model name: left out"));
+            None
+        }
+    };
     let instructions = body.trim().to_owned();
     if instructions.is_empty() {
         bail!("agent '{name}' has no instructions after its front matter");
@@ -351,6 +361,7 @@ pub fn parse_agent(text: &str, fallback: &str) -> Result<AgentDef> {
         skills,
         mcp,
         instructions,
+        model,
         source: "profile",
         plugin: None,
         notes,
@@ -840,10 +851,17 @@ mod tests {
             )
         );
         assert_eq!(def.instructions, "Be careful.");
+        // Its model is kept, for steps with it that name none.
+        assert_eq!(def.model.as_deref(), Some("sonnet"));
+        assert!(def.notes.is_empty(), "{:?}", def.notes);
+        let inherit = parse_agent("---\nmodel: inherit\n---\nHi", "x").unwrap();
+        assert_eq!(inherit.model, None);
+        let odd = parse_agent("---\nmodel: \"two words\"\n---\nHi", "x").unwrap();
+        assert_eq!(odd.model, None);
         assert!(
-            def.notes[0].contains("model is left out"),
+            odd.notes[0].contains("isn't a model name"),
             "{:?}",
-            def.notes
+            odd.notes
         );
         assert!(
             parse_agent("---\nname: x\n---\n", "x").is_err(),

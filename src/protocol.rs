@@ -32,6 +32,10 @@ pub enum Message {
         /// What this agent is for, as set by its owner.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
+        /// Per provider it serves: the model tasks that name none run on, and the models
+        /// tasks may ask for (left out when unset; older peers don't send it).
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        models: crate::models::Models,
     },
     Peers {
         addrs: Vec<EndpointAddr>,
@@ -345,6 +349,14 @@ mod tests {
     fn hello_with_addresses_round_trips() {
         let id = iroh::SecretKey::generate().public();
         let addr = EndpointAddr::new(id).with_ip_addr("127.0.0.1:4000".parse().unwrap());
+        let mut models = crate::models::Models::new();
+        models.insert(
+            Provider::Claude,
+            crate::models::ModelChoice {
+                default: Some("claude-sonnet-5.5".into()),
+                allowed: vec!["claude-sonnet-5.5".into(), "claude-opus-5.5".into()],
+            },
+        );
         let msg = Message::Hello {
             name: "a".into(),
             addr,
@@ -352,8 +364,19 @@ mod tests {
             shares: Vec::new(),
             owner: Some("alice".into()),
             role: None,
+            models,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
+        // An older peer's hello has no models: it reads as saying nothing about them.
+        let older = json.replace(
+            r#","models":{"claude":{"default":"claude-sonnet-5.5","allowed":["claude-sonnet-5.5","claude-opus-5.5"]}}"#,
+            "",
+        );
+        assert_ne!(older, json);
+        let Message::Hello { models, .. } = serde_json::from_str(&older).unwrap() else {
+            panic!("a hello");
+        };
+        assert!(models.is_empty());
     }
 }

@@ -274,6 +274,8 @@ pub struct SdkExecutor {
     providers: Vec<Provider>,
     /// The profile's role, given to the model with every task.
     role: Option<String>,
+    /// The profile's models per provider: the default and the ones tasks may ask for.
+    models: crate::models::Models,
     copilot: Option<CopilotBackend>,
     bridge: Option<Bridge>,
     accounts: Vec<(Provider, String)>,
@@ -319,6 +321,7 @@ impl SdkExecutor {
         Ok(Arc::new(Self {
             providers,
             role: profile.config.role.clone(),
+            models: profile.config.models.clone(),
             copilot,
             bridge,
             accounts,
@@ -328,6 +331,14 @@ impl SdkExecutor {
     /// Account each enabled provider is signed in as.
     pub fn accounts(&self) -> &[(Provider, String)] {
         &self.accounts
+    }
+
+    /// The models this agent's Copilot account may use (none without Copilot).
+    pub async fn copilot_models(&self) -> Result<Vec<crate::models::Offered>> {
+        match &self.copilot {
+            Some(copilot) => copilot.list_models().await,
+            None => Ok(Vec::new()),
+        }
     }
 }
 
@@ -348,6 +359,9 @@ impl Executor for SdkExecutor {
             bail!("Codex tasks can't use MCP servers here; use Copilot or Claude");
         }
         let mut task = with_role(self.role.as_deref(), task);
+        // The model it asked for, if this agent's owner allows it; else the default.
+        let choice = crate::models::choice(&self.models, task.provider);
+        task.model = choice.pick(task.model.as_deref())?;
         if !ctx.mcp.is_empty() {
             // MCP results reach the model as external content: the rule always leads.
             let names: Vec<String> = ctx.mcp.keys().cloned().collect();
@@ -370,7 +384,7 @@ impl Executor for SdkExecutor {
                     self.copilot
                         .as_ref()
                         .expect("enabled")
-                        .run(task, ctx.access, &ctx.workspace, &ctx.mcp)
+                        .run(task, ctx.access, &ctx.workspace, &ctx.mcp, &choice.allowed)
                         .await
                 }
                 Provider::Claude | Provider::Codex => {

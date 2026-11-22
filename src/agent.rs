@@ -63,6 +63,9 @@ pub struct AgentConfig {
     pub owner: Option<String>,
     /// What this agent is for, shown to peers.
     pub role: Option<String>,
+    /// Its providers' models: the defaults and the ones tasks may ask for, told to peers
+    /// (and, see [`crate::models`], the reason a task asking for another is refused).
+    pub models: crate::models::Models,
     /// Where per-task git worktrees are created (folders shared with `--worktrees`).
     pub worktrees_dir: PathBuf,
     /// Runs the team plans of team steps peers hand this agent (none: it refuses them).
@@ -84,6 +87,7 @@ impl AgentConfig {
             shares: ShareStore::default(),
             owner: None,
             role: None,
+            models: crate::models::Models::new(),
             worktrees_dir: std::env::temp_dir().join("proofkin-worktrees"),
             team: None,
             task_grace: TASK_GRACE,
@@ -244,6 +248,9 @@ pub struct PeerInfo {
     pub role: Option<String>,
     /// How busy it says it is (newer peers report it).
     pub load: Option<PeerLoad>,
+    /// Its providers' default models and the ones tasks may ask for (empty: it didn't
+    /// say, as older peers don't, or any model).
+    pub models: crate::models::Models,
 }
 
 struct PeerHandle {
@@ -255,6 +262,7 @@ struct PeerHandle {
     owner: Option<String>,
     role: Option<String>,
     load: Option<PeerLoad>,
+    models: crate::models::Models,
     tx: mpsc::UnboundedSender<Message>,
     close: Arc<Notify>,
 }
@@ -403,6 +411,7 @@ struct Inner {
     shares: Mutex<ShareStore>,
     owner: Option<String>,
     role: Option<String>,
+    models: crate::models::Models,
     task_slots: Semaphore,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
@@ -471,6 +480,7 @@ impl Agent {
             shares: Mutex::new(config.shares),
             owner: config.owner,
             role: config.role,
+            models: config.models,
             task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -579,6 +589,7 @@ impl Agent {
                 owner: p.owner.clone(),
                 role: p.role.clone(),
                 load: p.load,
+                models: p.models.clone(),
             })
             .collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1104,6 +1115,16 @@ impl Inner {
             .unwrap_or_default()
     }
 
+    /// The models of the providers this agent serves, as its hello tells peers.
+    fn models_offered(&self) -> crate::models::Models {
+        let serves = self.capabilities();
+        self.models
+            .iter()
+            .filter(|(p, _)| serves.contains(p))
+            .map(|(p, c)| (*p, c.clone()))
+            .collect()
+    }
+
     fn is_trusted(&self, id: &EndpointId) -> bool {
         self.trust.lock().unwrap().get(id).is_some()
     }
@@ -1504,6 +1525,13 @@ impl Inner {
         if !mcp.is_empty() && task.provider == Provider::Codex {
             bail!("Codex tasks can't use MCP servers; ask for copilot or claude");
         }
+        // The model it asks for must be one this agent's owner allows (a team step runs none).
+        if task.team.is_none()
+            && let Err(e) =
+                crate::models::choice(&self.models, task.provider).pick(task.model.as_deref())
+        {
+            bail!("{} refused the task: {e:#}", self.name);
+        }
         let now = Instant::now();
         let mut log = self.task_log.lock().unwrap();
         let recent = log.entry(*id).or_default();
@@ -1853,6 +1881,9 @@ impl Inner {
             .collect();
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();
+        // The model it asked for (allowed: checked when it was admitted), else the default.
+        prompt.model =
+            crate::models::choice(&self.models, task.provider).pick(task.model.as_deref())?;
         let mut results = Vec::<crate::evidence::CheckResult>::new();
         let (mut reports, mut used) = (Vec::<String>::new(), 0);
         let mut failed_before = Vec::<String>::new();
@@ -2025,6 +2056,23 @@ impl Inner {
     }
 }
 
+/// A peer's models as its hello says, kept only as far as they make sense: well-formed
+/// names, at most 50 per provider, and a default only if it is one of the allowed.
+fn clean_models(models: crate::models::Models) -> crate::models::Models {
+    let ok = |m: &String| crate::models::check_name(m).is_ok();
+    models
+        .into_iter()
+        .map(|(provider, choice)| {
+            let allowed: Vec<String> = choice.allowed.into_iter().filter(ok).take(50).collect();
+            let default = choice.default.filter(ok).filter(|d| {
+                allowed.is_empty() || allowed.iter().any(|m| m.eq_ignore_ascii_case(d))
+            });
+            (provider, crate::models::ModelChoice { default, allowed })
+        })
+        .filter(|(_, choice)| !choice.is_empty())
+        .collect()
+}
+
 async fn run_connection(
     inner: Arc<Inner>,
     conn: Connection,
@@ -2042,6 +2090,7 @@ async fn run_connection(
         shares: inner.shares_for(&peer_id),
         owner: inner.owner.clone(),
         role: inner.role.clone(),
+        models: inner.models_offered(),
     };
     write_message(&mut send, &hello).await?;
     let first = lines
@@ -2055,6 +2104,7 @@ async fn run_connection(
         shares,
         owner,
         role,
+        models,
     } = serde_json::from_str(&first)?
     else {
         bail!("expected hello, got {first}");
@@ -2081,6 +2131,7 @@ async fn run_connection(
         owner,
         role,
         load: None,
+        models: clean_models(models),
         tx: tx.clone(),
         close: close.clone(),
     };

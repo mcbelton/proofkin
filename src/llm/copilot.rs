@@ -181,15 +181,31 @@ impl CopilotBackend {
         let _ = self.client.stop().await;
     }
 
+    /// The models this account may use, as the Copilot CLI lists them.
+    pub async fn list_models(&self) -> Result<Vec<crate::models::Offered>> {
+        let models = self
+            .client
+            .list_models()
+            .await
+            .context("listing Copilot's models")?;
+        Ok(models
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .filter_map(|m| crate::models::Offered::from_json(&m))
+            .collect())
+    }
+
     /// Runs `task` in `workspace` with `access` (tools, permissions and sandbox follow
-    /// it) and the MCP servers `mcp`. The result names the models that answered, as
-    /// the CLI's usage events say (else the one the task asked for).
+    /// it) and the MCP servers `mcp`, on its model (if it names one) out of `allowed`
+    /// (empty: any). The result names the models that answered, as the CLI's usage
+    /// events say (else the one the task asked for).
     pub async fn run(
         &self,
         task: &LlmTask,
         access: Access,
         workspace: &Path,
         mcp: &BTreeMap<String, McpServer>,
+        allowed: &[String],
     ) -> Result<Ran> {
         let access = match (&self.sandbox, access) {
             (SandboxSupport::Unsupported(reason), Access::Full) => {
@@ -227,6 +243,10 @@ impl CopilotBackend {
         }
         if let Some(model) = &task.model {
             config = config.with_model(model.clone());
+        }
+        // The CLI keeps the session to these (an empty list would be refused: any).
+        if !allowed.is_empty() {
+            config = config.with_allowed_models(allowed.iter().cloned());
         }
         let session = Arc::new(
             self.client

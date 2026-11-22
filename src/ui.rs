@@ -404,6 +404,8 @@ impl Shared {
                     // How busy it says it is, with this agent's tasks there right now.
                     "load": p.load,
                     "mine": self.agent.pending_to(p.id),
+                    // Its providers' default models and the ones tasks may ask for.
+                    "models": p.models,
                 })
             })
             .collect();

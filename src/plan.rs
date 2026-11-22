@@ -3267,6 +3267,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let peers = vec![
             peer("alice", vec![share("app", Access::Full, &["test"], true)]),
@@ -3562,6 +3563,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let dir = tempfile::tempdir().unwrap();
         let kb = KnowledgeBase::new(dir.path().join("kb"));
@@ -3606,6 +3608,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let peers = vec![
             peer("alice", vec![Provider::Copilot], &["data", "code"]),
@@ -3893,6 +3896,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let mut trust = TrustStore::default();
         trust.allow(crate::trust::TrustedPeer {
@@ -4047,6 +4051,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let peers = vec![peer("open"), peer("plain"), peer("wide"), peer("helper")];
         let grants = [
@@ -4168,6 +4173,7 @@ mod tests {
             owner: None,
             role: None,
             load: None,
+            models: Default::default(),
         };
         let granted = |labels: &[&str]| {
             Some(M365Grant {
