@@ -724,12 +724,13 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
 | `team @lead:folder`, `levels=N` | Instead of a model, the lead's team does it, with the folder's team plan ([team steps](#team-steps-handing-work-down-a-level)). `levels=` (1 to 3, default 1) is how many levels down it may go. |
 | `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
+| `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue. |
 
 A step line is `name [after steps] [team] @peer[:folder] or #squad [options] what to do`: options
 go before the task text (the plan check warns about one typed after it, but not text in
 backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
-`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels` and `timeout` are given once.
+`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout` and `issue` are given once.
 
 **3. Agents do the work, and each result comes back with signed evidence.**
 
