@@ -2608,3 +2608,183 @@ async fn team_runs_show_on_the_bosss_step_and_the_leads_page() {
     lead.shutdown().await;
     member.shutdown().await;
 }
+
+/// A Work IQ that answers every search with `results` (the `structuredContent` of `retrieve`).
+#[derive(Debug)]
+struct SearchResults(Vec<Value>);
+
+#[async_trait]
+impl proofkin::workiq::context::WorkContext for SearchResults {
+    async fn retrieve(
+        &self,
+        _context: &proofkin::workiq::audit::CallContext,
+        _query: &str,
+        _strategy: &str,
+        _capabilities: &[&str],
+    ) -> anyhow::Result<proofkin::workiq::ToolResult> {
+        Ok(proofkin::workiq::ToolResult {
+            content: Vec::new(),
+            structured_content: Some(serde_json::json!({
+                "application/vnd.ms-workiq.retrieval": {
+                    "results": self.0,
+                    "stoppedReason": "completed",
+                }
+            })),
+            is_error: false,
+            ids: proofkin::workiq::RequestIds::default(),
+        })
+    }
+}
+
+fn found_file(id: &str, label: &str, text: &str, protection: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "markdown": text,
+        "entityType": "file",
+        "contentProtection": protection,
+        "sensitivityLabel": { "displayName": label },
+        "relevanceScore": 0.5,
+    })
+}
+
+/// A UI whose Work IQ answers with `results`: its profile, agent, port and token.
+async fn ui_with_work_results(
+    home: &std::path::Path,
+    results: Vec<Value>,
+) -> (Profile, Agent, u16, String) {
+    let profile = Profile::open_in(home, "owner").unwrap();
+    let mut config = AgentConfig::new("owner", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: profile.clone(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start_with_work(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+        Some(Arc::new(SearchResults(results))),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    (profile, agent, port.parse().unwrap(), token.to_owned())
+}
+
+async fn import_workiq(port: u16, token: Option<&str>, body: Value) -> Response {
+    let host = format!("127.0.0.1:{port}");
+    let body = body.to_string();
+    request(
+        port,
+        "POST",
+        "/api/kb/import/workiq",
+        &host,
+        token,
+        Some(&body),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn the_workiq_import_route_saves_a_marked_topic_and_needs_replace_to_overwrite() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, agent, port, token) = ui_with_work_results(
+        home.path(),
+        vec![
+            found_file("f1", "General", "Launch is in May.", "allowed"),
+            found_file("f2", "Confidential", "Budget is four million.", "allowed"),
+            found_file("f3", "General", "Hidden.", "blocked"),
+        ],
+    )
+    .await;
+    let token = Some(token.as_str());
+
+    let anonymous = import_workiq(port, None, serde_json::json!({})).await;
+    assert_eq!(anonymous.status, 401, "token-guarded");
+
+    let body = serde_json::json!({ "topic": "launch", "query": "the launch", "from": "files" });
+    let done = import_workiq(port, token, body).await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    let answer = done.json();
+    assert_eq!(answer["topic"], "launch");
+    assert_eq!(
+        (answer["kept"].as_u64(), answer["withheld"].as_u64()),
+        (Some(2), Some(1))
+    );
+    assert_eq!(
+        answer["labels"],
+        serde_json::json!(["Confidential", "General"])
+    );
+    let text = profile.knowledge().read("launch").unwrap();
+    assert_eq!(
+        proofkin::knowledge::parse_mark(&text),
+        Some(vec!["Confidential".to_owned(), "General".to_owned()])
+    );
+    assert!(text.contains("query: the launch\n"), "{text}");
+    assert!(text.contains("<!-- source: Work IQ retrieve -->"), "{text}");
+
+    let again = import_workiq(
+        port,
+        token,
+        serde_json::json!({ "topic": "launch", "query": "more" }),
+    )
+    .await;
+    assert_eq!(again.status, 400);
+    assert!(again.json()["error"].as_str().unwrap().contains("replace"));
+    assert_eq!(profile.knowledge().read("launch").unwrap(), text);
+
+    let replaced = import_workiq(
+        port,
+        token,
+        serde_json::json!({ "topic": "launch", "query": "more", "replace": true }),
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    let text = profile.knowledge().read("launch").unwrap();
+    assert!(text.contains("query: more\n"), "{text}");
+
+    let bad = import_workiq(
+        port,
+        token,
+        serde_json::json!({ "topic": "x", "query": "q", "from": "slack" }),
+    )
+    .await;
+    assert_eq!(bad.status, 400);
+    assert!(bad.json()["error"].as_str().unwrap().contains("slack"));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_workiq_import_route_writes_nothing_when_every_result_was_withheld() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, agent, port, token) = ui_with_work_results(
+        home.path(),
+        vec![found_file("f1", "General", "Hidden.", "blocked")],
+    )
+    .await;
+    let refused = import_workiq(
+        port,
+        Some(&token),
+        serde_json::json!({ "topic": "launch", "query": "q" }),
+    )
+    .await;
+    assert_eq!(refused.status, 400);
+    let error = refused.json()["error"].as_str().unwrap().to_owned();
+    assert!(
+        error.contains("1 in all") && error.contains("blocked"),
+        "{error}"
+    );
+    assert!(profile.knowledge().list().is_empty());
+    agent.shutdown().await;
+}

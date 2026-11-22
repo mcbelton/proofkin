@@ -1790,6 +1790,7 @@ function renderPalette() {
           part(`@${p.name}:${s.name}`, `${p.name}'s ${s.name} folder (${ACCESS_SHORT[s.access] ?? s.access})`)),
       ]),
       ...(state.squads ?? []).map((s) => part(`#${s.name}`, `Any online member of squad ${s.name}`)),
+      part("@workiq", "Your agent asks Microsoft 365 (Work IQ) itself: the answer is context, never proof"),
     ]),
     section("Checks and MCP servers", "What those folders' owners offer", [
       ...[...new Set(shares.flatMap((s) => s.checks ?? []))].map((c) =>

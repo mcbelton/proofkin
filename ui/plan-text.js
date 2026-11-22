@@ -9,19 +9,25 @@ const planText = (() => {
   // Step options (before what to do), by the option they set. Repeating a list
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
-    ["context", "context"], ["claims", "claims"], ["claim", "claims"]]);
+    ["context", "context"], ["claims", "claims"], ["claim", "claims"], ["workiq", "workiq"]]);
   const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue"]);
-  // A sign-off is a person's decision: no checks, retries, patches, saved result or agent.
-  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels"]);
+  // A sign-off is a person's decision: no checks, retries, patches, saved result, agent or search.
+  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq"]);
   // A team step is done and proven by the lead's team plan.
   const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent"]);
+  // A @workiq step asks Microsoft 365 for an answer: context, never proof. Its agent= is a Work IQ
+  // agent id; it has no skills, MCP servers, checks, claims, patches, folder or search of its own.
+  const WORKIQ = "@workiq";
+  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq"]);
   /// What a new step does until you say: selected, so typing replaces it (the plan
   /// check refuses to run it as is, see src/plan.rs).
   const TODO = "What to do";
   const ERRORS = {
     squadSignoff: "A sign-off needs a person (@name or @me), not a squad.",
-    signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result or agent.",
+    signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result, agent or Microsoft 365 search.",
     teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers or agent of its own.",
+    workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, patches, skills, MCP servers or search of its own.",
+    workiqKind: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it can't be a sign-off or a team step.",
     ownStep: (id) => `Step ${id} can't wait for itself.`,
   };
 
@@ -168,8 +174,11 @@ const planText = (() => {
     const step = parseStep(kind === "step" ? at.line : "");
     if (isTarget(part)) {
       if (step.approve && part.startsWith("#")) return { error: ERRORS.squadSignoff };
-      // A sign-off is by a person: the peer, not one of its folders.
-      step.target = step.approve ? part.split(":")[0] : part;
+      const workiq = part === WORKIQ || part.startsWith(`${WORKIQ}:`);
+      if (workiq && (step.approve || step.team)) return { error: ERRORS.workiqKind };
+      if (workiq && step.options.some((o) => NOT_IN_WORKIQ.has(optionOf(o)))) return { error: ERRORS.workiqOption };
+      // A sign-off is by a person: the peer, not one of its folders. Work IQ has no folders.
+      step.target = step.approve || workiq ? part.split(":")[0] : part;
     } else if (part.startsWith("after ")) {
       const dep = part.slice("after ".length);
       if (dep === step.id) return { error: ERRORS.ownStep(dep) };
@@ -177,6 +186,7 @@ const planText = (() => {
     } else {
       if (step.approve && NOT_IN_SIGNOFF.has(optionOf(part))) return { error: ERRORS.signoffOption };
       if (step.team && NOT_IN_TEAM.has(optionOf(part))) return { error: ERRORS.teamOption };
+      if (step.target === WORKIQ && NOT_IN_WORKIQ.has(optionOf(part))) return { error: ERRORS.workiqOption };
       setOption(step, part);
     }
     step.id ??= nextStepId(text);
@@ -415,10 +425,14 @@ const planText = (() => {
       if (!NAME.test(s.id) || KEYWORDS.has(s.id)) need("step", i, "id", badName);
       else if (plan.steps.findIndex((x) => x.id === s.id) < i) need("step", i, "id", `Another step is called ${s.id}`);
       if (!s.target) need("step", i, "target", s.approve ? "Choose who signs off" : "Choose who does it");
+      if (s.target === WORKIQ || s.target?.startsWith(`${WORKIQ}:`)) {
+        if (s.approve || s.team) need("step", i, "target", ERRORS.workiqKind);
+        else if (s.options.some((o) => NOT_IN_WORKIQ.has(optionOf(o)))) need("step", i, "target", ERRORS.workiqOption);
+      }
       if (blank(s.todo, TODO)) {
         need("step", i, "todo", s.approve ? "Say what to check before signing off" : "Say what this step should do");
       }
-      if (!s.approve && !s.team && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {
+      if (!s.approve && !s.team && s.target !== WORKIQ && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {
         need("step", i, "claims", "Without a check, this step can't prove a claim: pick a check, or let a sign-off prove it");
       }
     });

@@ -68,6 +68,10 @@ pub struct RunRecord {
     /// The GitHub issues the run was tracked on (see [`crate::tracker`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracked: Option<crate::tracker::TrackedRun>,
+    /// What the steps with `workiq=` found, by step: sources, counts and request ids. It
+    /// stays on this machine: it is left out of a team run that goes in signed evidence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workiq: BTreeMap<String, crate::plan::WorkRecord>,
 }
 
 /// How far (seconds) evidence timestamps may lie outside the run, for clock skew.
@@ -207,6 +211,7 @@ impl RunRecord {
             claims: plan.claims.clone(),
             peer_ids: BTreeMap::new(),
             tracked: None,
+            workiq: BTreeMap::new(),
             steps: plan
                 .steps
                 .iter()
@@ -361,6 +366,7 @@ impl RunRecord {
             timeout: None,
             issue: None,
             m365: None,
+            workiq: Vec::new(),
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims

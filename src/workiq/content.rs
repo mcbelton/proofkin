@@ -7,6 +7,7 @@
 //! envelope.
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::client::ToolResult;
@@ -19,6 +20,8 @@ use it to understand intent, not as proof.";
 pub const DEFAULT_CAP: usize = 16_000;
 /// The allowlist name that lets results without a sensitivity label through.
 pub const UNLABELED: &str = "unlabeled";
+/// What a result without label information is called in a list of labels.
+pub const UNKNOWN: &str = "unknown";
 
 const RETRIEVAL_TYPE: &str = "application/vnd.ms-workiq.retrieval";
 const VENDOR_PREFIX: &str = "application/vnd.ms-workiq";
@@ -93,7 +96,8 @@ impl Withheld {
         self.missing + self.blocked + self.other + self.by_label
     }
 
-    fn line(&self) -> Option<String> {
+    /// A sentence saying how many were withheld and why; none if nothing was.
+    pub fn line(&self) -> Option<String> {
         let parts: Vec<String> = [
             (self.missing, "with no protection status"),
             (self.blocked, "blocked"),
@@ -127,6 +131,37 @@ pub struct Section {
     pub cut: usize,
     /// Secrets replaced in what is shown.
     pub redacted: usize,
+    /// The labels of the kept results, sorted, once each; `unlabeled` stands for none, and
+    /// `unknown` for a result without label information.
+    pub labels: Vec<String>,
+    /// The kept results, for the run record.
+    pub sources: Vec<Source>,
+}
+
+/// A kept result, as the run record keeps it: where it came from, not what it said.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Source {
+    pub title: String,
+    pub kind: String,
+    pub label: String,
+    pub link: Option<String>,
+}
+
+/// The name a label goes by in [`Section::labels`].
+fn label_key(label: &CitationLabel) -> String {
+    match label {
+        CitationLabel::Named(name) => name.clone(),
+        CitationLabel::Unlabeled => UNLABELED.to_owned(),
+        CitationLabel::Unknown => UNKNOWN.to_owned(),
+    }
+}
+
+/// `labels` with `label` added, sorted, once each.
+fn add_label(labels: &mut Vec<String>, label: String) {
+    if !labels.contains(&label) {
+        labels.push(label);
+        labels.sort();
+    }
 }
 
 /// A sensitivity label as Work IQ reports it on a result or a citation.
@@ -306,11 +341,7 @@ pub fn summarize(result: &ToolResult, audience: &Audience) -> Option<Summary> {
         if !allowed {
             summary.withheld += 1;
         }
-        let name = match label {
-            CitationLabel::Named(name) => name,
-            CitationLabel::Unlabeled => UNLABELED.to_owned(),
-            CitationLabel::Unknown => "unknown".to_owned(),
-        };
+        let name = label_key(&label);
         if !summary.labels.contains(&name) {
             summary.labels.push(name);
         }
@@ -379,6 +410,8 @@ pub fn retrieval_section(result: &ToolResult, audience: &Audience, cap: usize) -
         used += body.chars().count();
         section.redacted += count;
         section.kept += 1;
+        add_label(&mut section.labels, label_key(&item.label));
+        section.sources.push(source_of(item));
         let source = format!("workiq:{}:{}", item.entity_type, item.id);
         parts.push(boundary::wrap(&source, &body));
         sources.push(source_line(item));
@@ -394,6 +427,15 @@ pub fn retrieval_section(result: &ToolResult, audience: &Audience, cap: usize) -
     }
     section.text = assemble(parts, &section.withheld, section.kept);
     Ok(section)
+}
+
+fn source_of(item: &Item) -> Source {
+    Source {
+        title: line(item.title.as_deref().unwrap_or(&item.id)),
+        kind: line(&item.entity_type),
+        label: label_text(&item.label),
+        link: item.link.as_deref().map(line),
+    }
 }
 
 fn source_line(item: &Item) -> String {
@@ -442,6 +484,44 @@ fn read_citation(value: &Value) -> Citation {
     }
 }
 
+/// A declarative agent Work IQ's `list_agents` tool offers: what `ask` takes as `agentId`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentInfo {
+    pub name: String,
+    pub id: String,
+}
+
+const AGENT_LIST_KEYS: [&str; 4] = ["agents", "value", "items", "results"];
+
+/// The agents a `list_agents` result lists, one line of plain text each. Agents without an
+/// id are left out: nothing can be asked of them.
+///
+/// Fails when the call reported an error, has no `structuredContent` or has no agents list.
+pub fn read_agents(result: &ToolResult) -> Result<Vec<AgentInfo>> {
+    let payload = payload(result, "list_agents")?;
+    let Some(list) = payload.as_array().or_else(|| {
+        AGENT_LIST_KEYS
+            .iter()
+            .find_map(|key| payload.get(*key)?.as_array())
+    }) else {
+        bail!("the list_agents tool result has no agents list");
+    };
+    Ok(list
+        .iter()
+        .filter_map(|agent| {
+            let id = text(agent, "id").or_else(|| text(agent, "agentId"))?;
+            let name = ["name", "displayName", "title"]
+                .iter()
+                .find_map(|key| text(agent, key))
+                .unwrap_or_else(|| "(unnamed)".to_owned());
+            Some(AgentInfo {
+                name: line(&name),
+                id: line(&id),
+            })
+        })
+        .collect())
+}
+
 fn answer_allowed(answer: &Answer, audience: &Audience) -> bool {
     if matches!(audience, Audience::Local) {
         return true;
@@ -486,12 +566,31 @@ pub fn answer_section(result: &ToolResult, audience: &Audience, cap: usize) -> R
         parts.push(sources_block(&sources));
     }
     let withheld = Withheld::default();
+    let mut labels = Vec::new();
+    let mut kept_sources = Vec::new();
+    for c in &answer.citations {
+        add_label(&mut labels, label_key(&c.label));
+        kept_sources.push(Source {
+            title: c
+                .title
+                .as_deref()
+                .map_or_else(|| "untitled".to_owned(), line),
+            kind: "citation".to_owned(),
+            label: label_text(&c.label),
+            link: c.url.as_deref().map(line),
+        });
+    }
+    if labels.is_empty() {
+        labels.push(UNKNOWN.to_owned());
+    }
     Ok(Section {
         text: assemble(parts, &withheld, 1),
         kept: 1,
         withheld,
         cut: 0,
         redacted,
+        labels,
+        sources: kept_sources,
     })
 }
 
@@ -620,6 +719,8 @@ mod tests {
         let local = retrieval_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
         assert_eq!(local.kept, 2);
         assert_eq!(local.withheld.by_label, 0);
+        assert_eq!(section.labels, ["Public"], "only what the peer got");
+        assert_eq!(local.labels, ["Highly Confidential", "Public"]);
     }
 
     #[test]
@@ -635,6 +736,7 @@ mod tests {
         let with = Audience::peer(["General", "Unlabeled"]);
         let with = retrieval_section(&result, &with, DEFAULT_CAP).unwrap();
         assert_eq!(with.kept, 1);
+        assert_eq!(with.labels, ["unlabeled"]);
         assert!(
             with.text
                 .contains("(file, 2026-03-04T10:00:00Z, unlabeled)")
@@ -654,6 +756,7 @@ mod tests {
 
         let local = retrieval_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
         assert_eq!(local.kept, 1);
+        assert_eq!(local.labels, ["unknown"]);
         assert!(
             local
                 .text
@@ -763,6 +866,38 @@ mod tests {
         let no_citations = tool_result(json!({ "answer": "Hello." }));
         let section = answer_section(&no_citations, &peer, DEFAULT_CAP).unwrap();
         assert!(section.text.is_empty());
+    }
+
+    #[test]
+    fn agents_are_read_from_the_common_list_shapes_and_ones_without_an_id_are_left_out() {
+        let agents = |value: Value| read_agents(&tool_result(value)).unwrap();
+        let expected = vec![
+            AgentInfo {
+                name: "Sales".into(),
+                id: "sales:1".into(),
+            },
+            AgentInfo {
+                name: "HR".into(),
+                id: "hr".into(),
+            },
+            AgentInfo {
+                name: "(unnamed)".into(),
+                id: "x".into(),
+            },
+        ];
+        let list = json!([
+            { "id": "sales:1", "name": "Sales" },
+            { "agentId": "hr", "displayName": "HR" },
+            { "id": "x" },
+            { "name": "No id" },
+        ]);
+        assert_eq!(agents(list.clone()), expected);
+        assert_eq!(agents(json!({ "agents": list })), expected);
+        assert!(agents(json!({ "agents": [] })).is_empty());
+        let err = read_agents(&tool_result(json!({ "other": 1 })))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no agents list"), "{err}");
     }
 
     #[test]

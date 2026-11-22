@@ -819,6 +819,18 @@ impl Client {
         strategy: Option<&str>,
         capabilities: &[&str],
     ) -> Result<ToolResult> {
+        self.retrieve_in(&self.context, query, strategy, capabilities)
+            .await
+    }
+
+    /// [`Client::retrieve`] for a given purpose and audience.
+    pub async fn retrieve_in(
+        &self,
+        context: &CallContext,
+        query: &str,
+        strategy: Option<&str>,
+        capabilities: &[&str],
+    ) -> Result<ToolResult> {
         let mut arguments = json!({ "query": query });
         if let Some(strategy) = strategy {
             arguments["strategy"] = json!(strategy);
@@ -830,12 +842,13 @@ impl Client {
                 .collect();
             arguments["capabilities"] = json!(capabilities);
         }
-        self.call_offered("retrieve", arguments).await
+        self.call_offered_in(context, "retrieve", arguments).await
     }
 
-    /// An answer from Microsoft 365 Copilot, or from the declarative agent `agent_id`.
-    pub async fn ask(
+    /// [`Client::ask`] for a given purpose and audience.
+    pub async fn ask_in(
         &self,
+        context: &CallContext,
         question: &str,
         agent_id: Option<&str>,
         conversation_id: Option<&str>,
@@ -847,7 +860,18 @@ impl Client {
         if let Some(conversation_id) = conversation_id {
             arguments["conversationId"] = json!(conversation_id);
         }
-        self.call_offered("ask", arguments).await
+        self.call_offered_in(context, "ask", arguments).await
+    }
+
+    /// An answer from Microsoft 365 Copilot, or from the declarative agent `agent_id`.
+    pub async fn ask(
+        &self,
+        question: &str,
+        agent_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<ToolResult> {
+        self.ask_in(&self.context, question, agent_id, conversation_id)
+            .await
     }
 
     /// Entities by their Work IQ paths (Microsoft Graph paths such as `/me/messages`).
@@ -861,6 +885,15 @@ impl Client {
     }
 
     async fn call_offered(&self, name: &str, arguments: Value) -> Result<ToolResult> {
+        self.call_offered_in(&self.context, name, arguments).await
+    }
+
+    async fn call_offered_in(
+        &self,
+        context: &CallContext,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolResult> {
         let tools = self.list_tools().await?;
         if !tools.iter().any(|tool| tool.name == name) {
             let offered: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
@@ -869,7 +902,7 @@ impl Client {
                 offered.join(", ")
             );
         }
-        self.call_tool(name, arguments).await
+        self.call_tool_in(context, name, arguments).await
     }
 
     /// A request in the current session. A 404 on a session means the server forgot it: a new

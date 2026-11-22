@@ -141,6 +141,7 @@ pub fn outline(name: &str) -> Result<Outline> {
         Target::Peer(p) if p == "me" => "you".to_owned(),
         Target::Peer(p) => format!("@{p}"),
         Target::Squad(s) => format!("a member of squad #{s}"),
+        Target::Workiq => "Microsoft 365 (Work IQ)".to_owned(),
     };
     let first_sentence = |text: &str| {
         let end = text.find(". ").map(|i| i + 1).unwrap_or(text.len());

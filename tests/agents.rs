@@ -1792,6 +1792,825 @@ async fn a_step_with_microsoft_365_content_is_checked_again_when_its_task_is_sen
     );
 }
 
+/// A Work IQ result for tests: a file with `text`, protected as `allowed`, labelled `label`.
+fn workiq_file(id: &str, label: &str, text: &str, score: f64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "markdown": text,
+        "webUrl": format!("https://contoso.example/files/{id}"),
+        "entityType": "file",
+        "contentProtection": "allowed",
+        "sensitivityLabel": { "displayName": label },
+        "resourceMetadata": { "document": { "title": format!("File {id}") } },
+        "relevanceScore": score,
+    })
+}
+
+/// The `structuredContent` of a `retrieve` answer with `files`.
+fn workiq_retrieval(files: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "application/vnd.ms-workiq.retrieval": {
+            "results": files,
+            "resultCount": files.len(),
+            "stoppedReason": "completed",
+            "conversationId": "conv-1",
+        }
+    })
+}
+
+/// What a step asked a [`FakeWork`] for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkAsk {
+    query: String,
+    strategy: String,
+    capabilities: Vec<String>,
+    /// The peer the content is for; none for the owner's own workers.
+    peer: Option<String>,
+    run: Option<String>,
+    step: Option<String>,
+}
+
+/// A Work IQ that answers every search with the same results and remembers the asks.
+#[derive(Debug)]
+struct FakeWork {
+    reply: serde_json::Value,
+    /// What `ask` answers (its `structuredContent`).
+    answer: serde_json::Value,
+    asks: Mutex<Vec<WorkAsk>>,
+    /// The question and the agent id of each `ask`.
+    questions: Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl FakeWork {
+    fn new(files: Vec<serde_json::Value>) -> Arc<Self> {
+        Self::answering(
+            files,
+            serde_json::json!({
+                "answer": "The launch moved to May.",
+                "citations": [
+                    { "title": "Launch plan", "sensitivityLabel": { "displayName": "General" } },
+                ],
+            }),
+        )
+    }
+
+    fn answering(files: Vec<serde_json::Value>, answer: serde_json::Value) -> Arc<Self> {
+        Arc::new(Self {
+            reply: workiq_retrieval(files),
+            answer,
+            asks: Mutex::default(),
+            questions: Mutex::default(),
+        })
+    }
+
+    fn questions(&self) -> Vec<(String, Option<String>)> {
+        self.questions.lock().unwrap().clone()
+    }
+
+    fn asks(&self) -> Vec<WorkAsk> {
+        self.asks.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl proofkin::workiq::context::WorkContext for FakeWork {
+    async fn retrieve(
+        &self,
+        context: &proofkin::workiq::audit::CallContext,
+        query: &str,
+        strategy: &str,
+        capabilities: &[&str],
+    ) -> anyhow::Result<proofkin::workiq::ToolResult> {
+        use proofkin::workiq::audit::Purpose;
+        let (run, step) = match &context.purpose {
+            Purpose::Step { run, step } => (Some(run.clone()), Some(step.clone())),
+            _ => (None, None),
+        };
+        self.asks.lock().unwrap().push(WorkAsk {
+            query: query.to_owned(),
+            strategy: strategy.to_owned(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            peer: context.peer.clone(),
+            run,
+            step,
+        });
+        Ok(proofkin::workiq::ToolResult {
+            content: Vec::new(),
+            structured_content: Some(self.reply.clone()),
+            is_error: false,
+            ids: proofkin::workiq::RequestIds::default(),
+        })
+    }
+
+    async fn ask(
+        &self,
+        _context: &proofkin::workiq::audit::CallContext,
+        question: &str,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<proofkin::workiq::ToolResult> {
+        self.questions
+            .lock()
+            .unwrap()
+            .push((question.to_owned(), agent_id.map(str::to_owned)));
+        Ok(proofkin::workiq::ToolResult {
+            content: Vec::new(),
+            structured_content: Some(self.answer.clone()),
+            is_error: false,
+            ids: proofkin::workiq::RequestIds::default(),
+        })
+    }
+}
+
+/// A boss connected to `helper`, one of its own digital workers, and `partner`, another
+/// person's agent that the boss grants Microsoft 365 content with `labels`.
+async fn boss_with_helper_and_partner(labels: &[&str]) -> (Agent, Vec<Agent>, EndpointId) {
+    let mut helper = Node::new("helper").serving(vec![Provider::Copilot]);
+    let mut partner = Node::new("partner").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut helper, &mut boss);
+    mutual(&mut partner, &mut boss);
+    boss.trust
+        .peers
+        .iter_mut()
+        .find(|p| p.name == "partner")
+        .unwrap()
+        .m365 = Some(proofkin::M365Grant {
+        labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+        tools: false,
+    });
+    let helper_id = helper.id();
+    let (helper, _he) = helper.start().await;
+    let (partner, _pe) = partner.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(helper.addr()).await.unwrap();
+    boss.connect(partner.addr()).await.unwrap();
+    wait_for_peers(&boss, 2).await;
+    (boss, vec![helper, partner], helper_id)
+}
+
+fn workiq_run(
+    helper_id: EndpointId,
+    work: Arc<dyn proofkin::workiq::context::WorkContext>,
+) -> RunContext {
+    RunContext {
+        run_id: Some("r1".into()),
+        recipients: proofkin::plan::Recipients::new(TrustStore::default(), vec![helper_id]),
+        work_context: Some(work),
+        ..RunContext::default()
+    }
+}
+
+fn done_output(states: &std::collections::BTreeMap<String, StepState>, id: &str) -> String {
+    match &states[id] {
+        StepState::Done { output, .. } => output.clone(),
+        other => panic!("{id}: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_local_step_gets_the_work_iq_section_in_front_of_its_task() {
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let work = FakeWork::new(vec![
+        workiq_file("f1", "Confidential", "Budget is four million.", 0.9),
+        workiq_file("f2", "General", "Launch is in May.", 0.5),
+    ]);
+    let ctx = workiq_run(helper_id, work.clone());
+    let plan = Plan::parse("a @helper workiq=email,files Find the launch budget").unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+
+    let output = done_output(&states, "a");
+    let section = output
+        .find("## Work context from Microsoft 365")
+        .expect(&output);
+    let task = output
+        .find("Your task:\nFind the launch budget")
+        .expect(&output);
+    assert!(
+        section < task,
+        "the section comes before the task: {output}"
+    );
+    assert!(output.contains("Budget is four million."), "{output}");
+    assert!(output.contains("Launch is in May."), "{output}");
+    assert!(
+        output.starts_with("copilot did: ## Rule for external content"),
+        "the prompt stays guarded: {output}"
+    );
+
+    // It asked for the step's own words, for the owner's worker, in this run and step.
+    assert_eq!(
+        work.asks(),
+        [WorkAsk {
+            query: "Find the launch budget".into(),
+            strategy: "grounding".into(),
+            capabilities: vec!["Email".into(), "OneDriveAndSharePoint".into()],
+            peer: None,
+            run: Some("r1".into()),
+            step: Some("a".into()),
+        }]
+    );
+    let record = &ctx.work_log.records()["a"];
+    assert_eq!((record.kept, record.withheld), (2, 0));
+    assert_eq!(record.labels, ["Confidential", "General"]);
+    assert_eq!(record.sources.len(), 2);
+    assert_eq!(
+        record.sources[0].title, "File f1",
+        "the most relevant first"
+    );
+    assert_eq!(
+        record.sources[0].link.as_deref(),
+        Some("https://contoso.example/files/f1")
+    );
+}
+
+#[tokio::test]
+async fn a_granted_peer_gets_only_the_work_iq_results_its_grant_allows() {
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let work = FakeWork::new(vec![
+        workiq_file("f1", "Confidential", "Budget is four million.", 0.9),
+        workiq_file("f2", "General", "Launch is in May.", 0.5),
+    ]);
+    let ctx = workiq_run(helper_id, work.clone());
+    let plan = Plan::parse("a @partner workiq=all Find the launch dates").unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+
+    let output = done_output(&states, "a");
+    assert!(output.contains("Launch is in May."), "{output}");
+    assert!(
+        !output.contains("Budget is four million."),
+        "a label the grant doesn't include is withheld: {output}"
+    );
+    let asks = work.asks();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0].peer.as_deref(), Some("partner"));
+    assert_eq!(asks[0].strategy, "copilot", "workiq=all");
+    assert!(
+        asks[0].capabilities.is_empty(),
+        "{:?}",
+        asks[0].capabilities
+    );
+    let record = &ctx.work_log.records()["a"];
+    assert_eq!((record.kept, record.withheld), (1, 1));
+    assert_eq!(record.labels, ["General"]);
+}
+
+#[tokio::test]
+async fn a_later_step_is_refused_at_send_time_when_what_was_found_exceeds_its_grant() {
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let work = FakeWork::new(vec![
+        workiq_file("f1", "Confidential", "Budget is four million.", 0.9),
+        workiq_file("f2", "General", "Launch is in May.", 0.5),
+    ]);
+    let ctx = workiq_run(helper_id, work.clone());
+    // `a` runs on the owner's own worker and gets all of it; what it found isn't known
+    // until it runs, so `b` is checked when it is sent.
+    let plan = Plan::parse("a @helper workiq=all Find it\nb after a @partner Write it up").unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+
+    assert!(
+        matches!(states["a"], StepState::Done { .. }),
+        "{:?}",
+        states["a"]
+    );
+    match &states["b"] {
+        StepState::Failed { peer, error, .. } => {
+            assert_eq!(peer.as_deref(), Some("partner"));
+            assert!(
+                error.contains("step 'b'") && error.contains("grant doesn't include Confidential"),
+                "{error}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(work.asks().len(), 1, "only `a` searched");
+
+    // With only what its grant allows found, the same step is sent.
+    let narrow = FakeWork::new(vec![workiq_file("f2", "General", "Launch is in May.", 0.5)]);
+    let ctx = workiq_run(helper_id, narrow);
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    assert!(
+        states.values().all(|s| matches!(s, StepState::Done { .. })),
+        "{states:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_work_iq_error_fails_the_step_with_its_one_line_message() {
+    #[derive(Debug)]
+    struct Down;
+
+    #[async_trait]
+    impl proofkin::workiq::context::WorkContext for Down {
+        async fn retrieve(
+            &self,
+            _: &proofkin::workiq::audit::CallContext,
+            _: &str,
+            _: &str,
+            _: &[&str],
+        ) -> anyhow::Result<proofkin::workiq::ToolResult> {
+            anyhow::bail!("Work IQ is unavailable (503)")
+        }
+    }
+
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let ctx = workiq_run(helper_id, Arc::new(Down));
+    let plan = Plan::parse("a @helper workiq=all Find it\nb after a @helper Use it").unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    match &states["a"] {
+        StepState::Failed { error, .. } => assert_eq!(error, "Work IQ is unavailable (503)"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        matches!(states["b"], StepState::Skipped { .. }),
+        "{:?}",
+        states["b"]
+    );
+}
+
+/// A Work IQ MCP endpoint that answers `retrieve` with two files and keeps what it was asked.
+#[derive(Default)]
+struct FakeMcp {
+    calls: Mutex<Vec<serde_json::Value>>,
+}
+
+async fn fake_mcp(
+    axum::extract::State(fake): axum::extract::State<Arc<FakeMcp>>,
+    body: String,
+) -> impl axum::response::IntoResponse {
+    use serde_json::json;
+    let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = message["id"].clone();
+    let reply = match message["method"].as_str().unwrap() {
+        "notifications/initialized" => {
+            return (
+                axum::http::StatusCode::ACCEPTED,
+                [("content-type", "application/json".to_string())],
+                String::new(),
+            );
+        }
+        "initialize" => json!({ "jsonrpc": "2.0", "id": id, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "fake-workiq", "version": "0" },
+        }}),
+        "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [
+            { "name": "retrieve", "inputSchema": { "type": "object" } },
+            { "name": "ask", "inputSchema": { "type": "object" } },
+            { "name": "list_agents", "inputSchema": { "type": "object" } },
+        ]}}),
+        "tools/call" => {
+            fake.calls.lock().unwrap().push(message["params"].clone());
+            let structured = match message["params"]["name"].as_str() {
+                Some("list_agents") => json!({ "agents": [
+                    { "id": "sales-agent:v1", "name": "Sales helper" },
+                    { "agentId": "hr_agent", "displayName": "HR" },
+                    { "name": "no id" },
+                ]}),
+                Some("ask") => json!({
+                    "answer": "The launch moved to May.",
+                    "citations": [{ "title": "Launch plan", "url": "https://contoso.example/p" }],
+                }),
+                _ => workiq_retrieval(vec![
+                    workiq_file("f1", "General", "Launch is in May.", 0.9),
+                    workiq_file("f2", "Confidential", "Budget is four million.", 0.5),
+                ]),
+            };
+            json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "content": [{ "type": "text", "text": "retrieved" }],
+                "structuredContent": structured,
+            }})
+        }
+        other => panic!("unexpected method {other}"),
+    };
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "application/json".to_string())],
+        reply.to_string(),
+    )
+}
+
+#[tokio::test]
+async fn workiq_steps_search_through_the_audited_client_and_stop_at_the_run_budget() {
+    use proofkin::workiq::audit::Audit;
+    use proofkin::workiq::client::{Client, FixedToken};
+    use proofkin::workiq::context::ClientWork;
+
+    let fake = Arc::new(FakeMcp::default());
+    let app = axum::Router::new()
+        .route("/mcp", axum::routing::post(fake_mcp))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let budget = proofkin::profile::WorkIqBudget {
+        calls_per_run: Some(1),
+        ..Default::default()
+    };
+    let audit = Arc::new(Audit::new(dir.path().join("audit.jsonl"), "boss", budget));
+    let client = Client::new(&url, Arc::new(FixedToken("token".into())))
+        .unwrap()
+        .with_audit(audit.clone());
+
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let ctx = workiq_run(helper_id, Arc::new(ClientWork::new(client)));
+    let plan = Plan::parse(
+        "a @helper workiq=email Find the launch budget\nb after a @helper workiq=files Find more",
+    )
+    .unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+
+    let output = done_output(&states, "a");
+    assert!(output.contains("Launch is in May."), "{output}");
+    assert!(
+        output.contains("Budget is four million."),
+        "the owner's worker gets both"
+    );
+    match &states["b"] {
+        StepState::Failed { error, .. } => {
+            assert!(
+                error.contains("proofkin workiq budget --per-run"),
+                "{error}"
+            );
+            assert!(!error.contains('\n'), "one line: {error}");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Only the first search was sent: grounding over the one capability.
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["name"], "retrieve");
+    let arguments = &calls[0]["arguments"];
+    assert_eq!(arguments["query"], "Find the launch budget");
+    assert_eq!(arguments["strategy"], "grounding");
+    assert_eq!(
+        arguments["capabilities"],
+        serde_json::json!([{ "name": "Email" }])
+    );
+    assert_eq!(
+        audit.usage(Some("r1")).run,
+        Some(1),
+        "the refused call doesn't count"
+    );
+
+    // What the run keeps of it: sources, labels, counts and the request ids.
+    let records = ctx.work_log.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records["a"];
+    assert_eq!((record.kept, record.withheld), (2, 0));
+    assert_eq!(record.labels, ["Confidential", "General"]);
+    assert_eq!(record.sources.len(), 2);
+    assert!(
+        record.request_ids.contains("client-request-id"),
+        "{}",
+        record.request_ids
+    );
+}
+
+#[tokio::test]
+async fn a_workiq_step_asks_for_its_words_and_hands_its_answer_to_later_steps() {
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let work = FakeWork::new(Vec::new());
+    let ctx = workiq_run(helper_id, work.clone());
+    let plan = Plan::parse(
+        "a @helper Collect the dates\n\
+         b after a @workiq agent=sales-agent:v1.2@acme What changed in the launch?\n\
+         c after b @helper Write it up",
+    )
+    .unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+
+    // It asked Work IQ's agent, with its own words and what `a` produced, not a peer.
+    let questions = work.questions();
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert_eq!(questions[0].1.as_deref(), Some("sales-agent:v1.2@acme"));
+    assert!(
+        questions[0].0.contains("What changed in the launch?")
+            && questions[0].0.contains("Collect the dates"),
+        "{}",
+        questions[0].0
+    );
+    assert!(work.asks().is_empty(), "it asked, not searched");
+
+    // Shown as done by workiq:<agent id>, with no evidence and not verified.
+    match &states["b"] {
+        StepState::Done {
+            peer,
+            output,
+            evidence,
+            verified,
+            ..
+        } => {
+            assert_eq!(peer, "workiq:sales-agent:v1.2@acme");
+            assert!(output.contains("The launch moved to May."), "{output}");
+            assert!(output.contains("Launch plan"), "{output}");
+            assert!(evidence.is_none() && !verified);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The answer is in the next step's prompt, and the cited label is on record.
+    let next = done_output(&states, "c");
+    assert!(next.contains("The launch moved to May."), "{next}");
+    let record = &ctx.work_log.records()["b"];
+    assert_eq!(record.labels, ["General"]);
+    assert_eq!(record.sources.len(), 1);
+}
+
+#[tokio::test]
+async fn an_agentless_workiq_step_sends_no_agent_id() {
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let work = FakeWork::new(Vec::new());
+    let ctx = workiq_run(helper_id, work.clone());
+    let plan = Plan::parse("a @workiq What changed?").unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    assert_eq!(work.questions(), [("What changed?".to_owned(), None)]);
+    match &states["a"] {
+        StepState::Done { peer, .. } => assert_eq!(peer, "workiq"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_later_peer_step_is_refused_when_the_answer_exceeds_its_grant_or_has_no_labels() {
+    let plan = Plan::parse("a @workiq What changed?\nb after a @partner Write it up").unwrap();
+
+    // Cited General, granted General: sent.
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let ctx = workiq_run(helper_id, FakeWork::new(Vec::new()));
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    let output = done_output(&states, "b");
+    assert!(output.contains("The launch moved to May."), "{output}");
+
+    // Granted a different label: refused.
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["Public"]).await;
+    let ctx = workiq_run(helper_id, FakeWork::new(Vec::new()));
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    match &states["b"] {
+        StepState::Failed { error, .. } => {
+            assert!(error.contains("grant doesn't include General"), "{error}")
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // A citation without label information is `unknown`, which no grant includes.
+    let unlabelled = serde_json::json!({
+        "answer": "The launch moved to May.",
+        "citations": [{ "title": "Launch plan" }],
+    });
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General", "Public"]).await;
+    let ctx = workiq_run(helper_id, FakeWork::answering(Vec::new(), unlabelled));
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    match &states["b"] {
+        StepState::Failed { error, .. } => {
+            assert!(error.contains("unknown"), "{error}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(ctx.work_log.records()["a"].labels, ["unknown"]);
+}
+
+#[tokio::test]
+async fn proofkin_workiq_agents_lists_the_agents_work_iq_offers() {
+    use proofkin::workiq::client::{Client, FixedToken};
+    use proofkin::workiq::context::agents_listing;
+
+    let fake = Arc::new(FakeMcp::default());
+    let app = axum::Router::new()
+        .route("/mcp", axum::routing::post(fake_mcp))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let client = Client::new(&url, Arc::new(FixedToken("token".into()))).unwrap();
+    let listing = agents_listing(&client).await.unwrap();
+    assert_eq!(
+        listing,
+        "Sales helper  sales-agent:v1\nHR            hr_agent\n"
+    );
+}
+
+#[tokio::test]
+async fn a_workiq_step_asks_through_the_audited_client_with_agent_id() {
+    use proofkin::workiq::audit::Audit;
+    use proofkin::workiq::client::{Client, FixedToken};
+    use proofkin::workiq::context::ClientWork;
+
+    let fake = Arc::new(FakeMcp::default());
+    let app = axum::Router::new()
+        .route("/mcp", axum::routing::post(fake_mcp))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let audit = Arc::new(Audit::new(
+        dir.path().join("audit.jsonl"),
+        "boss",
+        Default::default(),
+    ));
+    let client = Client::new(&url, Arc::new(FixedToken("token".into())))
+        .unwrap()
+        .with_audit(audit);
+
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let ctx = workiq_run(helper_id, Arc::new(ClientWork::new(client)));
+    let plan = Plan::parse("a @workiq agent=sales-agent:v1 What changed?").unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    let output = done_output(&states, "a");
+    assert!(output.contains("The launch moved to May."), "{output}");
+
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["name"], "ask");
+    assert_eq!(calls[0]["arguments"]["question"], "What changed?");
+    assert_eq!(calls[0]["arguments"]["agentId"], "sales-agent:v1");
+    assert_eq!(ctx.work_log.records()["a"].labels, ["unknown"]);
+}
+
+/// A fake Work IQ endpoint on localhost: what it was called with, and its URL.
+async fn serve_fake_mcp() -> (Arc<FakeMcp>, String) {
+    let fake = Arc::new(FakeMcp::default());
+    let app = axum::Router::new()
+        .route("/mcp", axum::routing::post(fake_mcp))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (fake, url)
+}
+
+#[tokio::test]
+async fn kb_import_workiq_saves_the_topic_with_its_mark_query_date_and_sources() {
+    use proofkin::knowledge::{KnowledgeBase, parse_mark};
+    use proofkin::workiq::audit::Audit;
+    use proofkin::workiq::client::{Client, FixedToken};
+    use proofkin::workiq::context::ClientWork;
+    use proofkin::workiq::import::import_knowledge;
+
+    let (fake, url) = serve_fake_mcp().await;
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit = Arc::new(Audit::new(audit_path.clone(), "boss", Default::default()));
+    let client = Client::new(&url, Arc::new(FixedToken("token".into())))
+        .unwrap()
+        .with_audit(audit);
+    let work = ClientWork::new(client);
+    let kb = KnowledgeBase::new(dir.path().join("knowledge"));
+
+    let done = import_knowledge(
+        &work,
+        &kb,
+        "launch",
+        "What is\nthe launch  budget?",
+        Some("files"),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!((done.kept, done.withheld), (2, 0));
+    assert_eq!(done.labels, ["Confidential", "General"]);
+
+    // Searched as a knowledge import, with the --from sources' strategy and capabilities.
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["name"], "retrieve");
+    assert_eq!(calls[0]["arguments"]["query"], "What is the launch budget?");
+    assert_eq!(calls[0]["arguments"]["strategy"], "grounding");
+    assert_eq!(
+        calls[0]["arguments"]["capabilities"],
+        serde_json::json!([{ "name": "OneDriveAndSharePoint" }])
+    );
+    let audited = std::fs::read_to_string(audit_path).unwrap();
+    assert!(audited.contains("knowledge-import"), "{audited}");
+
+    // The topic: front matter first (mark, query, date), then the source note and the results.
+    let text = kb.read("launch").unwrap();
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    assert!(text.starts_with("---\n"), "{text}");
+    assert!(
+        text.contains("query: What is the launch budget?\n"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("retrieved: {today}\n")), "{text}");
+    assert!(text.contains("<!-- source: Work IQ retrieve -->"), "{text}");
+    assert!(text.contains("Launch is in May."), "{text}");
+    assert!(text.contains("Budget is four million."), "{text}");
+    assert_eq!(parse_mark(&text), Some(done.labels.clone()));
+
+    // It works with context=, and its mark goes through the plan check to the steps using it.
+    assert!(
+        kb.context(&["launch".into()])
+            .unwrap()
+            .contains("Launch is in May.")
+    );
+    let plan = Plan::parse("a @helper context=launch Write it up")
+        .unwrap()
+        .marked(&kb);
+    assert_eq!(plan.steps[0].m365.as_deref(), Some(&done.labels[..]));
+}
+
+#[tokio::test]
+async fn kb_import_workiq_needs_replace_to_overwrite_a_topic_and_refuses_bad_sources() {
+    use proofkin::knowledge::KnowledgeBase;
+    use proofkin::workiq::import::import_knowledge;
+
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::new(dir.path().join("knowledge"));
+    let work = FakeWork::new(vec![workiq_file("f1", "General", "Launch is in May.", 0.9)]);
+
+    import_knowledge(work.as_ref(), &kb, "launch", "launch", None, false)
+        .await
+        .unwrap();
+    assert_eq!(work.asks()[0].strategy, "copilot", "no --from means all");
+    let first = kb.read("launch").unwrap();
+
+    let error = import_knowledge(work.as_ref(), &kb, "launch", "again", None, false)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("--replace"), "{error:#}");
+    assert_eq!(kb.read("launch").unwrap(), first, "left as it was");
+    assert_eq!(work.asks().len(), 1, "refused before Work IQ was asked");
+
+    import_knowledge(work.as_ref(), &kb, "launch", "again", None, true)
+        .await
+        .unwrap();
+    assert!(kb.read("launch").unwrap().contains("query: again\n"));
+
+    let error = import_knowledge(work.as_ref(), &kb, "other", "x", Some("email,slack"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("doesn't know the source \"slack\""),
+        "{error:#}"
+    );
+    assert_eq!(work.asks().len(), 2, "no search for bad sources");
+    assert!(kb.read("other").is_err());
+}
+
+#[tokio::test]
+async fn kb_import_workiq_writes_nothing_when_everything_was_withheld() {
+    use proofkin::knowledge::KnowledgeBase;
+    use proofkin::workiq::import::import_knowledge;
+
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::new(dir.path().join("knowledge"));
+    let mut blocked = workiq_file("f1", "General", "Secret.", 0.9);
+    blocked["contentProtection"] = serde_json::json!("blocked");
+    let mut unprotected = workiq_file("f2", "General", "Unprotected.", 0.8);
+    unprotected
+        .as_object_mut()
+        .unwrap()
+        .remove("contentProtection");
+    let work = FakeWork::new(vec![blocked, unprotected]);
+
+    let error = import_knowledge(work.as_ref(), &kb, "launch", "launch", None, false)
+        .await
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("2 in all") && error.contains("1 blocked"),
+        "{error}"
+    );
+    assert!(error.contains("1 with no protection status"), "{error}");
+    assert!(kb.list().is_empty(), "nothing written");
+
+    let none = FakeWork::new(Vec::new());
+    let error = import_knowledge(none.as_ref(), &kb, "launch", "launch", None, false)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("found nothing"), "{error:#}");
+    assert!(kb.list().is_empty());
+}
+
+#[tokio::test]
+async fn an_imported_result_without_label_information_is_marked_unknown() {
+    use proofkin::knowledge::{KnowledgeBase, parse_mark};
+    use proofkin::workiq::import::import_knowledge;
+
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::new(dir.path().join("knowledge"));
+    let mut file = workiq_file("f1", "General", "Launch is in May.", 0.9);
+    file.as_object_mut().unwrap().remove("sensitivityLabel");
+    let work = FakeWork::new(vec![file]);
+    let done = import_knowledge(work.as_ref(), &kb, "launch", "launch", None, false)
+        .await
+        .unwrap();
+    assert_eq!(done.labels, ["unknown"]);
+    assert_eq!(
+        parse_mark(&kb.read("launch").unwrap()),
+        Some(vec!["unknown".to_owned()])
+    );
+}
+
 #[tokio::test]
 async fn requests_are_resent_on_a_new_connection_and_run_only_once() {
     let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);

@@ -8,6 +8,8 @@ pub mod account;
 pub mod audit;
 pub mod client;
 pub mod content;
+pub mod context;
+pub mod import;
 pub mod login;
 
 pub use client::*;
