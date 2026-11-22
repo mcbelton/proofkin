@@ -47,6 +47,9 @@ pub struct WorkerSpec {
     /// Its owner's agent starts it whenever it starts.
     #[serde(default)]
     pub start_with_owner: bool,
+    /// It uses its owner's Work IQ account.
+    #[serde(default)]
+    pub workiq: bool,
 }
 
 /// A worker just created, and the entry for its owner's allowlist (added by the
@@ -103,6 +106,13 @@ pub fn create(
             );
         }
     }
+    if spec.workiq && owner.config.workiq.is_none() {
+        bail!(
+            "'{}' isn't signed in to Work IQ, and its workers use its account: {}",
+            owner.name,
+            owner.workiq_login_hint()
+        );
+    }
     let shares = owner.shares()?;
     let mut folders: Vec<Share> = Vec::new();
     for folder in &spec.folders {
@@ -124,6 +134,7 @@ pub fn create(
         providers,
         folders,
         spec.start_with_owner,
+        spec.workiq,
     )
     .inspect_err(|_| {
         let _ = worker.delete();
@@ -137,9 +148,11 @@ fn finish(
     providers: Vec<Provider>,
     folders: Vec<Share>,
     start_with_owner: bool,
+    workiq: bool,
 ) -> Result<Created> {
     worker.config.providers = providers;
     worker.config.start_with_owner = start_with_owner;
+    worker.config.workiq_from_owner = workiq;
     worker.save()?;
     if !folders.is_empty() {
         worker.update_shares(|shares| {

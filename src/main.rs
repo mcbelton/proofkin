@@ -216,6 +216,10 @@ stops and deletes it too.")]
         /// Its owner's agent starts it whenever it starts.
         #[arg(long)]
         start_with_owner: bool,
+        /// It uses its owner's Work IQ account (Microsoft 365 work context). Without this
+        /// flag it can't, even though it runs on its owner's other sign-ins.
+        #[arg(long)]
+        workiq: bool,
     },
     /// List digital workers (all, or those of --owner).
     List {
@@ -1131,12 +1135,22 @@ examples:
   proofkin auth login claude  --profile worker2 --api-key
   proofkin auth login codex   --profile worker1                 (browser sign-in)
   proofkin auth login codex   --profile worker2 --api-key
+  proofkin auth login workiq  --profile worker1 --tenant contoso.com --client-id <app-id> [--device-code]
 Secrets are read from a hidden prompt, or from stdin when piped.")]
     Login {
         #[arg(value_enum)]
-        provider: Provider,
+        target: AuthTarget,
         #[command(flatten)]
         profile: ProfileArg,
+        /// Work IQ: the Entra tenant (id or domain).
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Work IQ: the application (client) id registered for Proofkin.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// Work IQ: sign in with a device code instead of the browser.
+        #[arg(long)]
+        device_code: bool,
         /// Copilot: use this GitHub CLI account's token (add accounts with `gh auth login`).
         #[arg(long, conflicts_with_all = ["token", "api_key"])]
         gh_user: Option<String>,
@@ -1160,15 +1174,36 @@ Secrets are read from a hidden prompt, or from stdin when piped.")]
         #[command(flatten)]
         bridge: BridgeArg,
     },
-    /// Sign a profile out of a provider and delete its stored credentials.
+    /// Sign a profile out of a provider (or Work IQ) and delete its stored credentials.
     Logout {
         #[arg(value_enum)]
-        provider: Provider,
+        target: AuthTarget,
         #[command(flatten)]
         profile: ProfileArg,
         #[command(flatten)]
         bridge: BridgeArg,
     },
+}
+
+/// What `proofkin auth logout` signs out of: a provider, or the Work IQ account (which is
+/// not an LLM provider).
+#[derive(Clone, Copy, ValueEnum)]
+enum AuthTarget {
+    Copilot,
+    Claude,
+    Codex,
+    Workiq,
+}
+
+impl AuthTarget {
+    fn provider(self) -> Option<Provider> {
+        match self {
+            AuthTarget::Copilot => Some(Provider::Copilot),
+            AuthTarget::Claude => Some(Provider::Claude),
+            AuthTarget::Codex => Some(Provider::Codex),
+            AuthTarget::Workiq => None,
+        }
+    }
 }
 
 #[derive(ClapArgs)]
@@ -1399,6 +1434,7 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
             providers,
             folders,
             start_with_owner,
+            workiq,
         } => {
             let owner = Profile::open(&owner)?;
             let addr = proofkin::EndpointAddr::new(owner.identity()?.public());
@@ -1409,6 +1445,7 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
                 providers,
                 folders,
                 start_with_owner,
+                workiq,
             };
             let created = workers::create(&owner, addr, &trust, &spec)?;
             trust.allow(created.entry);
@@ -1421,6 +1458,9 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
             let mut works_in = vec!["its data folder".to_owned()];
             works_in.extend(workers::folders(worker));
             println!("works in: {}", works_in.join(", "));
+            if worker.config.workiq_from_owner {
+                println!("it uses '{}''s Work IQ account", owner.name);
+            }
             let providers: Vec<String> = worker
                 .config
                 .providers
@@ -3500,7 +3540,10 @@ fn run_peers(command: PeersCommand) -> Result<()> {
 async fn run_auth(command: AuthCommand) -> Result<()> {
     match command {
         AuthCommand::Login {
-            provider,
+            target,
+            tenant,
+            client_id,
+            device_code,
             profile,
             gh_user,
             host,
@@ -3508,6 +3551,23 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             api_key,
             bridge,
         } => {
+            let Some(provider) = target.provider() else {
+                let (Some(tenant), Some(client_id)) = (tenant, client_id) else {
+                    bail!("Work IQ sign-in needs --tenant <id-or-domain> and --client-id <app-id>");
+                };
+                let mut profile = Profile::open(&profile.name)?;
+                profile.check_can_sign_in()?;
+                let flow = if device_code {
+                    proofkin::workiq::login::Flow::DeviceCode
+                } else {
+                    proofkin::workiq::login::Flow::Browser
+                };
+                let who = proofkin::workiq::login::Login::new(&tenant, &client_id)
+                    .run(&mut profile, flow)
+                    .await?;
+                println!("profile '{}': Work IQ signed in as {who}", profile.name);
+                return Ok(());
+            };
             let method = match (gh_user, token, api_key) {
                 (Some(user), _, _) => LoginMethod::GhUser { user, host },
                 (None, true, _) => LoginMethod::Token { host },
@@ -3525,14 +3585,22 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             );
         }
         AuthCommand::Logout {
-            provider,
+            target,
             profile,
             bridge,
         } => {
             let mut profile = Profile::open(&profile.name)?;
             profile.check_can_sign_in()?;
-            ProviderTools::new(&bridge.path()).logout(&mut profile, provider)?;
-            println!("profile '{}': {provider} signed out", profile.name);
+            match target.provider() {
+                Some(provider) => {
+                    ProviderTools::new(&bridge.path()).logout(&mut profile, provider)?;
+                    println!("profile '{}': {provider} signed out", profile.name);
+                }
+                None => {
+                    proofkin::workiq::account::logout(&mut profile)?;
+                    println!("profile '{}': Work IQ signed out", profile.name);
+                }
+            }
         }
         AuthCommand::Status { profile, bridge } => {
             let names = match profile {
@@ -3558,6 +3626,10 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
                             .map(|r| format!("; role: {r}"))
                             .unwrap_or_default()
                     );
+                    println!(
+                        "  workiq   {}",
+                        proofkin::workiq::account::describe(&profile)
+                    );
                     continue;
                 }
                 for provider in [Provider::Copilot, Provider::Claude, Provider::Codex] {
@@ -3571,6 +3643,10 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
                     };
                     println!("  {provider:<8} {state}");
                 }
+                println!(
+                    "  workiq   {}",
+                    proofkin::workiq::account::describe(&profile)
+                );
             }
         }
     }

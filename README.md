@@ -295,15 +295,25 @@ shows which store is used. The allowlist is `<profile>\peers.json`.
 | `claude` | `proofkin auth login claude --profile P --token` | Prompts for a long-lived OAuth token from `claude setup-token` |
 | `codex` | `proofkin auth login codex --profile P` | Browser sign-in (`codex login`) into the profile's own `CODEX_HOME` |
 | `codex` | `proofkin auth login codex --profile P --api-key` | Prompts for an OpenAI API key (saved by `codex login --with-api-key`) |
-
+| `workiq` | `proofkin auth login workiq --profile P --tenant <id-or-domain> --client-id <app-id>` | Microsoft 365 work context: signs in to Entra ID in your browser (authorization code with PKCE, redirected to a loopback port on localhost; the address is printed too) and keeps the refresh token in the OS credential store |
+| `workiq` | `proofkin auth login workiq --profile P --tenant <id-or-domain> --client-id <app-id> --device-code` | Same, for machines without a browser: prints a web address and a code to enter on another device |
 Secrets are read from a hidden prompt, or from stdin when piped. Every login is verified
 right away; if verification fails, that provider is signed out again.
+
+Work IQ needs your tenant's admin to set it up first: the client app (a public client with
+the delegated `WorkIQAgent.Ask` permission and admin consent, and public client flows on for
+`--device-code`), billing and the Work IQ policy. Without that, sign-in fails and says what
+to ask the admin for; see [docs/work-iq.md](docs/work-iq.md). The Work IQ sign-in is
+checked right away against Work IQ (`tools/list`) and signed out again if that fails.
 
 ```powershell
 proofkin auth status                    # every profile: which account each provider uses
 proofkin auth status --profile worker1
 proofkin auth logout codex --profile worker1
+proofkin auth logout workiq --profile me   # removes the Work IQ account and its token
 ```
+
+`auth status` also shows each profile's Work IQ account: user, tenant and connection.
 
 ### Example: two workers on two accounts
 
@@ -1866,6 +1876,7 @@ Workflow for a change:
 - [src/skills.rs](src/skills.rs) and [skills/](skills): built-in and profile skills (instructions for plan steps)
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)
 - [src/tracker.rs](src/tracker.rs): tracked work: plan runs as GitHub issues and sub-issues on a GitHub Project's board (GraphQL through `gh`)
+- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait; see [docs/work-iq.md](docs/work-iq.md)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
