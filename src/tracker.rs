@@ -1677,11 +1677,65 @@ struct Run {
     /// Each step's last status and agent on the board.
     last: HashMap<String, (Status, String)>,
     config_path: Option<PathBuf>,
+    /// The step issues it works on, so a run at the same time doesn't share them.
+    _claim: Claim,
 }
 
 /// The marker in a step issue's body, so a later run on the same issue finds it.
 fn step_marker(step: &str) -> String {
     format!("<!-- proofkin:step={step} -->")
+}
+
+/// The step issues runs in this process work on now, by host, repository and number.
+/// Another run on the same issue makes its own sub-issue for a step they share instead
+/// of taking one in use; once a run has ended, a later run (the same plan again, after
+/// a failure) takes its sub-issues up again.
+static IN_USE: std::sync::Mutex<std::collections::BTreeSet<(String, String, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A run's claim on its step issues (see [`IN_USE`]), given up when the run is dropped:
+/// when it has ended, or was cancelled.
+#[derive(Debug)]
+struct Claim {
+    host: String,
+    repo: String,
+    numbers: Vec<u64>,
+}
+
+impl Claim {
+    fn new(config: &TrackerConfig) -> Self {
+        Self {
+            host: config.host.clone(),
+            repo: config.repo.clone(),
+            numbers: Vec::new(),
+        }
+    }
+
+    fn key(&self, number: u64) -> (String, String, u64) {
+        (self.host.clone(), self.repo.clone(), number)
+    }
+
+    /// Claims `number` unless another run's claim has it; whether it is this run's now.
+    fn take(&mut self, number: u64) -> bool {
+        if self.numbers.contains(&number) {
+            return true;
+        }
+        let mut used = IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        if !used.insert(self.key(number)) {
+            return false;
+        }
+        self.numbers.push(number);
+        true
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut used = IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        for n in &self.numbers {
+            used.remove(&self.key(*n));
+        }
+    }
 }
 
 impl Run {
@@ -1781,11 +1835,14 @@ impl Run {
                 json!({ "issueId": run_issue.id }),
             ));
         }
-        // The steps' issues: named ones, earlier runs' sub-issues, else new ones.
+        // The steps' issues: named ones, earlier runs' sub-issues (unless a run at the
+        // same time works on them), else new ones.
+        let mut claim = Claim::new(&tracker.config);
         let mut steps: BTreeMap<String, Issue> = BTreeMap::new();
         let mut new = Vec::new();
         for step in &plan.steps {
             if let Some(n) = step.issue {
+                claim.take(n);
                 let issue = existing[&n].clone();
                 match issue.parent {
                     Some(p) if p == run_issue.number => {}
@@ -1803,7 +1860,7 @@ impl Run {
             } else if let Some(sub) = run_issue
                 .subs
                 .iter()
-                .find(|s| s.open && s.body.contains(&step_marker(&step.id)))
+                .find(|s| s.open && s.body.contains(&step_marker(&step.id)) && claim.take(s.number))
             {
                 steps.insert(step.id.clone(), sub.clone());
             } else {
@@ -1823,6 +1880,7 @@ impl Run {
         for ((step, _), result) in new.iter().zip(made) {
             match result {
                 Ok(issue) => {
+                    claim.take(issue.number);
                     steps.insert(step.clone(), issue);
                 }
                 Err(e) => problems.push(format!("step {step} has no issue: {e:#}")),
@@ -1872,6 +1930,7 @@ impl Run {
             problems,
             last: HashMap::new(),
             config_path,
+            _claim: claim,
         };
         run.issue.open = true;
         run.apply_ops("LinkIssues", ops, "linking the issues").await;
@@ -3220,6 +3279,56 @@ mod tests {
         // A plan without claims that did every step is done: nothing waits for a merge.
         assert!(!fake.open(1) && !fake.open(2));
         assert_eq!(tracked.problems.len(), 1, "{:?}", tracked.problems);
+    }
+
+    /// Two runs at the same time on one issue each work on their own sub-issue for a
+    /// step they share (#96); once a run has ended, a later run takes its sub-issue up
+    /// again, as the same plan run again after a failure does.
+    #[tokio::test]
+    async fn runs_at_the_same_time_on_an_issue_dont_share_a_steps_sub_issue() {
+        let fake = Fake::with(&[
+            FakeIssue {
+                number: 10,
+                open: true,
+                body: "The feature".into(),
+                ..FakeIssue::default()
+            },
+            FakeIssue {
+                number: 11,
+                open: true,
+                body: format!("Earlier run\n{}", step_marker("review")),
+                parent: Some(10),
+                ..FakeIssue::default()
+            },
+        ]);
+        // A repository of its own: claims are per process, and tests run at once.
+        let config = || TrackerConfig {
+            repo: "acme/claims".into(),
+            ..config()
+        };
+        let plan = Plan::parse("track: #10\nreview @worker Review it").unwrap();
+        let first = start_with(fake.clone(), config(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        assert_eq!(first.refs["review"], ["acme/claims#11"]);
+        let second = start_with(fake.clone(), config(), &plan, "r2", "boss", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.calls("createIssue").len(),
+            1,
+            "the second makes its own"
+        );
+        assert_ne!(second.refs["review"], first.refs["review"]);
+        let Tracking { tx, task, .. } = first;
+        drop(tx);
+        task.await.unwrap();
+        let third = start_with(fake.clone(), config(), &plan, "r3", "boss", None)
+            .await
+            .unwrap();
+        assert_eq!(third.refs["review"], ["acme/claims#11"]);
+        assert_eq!(fake.calls("createIssue").len(), 1);
+        drop((second, third));
     }
 
     #[tokio::test]

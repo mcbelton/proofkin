@@ -981,10 +981,11 @@
     {
       "id": "TRK-1",
       "area": "tracking",
-      "claim": "With a tracker linked (a repository and, optionally, a GitHub Project), each plan run is tracked on GitHub: the run gets an issue (or works on an existing one with track: #N; track: <title> names a new one and track: off leaves the run untracked) and each step a sub-issue of it (or an existing issue named with issue=#N, made a sub-issue of the run's), assigned to the profile's GitHub account and blocked by the issues of the steps it runs after. On the board each item says which agent does it (an Agent field, added if the board has none). A later run on the same issue takes up its steps' open sub-issues again. A plan can't give two steps one issue, or a step the run's own.",
+      "claim": "With a tracker linked (a repository and, optionally, a GitHub Project), each plan run is tracked on GitHub: the run gets an issue (or works on an existing one with track: #N; track: <title> names a new one and track: off leaves the run untracked) and each step a sub-issue of it (or an existing issue named with issue=#N, made a sub-issue of the run's), assigned to the profile's GitHub account and blocked by the issues of the steps it runs after. On the board each item says which agent does it (an Agent field, added if the board has none).       A later run on the same issue takes up its steps' open sub-issues again, unless a run at the same time works on them: then it makes its own. A plan can't give two steps one issue, or a step the run's own.",
       "tests": [
         "lib::tracker::a_tracked_run_has_an_issue_with_a_sub_issue_per_step_and_the_board_follows_it",
         "lib::tracker::a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do",
+              "lib::tracker::runs_at_the_same_time_on_an_issue_dont_share_a_steps_sub_issue",
         "lib::plan::a_plan_says_how_its_run_is_tracked_and_its_steps_name_their_issues"
       ]
     },
