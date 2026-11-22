@@ -367,6 +367,7 @@ impl RunRecord {
             issue: None,
             m365: None,
             workiq: Vec::new(),
+            model: task.model.clone(),
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims
@@ -386,6 +387,9 @@ impl RunRecord {
         }
         if let Some(n) = task.attempts {
             text += &format!(" attempts={n}");
+        }
+        if let Some(model) = &task.model {
+            text += &format!(" model={model}");
         }
         text += &format!(" {prompt}");
         let plan = Plan {

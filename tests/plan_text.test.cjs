@@ -185,6 +185,14 @@ cases.push(
     needs(planText.parsePlan("claim: C-1 x\nbuild team @alice:app claims=C-1 Build it")), ""],
   ["no checks on a team step", part("build team @alice:app Build| it", "verify=test"), `error: ${ERRORS.teamOption}`],
   ["a team step's timeout", part("build team @alice:app Build| it", "timeout=30m"), "build team @alice:app timeout=30m Build it[]"],
+  // model= names the model a step runs on; a sign-off, team step or @workiq step has none.
+  ["a step's model", part("a @x Do| it", "model=gpt-5.5"), "a @x model=gpt-5.5 Do it[]"],
+  ["a step's model replaces its model", part("a @x model=gpt-5.5 Do| it", "model=claude-sonnet-5.5"), "a @x model=claude-sonnet-5.5 Do it[]"],
+  ["no model on a sign-off", part("ok approve @me Approve| it", "model=gpt-5.5"), `error: ${ERRORS.signoffOption}`],
+  ["no model on a team step", part("build team @alice:app Build| it", "model=gpt-5.5"), `error: ${ERRORS.teamOption}`],
+  ["no model on @workiq", part("a @workiq Do| it", "model=gpt-5.5"), `error: ${ERRORS.workiqOption}`],
+  ["a step's model comes back as it was", text(planText.parsePlan("a @x using claude model=claude-opus-5.5 Do it")),
+    "a @x using claude model=claude-opus-5.5 Do it"],
   // How the run is tracked on GitHub: one track: line, kept as written; issue= is a step's.
   ["a tracked plan comes back as it was", text(planText.parsePlan("// The feature\ntrack: #12\nclaim: C-1 x\na @x issue=#15 Do it")),
     "// The feature\ntrack: #12\n\nclaim: C-1 x\n\na @x issue=#15 Do it"],

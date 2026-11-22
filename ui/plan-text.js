@@ -10,23 +10,23 @@ const planText = (() => {
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
     ["context", "context"], ["claims", "claims"], ["claim", "claims"], ["workiq", "workiq"]]);
-  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue"]);
-  // A sign-off is a person's decision: no checks, retries, patches, saved result, agent or search.
-  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq"]);
+  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue", "model"]);
+  // A sign-off is a person's decision: no checks, retries, patches, saved result, agent, model or search.
+  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq", "model"]);
   // A team step is done and proven by the lead's team plan.
-  const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent"]);
+  const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent", "model"]);
   // A @workiq step asks Microsoft 365 for an answer: context, never proof. Its agent= is a Work IQ
-  // agent id; it has no skills, MCP servers, checks, claims, patches, folder or search of its own.
+  // agent id; it has no skills, MCP servers, checks, claims, patches, folder, model or search of its own.
   const WORKIQ = "@workiq";
-  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq"]);
+  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq", "model"]);
   /// What a new step does until you say: selected, so typing replaces it (the plan
   /// check refuses to run it as is, see src/plan.rs).
   const TODO = "What to do";
   const ERRORS = {
     squadSignoff: "A sign-off needs a person (@name or @me), not a squad.",
-    signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result, agent or Microsoft 365 search.",
-    teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers or agent of its own.",
-    workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, patches, skills, MCP servers or search of its own.",
+    signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result, agent, model or Microsoft 365 search.",
+    teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers, agent or model of its own.",
+    workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, patches, skills, MCP servers, model or search of its own.",
     workiqKind: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it can't be a sign-off or a team step.",
     ownStep: (id) => `Step ${id} can't wait for itself.`,
   };

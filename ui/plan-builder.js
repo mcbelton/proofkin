@@ -60,6 +60,22 @@ const planBuilder = (() => {
 
   /// The folder a step runs in, as its peer (or a squad's online members) share it:
   /// checks, MCP servers, worktrees and access.
+  /// What the step's peer (or a squad's members, merged) says about its models for
+  /// `provider`: its default and the models it allows (none: it didn't say, or any).
+  function modelsOf(target, provider) {
+    if (!target) return null;
+    const [who] = target.slice(1).split(":");
+    const peers = target.startsWith("#")
+      ? state.peers.filter((p) => (state.squads ?? []).find((q) => q.name === who)?.members.some((m) => m.name === p.name))
+      : state.peers.filter((p) => p.name === who);
+    const said = peers.map((p) => p.models?.[provider]).filter(Boolean);
+    if (!said.length) return null;
+    return {
+      default: said.length === 1 ? said[0].default ?? null : null,
+      allowed: [...new Set(said.flatMap((c) => c.allowed ?? []))],
+    };
+  }
+
   function folderOf(target) {
     if (!target) return null;
     const [who, name = "data"] = target.slice(1).split(":");
@@ -369,9 +385,23 @@ const planBuilder = (() => {
     if (!s.team) {
       const provider = el("select", {}, ...["copilot", "claude", "codex"].map((p) => el("option", { value: p, text: providerLabel(p) })));
       provider.value = s.using ?? "copilot";
-      provider.addEventListener("change", () => { s.using = provider.value === "copilot" ? null : provider.value; changed(); });
-      items.push(field(`${k}-using`, "Model", provider, "Which of the peer's providers runs it"));
+      provider.addEventListener("change", () => { s.using = provider.value === "copilot" ? null : provider.value; changed(true); });
+      items.push(field(`${k}-using`, "Provider", provider, "Which of the peer's providers runs it"));
       set += Boolean(s.using);
+      // The model: its peer's default, or one the peer allows (it says which in its hello).
+      const offer = modelsOf(s.target, provider.value);
+      const model = el("input", {
+        type: "text", class: "mono", spellcheck: "false", autocomplete: "off", list: `pb-${k}-models`,
+        placeholder: offer?.default ? `Its default (${offer.default})` : "Its default",
+      });
+      model.value = planText.valuesOf(s, "model")[0] ?? "";
+      model.addEventListener("change", () => { planText.setValues(s, "model", model.value.trim() || null); changed(); });
+      const modelField = field(`${k}-model`, "Model", model, offer?.allowed?.length
+        ? `${s.target} allows ${offer.allowed.join(", ")}; it refuses others`
+        : "A model's name, e.g. claude-sonnet-5.5; empty: the peer's default");
+      modelField.append(el("datalist", { id: `pb-${k}-models` }, ...(offer?.allowed ?? []).map((m) => el("option", { value: m }))));
+      items.push(modelField);
+      set += Boolean(model.value);
     }
     const context = planText.valuesOf(s, "context");
     const topics = [...new Set(["all", ...(state.knowledge ?? []).map((t) => t.name), ...context])];

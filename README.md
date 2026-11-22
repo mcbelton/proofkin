@@ -346,6 +346,11 @@ another member; Copilot sessions are also limited to the list. Peers learn the d
 the lists from the agent's hello when they connect. The settings are kept in
 `profile.json`; a running agent uses them once it restarts.
 
+A task picks its model with `model=` in a plan step (or its agent's `model:`), `/delegate
+--model <name>`, the **Model** field of the web UI's Run task form (the models the chosen
+peer allows, or a name when it allows any) or the `model` argument of the MCP and A2A
+`delegate`. The result names the model that did the work.
+
 ### Example: two workers on two accounts
 
 ```powershell
@@ -516,8 +521,8 @@ In terminal 2, once `+ worker` appears:
 | Command | Description |
 | --- | --- |
 | `<text>` | Broadcast a chat message |
-| `/ask <provider> <prompt>` | Run a task locally (needs `--providers`) |
-| `/delegate <provider>[@peer[:folder]] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder) |
+| `/ask <provider> [--model <name>] <prompt>` | Run a task locally (needs `--providers`), on that model if given |
+| `/delegate <provider>[@peer[:folder]] [--model <name>] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder); `--model` picks one of the [models](#models) the peer allows (default: its default) |
 | `/plan <file>` | Run a [plan](#squads-and-plans): steps on peers (`@name`) or squads (`#squad`), in dependency order |
 | `/squads` | List your squads and which members are online |
 | `/runs` | List saved evidence runs ([EDD with agents](#evidence-driven-development-with-agents)) |
@@ -874,7 +879,8 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `claims=ID,...` | The claims this step's evidence counts towards. Claims must be defined with a `claim:` line first. |
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
-| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own. Not on sign-offs. |
+| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step names one). Not on sign-offs. |
+| `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (default: the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
@@ -887,7 +893,7 @@ A step line is `name [after steps] [team] @peer[:folder] or #squad [options] wha
 go before the task text (the plan check warns about one typed after it, but not text in
 backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
-`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout` and `issue` are given once.
+`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout`, `issue` and `model` are given once.
 
 A step's task text can go on over the lines after it: lines indented more than the step line continue
 it, with their common indentation removed (deeper indentation is kept, so nested lists work), and a

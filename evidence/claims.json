@@ -1278,6 +1278,20 @@
         "lib::skills::agent_files_name_their_skills_and_mcp_servers_in_any_list_form",
         "agents::owners_set_the_default_model_and_which_ones_tasks_may_ask_for"
       ]
+    },
+    {
+      "id": "MDL-3",
+      "area": "models",
+      "claim": "A task chooses its model: a plan step's model= option (given once, a model's name, not on sign-offs, team steps or @workiq steps; a step with agent= and no model= takes the agent's model), /ask and /delegate --model right after the target, the web UI's Run task form (a Model list of the default and the models the chosen peer or this agent allows, or a name when any is allowed) and the model argument of the MCP and A2A delegate; the plan editor and builder read and write model=. The step's task carries it, the plan check warns when every peer a step may go to says it doesn't allow the model, the worker refuses a task asking for a model its owner doesn't allow (a refusal naming the allowed ones) and runs an allowed one, and the result, get_task and the A2A metadata name the model that did the work.",
+      "tests": [
+        "lib::plan::steps_name_their_model_or_take_their_agents_and_the_check_warns_when_peers_refuse_it",
+        "lib::models::a_task_runs_on_the_model_it_asks_for_if_allowed_else_the_default",
+        "bin::delegated_tasks_may_name_their_model_right_after_the_target",
+        "agents::owners_set_the_default_model_and_which_ones_tasks_may_ask_for",
+        "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a",
+        "ui::the_plan_editor_keeps_plans_valid",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
     }
   ]
 }

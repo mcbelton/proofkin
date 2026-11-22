@@ -19,8 +19,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 const COMMANDS: &str = "\
 commands:
   <text>                                broadcast a chat message
-  /ask <provider> <prompt>              run a task locally (provider: copilot|claude|codex)
-  /delegate <provider>[@peer[:folder]] <prompt>  run a task on a peer, in a folder it shares with you (default: data)
+  /ask <provider> [--model <name>] <prompt>  run a task locally (provider: copilot|claude|codex)
+  /delegate <provider>[@peer[:folder]] [--model <name>] <prompt>  run a task on a peer, in a folder it shares with you (default: data), on a model it allows (default: its default)
   /tasks                                list your running tasks
   /cancel <n>                           cancel your running task n (the peer stops it too)
   /plan <file>                          run a plan: steps on peers (@name) or squads (#squad), in dependency order
@@ -4734,10 +4734,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
 
 /// Parses `<provider>[@peer[:folder]] <prompt>`.
 fn parse_task(rest: &str) -> Result<(LlmTask, Option<String>)> {
-    let (target, prompt) = rest
-        .trim()
-        .split_once(' ')
-        .context("usage: <provider>[@peer[:folder]] <prompt>")?;
+    const USAGE: &str = "usage: <provider>[@peer[:folder]] [--model <name>] <prompt>";
+    let (target, prompt) = rest.trim().split_once(' ').context(USAGE)?;
     let (provider, peer) = match target.split_once('@') {
         Some((provider, peer)) => (provider, Some(peer)),
         None => (target, None),
@@ -4747,7 +4745,21 @@ fn parse_task(rest: &str) -> Result<(LlmTask, Option<String>)> {
         None => (None, None),
     };
     let provider = Provider::from_str(provider, true).map_err(|e| anyhow!("{e}"))?;
+    // `--model <name>` right after the target picks the model.
+    let (model, prompt) = match prompt.trim_start().strip_prefix("--model") {
+        Some(rest) if rest.starts_with(char::is_whitespace) => {
+            let (model, prompt) = rest.trim_start().split_once(' ').context(USAGE)?;
+            proofkin::models::check_name(model)?;
+            (Some(model.to_owned()), prompt)
+        }
+        Some(_) => bail!("{USAGE}"),
+        None => (None, prompt),
+    };
+    if prompt.trim().is_empty() {
+        bail!("{USAGE}");
+    }
     let mut task = LlmTask::new(provider, prompt.trim());
+    task.model = model;
     task.title = Some(proofkin::llm::title_of(prompt.trim()));
     if let Some(share) = share {
         task = task.in_share(share);
@@ -4912,6 +4924,33 @@ mod tests {
     fn cli_definition_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn delegated_tasks_may_name_their_model_right_after_the_target() {
+        let (task, peer) = parse_task("copilot@worker:repo --model gpt-5.5 Fix the build").unwrap();
+        assert_eq!(
+            (
+                task.model.as_deref(),
+                peer.as_deref(),
+                task.share.as_deref()
+            ),
+            (Some("gpt-5.5"), Some("worker"), Some("repo"))
+        );
+        assert_eq!(task.prompt, "Fix the build");
+        let (plain, _) = parse_task("claude Explain --model in the README").unwrap();
+        assert_eq!(
+            (plain.model, plain.prompt.as_str()),
+            (None, "Explain --model in the README")
+        );
+        for bad in [
+            "copilot --model",
+            "copilot --model gpt-5.5",
+            "copilot --model `x` Do it",
+            "copilot --modelx Do it",
+        ] {
+            assert!(parse_task(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

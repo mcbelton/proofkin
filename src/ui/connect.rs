@@ -692,6 +692,7 @@ fn tools() -> Value {
                 "peer": text("The peer's name (see list_peers)"),
                 "folder": text("A folder the peer shares (default: its data folder)"),
                 "provider": { "type": "string", "enum": ["copilot", "claude", "codex"], "description": "Which provider runs it (default: the peer's first)" },
+                "model": text("The model it runs on (list_peers says which ones each peer allows; default: the peer's default)"),
                 "mcp": { "type": "array", "items": { "type": "string" }, "description": "MCP servers of that folder the model may use" },
                 "wait_seconds": wait,
             }),
@@ -820,6 +821,8 @@ fn peers(s: &Shared) -> Value {
             json!({
                 "name": p.name,
                 "providers": p.capabilities,
+                // Per provider: the model tasks that name none run on, and the ones it allows.
+                "models": p.models,
                 "folders": p.shares,
                 "role": p.role,
                 "worker_of": p.owner,
@@ -848,6 +851,7 @@ struct Ask {
     peer: Option<String>,
     folder: Option<String>,
     provider: Option<String>,
+    model: Option<String>,
     mcp: Vec<String>,
 }
 
@@ -914,6 +918,7 @@ fn start_delegation(s: &AppState, ask: &Ask, via: &'static str) -> Result<Work, 
         mcp: ask.mcp.clone(),
         checks: Vec::new(),
         attempts: None,
+        model: ask.model.clone(),
     };
     let view = start_task(s, body, Some(via)).map_err(api_error)?;
     Ok(Work::Task(view.id))
@@ -1028,6 +1033,9 @@ fn job_json(s: &Shared, job: &Job) -> Value {
             if let Some(t) = views(s, job).first() {
                 v["peer"] = json!(t.target);
                 v["provider"] = json!(t.provider);
+                if let Some(model) = &t.model {
+                    v["model"] = json!(model);
+                }
                 if let Some(p) = &t.progress {
                     v["progress"] = json!(p.text);
                 }
@@ -1050,7 +1058,7 @@ fn job_json(s: &Shared, job: &Job) -> Value {
                 .iter()
                 .map(|t| {
                     json!({
-                        "step": t.step, "peer": t.target, "status": t.status,
+                        "step": t.step, "peer": t.target, "status": t.status, "model": t.model,
                         "output": t.output, "evidence": t.evidence,
                         "progress": t.progress.as_ref().map(|p| p.text.clone()),
                     })
@@ -1099,6 +1107,7 @@ fn start_job(s: &AppState, name: &str, args: &Value) -> Result<Job, String> {
                 peer: opt_text(args, "peer"),
                 folder: opt_text(args, "folder"),
                 provider: opt_text(args, "provider"),
+                model: opt_text(args, "model"),
                 mcp: text_list(args.get("mcp")),
             };
             let job = new_job(start_delegation(s, &ask, "MCP")?, "MCP", None, None);
@@ -1193,7 +1202,7 @@ pub(super) async fn agent_card(State(s): State<AppState>, headers: HeaderMap) ->
             {
                 "id": "delegate",
                 "name": "Delegate a task to a peer",
-                "description": "Runs a task on a teammate's agent (Copilot, Claude or Codex) in a folder it shares; the result is signed by that peer. Say where in the message's metadata or a data part: peer, folder, provider, mcp. Without a peer, any connected peer that runs tasks takes it.",
+                "description": "Runs a task on a teammate's agent (Copilot, Claude or Codex) in a folder it shares; the result is signed by that peer. Say where in the message's metadata or a data part: peer, folder, provider, model, mcp. Without a peer, any connected peer that runs tasks takes it.",
                 "tags": ["delegation", "coding", "peer-to-peer"],
                 "examples": ["Summarize the open TODOs in README.md", "Fix the failing parser test (with metadata {\"peer\": \"alice\", \"folder\": \"app\"})"],
                 "inputModes": ["text/plain", "application/json"],
@@ -1447,6 +1456,7 @@ fn start_message(s: &AppState, params: &Value, streaming: bool) -> Result<Job, A
         peer: opt_text(&meta, "peer"),
         folder: opt_text(&meta, "folder"),
         provider: opt_text(&meta, "provider"),
+        model: opt_text(&meta, "model"),
         mcp: text_list(meta.get("mcp")),
     };
     let plan = match opt_text(&meta, "kind").as_deref() {
@@ -1563,6 +1573,9 @@ fn a2a_task(s: &Shared, job: &Job, history: Option<i64>, artifacts: bool) -> Val
             if let Some(t) = t {
                 meta["peer"] = json!(t.target);
                 meta["provider"] = json!(t.provider);
+                if let Some(model) = &t.model {
+                    meta["model"] = json!(model);
+                }
             }
             match (state, t) {
                 (JobState::Working, Some(t)) => Some(match &t.progress {

@@ -2599,7 +2599,33 @@ function renderTaskOptions() {
   targetSel.replaceChildren(...targets.map(([v, label]) => el("option", { value: v, text: label })));
   if (targets.some(([v]) => v === prevTarget)) targetSel.value = prevTarget;
   renderShareOptions();
+  renderModelOptions();
   updateComposer();
+}
+
+/** The model a task runs on: the default, or one its agent allows (it says which: a
+ * peer in its hello, this agent in its own settings); a name of your own when it allows
+ * any. With "Any peer" the default: it isn't known which peer takes it. */
+function renderModelOptions() {
+  const provider = $("#provider").value;
+  const target = $("#target").value;
+  const said = target === "local" ? state.me?.models?.[provider]
+    : state.peers.find((p) => p.id === target)?.models?.[provider];
+  const list = said?.allowed ?? [];
+  const deflt = said?.default ? `Default (${said.default})` : "Default";
+  const sel = $("#model");
+  const prev = sel.value;
+  sel.replaceChildren(el("option", { value: "", text: deflt }), ...list.map((m) => el("option", { value: m, text: m })));
+  if (list.includes(prev)) sel.value = prev;
+  $("#model-field").hidden = !target || target === "auto" || !list.length;
+  $("#model-name-field").hidden = !target || target === "auto" || Boolean(list.length);
+  $("#model-name").placeholder = deflt;
+}
+
+function selectedModel() {
+  if (!$("#model-field").hidden) return $("#model").value || null;
+  if (!$("#model-name-field").hidden) return $("#model-name").value.trim() || null;
+  return null;
 }
 
 /** Folder picker for a peer target: the folders that peer shares with this agent. */
@@ -2722,6 +2748,7 @@ async function submitComposer(e) {
           mcp: selectedMcp(),
           checks,
           attempts: checks.length ? Number($("#attempts").value) : null,
+          model: selectedModel(),
           prompt: text,
         }),
       });
@@ -3014,7 +3041,7 @@ function init() {
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
-  $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
+  $("#target").addEventListener("change", () => { renderShareOptions(); renderModelOptions(); updateComposer(); });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
   $("#copy-ticket").addEventListener("click", copyTicket);

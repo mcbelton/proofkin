@@ -477,6 +477,8 @@ impl Shared {
             "workspace": self.info.workspace.display().to_string(),
             "providers": self.info.providers,
             "accounts": accounts,
+            // Its providers' default models and the ones tasks may ask for (as it started).
+            "models": self.info.profile.config.models,
             "shares": if self.info.serving { self.shares_json() } else { json!([]) },
             "ticket": ticket,
         })
@@ -1352,6 +1354,9 @@ struct TaskBody {
     /// Model attempts while the checks fail (default 1).
     #[serde(default)]
     attempts: Option<u32>,
+    /// The model it runs on (default: the agent's or the peer's default).
+    #[serde(default)]
+    model: Option<String>,
 }
 
 async fn create_task(
@@ -1374,6 +1379,15 @@ fn start_task(
     }
     let mut task = LlmTask::new(body.provider, prompt.clone());
     task.title = Some(crate::llm::title_of(&prompt));
+    if let Some(model) = body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        crate::models::check_name(model).map_err(|e| bad_request(format!("{e:#}")))?;
+        task.model = Some(model.to_owned());
+    }
     if body.target != "local" {
         task.mcp = body.mcp;
     }
