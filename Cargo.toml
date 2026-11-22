@@ -1,6 +1,6 @@
 [package]
 name = "proofkin"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 description = "Peer-to-peer LLM agents: delegate coding tasks across agents over the internet using the GitHub Copilot, Claude Agent and Codex SDKs"
 license = "MIT OR Apache-2.0"

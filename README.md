@@ -24,6 +24,14 @@ credentials, so different agents can use different GitHub, Anthropic and OpenAI 
 An agent never uses the machine's global Copilot/Claude/Codex sign-in. See
 [Accounts and profiles](#accounts-and-profiles) and [Internet P2P](#internet-p2p).
 
+**Microsoft 365 work context (preview).** With a [Work IQ](docs/work-iq.md) sign-in
+(`proofkin auth login workiq`), a plan step can start from cited results from your mail,
+meetings, files and Teams (`workiq=`). A step can also ask Microsoft 365 Copilot or one of
+your organization's agents (`@workiq`), and `proofkin kb import workiq` keeps what it finds
+as knowledge. Work data stays with you: a peer gets it only with your grant and within the
+sensitivity labels you choose, and every call is audited. See
+[Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq).
+
 ## Install (no source code or Rust needed)
 
 Prebuilt binaries for Windows (x64, ARM64), Linux (x64, ARM64) and macOS (Apple Silicon) are published as
@@ -298,6 +306,7 @@ shows which store is used. The allowlist is `<profile>\peers.json`.
 | `workiq` | `proofkin auth login workiq --profile P --tenant <id-or-domain> --client-id <app-id>` | Microsoft 365 work context: signs in to Entra ID in your browser (authorization code with PKCE, redirected to a loopback port on localhost; the address is printed too) and keeps the refresh token in the OS credential store |
 | `workiq` | `proofkin auth login workiq --profile P --tenant <id-or-domain> --client-id <app-id> --device-code` | Same, for machines without a browser: prints a web address and a code to enter on another device |
 | `workiq` | `proofkin auth login workiq --profile P --cli [--tenant <id>]` | Same Work IQ, through Microsoft's Work IQ CLI instead: Proofkin starts `workiq mcp` (else `npx -y @microsoft/workiq mcp`; install Node.js or `npm install -g @microsoft/workiq`) and talks to it over stdio. The CLI signs in by itself with its own app, which your tenant's admin must have approved, so Proofkin keeps no token. The CLI doesn't get the agent's provider credentials (`GH_TOKEN`, `ANTHROPIC_API_KEY` and so on). If the CLI says its EULA isn't accepted, run `workiq accept-eula` yourself; Proofkin never accepts it for you |
+
 Secrets are read from a hidden prompt, or from stdin when piped. Every login is verified
 right away; if verification fails, that provider is signed out again.
 
