@@ -229,14 +229,15 @@ impl KnowledgeBase {
         let path = self.path(topic)?;
         std::fs::create_dir_all(&self.dir)?;
         let (text, _) = crate::redact::redact(text);
-        let text = if text.starts_with("---") || source.is_empty() {
+        let text = if source.is_empty() {
             text
         } else {
-            format!(
-                "<!-- source: {} -->\n{}",
-                source.replace("--", "-"),
-                text.trim()
-            )
+            let note = format!("<!-- source: {} -->", source.replace("--", "-"));
+            match front_matter(&text) {
+                // Front matter (a guide's, a Microsoft 365 mark) must stay first.
+                Some((head, body)) => format!("---\n{head}\n---\n{note}\n{}", body.trim()),
+                None => format!("{note}\n{}", text.trim()),
+            }
         };
         std::fs::write(&path, text + "\n").with_context(|| format!("writing {}", path.display()))
     }
@@ -491,5 +492,30 @@ mod tests {
         assert_eq!(listed[0].workiq, Some(labels.clone()));
         assert_eq!(kb.marks(&["notes".into(), "api-down".into()]), Some(labels));
         assert_eq!(kb.marks(&["missing".into()]), None);
+    }
+
+    #[test]
+    fn a_topic_with_front_matter_keeps_its_source_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path());
+        let source = "run 1 step research by bob (signed, verified)";
+
+        kb.write("hr", &with_mark("Pay bands", &["HR".to_owned()]), source)
+            .unwrap();
+        let text = kb.read("hr").unwrap();
+        assert!(
+            text.starts_with(&format!(
+                "---\norigin: workiq\nlabels: HR\n---\n<!-- source: {source} -->\nPay bands"
+            )),
+            "{text}"
+        );
+        assert_eq!(parse_mark(&text), Some(vec!["HR".to_owned()]));
+
+        kb.write("plain", "Three services.", source).unwrap();
+        assert!(
+            kb.read("plain")
+                .unwrap()
+                .starts_with(&format!("<!-- source: {source} -->\nThree services."))
+        );
     }
 }

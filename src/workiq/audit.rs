@@ -137,7 +137,8 @@ pub struct Entry {
     pub results: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld: Option<usize>,
-    /// The sensitivity labels of the results (`unlabeled` for none).
+    /// The sensitivity labels of the results (`unlabeled` for none, `unknown` for a result
+    /// without label information).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1058,6 +1058,7 @@
         "lib::workiq::content::results_that_are_not_exactly_allowed_are_withheld_and_counted",
         "lib::workiq::content::a_peer_gets_only_the_labels_it_may_have_and_local_gets_all",
         "lib::workiq::content::results_without_a_label_go_to_a_peer_only_when_unlabeled_is_allowed",
+        "lib::workiq::content::results_without_label_information_never_go_to_a_peer",
         "lib::workiq::content::no_results_give_an_empty_section",
         "lib::workiq::content::a_result_that_stopped_with_an_error_or_has_no_structured_content_fails",
         "lib::workiq::content::the_cap_keeps_the_most_relevant_results",
@@ -1085,6 +1086,7 @@
       "claim": "Microsoft 365 content keeps its origin (docs/work-iq.md section 4) and plans don't send it to peers not allowed to receive it. A knowledge topic with front matter origin: workiq and labels: (comma-separated) is marked (parse_mark, with_mark and KnowledgeBase::marks in src/knowledge.rs); a mark can be written into a topic with or without troubleshooting-guide front matter, a guide stays a guide, and a topic can have both. A step (Step.m365, a field the workiq= option and @workiq steps will set too) is marked when a context= topic is marked, with the union of the labels (context=all included), when a step it runs after is marked because it gets that step's output, and the steps that save= from a marked step write the mark into the topic, so a later step that uses it is marked. The plan check (preflight, with the allowlist and the owner's digital workers as Recipients) gives an error for a marked step whose target (a peer, a squad member the squad may pick, or the person asked to approve) has no Microsoft 365 grant or whose grant lacks one of the labels, naming the step, the peer, the labels and the proofkin peers allow command that grants them; a granted peer (labels compared without case) and the owner's digital workers get none. When the plan runs, the same check is made against the allowlist as it is then before each task is sent, and the step fails with the same message if the grant changed.",
       "tests": [
         "lib::knowledge::a_topics_microsoft_365_mark_round_trips_with_and_without_guide_front_matter",
+        "lib::knowledge::a_topic_with_front_matter_keeps_its_source_after_it",
         "lib::plan::steps_with_microsoft_365_content_are_marked_through_context_and_after",
         "lib::plan::save_writes_a_marked_steps_mark_into_its_topic",
         "lib::plan::the_plan_check_stops_marked_steps_for_peers_that_may_not_have_them",

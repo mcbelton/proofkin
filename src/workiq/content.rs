@@ -63,6 +63,16 @@ impl Audience {
             }
         }
     }
+
+    /// Whether content with `label` may go to the audience. Content Work IQ gave no label
+    /// information for stays local: its sensitivity isn't known.
+    fn allows_label(&self, label: &CitationLabel) -> bool {
+        match label {
+            CitationLabel::Unknown => matches!(self, Audience::Local),
+            CitationLabel::Unlabeled => self.allows(None),
+            CitationLabel::Named(name) => self.allows(Some(name)),
+        }
+    }
 }
 
 /// How many results were withheld, and why.
@@ -119,12 +129,12 @@ pub struct Section {
     pub redacted: usize,
 }
 
-/// A sensitivity label as a citation carries it.
+/// A sensitivity label as Work IQ reports it on a result or a citation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CitationLabel {
-    /// The citation has no label metadata.
+    /// No label information (no `sensitivityLabel`): the sensitivity isn't known.
     Unknown,
-    /// The citation says it has no label.
+    /// It says it has no label (`sensitivityLabel` is empty).
     Unlabeled,
     Named(String),
 }
@@ -149,7 +159,7 @@ struct Item {
     markdown: String,
     title: Option<String>,
     date: Option<String>,
-    label: Option<String>,
+    label: CitationLabel,
     link: Option<String>,
     score: f64,
 }
@@ -203,6 +213,24 @@ fn label_name(value: &Value) -> Option<String> {
     }
 }
 
+/// The label of a result or citation: unknown when it has no `sensitivityLabel` at all.
+fn label_of(value: &Value) -> CitationLabel {
+    if value.get("sensitivityLabel").is_none() {
+        CitationLabel::Unknown
+    } else {
+        label_name(value).map_or(CitationLabel::Unlabeled, CitationLabel::Named)
+    }
+}
+
+/// How a label reads in a sources list.
+fn label_text(label: &CitationLabel) -> String {
+    match label {
+        CitationLabel::Named(name) => line(name),
+        CitationLabel::Unlabeled => UNLABELED.to_owned(),
+        CitationLabel::Unknown => "no label information".to_owned(),
+    }
+}
+
 fn read_item(value: &Value) -> Item {
     let metadata = value.get("resourceMetadata");
     Item {
@@ -215,7 +243,7 @@ fn read_item(value: &Value) -> Item {
             .to_owned(),
         title: facet_text(metadata, &TITLE_KEYS),
         date: facet_text(metadata, &DATE_KEYS),
-        label: label_name(value),
+        label: label_of(value),
         link: text(value, "webUrl").or_else(|| text(value, "entityUrl")),
         score: value
             .get("relevanceScore")
@@ -256,7 +284,8 @@ pub struct Summary {
     pub results: usize,
     /// Results the policy would withhold from the audience.
     pub withheld: usize,
-    /// Every label the results carry, sorted; `unlabeled` stands for none.
+    /// Every label the results carry, sorted; `unlabeled` stands for none, and `unknown` for
+    /// a result without label information.
     pub labels: Vec<String>,
 }
 
@@ -271,13 +300,17 @@ pub fn summarize(result: &ToolResult, audience: &Audience) -> Option<Summary> {
         ..Summary::default()
     };
     for value in results {
-        let label = label_name(value);
+        let label = label_of(value);
         let allowed = text(value, "contentProtection").as_deref() == Some("allowed")
-            && audience.allows(label.as_deref());
+            && audience.allows_label(&label);
         if !allowed {
             summary.withheld += 1;
         }
-        let name = label.unwrap_or_else(|| UNLABELED.to_owned());
+        let name = match label {
+            CitationLabel::Named(name) => name,
+            CitationLabel::Unlabeled => UNLABELED.to_owned(),
+            CitationLabel::Unknown => "unknown".to_owned(),
+        };
         if !summary.labels.contains(&name) {
             summary.labels.push(name);
         }
@@ -316,7 +349,7 @@ pub fn retrieval_section(result: &ToolResult, audience: &Audience, cap: usize) -
             }
         }
         let item = read_item(value);
-        if audience.allows(item.label.as_deref()) {
+        if audience.allows_label(&item.label) {
             items.push(item);
         } else {
             withheld.by_label += 1;
@@ -369,10 +402,7 @@ fn source_line(item: &Item) -> String {
         .date
         .as_deref()
         .map_or_else(|| "no date".to_owned(), line);
-    let label = item
-        .label
-        .as_deref()
-        .map_or_else(|| UNLABELED.to_owned(), line);
+    let label = label_text(&item.label);
     let mut entry = format!(
         "- {} ({}, {date}, {label})",
         line(title),
@@ -405,15 +435,10 @@ pub fn read_answer(result: &ToolResult) -> Result<Answer> {
 }
 
 fn read_citation(value: &Value) -> Citation {
-    let label = if value.get("sensitivityLabel").is_none() {
-        CitationLabel::Unknown
-    } else {
-        label_name(value).map_or(CitationLabel::Unlabeled, CitationLabel::Named)
-    };
     Citation {
         title: text(value, "title").or_else(|| text(value, "name")),
         url: text(value, "webUrl").or_else(|| text(value, "url")),
-        label,
+        label: label_of(value),
     }
 }
 
@@ -422,11 +447,10 @@ fn answer_allowed(answer: &Answer, audience: &Audience) -> bool {
         return true;
     }
     !answer.citations.is_empty()
-        && answer.citations.iter().all(|c| match &c.label {
-            CitationLabel::Unknown => false,
-            CitationLabel::Unlabeled => audience.allows(None),
-            CitationLabel::Named(name) => audience.allows(Some(name)),
-        })
+        && answer
+            .citations
+            .iter()
+            .all(|c| audience.allows_label(&c.label))
 }
 
 /// The prompt section for an `ask` answer. The citations decide its labels: a peer gets it
@@ -449,11 +473,7 @@ pub fn answer_section(result: &ToolResult, audience: &Audience, cap: usize) -> R
         .citations
         .iter()
         .map(|c| {
-            let label = match &c.label {
-                CitationLabel::Named(name) => line(name),
-                CitationLabel::Unlabeled => UNLABELED.to_owned(),
-                CitationLabel::Unknown => "no label information".to_owned(),
-            };
+            let label = label_text(&c.label);
             let title = c
                 .title
                 .as_deref()
@@ -604,7 +624,10 @@ mod tests {
 
     #[test]
     fn results_without_a_label_go_to_a_peer_only_when_unlabeled_is_allowed() {
-        let result = retrieval(json!([document("nolabel", Some("allowed"), None, 0.9)]));
+        // Work IQ says a result has no label with an empty `sensitivityLabel`.
+        let mut unlabeled = document("nolabel", Some("allowed"), None, 0.9);
+        unlabeled["sensitivityLabel"] = json!({});
+        let result = retrieval(json!([unlabeled]));
         let without = retrieval_section(&result, &Audience::peer(["General"]), DEFAULT_CAP);
         let without = without.unwrap();
         assert_eq!(without.kept, 0);
@@ -615,6 +638,32 @@ mod tests {
         assert!(
             with.text
                 .contains("(file, 2026-03-04T10:00:00Z, unlabeled)")
+        );
+    }
+
+    #[test]
+    fn results_without_label_information_never_go_to_a_peer() {
+        // No `sensitivityLabel` at all: its sensitivity isn't known, so only this agent gets it.
+        let result = retrieval(json!([document("unknown", Some("allowed"), None, 0.9)]));
+        let peer = Audience::peer(["General", "Unlabeled"]);
+        let section = retrieval_section(&result, &peer, DEFAULT_CAP).unwrap();
+        assert_eq!(section.kept, 0);
+        assert_eq!(section.withheld.by_label, 1);
+        assert!(!section.text.contains("workiq:file:unknown"));
+        assert_eq!(summarize(&result, &peer).unwrap().withheld, 1);
+
+        let local = retrieval_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
+        assert_eq!(local.kept, 1);
+        assert!(
+            local
+                .text
+                .contains("(file, 2026-03-04T10:00:00Z, no label information)"),
+            "{}",
+            local.text
+        );
+        assert_eq!(
+            summarize(&result, &Audience::Local).unwrap().labels,
+            ["unknown"]
         );
     }
 

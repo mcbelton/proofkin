@@ -2178,7 +2178,7 @@ mod tests {
         assert_eq!(first.query_sha256, sha);
         assert_eq!(first.query_chars, SECRET_QUERY.chars().count());
         assert_eq!((first.results, first.withheld), (Some(3), Some(1)));
-        assert_eq!(first.labels, ["General", "Secret", "unlabeled"]);
+        assert_eq!(first.labels, ["General", "Secret", "unknown"]);
         assert!(first.request_id.as_deref().unwrap().starts_with("req-"));
         assert!(
             first

@@ -141,7 +141,9 @@ Every result goes through one function before it reaches a prompt (`src/workiq/c
 2. Keep only `contentProtection: "allowed"`. Count the rest as withheld, by reason.
 3. Filter by the audience's labels. The owner's own agent and digital workers get every label;
    a peer gets only the labels the owner allowed for it (`unlabeled` is one of the choices).
-   Labels are names each tenant defines, so the rule is an allowlist, not a ranking.
+   Labels are names each tenant defines, so the rule is an allowlist, not a ranking. A
+   result without label information (no `sensitivityLabel`) has an unknown sensitivity, so
+   it goes to no peer; Work IQ marks unlabeled content with an empty one.
 4. Redact secrets (`redact`), cap the size (highest relevance first, 16 000 characters by
    default) and wrap each result in the external-content envelope (`boundary`) with its
    source: title, type, date, label and link.
