@@ -93,11 +93,11 @@ pub(super) async fn list(
     let gh_accounts: Vec<Value> =
         if query.accounts && can_own && !me.is_configured(Provider::Copilot) {
             tokio::task::spawn_blocking(crate::github::gh_accounts)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(login, host, active)| json!({ "login": login, "host": host, "active": active }))
-            .collect()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| json!({ "login": a.login, "host": a.host, "active": a.active }))
+                .collect()
         } else {
             Vec::new()
         };

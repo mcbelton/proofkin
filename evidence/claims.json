@@ -493,6 +493,35 @@
       "live": ["linked a GitHub repository with the profile's GitHub sign-in"]
     },
     {
+      "id": "GH-2",
+      "area": "github",
+      "claim": "A profile's GitHub account gets a scope it lacks without a terminal: Grant access (on the Tracker card when the board lacks the project scope, which the tracker names, or on the GitHub card) and proofkin github grant run the GitHub CLI's device flow and show its one-time code and where to enter it. gh's active account is switched to the profile's for the refresh only if needed, and switched back afterwards, also when the flow fails, is cancelled, times out or the agent stops; afterwards the token is checked for the scopes. One flow runs at a time, scope names are checked, an account the GitHub CLI doesn't have is refused, and a profile not signed in to GitHub (or a digital worker) can't grant.",
+      "tests": [
+        "lib::gh_auth::accounts_are_read_with_their_scopes",
+        "lib::gh_auth::gh_output_gives_the_code_and_where_to_enter_it",
+        "lib::gh_auth::a_grant_switches_to_the_account_refreshes_and_switches_back",
+        "lib::gh_auth::a_grant_for_the_active_account_switches_nothing",
+        "lib::gh_auth::gh_is_switched_back_when_a_grant_fails_is_cancelled_or_times_out",
+        "lib::gh_auth::the_agent_stopping_mid_flow_still_switches_gh_back",
+        "lib::gh_auth::one_flow_waits_at_a_time_and_unknown_accounts_are_refused",
+        "lib::gh_auth::the_github_cli_runner_passes_the_arguments_and_reads_the_output",
+        "lib::tracker::without_the_project_scope_tracking_keeps_to_issues_and_says_how_to_fix_it",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
+      ]
+    },
+    {
+      "id": "GH-3",
+      "area": "github",
+      "claim": "Another GitHub account signs in from the web UI (Sign in another account, with the project and workflow scopes ticked) or with proofkin github login --new: the GitHub CLI's device flow shows its code in a dialog, the profile then uses the new account, and gh's previously active account is made active again. A new sign-in's host and scopes are checked before gh starts. The GitHub card shows what each scope of the profile's token is for, and gh's active account when it is another one.",
+      "tests": [
+        "lib::gh_auth::signing_in_another_account_switches_gh_back_and_names_the_new_account",
+        "lib::gh_auth::gh_output_gives_the_code_and_where_to_enter_it",
+        "lib::gh_auth::the_github_cli_runner_passes_the_arguments_and_reads_the_output",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
       "id": "SPEC-1",
       "area": "spec-driven",
       "claim": "Built-in checks validate a feature's spec package before any code: spec:spec (user stories with testable Given/When/Then or 'must' acceptance criteria tied to stories, security and privacy covered), spec:api (an OpenAPI 3 REST contract whose operations name their criteria and whose examples match their schemas, with success and client-error responses), spec:ux (a self-contained prototype showing every story, no external resources or server calls) and spec:trace (every criterion covered by the API or the prototype and claimed in evidence/claims.json). spec init writes a starter package that passes them all.",

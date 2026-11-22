@@ -454,7 +454,33 @@ pub struct Tracker {
     pub board: Option<Board>,
     /// Why the board isn't used, e.g. the account lacks the `project` scope.
     pub board_problem: Option<String>,
+    /// The scope the account's token lacks for the board, when that is the problem.
+    pub board_scope: Option<String>,
 }
+
+/// The account's token lacks the scope the board needs.
+#[derive(Debug)]
+struct MissingScope {
+    login: String,
+    host: String,
+    scope: &'static str,
+}
+
+impl std::fmt::Display for MissingScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the GitHub account {login} can't use projects yet: its token lacks the {scope} scope. \
+             Grant it with `proofkin github grant {scope}` or Grant access in the web UI (or run \
+             `gh auth refresh --hostname {host} --scopes {scope}` while {login} is the GitHub CLI's active account)",
+            login = self.login,
+            host = self.host,
+            scope = self.scope
+        )
+    }
+}
+
+impl std::error::Error for MissingScope {}
 
 const REPO_QUERY: &str = "query Repo($owner: String!, $name: String!) { viewer { id login } repository(owner: $owner, name: $name) { id url } }";
 
@@ -499,11 +525,17 @@ impl Tracker {
             config,
             board: None,
             board_problem: None,
+            board_scope: None,
         };
         if let Some(project) = tracker.config.project.clone() {
             match tracker.open_board(&project).await {
                 Ok(board) => tracker.board = Some(board),
-                Err(e) => tracker.board_problem = Some(format!("{e:#}")),
+                Err(e) => {
+                    if let Some(missing) = e.downcast_ref::<MissingScope>() {
+                        tracker.board_scope = Some(missing.scope.to_owned());
+                    }
+                    tracker.board_problem = Some(format!("{e:#}"));
+                }
             }
         }
         Ok(tracker)
@@ -518,13 +550,12 @@ impl Tracker {
             )
             .await?;
         if reply.lacks_scope() {
-            bail!(
-                "the GitHub account {} can't use projects yet: grant its token the project scope with \
-                 `gh auth refresh --hostname {} --scopes project` while {} is the GitHub CLI's active account",
-                self.login,
-                self.config.host,
-                self.login
-            );
+            return Err(MissingScope {
+                login: self.login.clone(),
+                host: self.config.host.clone(),
+                scope: "project",
+            }
+            .into());
         }
         let data = reply.ok()?;
         let board = data
@@ -614,6 +645,7 @@ impl Tracker {
                 agent_field: b.agent.is_some(),
             }),
             board_problem: self.board_problem.clone(),
+            board_scope: self.board_scope.clone(),
             open_runs: self.config.open_runs.clone(),
         }
     }
@@ -1393,6 +1425,8 @@ pub struct TrackerInfo {
     pub project: Option<ProjectRef>,
     pub board: Option<BoardInfo>,
     pub board_problem: Option<String>,
+    /// The scope the account's token lacks for the board (the web UI offers to grant it).
+    pub board_scope: Option<String>,
     pub open_runs: Vec<u64>,
 }
 
@@ -2096,6 +2130,7 @@ impl Run {
                     repo_url: self.tracker.repo_url.clone(),
                     board: self.tracker.board.clone(),
                     board_problem: None,
+                    board_scope: None,
                 };
                 if let Ok(closed) = tracker.settle().await
                     && !closed.is_empty()
@@ -3135,10 +3170,18 @@ mod tests {
         assert!(
             problem.starts_with(
                 "the board isn't updated: the GitHub account alice can't use projects yet"
-            ) && problem.contains("gh auth refresh --hostname github.com --scopes project"),
+            ) && problem.contains("`proofkin github grant project`")
+                && problem.contains("gh auth refresh --hostname github.com --scopes project"),
             "{problem}"
         );
         assert_eq!(tracking.tracked.board, None);
+        // The web UI learns which scope is missing, to offer to grant it.
+        let info = Tracker::connect(fake.clone(), config())
+            .await
+            .unwrap()
+            .info();
+        assert_eq!(info.board_scope.as_deref(), Some("project"));
+        assert!(info.board_problem.is_some());
         tracking.update("a", &done("worker", None));
         let mut record = RunRecord::new(
             "boss",

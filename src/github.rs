@@ -103,28 +103,15 @@ pub fn parse_repo(input: &str, default_host: &str) -> Result<(String, String)> {
     Ok((host.to_owned(), format!("{owner}/{repo}")))
 }
 
-/// GitHub CLI accounts signed in on this machine: `(login, host, active)`.
-pub fn gh_accounts() -> Vec<(String, String, bool)> {
+/// GitHub CLI accounts signed in on this machine, with their token's scopes.
+pub fn gh_accounts() -> Vec<crate::gh_auth::GhAccount> {
     let out = std::process::Command::new(gh_program())
         .args(["auth", "status", "--json", "hosts"])
         .stdin(Stdio::null())
         .output();
     let Ok(out) = out else { return Vec::new() };
     let hosts: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    let mut accounts = Vec::new();
-    if let Some(hosts) = hosts.get("hosts").and_then(|h| h.as_object()) {
-        for (host, list) in hosts {
-            for a in list.as_array().into_iter().flatten() {
-                if a.get("state").and_then(|s| s.as_str()) == Some("success")
-                    && let Some(login) = a.get("login").and_then(|l| l.as_str())
-                {
-                    let active = a.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-                    accounts.push((login.to_owned(), host.clone(), active));
-                }
-            }
-        }
-    }
-    accounts
+    crate::gh_auth::parse_accounts(&hosts)
 }
 
 /// The GitHub CLI (`PROOFKIN_GH` overrides it, e.g. for tests).

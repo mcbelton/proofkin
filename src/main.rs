@@ -376,12 +376,32 @@ enum KbImportCommand {
 
 #[derive(Subcommand)]
 enum GithubCommand {
-    /// Use a GitHub CLI account (see `gh auth status`) for this profile's repositories.
+    /// Use a GitHub CLI account (see `gh auth status`) for this profile's repositories,
+    /// or sign in another one in the browser with --new.
     Login {
+        #[arg(long, required_unless_present = "new", conflicts_with = "new")]
+        gh_user: Option<String>,
+        /// Sign in another account with the GitHub CLI's device flow and use it; gh's
+        /// active account is switched back afterwards.
         #[arg(long)]
-        gh_user: String,
+        new: bool,
+        /// With --new: scopes for the new account's token besides gh's own.
+        #[arg(
+            long = "scope",
+            value_delimiter = ',',
+            default_value = "project,workflow"
+        )]
+        scopes: Vec<String>,
         #[arg(long, default_value = DEFAULT_GITHUB_HOST)]
         host: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Give the profile's GitHub account more scopes, e.g. `project` for the tracker's
+    /// board: gh is switched to it for the refresh and back afterwards.
+    Grant {
+        #[arg(value_delimiter = ',', required = true)]
+        scopes: Vec<String>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1393,7 +1413,7 @@ async fn main() -> Result<()> {
         Some(Command::Agent(command)) => run_agent_command(command),
         Some(Command::Spec(command)) => run_spec(command),
         Some(Command::Design(command)) => run_design(command),
-        Some(Command::Github(command)) => run_github(command),
+        Some(Command::Github(command)) => run_github(command).await,
         Some(Command::Repo(command)) => run_repo(command).await,
         Some(Command::Tracker(command)) => run_tracker(command).await,
         Some(Command::Monitor(command)) => run_monitor(command),
@@ -1985,12 +2005,47 @@ fn github_login(profile: &mut Profile, user: &str, host: &str) -> Result<String>
     profile.github_login(user, host)
 }
 
-fn run_github(command: GithubCommand) -> Result<()> {
+/// Runs a GitHub CLI device flow in the terminal: shows the code, waits for the user to
+/// enter it on GitHub (Ctrl-C cancels), and returns how it ended.
+async fn device_flow(
+    kind: proofkin::gh_auth::Kind,
+    host: &str,
+    what: &str,
+) -> Result<proofkin::gh_auth::Flow> {
+    use proofkin::gh_auth::{Flows, GhCli};
+    let flows = Flows::new(std::sync::Arc::new(GhCli::new()));
+    let flow = flows.start(kind, host, |_| {}).await?;
+    println!("Enter the code {} at {} to {what}.", flow.code, flow.url);
+    if let (Some(before), Some(login)) = (&flow.active_before, &flow.login)
+        && !before.eq_ignore_ascii_case(login)
+    {
+        println!(
+            "The GitHub CLI's active account is {login} until you finish, then {before} again."
+        );
+    }
+    println!("Waiting (Ctrl-C cancels)...");
+    let ended = tokio::select! {
+        ended = flows.ended() => ended,
+        _ = tokio::signal::ctrl_c() => {
+            flows.cancel();
+            flows.ended().await
+        }
+    };
+    let ended = ended.context("the sign-in ended without a result")?;
+    if let Some(note) = &ended.note {
+        eprintln!("{note}");
+    }
+    Ok(ended)
+}
+
+async fn run_github(command: GithubCommand) -> Result<()> {
+    use proofkin::gh_auth::{Kind, State, check_scopes};
     match command {
         GithubCommand::Login {
-            gh_user,
+            gh_user: Some(gh_user),
             host,
             profile,
+            ..
         } => {
             let mut profile = Profile::open(&profile.name)?;
             let login = github_login(&mut profile, &gh_user, &host)?;
@@ -1998,6 +2053,67 @@ fn run_github(command: GithubCommand) -> Result<()> {
                 "profile '{}': GitHub repositories as {login}@{host}",
                 profile.name
             );
+        }
+        GithubCommand::Login {
+            scopes,
+            host,
+            profile,
+            ..
+        } => {
+            let mut profile = Profile::open(&profile.name)?;
+            if profile.config.owner.is_some() {
+                bail!("digital workers use their owner's GitHub account");
+            }
+            // `--scope ""`: only the GitHub CLI's own scopes.
+            let scopes: Vec<String> = scopes.into_iter().filter(|s| !s.is_empty()).collect();
+            check_scopes(&scopes)?;
+            let ended = device_flow(Kind::SignIn { scopes }, &host, "sign in to GitHub").await?;
+            match ended.state {
+                State::Done { login } => {
+                    let login = github_login(&mut profile, &login, &host)?;
+                    println!(
+                        "profile '{}': GitHub repositories as {login}@{host}",
+                        profile.name
+                    );
+                }
+                State::Failed { reason } => bail!("the sign-in failed: {reason}"),
+                State::Cancelled | State::Waiting => bail!("the sign-in was cancelled"),
+            }
+        }
+        GithubCommand::Grant { scopes, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            if profile.config.owner.is_some() {
+                bail!(
+                    "a digital worker uses its owner's GitHub account: grant the scope to the owner's profile"
+                );
+            }
+            let Some(proofkin::profile::GithubAuth::Gh { user, host }) =
+                profile.config.github.clone()
+            else {
+                bail!(
+                    "profile '{}' isn't signed in to GitHub; run: proofkin github login --gh-user <login> --profile {}",
+                    profile.name,
+                    profile.name
+                );
+            };
+            check_scopes(&scopes)?;
+            let what = format!("approve the {} scope for {user}", scopes.join(", "));
+            let ended = device_flow(
+                Kind::Grant {
+                    login: user,
+                    scopes: scopes.clone(),
+                },
+                &host,
+                &what,
+            )
+            .await?;
+            match ended.state {
+                State::Done { login } => {
+                    println!("{login}'s token now has the {} scope", scopes.join(", "))
+                }
+                State::Failed { reason } => bail!("the grant failed: {reason}"),
+                State::Cancelled | State::Waiting => bail!("the grant was cancelled"),
+            }
         }
         GithubCommand::Status { profile } => {
             let profile = Profile::open(&profile.name)?;
@@ -2009,8 +2125,14 @@ fn run_github(command: GithubCommand) -> Result<()> {
                 Err(e) => println!("{e:#}"),
             }
             println!("GitHub CLI accounts on this machine:");
-            for (login, host, active) in proofkin::github::gh_accounts() {
-                println!("  {login}@{host}{}", if active { " (active)" } else { "" });
+            for a in proofkin::github::gh_accounts() {
+                println!(
+                    "  {}@{}{} (scopes: {})",
+                    a.login,
+                    a.host,
+                    if a.active { ", active" } else { "" },
+                    a.scopes.join(", ")
+                );
             }
         }
         GithubCommand::Logout { profile } => {

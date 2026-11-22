@@ -503,6 +503,13 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .tracker-problem { margin: 6px 0; padding: 6px 10px; border-left: 3px solid var(--warn); border-radius: 4px; background: var(--warn-soft); }
 .tracker-problem p { margin: 0; }
 .tracker-problem .command { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; }
+.tracker-problem details { margin-top: 6px; }
+.tracker-problem summary { cursor: pointer; }
+.tracker-problem pre { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+#github-scopes p { margin: 4px 0; }
+.device-code-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.device-code { font-family: var(--mono); font-size: 22px; font-weight: 700; letter-spacing: 2px; padding: 4px 12px; border-radius: 6px; background: var(--surface-3); user-select: all; }
+.gh-flow-status { display: flex; align-items: center; gap: 6px; min-height: 1.5em; margin: 0; }
 .tracker-problem code { overflow-wrap: anywhere; font-size: 12px; font-weight: 400; }
 .tracker-groups { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; max-height: 60vh; overflow: auto; overscroll-behavior: contain; }
 .tracker-group h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }

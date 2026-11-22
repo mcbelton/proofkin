@@ -334,6 +334,8 @@ struct Shared {
     fixed_port: bool,
     /// Where imports search Microsoft 365, if not Work IQ's hosted service.
     work: Option<Arc<dyn crate::workiq::context::WorkContext>>,
+    /// GitHub CLI sign-ins run for the user: granting a scope, signing in an account.
+    gh: Arc<crate::gh_auth::Flows>,
 }
 
 type AppState = Arc<Shared>;
@@ -754,6 +756,7 @@ pub async fn start_with_work(
         team_runs: Mutex::new(HashMap::new()),
         fixed_port: bind.port() != 0,
         work,
+        gh: crate::gh_auth::Flows::new(Arc::new(crate::gh_auth::GhCli::new())),
     });
     if stopped > 0 {
         let (were, they, them) = if stopped == 1 {
@@ -933,6 +936,12 @@ pub async fn start_with_work(
         .route("/api/plans/check", post(check_plan))
         .route("/api/github", get(github_state))
         .route("/api/github/login", post(github_sign_in))
+        .route("/api/github/login/new", post(github_sign_in_new))
+        .route("/api/github/grant", post(github_grant))
+        .route(
+            "/api/github/flow",
+            get(github_flow).delete(cancel_github_flow),
+        )
         .route("/api/repos", post(link_repo))
         .route("/api/repos/{name}", delete(unlink_repo))
         .route("/api/repos/{name}/sync", post(sync_repo))
@@ -2404,12 +2413,9 @@ async fn github_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError
         None if profile.config.owner.is_some() => json!({ "owner": profile.config.owner }),
         None => Value::Null,
     };
-    let accounts: Vec<Value> = tokio::task::spawn_blocking(gh_accounts)
+    let accounts = tokio::task::spawn_blocking(gh_accounts)
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(login, host, active)| json!({ "login": login, "host": host, "active": active }))
-        .collect();
+        .unwrap_or_default();
     let mut repos = Vec::new();
     for repo in RepoStore::load(&profile.repos_path())
         .map_err(internal)?
@@ -2426,7 +2432,165 @@ async fn github_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError
         "accounts": accounts,
         "repos": repos,
         "serving": s.info.serving,
+        // A sign-in that waits for its code to be entered on GitHub, or the last one.
+        "flow": s.gh.current(),
     })))
+}
+
+#[derive(Deserialize)]
+struct GrantBody {
+    /// Default: `project`, which the tracker's board needs.
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+/// Gives the profile's GitHub account more scopes: gh is switched to it for the
+/// refresh and back afterwards (see [`crate::gh_auth`]). Answers once gh shows its code.
+async fn github_grant(
+    State(s): State<AppState>,
+    Json(body): Json<GrantBody>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    if profile.config.owner.is_some() {
+        return Err(bad_request(
+            "a digital worker uses its owner's GitHub account: grant the scope on the owner's agent",
+        ));
+    }
+    let Some(crate::profile::GithubAuth::Gh { user, host }) = profile.config.github.clone() else {
+        return Err(bad_request("sign in to GitHub first"));
+    };
+    let scopes = if body.scopes.is_empty() {
+        vec!["project".to_owned()]
+    } else {
+        body.scopes
+    };
+    crate::gh_auth::check_scopes(&scopes).map_err(|e| bad_request(format!("{e:#}")))?;
+    let kind = crate::gh_auth::Kind::Grant {
+        login: user,
+        scopes,
+    };
+    let shared = s.clone();
+    let flow =
+        s.gh.start(kind, &host, move |flow| report_flow(&shared, &flow))
+            .await
+            .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(json!({ "flow": flow })))
+}
+
+#[derive(Deserialize)]
+struct NewLoginBody {
+    #[serde(default)]
+    host: Option<String>,
+    /// Scopes for the new account's token on top of gh's own (e.g. `project`, `workflow`).
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+/// Signs another account in to the GitHub CLI and makes the profile use it; gh's active
+/// account is switched back afterwards. Answers once gh shows its code.
+async fn github_sign_in_new(
+    State(s): State<AppState>,
+    Json(body): Json<NewLoginBody>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    if profile.config.owner.is_some() {
+        return Err(bad_request(
+            "digital workers use their owner's GitHub account",
+        ));
+    }
+    let host = body
+        .host
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| crate::profile::DEFAULT_GITHUB_HOST.to_owned());
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(bad_request(format!("{host:?} isn't a GitHub host name")));
+    }
+    crate::gh_auth::check_scopes(&body.scopes).map_err(|e| bad_request(format!("{e:#}")))?;
+    let kind = crate::gh_auth::Kind::SignIn {
+        scopes: body.scopes,
+    };
+    let shared = s.clone();
+    let flow =
+        s.gh.start(kind, &host, move |flow| {
+            let crate::gh_auth::State::Done { login } = &flow.state else {
+                report_flow(&shared, &flow);
+                return;
+            };
+            // The profile uses the new account, once GitHub accepts its token.
+            let (login, host) = (login.clone(), flow.host.clone());
+            tokio::spawn(async move {
+                let profile = shared.info.profile.clone();
+                let used = tokio::task::spawn_blocking(move || {
+                    profile.reload()?.github_login(&login, &host)
+                })
+                .await;
+                match used {
+                    Ok(Ok(_)) => report_flow(&shared, &flow),
+                    Ok(Err(e)) => shared.system(
+                        "warn",
+                        format!(
+                            "Signed in to GitHub, but the profile can't use the account: {e:#}"
+                        ),
+                    ),
+                    Err(e) => shared.system("warn", format!("{e:#}")),
+                }
+            });
+        })
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(json!({ "flow": flow })))
+}
+
+/// Says in the activity feed how a GitHub CLI sign-in ended.
+fn report_flow(s: &Shared, flow: &crate::gh_auth::Flow) {
+    use crate::gh_auth::State;
+    let back = flow
+        .active_before
+        .as_deref()
+        .map(|a| format!("; the GitHub CLI's active account is {a} again"))
+        .unwrap_or_default();
+    let who = flow.login.as_deref().unwrap_or("the account");
+    let (level, text) = match &flow.state {
+        State::Done { login } if flow.kind == "grant" => (
+            "info",
+            format!(
+                "GitHub: {login}'s token now has the {} scope{}{back}",
+                flow.scopes.join(", "),
+                if flow.scopes.len() == 1 { "" } else { "s" }
+            ),
+        ),
+        State::Done { login } => (
+            "info",
+            format!("Signed in to GitHub as {login}@{}{back}", flow.host),
+        ),
+        State::Failed { reason } if flow.kind == "grant" => (
+            "warn",
+            format!("Granting GitHub access to {who} failed: {reason}"),
+        ),
+        State::Failed { reason } => ("warn", format!("GitHub sign-in failed: {reason}")),
+        State::Cancelled if flow.kind == "grant" => (
+            "info",
+            format!("Granting GitHub access to {who} cancelled{back}"),
+        ),
+        State::Cancelled => ("info", format!("GitHub sign-in cancelled{back}")),
+        State::Waiting => return,
+    };
+    s.system(level, text);
+    if let Some(note) = &flow.note {
+        s.system("warn", note.clone());
+    }
+}
+
+async fn github_flow(State(s): State<AppState>) -> Json<Value> {
+    Json(json!({ "flow": s.gh.current() }))
+}
+
+async fn cancel_github_flow(State(s): State<AppState>) -> Json<Value> {
+    Json(json!({ "cancelled": s.gh.cancel() }))
 }
 
 #[derive(Deserialize)]

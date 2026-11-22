@@ -1396,6 +1396,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     // GitHub: not signed in yet, so repositories can't be linked.
     let github = get("/api/github").await.json();
     assert!(github["account"].is_null() && github["repos"].as_array().unwrap().is_empty());
+    assert!(github["flow"].is_null(), "no GitHub CLI sign-in waits");
     let link = post("/api/repos", r#"{"repo":"acme/app"}"#).await;
     assert_eq!(link.status, 400);
     assert!(
@@ -1403,6 +1404,23 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         "{}",
         link.body
     );
+    // Granting a scope needs a sign-in too, and a new sign-in's host and scopes are
+    // checked before the GitHub CLI starts.
+    let grant = post("/api/github/grant", r#"{"scopes":["project"]}"#).await;
+    assert_eq!(grant.status, 400);
+    assert!(
+        grant.body.contains("sign in to GitHub first"),
+        "{}",
+        grant.body
+    );
+    for body in [
+        r#"{"host":"github.com --web"}"#,
+        r#"{"scopes":["project --admin"]}"#,
+    ] {
+        let new = post("/api/github/login/new", body).await;
+        assert_eq!(new.status, 400, "{body}: {}", new.body);
+    }
+    assert!(get("/api/github/flow").await.json()["flow"].is_null());
     agent.shutdown().await;
 }
 
