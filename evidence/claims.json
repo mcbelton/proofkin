@@ -973,6 +973,16 @@
       ]
     },
     {
+      "id": "TRK-5",
+      "area": "tracking",
+      "claim": "The Tracker card, tracker status and tracker sync say what each run issue left open is waiting for: the run's number, title and link, how many of its sub-issues are closed, and each open sub-issue with the pull request that will close it, or that it is not started. They are read in one GraphQL query and returned as waiting by GET /api/tracker and POST /api/tracker/sync, which also returns the run issues it closed. Runs that are closed or gone are left out.",
+      "tests": [
+        "lib::tracker::a_left_open_run_lists_its_sub_issues_with_the_pull_requests_that_close_them",
+        "lib::tracker::a_sync_says_what_it_closed_and_what_is_still_open",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
       "id": "WIQ-1",
       "area": "work-iq",
       "claim": "The Work IQ client speaks MCP over streamable HTTP to a configurable endpoint (default https://workiq.svc.cloud.microsoft/mcp). It sends initialize (protocol 2025-06-18, client info proofkin and its version) and then notifications/initialized, keeps the Mcp-Session-Id and sends it with the MCP-Protocol-Version on later requests, and starts a new session once, sending the request again, when a request with a session gets 404. Every request carries Accept, Content-Type, a bearer token from the TokenSource and a new client-request-id in UUID v4 form. JSON and Server-Sent Events replies are both read (the SSE response is the event answering the request, skipping notifications). tools/list is cached per client and a tool the server doesn't offer is a clear error. The request-id, x-ms-request-id, client-request-id and x-ms-correlation-id of a response are kept with the result and with errors. The messages go through a Transport trait so a stdio transport can reuse the client.",

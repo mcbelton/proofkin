@@ -2446,7 +2446,12 @@ async fn tracker_state(State(s): State<AppState>) -> Result<Json<Value>, ApiErro
     };
     Ok(Json(match crate::tracker::open(&profile).await {
         Ok(Some(tracker)) => {
-            json!({ "linked": true, "signed_in": true, "tracker": tracker.info() })
+            // Reading what the open runs wait for must not hide the tracker.
+            let (waiting, waiting_error) = match tracker.waiting().await {
+                Ok(w) => (w, None),
+                Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+            };
+            json!({ "linked": true, "signed_in": true, "tracker": tracker.info(), "waiting": waiting, "waiting_error": waiting_error })
         }
         Ok(None) => json!({ "linked": false, "signed_in": signed_in }),
         // Linked, but GitHub can't be reached with it now: say why, keep the settings.
@@ -2550,19 +2555,19 @@ async fn add_to_board(
     Ok(Json(json!(result)))
 }
 
-/// Closes the run issues whose sub-issues are all closed.
+/// Closes the run issues whose sub-issues are all closed, and says what the rest wait for.
 async fn sync_tracker(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let profile = s.info.profile.reload().map_err(internal)?;
-    let closed = crate::tracker::settle(&profile)
+    let synced = crate::tracker::sync(&profile)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?;
-    for n in &closed {
+    for n in &synced.closed {
         s.system(
             "info",
             format!("Run issue #{n} is closed: all its sub-issues are"),
         );
     }
-    Ok(Json(json!({ "closed": closed })))
+    Ok(Json(json!(synced)))
 }
 
 /// Every 10 minutes (`PROOFKIN_TRACKER_SETTLE_SECS`), closes the tracked run issues

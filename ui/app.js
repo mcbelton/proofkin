@@ -2255,15 +2255,31 @@ async function loadTracker() {
   } else {
     box.append(el("p", { class: "muted small", text: "No board: issues only. Choose Change to add your project's address." }));
   }
-  if (t.open_runs?.length) {
-    box.append(el("p", { class: "muted small" },
-      `Waiting for pull requests: ${t.open_runs.map((n) => `#${n}`).join(", ")}. `,
-      el("button", { type: "button", class: "btn small", onclick: (e) => syncTracker(e.currentTarget) }, "Check now")));
+  if (tracker.waiting_error) {
+    box.append(el("p", { class: "warn-text small", text: `What the open runs wait for can't be read now: ${tracker.waiting_error}` }));
   }
+  if (tracker.waiting?.length) box.append(waitingRuns(tracker.waiting));
   box.append(el("div", { class: "repo-actions" },
     el("button", { type: "button", class: "btn small", onclick: openTrackerItems }, t.board ? "Board items" : "Open issues"),
     t.board ? el("button", { type: "button", class: "btn small", onclick: (e) => addAllToBoard(t, e.currentTarget) }, "Add existing issues") : null,
     el("button", { type: "button", class: "btn small danger", onclick: unlinkTracker }, "Stop tracking")));
+}
+
+/** The run issues left open, what each waits for, and the button that checks now. */
+function waitingRuns(runs) {
+  return el("div", { class: "tracker-waiting small" },
+    el("p", { class: "tracker-waiting-h", text: "Left open until their sub-issues close" }),
+    el("ul", { class: "tracker-waiting-list" }, ...runs.map((run) => {
+      const open = run.sub_issues.filter((s) => s.open);
+      return el("li", {},
+        externalLink(run.url, `#${run.number} ${run.title}`),
+        `: ${run.sub_issues.length - open.length} of ${nOf(run.sub_issues.length, "sub-issue")} closed`,
+        open.length ? el("ul", {}, ...open.map((s) => el("li", {},
+          externalLink(s.url, `#${s.number} ${s.title}`),
+          s.pull_requests.length ? `: pull request ${s.pull_requests.map((n) => `#${n}`).join(", ")}` : ": not started"))) : null);
+    })),
+    el("p", { class: "muted small", text: "Proofkin closes each one when all its sub-issues are closed. It looks every 10 minutes; Check now looks at once." }),
+    el("button", { type: "button", class: "btn small", onclick: (e) => syncTracker(e.currentTarget) }, "Check now"));
 }
 
 /** Puts every issue and pull request of the tracker's repository on its board. */
@@ -2344,7 +2360,10 @@ async function syncTracker(button) {
   button.disabled = true;
   try {
     const res = await api("/api/tracker/sync", { method: "POST" });
-    toast(res.closed.length ? `Closed ${res.closed.map((n) => `#${n}`).join(", ")}: their pull requests are merged` : "Still waiting for their pull requests");
+    const stillOpen = res.waiting.reduce((n, run) => n + run.sub_issues.filter((s) => s.open).length, 0);
+    toast(res.closed.length
+      ? `Closed ${res.closed.map((n) => `#${n}`).join(", ")}: all their sub-issues are closed`
+      : `Nothing could be closed yet: ${nOf(stillOpen, "sub-issue")} still open`);
     await loadTracker();
   } catch (err) {
     toast(err.message, "error");

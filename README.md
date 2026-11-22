@@ -1114,7 +1114,11 @@ is tracked on GitHub, where your team already tracks work:
   GitHub links the pull request to the issues and closes them when it merges. The run's
   issue waits *In review* until then (or, if it has other open sub-issues, where it was)
   and is closed once all its sub-issues are (checked every 10 minutes by a running
-  agent, or now with `tracker sync`).
+  agent, or now with `tracker sync`). The **Tracker** card lists those run issues under
+  *Left open until their sub-issues close*: each run with how many of its sub-issues are
+  closed, and the open ones with the pull request that will close them, or *not started*.
+  **Check now** (`tracker sync`) closes what can be closed at once and says what is still
+  open; `tracker status` prints the same list.
 
 ```powershell
 proofkin github login --gh-user alice --profile boss

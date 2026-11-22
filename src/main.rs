@@ -2133,7 +2133,7 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
     Ok(())
 }
 
-fn print_tracker(info: &proofkin::tracker::TrackerInfo) {
+fn print_tracker(info: &proofkin::tracker::TrackerInfo, waiting: &[proofkin::tracker::WaitingRun]) {
     println!(
         "issues: {} ({}), as {}",
         info.repo, info.repo_url, info.login
@@ -2157,9 +2157,36 @@ fn print_tracker(info: &proofkin::tracker::TrackerInfo) {
         (None, Some(problem)) => println!("board: not updated: {problem}"),
         (None, None) => println!("board: none (add one with --project)"),
     }
-    if !info.open_runs.is_empty() {
-        let runs: Vec<String> = info.open_runs.iter().map(|n| format!("#{n}")).collect();
-        println!("run issues waiting for pull requests: {}", runs.join(", "));
+    print_waiting(waiting);
+}
+
+/// The run issues left open and what each waits for.
+fn print_waiting(waiting: &[proofkin::tracker::WaitingRun]) {
+    if waiting.is_empty() {
+        return;
+    }
+    println!("run issues left open until their sub-issues close:");
+    for run in waiting {
+        let closed = run.sub_issues.iter().filter(|s| !s.open).count();
+        println!(
+            "  #{} {}: {closed} of {} sub-issues closed",
+            run.number,
+            run.title,
+            run.sub_issues.len()
+        );
+        for sub in run.sub_issues.iter().filter(|s| s.open) {
+            let prs: Vec<String> = sub.pull_requests.iter().map(|n| format!("#{n}")).collect();
+            println!(
+                "    #{} {}: {}",
+                sub.number,
+                sub.title,
+                if prs.is_empty() {
+                    "not started".to_owned()
+                } else {
+                    format!("pull request {}", prs.join(", "))
+                }
+            );
+        }
     }
 }
 
@@ -2174,12 +2201,16 @@ async fn run_tracker(command: TrackerCommand) -> Result<()> {
             let profile = Profile::open(&profile.name)?;
             let tracker = proofkin::tracker::link(&profile, &repo, project.as_deref()).await?;
             println!("profile '{}' tracks its plan runs on GitHub", profile.name);
-            print_tracker(&tracker.info());
+            let waiting = tracker.waiting().await?;
+            print_tracker(&tracker.info(), &waiting);
         }
         TrackerCommand::Status { profile } => {
             let profile = Profile::open(&profile.name)?;
             match proofkin::tracker::open(&profile).await? {
-                Some(tracker) => print_tracker(&tracker.info()),
+                Some(tracker) => {
+                    let waiting = tracker.waiting().await?;
+                    print_tracker(&tracker.info(), &waiting);
+                }
                 None => println!(
                     "profile '{}' has no tracker; link one with: proofkin tracker link <owner/repo> --project <url> --profile {}",
                     profile.name, profile.name
@@ -2285,13 +2316,14 @@ async fn run_tracker(command: TrackerCommand) -> Result<()> {
         }
         TrackerCommand::Sync { profile } => {
             let profile = Profile::open(&profile.name)?;
-            let closed = proofkin::tracker::settle(&profile).await?;
-            if closed.is_empty() {
+            let synced = proofkin::tracker::sync(&profile).await?;
+            if synced.closed.is_empty() {
                 println!("no run issue to close");
             }
-            for n in closed {
+            for n in synced.closed {
                 println!("closed run issue #{n}: all its sub-issues are closed");
             }
+            print_waiting(&synced.waiting);
         }
         TrackerCommand::Unlink { profile } => {
             let profile = Profile::open(&profile.name)?;

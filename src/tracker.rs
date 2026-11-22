@@ -931,6 +931,71 @@ impl Tracker {
         Ok(closed)
     }
 
+    /// What each run issue left open ([`TrackerConfig::open_runs`]) is waiting for: its
+    /// sub-issues and the pull requests that will close the open ones. One request;
+    /// runs that are closed or gone are left out.
+    pub async fn waiting(&self) -> Result<Vec<WaitingRun>> {
+        if self.config.open_runs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (owner, name) = self.config.repo.split_once('/').unwrap_or_default();
+        let wanted: std::collections::BTreeSet<u64> =
+            self.config.open_runs.iter().copied().collect();
+        let query = format!(
+            "query Waiting($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {} }} }}",
+            wanted
+                .iter()
+                .map(|n| format!("n{n}: issue(number: {n}) {{ {WAITING_ISSUE} subIssues(first: 100) {{ nodes {{ {WAITING_ISSUE} closedByPullRequestsReferences(first: 5) {{ nodes {{ number }} }} }} }} }}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let reply = self
+            .api
+            .graphql(&query, json!({ "owner": owner, "name": name }))
+            .await?;
+        let mut runs = Vec::new();
+        for n in &wanted {
+            let Some(run) = reply.data.pointer(&format!("/repository/n{n}")) else {
+                continue;
+            };
+            let Some((number, title, url, open)) = waiting_head(run) else {
+                continue;
+            };
+            if !open {
+                continue;
+            }
+            let nodes = |v: &Value, pointer: &str| {
+                v.pointer(pointer)
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let sub_issues = nodes(run, "/subIssues/nodes")
+                .iter()
+                .filter_map(|s| {
+                    let (number, title, url, open) = waiting_head(s)?;
+                    Some(WaitingSub {
+                        number,
+                        title,
+                        url,
+                        open,
+                        pull_requests: nodes(s, "/closedByPullRequestsReferences/nodes")
+                            .iter()
+                            .filter_map(|p| p.get("number")?.as_u64())
+                            .collect(),
+                    })
+                })
+                .collect();
+            runs.push(WaitingRun {
+                number,
+                title,
+                url,
+                sub_issues,
+            });
+        }
+        Ok(runs)
+    }
+
     /// The board's items (or, without a board, the repository's open issues).
     pub async fn items(&self) -> Result<Vec<Item>> {
         let Some(board) = &self.board else {
@@ -1427,6 +1492,66 @@ pub async fn settle(profile: &Profile) -> Result<Vec<u64>> {
         save_open_runs(&profile.tracker_path(), &tracker.config.open_runs, &closed)?;
     }
     Ok(closed)
+}
+
+/// A run issue left open (see [`TrackerConfig::open_runs`]) and its sub-issues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WaitingRun {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub sub_issues: Vec<WaitingSub>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WaitingSub {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub open: bool,
+    /// The pull requests that will close it.
+    pub pull_requests: Vec<u64>,
+}
+
+const WAITING_ISSUE: &str = "number title url state";
+
+/// An issue's number, title, url and whether it is open, as `WAITING_ISSUE` reads them.
+fn waiting_head(v: &Value) -> Option<(u64, String, String, bool)> {
+    let text = |key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Some((
+        v.get("number")?.as_u64()?,
+        text("title"),
+        text("url"),
+        text("state") == "OPEN",
+    ))
+}
+
+/// What [`sync`] found: the run issues it closed and what the open ones wait for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Synced {
+    pub closed: Vec<u64>,
+    pub waiting: Vec<WaitingRun>,
+}
+
+/// Like [`settle`], then reads what the run issues still open wait for.
+pub async fn sync(profile: &Profile) -> Result<Synced> {
+    let Some(mut tracker) = open(profile).await? else {
+        return Ok(Synced {
+            closed: Vec::new(),
+            waiting: Vec::new(),
+        });
+    };
+    let closed = tracker.settle().await?;
+    if !closed.is_empty() {
+        save_open_runs(&profile.tracker_path(), &tracker.config.open_runs, &closed)?;
+    }
+    let waiting = tracker.waiting().await?;
+    Ok(Synced { closed, waiting })
 }
 
 /// Saves `open` as the tracker's open run issues, keeping any added since it was
@@ -2476,6 +2601,8 @@ mod tests {
         /// A pull request (merged, if closed and `merged`).
         pr: bool,
         merged: bool,
+        /// The pull requests that will close it.
+        closed_by: Vec<u64>,
     }
 
     /// GitHub as far as tracking uses it: issues, sub-issues and a board, with every
@@ -2523,6 +2650,22 @@ mod tests {
             v["subIssuesSummary"] = json!({ "total": subs.len(), "completed": subs.iter().filter(|s| !s.open).count() });
             v["projectItems"] = json!({ "nodes": i.item.iter().map(|item| json!({ "id": item, "project": { "id": "P1" },
                 "fieldValueByName": i.status.as_ref().map(|s| json!({ "name": s })).unwrap_or(Value::Null) })).collect::<Vec<_>>() });
+            v
+        }
+
+        /// An issue and its sub-issues as the `Waiting` query reads them.
+        fn waiting_json(&self, n: u64) -> Value {
+            let issues = self.issues.lock().unwrap();
+            let Some(i) = issues.get(&n) else {
+                return Value::Null;
+            };
+            let node = |i: &FakeIssue| {
+                json!({ "number": i.number, "title": i.body, "state": if i.open { "OPEN" } else { "CLOSED" },
+                        "url": format!("https://github.com/acme/app/issues/{}", i.number),
+                        "closedByPullRequestsReferences": { "nodes": i.closed_by.iter().map(|p| json!({ "number": p })).collect::<Vec<_>>() } })
+            };
+            let mut v = node(i);
+            v["subIssues"] = json!({ "nodes": issues.values().filter(|s| s.parent == Some(n)).map(node).collect::<Vec<_>>() });
             v
         }
 
@@ -2676,6 +2819,14 @@ mod tests {
                     for part in query.split(": issue(number: ").skip(1) {
                         let n: u64 = part.split(')').next().unwrap().parse().unwrap();
                         repo.insert(format!("n{n}"), self.issue_json(n));
+                    }
+                    json!({ "repository": repo })
+                }
+                "Waiting" => {
+                    let mut repo = serde_json::Map::new();
+                    for part in query.split(": issue(number: ").skip(1) {
+                        let n: u64 = part.split(')').next().unwrap().parse().unwrap();
+                        repo.insert(format!("n{n}"), self.waiting_json(n));
                     }
                     json!({ "repository": repo })
                 }
@@ -3150,6 +3301,87 @@ mod tests {
         let mut tracker = Tracker::connect(fake.clone(), config_now).await.unwrap();
         assert_eq!(tracker.settle().await.unwrap(), [10]);
         assert!(!fake.open(10) && fake.status(10).as_deref() == Some("Done"));
+    }
+
+    #[tokio::test]
+    async fn a_left_open_run_lists_its_sub_issues_with_the_pull_requests_that_close_them() {
+        let issue = |number, open, parent: Option<u64>| FakeIssue {
+            number,
+            open,
+            body: format!("Issue {number}"),
+            parent,
+            ..FakeIssue::default()
+        };
+        let fake = Fake::with(&[
+            issue(10, true, None),
+            issue(11, false, Some(10)),
+            FakeIssue {
+                closed_by: vec![20],
+                ..issue(12, true, Some(10))
+            },
+            issue(13, true, Some(10)),
+        ]);
+        let config = TrackerConfig {
+            open_runs: vec![10, 99],
+            ..config()
+        };
+        let mut tracker = Tracker::connect(fake.clone(), config).await.unwrap();
+        let waiting = tracker.waiting().await.unwrap();
+        // #99 doesn't exist; #10 has its three sub-issues, one of them started.
+        assert_eq!(waiting.len(), 1);
+        let run = &waiting[0];
+        assert_eq!((run.number, run.title.as_str()), (10, "Issue 10"));
+        assert_eq!(run.url, "https://github.com/acme/app/issues/10");
+        let subs: Vec<_> = run
+            .sub_issues
+            .iter()
+            .map(|s| (s.number, s.open, s.pull_requests.clone()))
+            .collect();
+        assert_eq!(
+            subs,
+            [
+                (11, false, vec![]),
+                (12, true, vec![20]),
+                (13, true, vec![])
+            ]
+        );
+        assert_eq!(run.sub_issues[2].title, "Issue 13");
+
+        // Settling closes nothing yet and the run is still listed; once its
+        // sub-issues close it is closed and no longer listed.
+        assert!(tracker.settle().await.unwrap().is_empty());
+        assert_eq!(tracker.waiting().await.unwrap(), waiting);
+        for n in [12, 13] {
+            fake.issues.lock().unwrap().get_mut(&n).unwrap().open = false;
+        }
+        assert_eq!(tracker.settle().await.unwrap(), [10]);
+        assert!(tracker.waiting().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_sync_says_what_it_closed_and_what_is_still_open() {
+        let synced = Synced {
+            closed: vec![7],
+            waiting: vec![WaitingRun {
+                number: 8,
+                title: "Run".into(),
+                url: "https://github.com/acme/app/issues/8".into(),
+                sub_issues: vec![WaitingSub {
+                    number: 9,
+                    title: "Part".into(),
+                    url: "https://github.com/acme/app/issues/9".into(),
+                    open: true,
+                    pull_requests: vec![12],
+                }],
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&synced).unwrap(),
+            json!({ "closed": [7], "waiting": [{
+                "number": 8, "title": "Run", "url": "https://github.com/acme/app/issues/8",
+                "sub_issues": [{ "number": 9, "title": "Part", "url": "https://github.com/acme/app/issues/9",
+                                "open": true, "pull_requests": [12] }] }] })
+        );
     }
 
     #[tokio::test]

@@ -496,6 +496,10 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .branch .btn { margin-left: auto; }
 .issue-link { flex: none; min-width: 24px; padding: 0 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; line-height: 24px; text-align: center; text-decoration: none; white-space: nowrap; }
 .issue-link:hover { text-decoration: underline; }
+.tracker-waiting { margin: 6px 0; }
+.tracker-waiting p { margin: 4px 0; }
+.tracker-waiting-h { font-weight: 600; }
+.tracker-waiting ul { margin: 2px 0; padding-left: 18px; }
 .tracker-problem { margin: 6px 0; padding: 6px 10px; border-left: 3px solid var(--warn); border-radius: 4px; background: var(--warn-soft); }
 .tracker-problem p { margin: 0; }
 .tracker-problem .command { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; }
