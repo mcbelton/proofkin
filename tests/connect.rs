@@ -32,6 +32,9 @@ impl Executor for Echo {
         if task.prompt == "hang" {
             std::future::pending::<()>().await;
         }
+        if task.prompt == "slow" {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
         if task.prompt == "gated" {
             GATE.notified().await;
         }
@@ -124,6 +127,26 @@ async fn follow_stream(
         .await
         .expect("the stream closes when the task ends")
         .unwrap();
+    parse_events(raw)
+}
+
+/// Splits a response read to its end into its head and the events of its stream.
+fn parse_events(raw: Vec<u8>) -> (String, Vec<Value>) {
+    let (head, text) = split_response(raw);
+    (head, sse_events(&text))
+}
+
+/// The JSON data of a stream's events.
+fn sse_events(text: &str) -> Vec<Value> {
+    text.split("\n\n")
+        .flat_map(|event| event.lines())
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| serde_json::from_str(data.trim()).expect("JSON event"))
+        .collect()
+}
+
+/// A response read to its end: its head, and its body (its chunks joined).
+fn split_response(raw: Vec<u8>) -> (String, String) {
     let raw = String::from_utf8(raw).unwrap();
     let (head, body) = raw.split_once("\r\n\r\n").expect("HTTP response");
     let mut text = String::new();
@@ -140,13 +163,7 @@ async fn follow_stream(
     } else {
         text = body.to_owned();
     }
-    let events = text
-        .split("\n\n")
-        .flat_map(|event| event.lines())
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(|data| serde_json::from_str(data.trim()).expect("JSON event"))
-        .collect();
-    (head.to_owned(), events)
+    (head.to_owned(), text)
 }
 
 /// Checks a followed task: it starts as the task, says what it is doing, and ends as
@@ -191,22 +208,29 @@ fn assert_followed(head: &str, events: &[Value], result: &str) -> String {
 
 /// A request of MCP's stateless revision: the version in `_meta`, mirrored in headers.
 fn modern(method: &str, mut params: Value) -> String {
-    params["_meta"] = json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": {},
-    });
+    params["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2026-07-28");
+    params["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
     rpc(method, params)
+}
+
+/// The home both tests use: the environment is set once, before any thread reads it.
+fn shared_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = tempfile::tempdir().unwrap();
+        // Integration tokens go to files under the temporary home, never the OS store.
+        unsafe {
+            std::env::set_var("PROOFKIN_HOME", home.path());
+            std::env::set_var("PROOFKIN_SECRET_STORE", "file");
+        }
+        home
+    })
+    .path()
 }
 
 #[tokio::test]
 async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
-    let home = tempfile::tempdir().unwrap();
-    // The only test in this binary: no other thread reads the environment yet. Its
-    // integration token goes to files under the temporary home, never the OS store.
-    unsafe {
-        std::env::set_var("PROOFKIN_HOME", home.path());
-        std::env::set_var("PROOFKIN_SECRET_STORE", "file");
-    }
+    let home = shared_home();
     let (boss_key, worker_key) = (SecretKey::generate(), SecretKey::generate());
     let trust = |name: &str, key: &SecretKey, delegate: bool| TrustedPeer {
         name: name.into(),
@@ -222,7 +246,7 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
     worker.bind = Some("127.0.0.1:0".parse().unwrap());
     worker.trust.allow(trust("boss", &boss_key, true));
     worker.executor = Some(Arc::new(Echo));
-    worker.shares = ShareStore::with_data(home.path().join("data"));
+    worker.shares = ShareStore::with_data(home.join("data"));
     let (worker, _we) = Agent::bind(worker).await.unwrap();
     let mut config = AgentConfig::new("boss", boss_key);
     config.network = Network::Local;
@@ -237,13 +261,13 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
     })
     .await
     .unwrap();
-    let profiles = home.path().join("profiles");
+    let profiles = home.join("profiles");
     let info = UiInfo {
         profile: Profile::open_in(&profiles, "boss").unwrap(),
         network: Network::Local,
         serving: false,
         access: Access::ReadOnly,
-        workspace: home.path().to_path_buf(),
+        workspace: home.to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
         workers: None,
@@ -759,6 +783,208 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
     assert_eq!(refused.status, 401);
     let card = request(port, "GET", "/.well-known/agent-card.json", &[], None).await;
     assert_eq!(card.status, 404);
+    boss.shutdown().await;
+    worker.shutdown().await;
+}
+
+/// Posts to /mcp and reads the response to its end: its head, and the events if it is a
+/// stream (a JSON body is the one event).
+async fn post_mcp(port: u16, headers: &[(&str, &str)], body: &str) -> (String, Vec<Value>) {
+    let mut req = format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        req += &format!("{name}: {value}\r\n");
+    }
+    req += &format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut raw))
+        .await
+        .expect("the response ends")
+        .unwrap();
+    let (head, text) = split_response(raw);
+    if head.to_lowercase().contains("text/event-stream") {
+        return (head, sse_events(&text));
+    }
+    let body = serde_json::from_str(&text).unwrap_or_else(|_| panic!("JSON body: {text}"));
+    (head, vec![body])
+}
+
+#[tokio::test]
+async fn mcp_clients_follow_a_task_with_progress_notifications() {
+    let home = shared_home();
+    let (boss_key, worker_key) = (SecretKey::generate(), SecretKey::generate());
+    let trust = |name: &str, key: &SecretKey, delegate: bool| TrustedPeer {
+        name: name.into(),
+        id: key.public(),
+        addrs: Default::default(),
+        can_delegate: delegate,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec!["data".into()],
+    };
+    let mut worker = AgentConfig::new("slowworker", worker_key.clone());
+    worker.network = Network::Local;
+    worker.bind = Some("127.0.0.1:0".parse().unwrap());
+    worker.trust.allow(trust("progressboss", &boss_key, true));
+    worker.executor = Some(Arc::new(Echo));
+    worker.shares = ShareStore::with_data(home.join("progress-data"));
+    let (worker, _we) = Agent::bind(worker).await.unwrap();
+    let mut config = AgentConfig::new("progressboss", boss_key);
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.trust.allow(trust("slowworker", &worker_key, false));
+    let (boss, events) = Agent::bind(config).await.unwrap();
+    boss.connect(worker.addr()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while boss.peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(&home.join("progress-profiles"), "progressboss").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        boss.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, ui_token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let on = request(
+        port,
+        "POST",
+        "/api/connect",
+        &[("Authorization", &format!("Bearer {ui_token}"))],
+        None,
+    )
+    .await
+    .json();
+    let auth = format!("Bearer {}", on["token"].as_str().unwrap());
+    let call = |prompt: &str, token: Option<Value>| {
+        let mut params = json!({
+            "name": "delegate",
+            "arguments": { "prompt": prompt, "peer": "slowworker", "wait_seconds": 30 },
+        });
+        if let Some(token) = token {
+            params["_meta"] = json!({ "progressToken": token });
+        }
+        params
+    };
+    let stream = [
+        ("Authorization", auth.as_str()),
+        ("Accept", "application/json, text/event-stream"),
+    ];
+
+    // The legacy revision: progress notifications, then the result, then the end.
+    let (head, events) = post_mcp(
+        port,
+        &stream,
+        &rpc("tools/call", call("slow", Some(json!("t-1")))),
+    )
+    .await;
+    assert!(
+        head.to_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+    let (result, notes) = events.split_last().unwrap();
+    assert!(notes.len() >= 2, "{events:?}");
+    let mut last = 0;
+    for note in notes {
+        assert_eq!(note["method"], "notifications/progress", "{note}");
+        assert_eq!(note["params"]["progressToken"], "t-1");
+        let progress = note["params"]["progress"].as_u64().unwrap();
+        assert!(progress > last, "progress increases: {events:?}");
+        last = progress;
+        assert!(
+            note["params"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty())
+        );
+    }
+    assert!(
+        notes[0]["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Running on slowworker"),
+        "{notes:?}"
+    );
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert_eq!(result["result"]["structuredContent"]["state"], "completed");
+    assert_eq!(
+        result["result"]["structuredContent"]["output"],
+        "echo: slow"
+    );
+    assert!(result["result"].get("resultType").is_none());
+
+    // The modern revision: a numeric token, and the result with its resultType.
+    let modern_stream = [
+        stream[0],
+        stream[1],
+        ("MCP-Protocol-Version", "2026-07-28"),
+        ("Mcp-Method", "tools/call"),
+        ("Mcp-Name", "delegate"),
+    ];
+    let (head, events) = post_mcp(
+        port,
+        &modern_stream,
+        &modern("tools/call", call("slow", Some(json!(7)))),
+    )
+    .await;
+    assert!(
+        head.to_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+    let (result, notes) = events.split_last().unwrap();
+    assert!(notes.len() >= 2, "{events:?}");
+    assert!(notes.iter().all(|n| n["params"]["progressToken"] == 7));
+    assert_eq!(result["result"]["resultType"], "complete");
+    assert_eq!(result["result"]["structuredContent"]["state"], "completed");
+
+    // Without a token, or without text/event-stream in Accept: one JSON body.
+    let (head, events) = post_mcp(port, &stream, &rpc("tools/call", call("plain", None))).await;
+    assert!(head.to_lowercase().contains("application/json"), "{head}");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["result"]["structuredContent"]["output"],
+        "echo: plain"
+    );
+    let json_only = [
+        ("Authorization", auth.as_str()),
+        ("Accept", "application/json"),
+    ];
+    let (head, events) = post_mcp(
+        port,
+        &json_only,
+        &rpc("tools/call", call("plain", Some(json!("t-2")))),
+    )
+    .await;
+    assert!(head.to_lowercase().contains("application/json"), "{head}");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["result"]["structuredContent"]["output"],
+        "echo: plain"
+    );
     boss.shutdown().await;
     worker.shutdown().await;
 }

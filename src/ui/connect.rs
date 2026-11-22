@@ -436,7 +436,7 @@ async fn mcp_modern(
             _ => {}
         }
     }
-    let mut result = match method {
+    let result = match method {
         "server/discover" => json!({
             "supportedVersions": MCP_MODERN,
             "capabilities": { "tools": {} },
@@ -450,10 +450,15 @@ async fn mcp_modern(
             list["cacheScope"] = json!("private");
             list
         }
-        "tools/call" => match call_tool(s, params).await {
-            Ok(result) => result,
-            Err(message) => return reply(StatusCode::OK, rpc_err(id, -32602, message, None)),
-        },
+        "tools/call" => {
+            if let Some(stream) = progress_stream(s, headers, id, params, true) {
+                return stream;
+            }
+            match call_tool(s, params).await {
+                Ok(result) => result,
+                Err(message) => return reply(StatusCode::OK, rpc_err(id, -32602, message, None)),
+            }
+        }
         _ => {
             return reply(
                 StatusCode::NOT_FOUND,
@@ -461,9 +466,125 @@ async fn mcp_modern(
             );
         }
     };
+    reply(StatusCode::OK, rpc_ok(id, modern_result(result)))
+}
+
+/// A result of the stateless revision.
+fn modern_result(mut result: Value) -> Value {
     result["resultType"] = json!("complete");
     result["_meta"] = json!({ "io.modelcontextprotocol/serverInfo": server_info() });
-    reply(StatusCode::OK, rpc_ok(id, result))
+    result
+}
+
+/// The progress token of a request (a string or a number).
+fn progress_token(params: &Value) -> Option<Value> {
+    params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .filter(|t| t.is_string() || t.is_number())
+        .cloned()
+}
+
+/// Answers a `tools/call` of delegate, run_plan or get_task that waits with a stream of
+/// progress notifications (see [`follow_progress`]), when the client asks for one: it
+/// sent a progress token and accepts `text/event-stream`. Other calls get `None`, and
+/// are answered with JSON.
+fn progress_stream(
+    s: &AppState,
+    headers: &HeaderMap,
+    id: &Value,
+    params: &Value,
+    modern: bool,
+) -> Option<Response> {
+    let token = progress_token(params)?;
+    let accepts_events = header(headers, "accept")
+        .is_some_and(|a| a.to_ascii_lowercase().contains("text/event-stream"));
+    if !accepts_events {
+        return None;
+    }
+    let name = params.get("name").and_then(Value::as_str)?;
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !args.is_object() || !matches!(name, "delegate" | "run_plan" | "get_task") {
+        return None;
+    }
+    let limit = wait_arg(&args);
+    if limit.is_zero() {
+        return None;
+    }
+    // A call that can't start is answered with JSON, as its error.
+    let job = start_job(s, name, &args).ok()?;
+    let (tx, rx) = mpsc::channel(16);
+    let shared = s.clone();
+    let id = id.clone();
+    tokio::spawn(async move {
+        follow_progress(&shared, &id, &token, &job, limit, modern, tx).await;
+    });
+    let events = ReceiverStream::new(rx)
+        .map(|event: Value| Ok::<_, Infallible>(SseEvent::default().data(event.to_string())));
+    Some(
+        Sse::new(events)
+            .keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
+            .into_response(),
+    )
+}
+
+/// Sends a `notifications/progress` each time `job`'s status changes (its state, or what
+/// its steps' peers say they are doing), then the tool call's response when the work ends
+/// or `limit` is up. Returns when that is sent, or the client has gone away (`tx` closed).
+async fn follow_progress(
+    s: &Shared,
+    id: &Value,
+    token: &Value,
+    job: &Job,
+    limit: Duration,
+    modern: bool,
+    tx: mpsc::Sender<Value>,
+) {
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut seen: Option<String> = None;
+    let mut count = 0u64;
+    loop {
+        // Made before looking, so a change in between still wakes it.
+        let changed = s.changed.notified();
+        tokio::pin!(changed);
+        let state = job_state(s, job);
+        let task = a2a_task(s, job, Some(0), false);
+        let text = task["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or(state.name())
+            .to_owned();
+        let now = format!("{}\n{text}", state.name());
+        if seen.as_ref() != Some(&now) {
+            seen = Some(now);
+            count += 1;
+            let note = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": { "progressToken": token, "progress": count, "message": text },
+            });
+            if tx.send(note).await.is_err() {
+                return;
+            }
+        }
+        if state != JobState::Working {
+            break;
+        }
+        tokio::select! {
+            _ = &mut changed => {}
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tx.closed() => return,
+        }
+    }
+    let result = tool_result(Ok(job_json(s, job)));
+    let result = if modern {
+        modern_result(result)
+    } else {
+        result
+    };
+    let _ = tx.send(rpc_ok(id, result)).await;
 }
 
 /// A request of a revision that starts with `initialize` (no sessions are kept: every
@@ -511,10 +632,15 @@ async fn mcp_legacy(
         }
         "ping" => json!({}),
         "tools/list" => tools(),
-        "tools/call" => match call_tool(s, params).await {
-            Ok(result) => result,
-            Err(message) => return reply(StatusCode::OK, rpc_err(id, -32602, message, None)),
-        },
+        "tools/call" => {
+            if let Some(stream) = progress_stream(s, headers, id, params, false) {
+                return stream;
+            }
+            match call_tool(s, params).await {
+                Ok(result) => result,
+                Err(message) => return reply(StatusCode::OK, rpc_err(id, -32602, message, None)),
+            }
+        }
         _ => {
             return reply(
                 StatusCode::OK,
@@ -560,7 +686,7 @@ fn tools() -> Value {
             "The connected peers (teammates' agents): the providers they run tasks with (copilot, claude, codex), the folders they share with this agent (access, checks, worktrees, MCP servers) and what they are for; and the squads.",
             json!({}), &[], true),
         tool("delegate", "Delegate a task to a peer",
-            "Run a task on a peer's agent, in a folder it shares with this agent; the result is signed by that peer. Without a peer, any connected peer that runs tasks (with the provider, if given) takes it.",
+            "Run a task on a peer's agent, in a folder it shares with this agent; the result is signed by that peer. Without a peer, any connected peer that runs tasks (with the provider, if given) takes it. With a progress token (_meta.progressToken) and Accept listing text/event-stream, it streams notifications/progress while the task runs, then the result.",
             json!({
                 "prompt": text("What to do"),
                 "peer": text("The peer's name (see list_peers)"),
@@ -571,7 +697,7 @@ fn tools() -> Value {
             }),
             &["prompt"], false),
         tool("get_task", "Get a task's result",
-            "The state and result of a task or plan started with delegate or run_plan (with each step's result and the evidence verdict for a plan). Waits for it to finish, up to wait_seconds.",
+            "The state and result of a task or plan started with delegate or run_plan (with each step's result and the evidence verdict for a plan). Waits for it to finish, up to wait_seconds. If the call has a progress token (_meta.progressToken) and Accept lists text/event-stream, the answer is a stream of notifications/progress (the status each time it changes) and then the result.",
             json!({ "task_id": task_id, "wait_seconds": wait }),
             &["task_id"], true),
         tool("cancel_task", "Cancel a task",
@@ -583,7 +709,7 @@ fn tools() -> Value {
             json!({ "plan": text("The plan text") }),
             &["plan"], true),
         tool("run_plan", "Run an evidence plan",
-            "Run a plan across peers and squads in dependency order. A plan is claim lines (claim: ID what must be true), then one step per line: name [after a,b] @peer[:folder] or #squad [skill=s] [verify=check] [attempts=N] [apply=step] [claims=IDs] what to do; `approve @person` steps are sign-offs. Claims are proven only by passing checks or sign-offs; the run's evidence report is saved (get_run).",
+            "Run a plan across peers and squads in dependency order. A plan is claim lines (claim: ID what must be true), then one step per line: name [after a,b] @peer[:folder] or #squad [skill=s] [verify=check] [attempts=N] [apply=step] [claims=IDs] what to do; `approve @person` steps are sign-offs. Claims are proven only by passing checks or sign-offs; the run's evidence report is saved (get_run). With a progress token (_meta.progressToken) and Accept listing text/event-stream, it streams notifications/progress while the plan runs, then the result.",
             json!({ "plan": text("The plan text"), "wait_seconds": wait }),
             &["plan"], false),
         tool("get_run", "Get an evidence report",
@@ -656,24 +782,33 @@ async fn call_tool(s: &AppState, params: &Value) -> Result<Value, String> {
     }
     let outcome = match name {
         "list_peers" => Ok(peers(s)),
-        "delegate" => delegate(s, &args).await,
-        "get_task" => get_task(s, &args).await,
+        "delegate" | "run_plan" | "get_task" => match start_job(s, name, &args) {
+            Ok(job) => {
+                wait(s, &job, wait_arg(&args)).await;
+                Ok(job_json(s, &job))
+            }
+            Err(e) => Err(e),
+        },
         "cancel_task" => cancel_task(s, &args),
         "check_plan" => text_arg(&args, "plan").map(|plan| plan_check(s, &plan)),
-        "run_plan" => run_plan(s, &args).await,
         "get_run" => text_arg(&args, "run_id")
             .and_then(|id| run_details(s, &id).map_err(|e| format!("{e:#}"))),
         "import_spec" => import_spec(s, &args).await,
         _ => return Err(format!("Unknown tool: {name}")),
     };
-    Ok(match outcome {
+    Ok(tool_result(outcome))
+}
+
+/// A tool's outcome as a result.
+fn tool_result(outcome: Result<Value, String>) -> Value {
+    match outcome {
         Ok(value) => json!({
             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
             "structuredContent": value,
             "isError": false,
         }),
         Err(error) => json!({ "content": [{ "type": "text", "text": error }], "isError": true }),
-    })
+    }
 }
 
 fn peers(s: &Shared) -> Value {
@@ -955,32 +1090,29 @@ fn find_job(s: &Shared, id: &str) -> Result<Job, String> {
     })
 }
 
-async fn delegate(s: &AppState, args: &Value) -> Result<Value, String> {
-    let ask = Ask {
-        text: text_arg(args, "prompt")?,
-        peer: opt_text(args, "peer"),
-        folder: opt_text(args, "folder"),
-        provider: opt_text(args, "provider"),
-        mcp: text_list(args.get("mcp")),
-    };
-    let job = new_job(start_delegation(s, &ask, "MCP")?, "MCP", None, None);
-    s.connect.add(job.clone());
-    wait(s, &job, wait_arg(args)).await;
-    Ok(job_json(s, &job))
-}
-
-async fn run_plan(s: &AppState, args: &Value) -> Result<Value, String> {
-    let work = start_plan_for(s, &text_arg(args, "plan")?, "MCP")?;
-    let job = new_job(work, "MCP", None, None);
-    s.connect.add(job.clone());
-    wait(s, &job, wait_arg(args)).await;
-    Ok(job_json(s, &job))
-}
-
-async fn get_task(s: &AppState, args: &Value) -> Result<Value, String> {
-    let job = find_job(s, &text_arg(args, "task_id")?)?;
-    wait(s, &job, wait_arg(args)).await;
-    Ok(job_json(s, &job))
+/// The work that delegate, run_plan or get_task is about (started, or looked up).
+fn start_job(s: &AppState, name: &str, args: &Value) -> Result<Job, String> {
+    match name {
+        "delegate" => {
+            let ask = Ask {
+                text: text_arg(args, "prompt")?,
+                peer: opt_text(args, "peer"),
+                folder: opt_text(args, "folder"),
+                provider: opt_text(args, "provider"),
+                mcp: text_list(args.get("mcp")),
+            };
+            let job = new_job(start_delegation(s, &ask, "MCP")?, "MCP", None, None);
+            s.connect.add(job.clone());
+            Ok(job)
+        }
+        "run_plan" => {
+            let work = start_plan_for(s, &text_arg(args, "plan")?, "MCP")?;
+            let job = new_job(work, "MCP", None, None);
+            s.connect.add(job.clone());
+            Ok(job)
+        }
+        _ => find_job(s, &text_arg(args, "task_id")?),
+    }
 }
 
 fn cancel_task(s: &Shared, args: &Value) -> Result<Value, String> {
