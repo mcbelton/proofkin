@@ -472,10 +472,11 @@
     {
       "id": "PRE-1",
       "area": "squads",
-      "claim": "Before a plan runs it is checked against what exists now: connected peers, the folders they share with you with their checks, access and worktrees, squads, knowledge topics and skills. A plan with errors is refused with every reason, in the terminal and the web UI, and the web UI checks plans as you type. A malformed line is explained with what a step line looks like, repeating a list option adds to it (one-value options can't be repeated), and options typed into the task text are flagged. A claim that would end unverified (nothing proves it, or a step without checks claims it) is flagged on the step, saying why, with the changes that fix it: let a sign-off prove it, add your sign-off, use the folder's own check, or remove the claim.",
+      "claim": "Before a plan runs it is checked against what exists now: connected peers, the folders they share with you with their checks, access and worktrees, squads, knowledge topics and skills. A plan with errors is refused with every reason, in the terminal and the web UI, and the web UI checks plans as you type. A malformed line is explained with what a step line looks like, repeating a list option adds to it (one-value options can't be repeated), and options typed into the task text are flagged (text in backticks isn't). A claim that would end unverified (nothing proves it, or a step without checks claims it) is flagged on the step, saying why, with the changes that fix it: let a sign-off prove it, add your sign-off, use the folder's own check, or remove the claim.",
       "tests": [
         "lib::plan::preflight_finds_what_would_fail_before_anything_runs",
         "lib::plan::step_lines_say_what_is_wrong_and_repeated_options_add_up",
+        "lib::plan::words_in_backticks_are_examples_not_misplaced_options",
         "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
       ],
       "live": ["a plan with errors was refused before anything ran"]
