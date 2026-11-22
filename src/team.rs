@@ -196,6 +196,8 @@ impl TeamRunner {
                 .filter(|(_, issues)| !issues.is_empty())
                 .collect(),
             recipients,
+            work_context: crate::plan::work_context(&self.profile, &plan)?,
+            work_log: crate::plan::WorkLog::default(),
         };
         let finals = crate::plan::run_plan_with(agent, &squads, &ready, &ctx, |id, state| {
             states.insert(id.to_owned(), state.clone());
@@ -218,10 +220,18 @@ impl TeamRunner {
         );
         record.id = run_id;
         record.peer_ids = crate::runs::peer_ids(agent);
+        record.workiq = ctx.work_log.records();
         if let Err(e) = record.save(&self.profile.runs_dir()) {
             eprintln!("could not save team run {}: {e:#}", record.id);
         }
-        crate::plan::save_knowledge(&kb, &plan, &finals, &record.id);
+        // What Work IQ found stays on this machine: the record goes to the requester.
+        record.workiq.clear();
+        crate::plan::save_knowledge(
+            &kb,
+            &crate::plan::with_actual_labels(&plan, &ctx.work_log),
+            &finals,
+            &record.id,
+        );
 
         let mut output = format!(
             "Team run {} by {}: {}\n",

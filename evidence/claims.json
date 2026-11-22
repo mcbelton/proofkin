@@ -1104,6 +1104,53 @@
         "lib::workiq::client::a_new_day_resets_the_daily_count",
         "lib::workiq::audit::budgets_are_saved_in_profile_json_and_a_limit_left_out_keeps_its_value"
       ]
+    },
+    {
+      "id": "WIQ-11",
+      "area": "work-iq",
+      "claim": "The workiq= step option (all, or a comma list of email, meetings, files, teams, people and connectors) is parsed, refused for unknown sources (naming the known ones) and on approve steps, and taught to the plan editor (option list and round trip). all uses the copilot strategy with no capabilities, a list with connectors uses copilot with those capabilities, any other list uses grounding. The plan check needs the plan profile's Work IQ account (naming proofkin auth login workiq) and a target that is the owner's digital worker or a peer with a Microsoft 365 grant (naming the grant command); the step is marked, a peer gets at most its grant's labels, and a later step after a workiq= step on the owner's own worker gets a warning, not an error. When the step is sent, after its peer is picked, the agent searches Work IQ with the step's own words through the audited client (a call context for the run and step, so budgets apply), builds the retrieval section for that peer's audience and puts it before Your task: in the guarded prompt; the kept results' labels are the step's actual labels, which the send-time check of a later step uses. A Work IQ error or a budget refusal fails the step with its one-line message. The run record keeps per step the sources, labels, kept and withheld counts and request ids.",
+      "tests": [
+        "lib::plan::workiq_sources_pick_the_strategy_and_capabilities_and_bad_ones_are_refused",
+        "lib::plan::a_workiq_step_is_marked_and_its_grant_labels_go_to_the_steps_after",
+        "lib::plan::the_plan_check_needs_a_sign_in_and_a_recipient_for_workiq_steps",
+        "ui::the_plan_editor_keeps_plans_valid",
+        "agents::a_local_step_gets_the_work_iq_section_in_front_of_its_task",
+        "agents::a_granted_peer_gets_only_the_work_iq_results_its_grant_allows",
+        "agents::a_later_step_is_refused_at_send_time_when_what_was_found_exceeds_its_grant",
+        "agents::a_work_iq_error_fails_the_step_with_its_one_line_message",
+        "agents::workiq_steps_search_through_the_audited_client_and_stop_at_the_run_budget"
+      ]
+    },
+    {
+      "id": "WIQ-12",
+      "area": "work-iq",
+      "claim": "A step whose target is @workiq is run by the plan's own agent, never sent to a peer: it calls Work IQ's ask tool through the audited client with the step's own words plus the results of the steps it runs after (capped like other steps), and agent=<id> (letters, digits and - _ . : @, at most 200 characters) is sent as agentId. Its output is the answer and its cited sources for the local audience; the step is marked as Microsoft 365 content with its citations' labels, and a citation without label information adds the label unknown, which no peers allow --m365 grant can include, so no peer gets that output (a later step on a peer without a grant, or with a narrower one, is refused). The answer reaches later steps through after, and save= writes the mark and a source note saying it was a Work IQ answer. Plan errors say an answer is context and never proof for claims=, verify=, apply=, mcp=, skill=, attempts=, levels=, team and approve on a @workiq step. The plan check needs the profile's Work IQ account. The run shows it as done by workiq (or workiq:<agent id>), with no evidence and not verified. proofkin workiq agents lists the agents list_agents returns (name and id). The plan editor knows the @workiq target.",
+      "tests": [
+        "lib::plan::a_workiq_step_parses_and_everything_that_would_make_an_answer_proof_is_refused",
+        "lib::plan::a_workiq_step_is_marked_and_save_keeps_the_mark_and_says_it_was_an_answer",
+        "lib::plan::the_plan_check_needs_the_work_iq_account_for_workiq_steps",
+        "lib::workiq::content::agents_are_read_from_the_common_list_shapes_and_ones_without_an_id_are_left_out",
+        "lib::trust::m365_off_removes_the_grant_and_bad_specs_are_refused",
+        "ui::the_plan_editor_keeps_plans_valid",
+        "agents::a_workiq_step_asks_for_its_words_and_hands_its_answer_to_later_steps",
+        "agents::an_agentless_workiq_step_sends_no_agent_id",
+        "agents::a_later_peer_step_is_refused_when_the_answer_exceeds_its_grant_or_has_no_labels",
+        "agents::proofkin_workiq_agents_lists_the_agents_work_iq_offers",
+        "agents::a_workiq_step_asks_through_the_audited_client_with_agent_id"
+      ]
+    },
+    {
+      "id": "WIQ-13",
+      "area": "work-iq",
+      "claim": "proofkin kb import workiq <topic> --query <text> [--from SOURCES] [--replace] runs Work IQ's retrieve through the audited client for the profile (purpose knowledge-import, the query on one line, --from taking the sources of the workiq= option with the same strategy and capabilities and the same refusals, default all), builds the retrieval section for the local audience and saves it as the topic: marked as Microsoft 365 content with the labels of the kept results (unknown for a result without label information), with the front matter lines query: and retrieved: (the date) and the source note Work IQ retrieve. An existing topic is not overwritten without --replace (and Work IQ is not asked), and when no result was kept nothing is written and the error says how many results were withheld and why. The saved topic works with context=, and its mark goes through the plan check to the steps that use it. POST /api/kb/import/workiq (topic, query, from, replace) is token-guarded, does the same and answers with the topic and the kept and withheld counts and labels.",
+      "tests": [
+        "agents::kb_import_workiq_saves_the_topic_with_its_mark_query_date_and_sources",
+        "agents::kb_import_workiq_needs_replace_to_overwrite_a_topic_and_refuses_bad_sources",
+        "agents::kb_import_workiq_writes_nothing_when_everything_was_withheld",
+        "agents::an_imported_result_without_label_information_is_marked_unknown",
+        "ui::the_workiq_import_route_saves_a_marked_topic_and_needs_replace_to_overwrite",
+        "ui::the_workiq_import_route_writes_nothing_when_every_result_was_withheld"
+      ]
     }
   ]
 }

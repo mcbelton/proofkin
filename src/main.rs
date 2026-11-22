@@ -193,6 +193,12 @@ enum WorkiqCommand {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// List the declarative agents Work IQ offers this profile's account: their names and the
+    /// ids `agent=` takes on a `@workiq` step in a plan.
+    Agents {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Change how many Work IQ calls this profile may make (a limit you leave out is kept).
     #[command(after_help = "\
 examples:
@@ -328,6 +334,31 @@ enum KbCommand {
     Learn {
         #[arg(long, default_value_t = 168)]
         hours: u64,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Keep content from elsewhere as a topic.
+    #[command(subcommand)]
+    Import(KbImportCommand),
+}
+
+#[derive(Subcommand)]
+enum KbImportCommand {
+    /// Search Microsoft 365 through Work IQ and keep what it cites as a topic, marked with
+    /// the results' sensitivity labels, for a step's context=. Nothing is written when
+    /// every result was withheld.
+    Workiq {
+        topic: String,
+        /// What to look for.
+        #[arg(long)]
+        query: String,
+        /// Where to look, as a step's workiq= takes it: all (default), or a list of email,
+        /// meetings, files, teams, people, connectors.
+        #[arg(long)]
+        from: Option<String>,
+        /// Overwrite the topic if it exists.
+        #[arg(long)]
+        replace: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1339,10 +1370,10 @@ async fn main() -> Result<()> {
         Some(Command::Mcp(command)) => run_mcp(command),
         Some(Command::Plugin(command)) => run_plugin(command).await,
         Some(Command::Worker(command)) => run_worker(command),
-        Some(Command::Workiq(command)) => run_workiq(command),
+        Some(Command::Workiq(command)) => run_workiq(command).await,
         Some(Command::Squad(command)) => run_squad(command),
         Some(Command::Runs(command)) => run_runs(command),
-        Some(Command::Kb(command)) => run_kb(command),
+        Some(Command::Kb(command)) => run_kb(command).await,
         Some(Command::Playbook(command)) => run_playbook(command),
         Some(Command::Skill(command)) => run_skill(command),
         Some(Command::Agent(command)) => run_agent_command(command),
@@ -1462,13 +1493,21 @@ fn civil_date(days: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-fn run_workiq(command: WorkiqCommand) -> Result<()> {
+async fn run_workiq(command: WorkiqCommand) -> Result<()> {
     use proofkin::workiq::audit::{Audit, set_budget};
     match command {
         WorkiqCommand::Usage { profile } => {
             let profile = Profile::open(&profile.name)?;
             let report = Audit::for_profile(&profile).report()?;
             print!("{}", report.describe(&profile.name));
+        }
+        WorkiqCommand::Agents { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let client = proofkin::workiq::context::client_for_profile(&profile)?;
+            print!(
+                "{}",
+                proofkin::workiq::context::agents_listing(&client).await?
+            );
         }
         WorkiqCommand::Budget {
             per_day,
@@ -1806,8 +1845,35 @@ fn ops_report(profile: &Profile, hours: u64) -> Result<String> {
     ))
 }
 
-fn run_kb(command: KbCommand) -> Result<()> {
+async fn run_kb(command: KbCommand) -> Result<()> {
     match command {
+        KbCommand::Import(KbImportCommand::Workiq {
+            topic,
+            query,
+            from,
+            replace,
+            profile,
+        }) => {
+            let profile = Profile::open(&profile.name)?;
+            let work = proofkin::workiq::context::ClientWork::for_profile(&profile)?;
+            let done = proofkin::workiq::import::import_knowledge(
+                &work,
+                &profile.knowledge(),
+                &topic,
+                &query,
+                from.as_deref(),
+                replace,
+            )
+            .await?;
+            println!(
+                "profile '{}': saved topic {} from Work IQ: {} result(s) kept ({}), {} withheld",
+                profile.name,
+                done.topic,
+                done.kept,
+                done.labels.join(", "),
+                done.withheld
+            );
+        }
         KbCommand::List { profile } => {
             let profile = Profile::open(&profile.name)?;
             let topics = profile.knowledge().list();
@@ -4128,16 +4194,18 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                         bail!("the plan was not started: fix the errors above");
                     }
                     let ready = plan.prepare(&kb, &skills)?;
-                    Ok((text, plan, ready))
+                    let work = proofkin::plan::work_context(&profile, &plan)?;
+                    Ok((text, plan, ready, work))
                 });
                 match parsed {
                     Err(e) => eprintln!("{e:#}"),
-                    Ok((text, plan, ready)) => {
+                    Ok((text, plan, ready, work)) => {
                         let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                         let agent = agent.clone();
                         let runs_dir = profile.runs_dir();
                         let ctx = proofkin::plan::RunContext {
                             recipients,
+                            work_context: work,
                             ..Default::default()
                         };
                         let n = tasks.spawn(
@@ -4155,6 +4223,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                                     started,
                                 );
                                 run.peer_ids = proofkin::runs::peer_ids(&agent);
+                                run.workiq = ctx.work_log.records();
                                 println!("=== plan finished: {} ===", run.verdict_line());
                                 for claim in run.claim_results() {
                                     println!(
@@ -4168,8 +4237,12 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                                     Ok(report) => println!("  report: {}", report.display()),
                                     Err(e) => eprintln!("could not save the run: {e:#}"),
                                 }
-                                let saved =
-                                    proofkin::plan::save_knowledge(&kb, &plan, &states, &run.id);
+                                let saved = proofkin::plan::save_knowledge(
+                                    &kb,
+                                    &proofkin::plan::with_actual_labels(&plan, &ctx.work_log),
+                                    &states,
+                                    &run.id,
+                                );
                                 if !saved.is_empty() {
                                     println!("  knowledge saved: {}", saved.join(", "));
                                 }

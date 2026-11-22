@@ -553,6 +553,8 @@ sent: it fails saying which budget is used up and how to raise it, and is record
 ```
 
 `budget` keeps a limit you leave out, and saves them in `profile.json` (`workiq_budget`).
+`proofkin workiq agents --profile alice` lists the declarative agents Work IQ offers (name
+and id), for `agent=` on [`@workiq` steps](#asking-microsoft-365-in-a-step-workiq).
 
 ### Cancelling tasks
 
@@ -610,6 +612,8 @@ report after api,tests @helper Write a one-paragraph status report
 - With a [tracker](#tracked-work) linked, each run is a GitHub issue and each step a
   sub-issue on your project's board, which follows the run: `track: #12` works on issue 12,
   `issue=#15` makes a step work on issue 15, and `track: off` leaves a run untracked.
+- `workiq=all` or `workiq=email,files` makes a step search your Microsoft 365 first; see
+  [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq).
 
 Run it with `/plan plan.txt`, or in the web UI's **Plan** mode. The web UI shows the plan as
 one card: a bar of its steps (done, running, failed), the steps in the order they can run
@@ -635,6 +639,66 @@ member, and squads use it to pick a member. Tasks carry where they come from, so
 worker's activity and audit log say "boss delegated step build of run 20261121-… to this
 agent". Agents that connect over [MCP or A2A](#connect-other-agents-mcp-and-a2a) get the
 same status text while they poll a task.
+
+### Microsoft 365 search in a step (`workiq=`)
+
+A step with `workiq=` searches your Microsoft 365 (through Work IQ) for its own words (its
+`brief`, else its prompt; the first 1,000 characters) when the step is sent, and the results
+go into its prompt, before `Your task:`, as cited and unverified external content.
+
+```text
+notes @helper workiq=meetings,email Summarize what was decided about the launch
+```
+
+(Options go before the task text, as for the others.)
+
+- The value is `all` or a comma list of `email`, `meetings`, `files`, `teams`, `people` and
+  `connectors`. `all` searches everything (Work IQ's `copilot` strategy), a list with
+  `connectors` uses `copilot` over those sources, any other list uses `grounding` over them.
+  An unknown source is refused, and so is `workiq=` on an `approve` step.
+- The plan check needs the profile's Work IQ sign-in (`proofkin auth login workiq`), and a
+  target that is one of your digital workers or a peer you granted Microsoft 365 content with
+  `proofkin peers allow <id> --name <name> --m365 <labels>`.
+- A step with `workiq=` is marked as having Microsoft 365 content, like one with a marked
+  `context=` topic. A peer only gets results whose sensitivity labels its grant includes;
+  your own workers get all that Work IQ allows. When the step goes to your own worker, the
+  labels are only known once it runs, so a later step for a peer gets a plan check
+  **warning**, and is checked again when it is sent: it is refused if what was found has
+  labels beyond the peer's grant.
+- Searches are audited and held to the profile's Work IQ budgets. A Work IQ error or a budget
+  refusal fails the step with its one-line message.
+- The run record keeps, for each step, the sources (title, type, label, link), how many
+  results were kept and withheld, and the request ids. It stays on this machine.
+
+### Asking Microsoft 365 in a step (`@workiq`)
+
+A step whose target is `@workiq` is run by the plan's own agent and never sent to a peer. It
+calls Work IQ's `ask` tool, through the same audited client as `workiq=`, with the step's own
+words plus the results of the steps it runs `after` (cut to the same size as for other
+steps). Its output is Work IQ's answer and the sources it cites.
+
+```text
+dates @helper Collect the launch dates
+ask after dates @workiq agent=sales-agent:v1 save=launch What changed in the launch plan?
+write after ask @alice Write the announcement
+```
+
+- `agent=<id>` asks that declarative agent (sent as `agentId`); ids are letters, digits and
+  `-`, `_`, `.`, `:`, `@`, at most 200 characters. List the ones your account has with
+  `proofkin workiq agents --profile P` (name and id). Without `agent=`, Work IQ answers.
+- The plan check needs the profile's Work IQ sign-in (`proofkin auth login workiq`).
+- The step is marked as Microsoft 365 content with the labels of its citations. A citation
+  without label information, or an answer with no citations, adds the label `unknown`. No
+  grant can include it (`peers allow --m365` refuses `unknown`), so no peer gets that output:
+  a later step for a peer is refused. Without a grant a peer fails the plan check; with one,
+  it is checked when the step is sent.
+- `after` hands the answer to later steps; `save=topic` writes it, with its mark, to the
+  knowledge base, and the topic's source note says it was a Work IQ answer.
+- An answer is context and never proof, so a `@workiq` step can't have `claims=`, `verify=`,
+  `apply=`, `mcp=`, `skill=`, `attempts=`, `levels=`, `team` or `approve`, nor `context=`,
+  `workiq=` or a folder. The run shows it as done by `workiq` (or `workiq:<agent id>`),
+  with no evidence and not verified.
+- `workiq` is reserved as a target name, so no peer can be called that in a plan.
 
 ### Team steps: handing work down a level
 
@@ -755,6 +819,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
 | `team @lead:folder`, `levels=N` | Instead of a model, the lead's team does it, with the folder's team plan ([team steps](#team-steps-handing-work-down-a-level)). `levels=` (1 to 3, default 1) is how many levels down it may go. |
 | `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
+| `workiq=all` / `workiq=email,files` | Searches your Microsoft 365 (Work IQ) for the step's own words when the step is sent, and puts what it finds in the prompt before `Your task:`. `all` searches everything; a list names sources: `email`, `meetings`, `files`, `teams`, `people`, `connectors`. Not on sign-offs. See [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq). |
 | `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue. |
 
 A step line is `name [after steps] [team] @peer[:folder] or #squad [options] what to do`: options
@@ -1074,6 +1139,28 @@ So reverse-engineered architecture, risks, designs and insights build up across 
 ```powershell
 proofkin kb list | show <topic> | add <topic> <file.md> | remove <topic> | search <words> --profile boss
 ```
+
+**Importing from Microsoft 365.** `proofkin kb import workiq <topic> --query "..."` searches
+Work IQ and keeps what it cites as a topic for `context=`:
+
+```powershell
+proofkin kb import workiq invoice-retention --query "invoice retention decisions" `
+  --from meetings,files --profile alice
+```
+
+- `--from` takes the sources of a step's [`workiq=`](#microsoft-365-search-in-a-step-workiq)
+  option (`all` by default, or a list of `email`, `meetings`, `files`, `teams`, `people`,
+  `connectors`) with the same rules.
+- The topic is marked as Microsoft 365 content with the labels of the results kept (`unknown`
+  for a result without label information), so a peer only gets it if its `--m365` grant
+  includes those labels. Its front matter also has `query:` and `retrieved:` (the date), and
+  it has the source note `Work IQ retrieve`.
+- An existing topic is only overwritten with `--replace`. If every result was withheld
+  (blocked, or without a protection status), nothing is written and the error says how many
+  were withheld and why.
+- The search counts in the [audit file and budgets](#work-iq-audit-file-and-budgets) as a
+  knowledge import. The web UI's API does the same with `POST /api/kb/import/workiq`
+  (`topic`, `query`, `from`, `replace`).
 
 **Operations.** On the machine where a service runs, its owner adds monitors: in the web
 UI (**Health → Add monitor**, which offers the folders' checks) or in a terminal. A monitor

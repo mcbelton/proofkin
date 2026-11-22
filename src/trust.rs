@@ -68,6 +68,11 @@ impl M365Grant {
         }
         let mut labels: Vec<String> = Vec::new();
         for label in spec.split(',').map(str::trim).filter(|l| !l.is_empty()) {
+            if label.eq_ignore_ascii_case(crate::workiq::content::UNKNOWN) {
+                bail!(
+                    "--m365 can't include '{label}': it stands for Work IQ content with no label information, whose sensitivity isn't known, so no peer gets it"
+                );
+            }
             if !labels.iter().any(|l| l.eq_ignore_ascii_case(label)) {
                 labels.push(label.to_owned());
             }
@@ -265,6 +270,12 @@ mod tests {
         assert_eq!(M365Grant::parse(" OFF ", false).unwrap(), None);
         assert!(M365Grant::parse("off", true).is_err());
         assert!(M365Grant::parse(" , ", false).is_err());
+        // Content without label information can't be granted to anyone.
+        let error = M365Grant::parse("General, Unknown", false).unwrap_err();
+        assert!(
+            error.to_string().contains("no label information"),
+            "{error}"
+        );
     }
 
     #[test]

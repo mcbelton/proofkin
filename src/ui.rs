@@ -332,6 +332,8 @@ struct Shared {
     team_runs: Mutex<TeamRuns>,
     /// Started with --ui-port: the address other agents use stays the same.
     fixed_port: bool,
+    /// Where imports search Microsoft 365, if not Work IQ's hosted service.
+    work: Option<Arc<dyn crate::workiq::context::WorkContext>>,
 }
 
 type AppState = Arc<Shared>;
@@ -700,10 +702,23 @@ pub struct UiServer {
 /// Starts the UI on `bind` (use 127.0.0.1). Consumes the agent's event stream.
 pub async fn start(
     agent: Agent,
+    events: mpsc::UnboundedReceiver<Event>,
+    info: UiInfo,
+    executor: Option<Arc<dyn Executor>>,
+    bind: SocketAddr,
+) -> Result<UiServer> {
+    start_with_work(agent, events, info, executor, bind, None).await
+}
+
+/// [`start`], with `work` as the Work IQ the UI's imports search (none: Work IQ's hosted
+/// service with the profile's account).
+pub async fn start_with_work(
+    agent: Agent,
     mut events: mpsc::UnboundedReceiver<Event>,
     info: UiInfo,
     executor: Option<Arc<dyn Executor>>,
     bind: SocketAddr,
+    work: Option<Arc<dyn crate::workiq::context::WorkContext>>,
 ) -> Result<UiServer> {
     let token = data_encoding::HEXLOWER.encode(&iroh::SecretKey::generate().to_bytes()[..16]);
     let (tx, _) = broadcast::channel(256);
@@ -738,6 +753,7 @@ pub async fn start(
         connect: connect::Connect::default(),
         team_runs: Mutex::new(HashMap::new()),
         fixed_port: bind.port() != 0,
+        work,
     });
     if stopped > 0 {
         let (were, they, them) = if stopped == 1 {
@@ -912,6 +928,7 @@ pub async fn start(
         .route("/api/monitors/{name}", delete(delete_monitor))
         .route("/api/playbooks", get(list_playbooks))
         .route("/api/playbooks/{name}", post(render_playbook))
+        .route("/api/kb/import/workiq", post(import_workiq))
         .route("/api/kb/{topic}", get(kb_topic))
         .route("/api/plans/check", post(check_plan))
         .route("/api/github", get(github_state))
@@ -1761,6 +1778,7 @@ fn start_plan(
         return Err(format!("the plan was not started:\n{}", errors.join("\n")));
     }
     let ready = plan.prepare(&kb, &skills).map_err(|e| format!("{e:#}"))?;
+    let work = crate::plan::work_context(&s.info.profile, &plan).map_err(|e| format!("{e:#}"))?;
     let plan_id = s.next_task_id.fetch_add(1, Ordering::Relaxed);
     let mut ids = HashMap::new();
     for step in &plan.steps {
@@ -1830,6 +1848,8 @@ fn start_plan(
                 .map(|t| t.refs.clone())
                 .unwrap_or_default(),
             recipients,
+            work_context: work,
+            work_log: crate::plan::WorkLog::default(),
         };
         let agent = shared.agent.clone();
         let states = crate::plan::run_plan_with(&agent, &squads, &ready, &ctx, |step, state| {
@@ -1853,6 +1873,7 @@ fn start_plan(
         );
         run.id = run_id;
         run.peer_ids = crate::runs::peer_ids(&shared.agent);
+        run.workiq = ctx.work_log.records();
         if let Some(t) = tracking {
             let known = t.tracked.problems.len();
             let tracked = t.finish(&run).await;
@@ -1877,7 +1898,12 @@ fn start_plan(
                 shared.update_task(*id, |t| t.run = Some(run_id.clone()));
             }
         }
-        let saved = crate::plan::save_knowledge(&kb, &plan, &states, &run.id);
+        let saved = crate::plan::save_knowledge(
+            &kb,
+            &crate::plan::with_actual_labels(&plan, &ctx.work_log),
+            &states,
+            &run.id,
+        );
         if !saved.is_empty() {
             shared.system("info", format!("Knowledge saved: {}", saved.join(", ")));
         }
@@ -2855,6 +2881,54 @@ async fn render_playbook(
     Ok(Json(
         json!({ "text": rendered.text, "notes": rendered.notes, "knowledge": saved }),
     ))
+}
+
+#[derive(Deserialize)]
+struct ImportWorkiq {
+    topic: String,
+    query: String,
+    /// Sources as a step's `workiq=` takes them; none: all.
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    replace: bool,
+}
+
+/// Imports what Work IQ cites for a query as a marked topic (`kb import workiq`).
+async fn import_workiq(
+    State(s): State<AppState>,
+    Json(body): Json<ImportWorkiq>,
+) -> Result<Json<Value>, ApiError> {
+    let from = body
+        .from
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty());
+    let work: Arc<dyn crate::workiq::context::WorkContext> = match &s.work {
+        Some(work) => work.clone(),
+        None => Arc::new(
+            crate::workiq::context::ClientWork::for_profile(&s.info.profile)
+                .map_err(|e| bad_request(format!("{e:#}")))?,
+        ),
+    };
+    let done = crate::workiq::import::import_knowledge(
+        work.as_ref(),
+        &s.info.profile.knowledge(),
+        body.topic.trim(),
+        &body.query,
+        from,
+        body.replace,
+    )
+    .await
+    .map_err(|e| bad_request(format!("{e:#}")))?;
+    // The knowledge list is part of the ops view.
+    s.send(json!({ "type": "ops" }));
+    Ok(Json(json!({
+        "topic": done.topic,
+        "kept": done.kept,
+        "withheld": done.withheld,
+        "labels": done.labels,
+    })))
 }
 
 async fn kb_topic(

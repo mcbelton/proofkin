@@ -1582,6 +1582,7 @@ impl Run {
             Target::Peer(name) if step.approve => self.person(name),
             Target::Peer(name) => name.clone(),
             Target::Squad(name) => format!("#{name}"),
+            Target::Workiq => step.workiq_name(),
         }
     }
 
@@ -2086,6 +2087,9 @@ fn step_body(step: &Step, run_id: &str, agent: &str) -> String {
         }
     } else if step.team.is_some() {
         format!("{target}'s team does it.")
+    } else if step.is_workiq() {
+        "Proofkin asks Microsoft 365 (Work IQ) for it; the answer is cited context, never proof."
+            .to_owned()
     } else if matches!(step.target, Target::Squad(_)) {
         format!("A member of squad {target} does it with {}.", step.provider)
     } else {

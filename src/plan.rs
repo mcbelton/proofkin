@@ -34,6 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::EndpointId;
@@ -48,7 +49,11 @@ use crate::profile::validate_name;
 use crate::protocol::{Origin, Phase, Progress};
 use crate::skills::Skills;
 use crate::trust::TrustStore;
-use crate::workiq::content::{Audience, UNLABELED};
+use crate::workiq::audit::{CallContext, Purpose};
+use crate::workiq::content::{
+    Audience, DEFAULT_CAP, Source, UNLABELED, answer_section, retrieval_section,
+};
+use crate::workiq::context::{ClientWork, WorkContext};
 
 /// Longest prerequisite result passed on to a dependent step.
 const MAX_DEP_CHARS: usize = 8_000;
@@ -135,15 +140,33 @@ impl SquadStore {
 pub enum Target {
     Peer(String),
     Squad(String),
+    /// `@workiq`: the plan's own agent asks Work IQ; nothing is sent to a peer.
+    Workiq,
 }
+
+/// The name `@workiq` steps are written with; no peer can be given tasks under it.
+pub const WORKIQ_TARGET: &str = "workiq";
+
+/// The longest Work IQ agent id `agent=` takes on a `@workiq` step.
+const MAX_WORKIQ_AGENT_ID: usize = 200;
 
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Target::Peer(name) => write!(f, "@{name}"),
             Target::Squad(name) => write!(f, "#{name}"),
+            Target::Workiq => write!(f, "@{WORKIQ_TARGET}"),
         }
     }
+}
+
+/// Whether `id` is a Work IQ agent id: letters, digits and `-`, `_`, `.`, `:`, `@`.
+fn valid_workiq_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= MAX_WORKIQ_AGENT_ID
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '@'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,8 +230,128 @@ pub struct Step {
     /// option and `@workiq` steps, and [`Plan::marked`] passes it on to the steps after.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m365: Option<Vec<String>>,
+    /// Microsoft 365 sources the step's agent searches through Work IQ before the task is
+    /// sent (`workiq=all` or `workiq=email,files`, see [`WORKIQ_SOURCES`]); the results
+    /// go in front of its task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workiq: Vec<String>,
 }
 
+/// The `workiq=` sources, and the Work IQ capability each one names.
+pub const WORKIQ_SOURCES: &[(&str, &str)] = &[
+    ("email", "Email"),
+    ("meetings", "Meetings"),
+    ("files", "OneDriveAndSharePoint"),
+    ("teams", "TeamsMessages"),
+    ("people", "People"),
+    ("connectors", "GraphConnectors"),
+];
+
+/// The Work IQ strategy and capability names for `workiq=`-style `sources` (see
+/// [`Step::workiq_request`]); `None` for no sources.
+pub fn workiq_request_for(sources: &[String]) -> Option<(&'static str, Vec<&'static str>)> {
+    if sources.is_empty() {
+        return None;
+    }
+    if sources.iter().any(|s| s == "all") {
+        return Some(("copilot", Vec::new()));
+    }
+    let capabilities: Vec<&'static str> = WORKIQ_SOURCES
+        .iter()
+        .filter(|(name, _)| sources.iter().any(|s| s == name))
+        .map(|(_, capability)| *capability)
+        .collect();
+    let strategy = if sources.iter().any(|s| s == "connectors") {
+        "copilot"
+    } else {
+        "grounding"
+    };
+    Some((strategy, capabilities))
+}
+
+/// The sources of a `workiq=` value (also `kb import workiq --from`): `all`, or names from
+/// [`WORKIQ_SOURCES`], with the same refusals as in a plan.
+pub fn parse_workiq_sources(value: &str) -> Result<Vec<String>> {
+    let mut list = Vec::new();
+    add_workiq(&mut list, value)?;
+    Ok(list)
+}
+
+/// The longest search text sent to Work IQ, in characters.
+pub const WORKIQ_QUERY_CHARS: usize = 1000;
+
+impl Step {
+    /// Whether this is a `@workiq` step.
+    pub fn is_workiq(&self) -> bool {
+        self.target == Target::Workiq
+    }
+
+    /// Whether the step's own output or results are Microsoft 365 content whose labels are
+    /// known only when it runs: a `@workiq` step, or one with `workiq=`.
+    pub fn brings_m365(&self) -> bool {
+        self.is_workiq() || !self.workiq.is_empty()
+    }
+
+    /// Who a `@workiq` step shows as having done it: `workiq`, or `workiq:<agent id>`.
+    pub fn workiq_name(&self) -> String {
+        match &self.agent {
+            Some(id) => format!("{WORKIQ_TARGET}:{id}"),
+            None => WORKIQ_TARGET.to_owned(),
+        }
+    }
+
+    /// Why this `@workiq` step can't be, if it can't: what it has that would make an answer
+    /// from Microsoft 365 look like proof, or that has no meaning for it.
+    fn workiq_refusal(&self) -> Option<String> {
+        if !self.is_workiq() {
+            return None;
+        }
+        let never_proof = |what: &str| {
+            format!(
+                "@workiq step '{}' can't have {what}: an answer from Microsoft 365 is context and never proof",
+                self.id
+            )
+        };
+        let has = [
+            ("approve", self.approve),
+            ("team", self.team.is_some()),
+            ("claims=", !self.claims.is_empty()),
+            ("verify=", !self.checks.is_empty()),
+            ("apply=", self.apply.is_some()),
+            ("mcp=", !self.mcp.is_empty()),
+            ("skill=", !self.skills.is_empty()),
+            ("attempts=", self.attempts.is_some()),
+        ];
+        if let Some((what, _)) = has.iter().find(|(_, present)| *present) {
+            return Some(never_proof(what));
+        }
+        let meaningless = [
+            ("context=", !self.context.is_empty()),
+            ("workiq=", !self.workiq.is_empty()),
+            ("a folder", self.share.is_some()),
+        ];
+        meaningless.iter().find(|(_, present)| *present).map(|(what, _)| {
+            format!(
+                "@workiq step '{}' can't have {what}: it asks Work IQ with its own words and the results of the steps it runs after",
+                self.id
+            )
+        })
+    }
+
+    /// The Work IQ strategy and capability names a `workiq=` list asks for: `all` is the
+    /// `copilot` strategy over everything, a list with `connectors` is `copilot` over those
+    /// capabilities (only it searches connectors), any other list is `grounding` over them.
+    /// `None` when the step has no `workiq=`.
+    pub fn workiq_request(&self) -> Option<(&'static str, Vec<&'static str>)> {
+        workiq_request_for(&self.workiq)
+    }
+
+    /// What the step's agent searches Work IQ for: its own words, cut to a size Work IQ
+    /// takes.
+    pub fn workiq_query(&self) -> String {
+        self.own_text().chars().take(WORKIQ_QUERY_CHARS).collect()
+    }
+}
 impl Step {
     /// The step's own words: what it was written with, before anything was put in
     /// front of its prompt.
@@ -369,6 +512,18 @@ impl Plan {
             }
         }
         for step in &self.steps {
+            if let Some(why) = step.workiq_refusal() {
+                bail!("{why}");
+            }
+            if step.is_workiq()
+                && let Some(id) = &step.agent
+                && !valid_workiq_agent_id(id)
+            {
+                bail!(
+                    "@workiq step '{}': agent= needs a Work IQ agent id, got {id:?}",
+                    step.id
+                );
+            }
             for dep in &step.after {
                 if dep == &step.id {
                     bail!("step '{}' can't depend on itself", step.id);
@@ -411,6 +566,12 @@ impl Plan {
             }
             if step.approve && step.save.is_some() {
                 bail!("approval step '{}' has no result to save", step.id);
+            }
+            if step.approve && !step.workiq.is_empty() {
+                bail!(
+                    "approval step '{}' is a person's decision: it has no task to search Microsoft 365 for (workiq=)",
+                    step.id
+                );
             }
             if step.approve && step.agent.is_some() {
                 bail!(
@@ -472,7 +633,8 @@ impl Plan {
     pub fn prepare(&self, kb: &KnowledgeBase, skills: &Skills) -> Result<Plan> {
         let mut plan = self.with_knowledge(kb)?;
         for step in &mut plan.steps {
-            let agent = match &step.agent {
+            let workiq = step.is_workiq();
+            let agent = match step.agent.as_ref().filter(|_| !workiq) {
                 Some(name) => Some(
                     skills
                         .agent(name)
@@ -527,9 +689,21 @@ impl Plan {
     /// because it gets that step's output. Topics that don't exist are left out here;
     /// the plan check reports them.
     pub fn marked(&self, kb: &KnowledgeBase) -> Plan {
+        self.marked_with(kb, &HashMap::new())
+    }
+
+    /// [`Plan::marked`] where `seeds` adds labels to steps by id: the labels a `workiq=`
+    /// step's results can have, when they are known (the grant of the peer it goes to).
+    /// A step with `workiq=` is always marked.
+    pub fn marked_with(&self, kb: &KnowledgeBase, seeds: &HashMap<String, Vec<String>>) -> Plan {
         let mut plan = self.clone();
         for step in &mut plan.steps {
-            if let Some(labels) = kb.marks(&step.context) {
+            let mut labels = kb.marks(&step.context);
+            if step.brings_m365() {
+                let seed = seeds.get(&step.id).map(Vec::as_slice).unwrap_or_default();
+                labels = Some(union_labels(labels.as_deref().unwrap_or_default(), seed));
+            }
+            if let Some(labels) = labels {
                 step.m365 = Some(union_labels(
                     step.m365.as_deref().unwrap_or_default(),
                     &labels,
@@ -569,6 +743,8 @@ pub struct Recipients {
     pub workers: Vec<EndpointId>,
     /// The profile the grants are made in, for the command that adds one.
     pub profile: Option<String>,
+    /// Whether the profile has a Work IQ account for `workiq=` steps.
+    pub workiq_account: bool,
 }
 
 impl Recipients {
@@ -577,6 +753,7 @@ impl Recipients {
             trust,
             workers,
             profile: None,
+            workiq_account: false,
         }
     }
 
@@ -587,7 +764,30 @@ impl Recipients {
             trust: agent.trusted(),
             workers: crate::workers::worker_ids(profile).unwrap_or_default(),
             profile: Some(profile.name.clone()),
+            workiq_account: profile.workiq_account().is_ok(),
         }
+    }
+
+    /// The audience `id` is: the owner's digital worker, a peer with a grant, or none.
+    pub fn audience_of(&self, id: &EndpointId) -> Option<Audience> {
+        self.trust.audience_for(id, &self.workers)
+    }
+
+    /// [`Recipients::refusal`] for a step whose content is Microsoft 365 `labels`, with
+    /// `labels` empty when none are known (yet): then only the grant itself is needed.
+    pub fn refusal_for_labels(
+        &self,
+        step: &Step,
+        labels: &[String],
+        name: &str,
+        id: &EndpointId,
+    ) -> Option<String> {
+        if labels.is_empty() && matches!(self.audience_of(id), Some(Audience::Peer { .. })) {
+            return None;
+        }
+        let mut marked = step.clone();
+        marked.m365 = Some(labels.to_vec());
+        self.refusal(&marked, name, id)
     }
 
     /// Why `step`'s content may not go to the peer `name` (`id`), if it may not: it has no
@@ -646,7 +846,8 @@ impl Recipients {
 
 /// Saves the result of every finished step with `save=` into `kb`, if its evidence
 /// was verified (or it ran locally); returns the topics written. A step with Microsoft 365
-/// content saves its topic marked as such, with the step's labels.
+/// content saves its topic marked as such, with the step's labels. A `@workiq` step's
+/// answer has no evidence to verify: it is saved as an answer from Work IQ, marked.
 pub fn save_knowledge(
     kb: &KnowledgeBase,
     plan: &Plan,
@@ -661,17 +862,26 @@ pub fn save_knowledge(
             Some(StepState::Done {
                 peer,
                 output,
-                verified: true,
+                verified,
                 ..
             }),
         ) = (&step.save, states.get(&step.id))
         else {
             continue;
         };
-        let source = format!(
-            "run {run_id}, step {} by {peer} (signed, verified)",
-            step.id
-        );
+        let source = if step.is_workiq() {
+            format!(
+                "run {run_id}, step {} was a Work IQ answer from {peer} (cited, unverified)",
+                step.id
+            )
+        } else if *verified {
+            format!(
+                "run {run_id}, step {} by {peer} (signed, verified)",
+                step.id
+            )
+        } else {
+            continue;
+        };
         let text = match &step.m365 {
             Some(labels) => with_mark(output, labels),
             None => output.clone(),
@@ -708,7 +918,7 @@ const TODO_CLAIM: &str = "What must be true at the end";
 /// Step options (`name=value`, before what to do).
 const STEP_OPTIONS: &[&str] = &[
     "verify", "attempts", "claims", "claim", "apply", "context", "skill", "skills", "mcp", "save",
-    "agent", "levels", "timeout", "issue",
+    "agent", "levels", "timeout", "issue", "workiq",
 ];
 
 /// The longest `timeout=` a step may have (a week).
@@ -840,7 +1050,9 @@ fn parse_step(line: &str) -> Result<Step> {
         None => (rest, None),
     };
     validate_name(name).map_err(|_| anyhow!("invalid target {target:?}"))?;
-    let target = if target.starts_with('@') {
+    let target = if target.starts_with('@') && name == WORKIQ_TARGET {
+        Target::Workiq
+    } else if target.starts_with('@') {
         Target::Peer(name.to_owned())
     } else {
         Target::Squad(name.to_owned())
@@ -849,6 +1061,7 @@ fn parse_step(line: &str) -> Result<Step> {
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
     let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
     let mut agent = None;
+    let mut workiq = Vec::new();
     let (mut levels, mut timeout, mut issue) = (None, None, None);
     let mut once = std::collections::HashSet::new();
     loop {
@@ -886,6 +1099,7 @@ fn parse_step(line: &str) -> Result<Step> {
                     "apply" => apply = Some(value.to_owned()).filter(|v| !v.is_empty()),
                     "context" => add(&mut context, value),
                     "skill" | "skills" => add(&mut skills, value),
+                    "workiq" => add_workiq(&mut workiq, value)?,
                     "mcp" => {
                         add(&mut mcp, value);
                         if let Some(bad) = mcp.iter().find(|m| validate_name(m).is_err()) {
@@ -896,6 +1110,14 @@ fn parse_step(line: &str) -> Result<Step> {
                         validate_name(value)
                             .map_err(|_| anyhow!("save= needs a topic name, got {value:?}"))?;
                         save = Some(value.to_owned());
+                    }
+                    "agent" if target == Target::Workiq => {
+                        if !valid_workiq_agent_id(value) {
+                            bail!(
+                                "agent= on a @workiq step needs a Work IQ agent id (letters, digits and - _ . : @, at most {MAX_WORKIQ_AGENT_ID} characters), got {value:?}"
+                            );
+                        }
+                        agent = Some(value.to_owned());
                     }
                     "agent" => {
                         validate_name(value)
@@ -928,10 +1150,15 @@ fn parse_step(line: &str) -> Result<Step> {
     if prompt.is_empty() {
         bail!("missing the task prompt: what to do comes last, after who runs it and the options");
     }
+    if levels.is_some() && target == Target::Workiq {
+        bail!(
+            "@workiq step '{id}' can't have levels=: an answer from Microsoft 365 is context and never proof"
+        );
+    }
     if levels.is_some() && !team {
         bail!("levels= is for team steps (name team @lead ...)");
     }
-    Ok(Step {
+    let step = Step {
         id,
         after,
         target,
@@ -953,7 +1180,41 @@ fn parse_step(line: &str) -> Result<Step> {
         timeout,
         issue,
         m365: None,
-    })
+        workiq,
+    };
+    if let Some(why) = step.workiq_refusal() {
+        bail!("{why}");
+    }
+    Ok(step)
+}
+
+/// Adds the sources of a `workiq=` value to `list`: `all`, or names from
+/// [`WORKIQ_SOURCES`]. Unknown sources are refused, as is `all` next to others.
+fn add_workiq(list: &mut Vec<String>, value: &str) -> Result<()> {
+    let mut given = Vec::new();
+    add(&mut given, &value.to_ascii_lowercase());
+    if given.is_empty() {
+        bail!("workiq= needs sources: {}", workiq_sources_text());
+    }
+    if let Some(bad) = given
+        .iter()
+        .find(|s| *s != "all" && !WORKIQ_SOURCES.iter().any(|(name, _)| name == s))
+    {
+        bail!(
+            "workiq= doesn't know the source {bad:?}; use {}",
+            workiq_sources_text()
+        );
+    }
+    add(list, &given.join(","));
+    if list.len() > 1 && list.iter().any(|s| s == "all") {
+        bail!("workiq=all already searches everything; don't list sources with it");
+    }
+    Ok(())
+}
+
+fn workiq_sources_text() -> String {
+    let names: Vec<&str> = WORKIQ_SOURCES.iter().map(|(name, _)| *name).collect();
+    format!("all or a list of {}", names.join(", "))
 }
 
 /// `first`, then those of `then` that aren't in it.
@@ -966,6 +1227,9 @@ fn union(first: &[String], then: &[String]) -> Vec<String> {
 /// The step as it runs as its agent: the agent's skills and MCP servers come first.
 fn with_agent(step: &Step, skills: &Skills) -> Result<Step> {
     let mut step = step.clone();
+    if step.is_workiq() {
+        return Ok(step);
+    }
     if let Some(name) = &step.agent {
         let agent = skills.agent(name)?;
         step.skills = union(&agent.skills, &step.skills);
@@ -1304,6 +1568,41 @@ fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
     None
 }
 
+/// Who `step` goes to, by name: the connected peer it names, or the members of its squad (also
+/// those that are offline, as they may be sent it later).
+fn receivers_of(
+    step: &Step,
+    peers: &[PeerInfo],
+    squads: &SquadStore,
+    recipients: &Recipients,
+) -> Vec<(String, EndpointId)> {
+    match &step.target {
+        Target::Squad(name) => squads
+            .get(name)
+            .map(|squad| {
+                squad
+                    .members
+                    .iter()
+                    .filter_map(|member| {
+                        let id = peers
+                            .iter()
+                            .find(|p| &p.name == member)
+                            .map(|p| p.id)
+                            .or_else(|| recipients.trust.get_by_name(member).map(|p| p.id))?;
+                        Some((member.clone(), id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Target::Workiq => Vec::new(),
+        Target::Peer(name) => peers
+            .iter()
+            .filter(|p| &p.name == name)
+            .map(|p| (p.name.clone(), p.id))
+            .collect(),
+    }
+}
+
 /// Checks `plan` against what is known now (connected peers, their folders, checks
 /// and access, squads, knowledge and skills) so problems show before anything runs.
 pub fn preflight(
@@ -1315,6 +1614,34 @@ pub fn preflight(
     recipients: &Recipients,
 ) -> Vec<Problem> {
     let marked = plan.marked(kb);
+    // What the steps with `workiq=` bring: the labels a granted peer's grant allows are
+    // known now; what an own worker's results hold is known only when the step runs.
+    let workiq_steps: HashSet<String> = plan
+        .steps
+        .iter()
+        .filter(|s| s.brings_m365())
+        .map(|s| s.id.clone())
+        .collect();
+    let mut seeds: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pending: HashSet<String> = HashSet::new();
+    for step in plan.steps.iter().filter(|s| s.brings_m365()) {
+        let mut granted: Vec<String> = Vec::new();
+        for (_, id) in receivers_of(step, peers, squads, recipients) {
+            match recipients.audience_of(&id) {
+                Some(Audience::Peer { labels }) => granted = union_labels(&granted, &labels),
+                Some(Audience::Local) => {
+                    pending.insert(step.id.clone());
+                }
+                None => {}
+            }
+        }
+        if step.is_workiq() {
+            // Run by this agent: what it finds is known only when it runs.
+            pending.insert(step.id.clone());
+        }
+        seeds.insert(step.id.clone(), granted);
+    }
+    let seeded = plan.marked_with(kb, &seeds);
     let mut problems: Vec<Problem> = plan
         .steps
         .iter()
@@ -1362,7 +1689,27 @@ pub fn preflight(
         if let Err(e) = check_topics(kb, &step.context) {
             report(Some(step), true, format!("{e:#}"));
         }
+        if step.brings_m365() && !recipients.workiq_account {
+            let profile = recipients
+                .profile
+                .as_ref()
+                .map(|p| format!(" --profile {p}"))
+                .unwrap_or_default();
+            let what = if step.is_workiq() {
+                "a @workiq step"
+            } else {
+                "workiq="
+            };
+            report(
+                Some(step),
+                true,
+                format!(
+                    "{what} needs this profile's Work IQ sign-in, and there is none; run: proofkin auth login workiq{profile}"
+                ),
+            );
+        }
         let candidates: Vec<&PeerInfo> = match &step.target {
+            Target::Workiq => continue,
             Target::Peer(name) if name == "me" => {
                 if !step.approve {
                     report(
@@ -1399,32 +1746,64 @@ pub fn preflight(
                 }
             },
         };
-        if step.m365.is_some() {
-            let receivers: Vec<(String, EndpointId)> = match &step.target {
-                Target::Squad(name) => squads
-                    .get(name)
-                    .map(|squad| {
-                        squad
-                            .members
-                            .iter()
-                            .filter_map(|member| {
-                                let id = peers
-                                    .iter()
-                                    .find(|p| &p.name == member)
-                                    .map(|p| p.id)
-                                    .or_else(|| {
-                                        recipients.trust.get_by_name(member).map(|p| p.id)
-                                    })?;
-                                Some((member.clone(), id))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                Target::Peer(_) => candidates.iter().map(|p| (p.name.clone(), p.id)).collect(),
+        let via_workiq = !step.workiq.is_empty()
+            || ancestors(plan, &step.id)
+                .iter()
+                .any(|a| workiq_steps.contains(a));
+        if step.m365.is_some() || via_workiq {
+            let receivers = receivers_of(step, peers, squads, recipients);
+            let labels = if step.workiq.is_empty() {
+                seeded
+                    .steps
+                    .iter()
+                    .find(|s| s.id == step.id)
+                    .and_then(|s| s.m365.clone())
+                    .unwrap_or_default()
+            } else {
+                // Its own results can't be outside its receiver's grant: only what it
+                // gets from the steps before it counts.
+                let mut labels = step.m365.clone().unwrap_or_default();
+                for before in ancestors(plan, &step.id) {
+                    if let Some(found) = seeded
+                        .steps
+                        .iter()
+                        .find(|s| s.id == before)
+                        .and_then(|s| s.m365.as_ref())
+                    {
+                        labels = union_labels(&labels, found);
+                    }
+                }
+                labels
             };
+            let mut warned = false;
             for (name, id) in receivers {
-                if let Some(why) = recipients.refusal(step, &name, &id) {
+                let why = if via_workiq {
+                    recipients.refusal_for_labels(step, &labels, &name, &id)
+                } else {
+                    recipients.refusal(step, &name, &id)
+                };
+                if let Some(why) = why {
                     report(Some(step), true, why);
+                }
+                let own_worker = matches!(recipients.audience_of(&id), Some(Audience::Local));
+                let waits_for_worker = ancestors(plan, &step.id)
+                    .iter()
+                    .any(|a| pending.contains(a));
+                if !own_worker && waits_for_worker && !warned {
+                    warned = true;
+                    let answered = ancestors(plan, &step.id)
+                        .iter()
+                        .any(|a| plan.steps.iter().any(|s| &s.id == a && s.is_workiq()));
+                    let message = if answered {
+                        format!(
+                            "{name} gets a Work IQ answer from a @workiq step: its labels are known when the plan runs, and checked when the step is sent; an answer with a citation that has no label stays on this machine"
+                        )
+                    } else {
+                        format!(
+                            "{name} gets Microsoft 365 content from a workiq= step on one of your own workers: its labels are known when the plan runs, and checked when the step is sent"
+                        )
+                    };
+                    report(Some(step), false, message);
                 }
             }
         }
@@ -1522,6 +1901,7 @@ pub fn choose_peer(
     // The same test as the plan check: provider, folder, checks, access, MCP servers.
     let capable = |p: &&PeerInfo| unable(step, p).is_none();
     match &step.target {
+        Target::Workiq => bail!("@workiq steps are asked of Work IQ, never sent to a peer"),
         Target::Peer(name) => {
             let peer = peers
                 .iter()
@@ -1566,10 +1946,19 @@ pub fn choose_peer(
 /// Those results (and any knowledge) are external content: other peers or models
 /// wrote them, so they are wrapped and the prompt starts with the rule for them.
 pub fn step_prompt(step: &Step, deps: &[(&str, &str, &str)]) -> String {
-    if deps.is_empty() {
+    step_prompt_with(step, deps, "")
+}
+
+/// [`step_prompt`] with the Microsoft 365 `work` section (what the step's `workiq=`
+/// search found; empty if none) in front of the task.
+pub fn step_prompt_with(step: &Step, deps: &[(&str, &str, &str)], work: &str) -> String {
+    if deps.is_empty() && work.is_empty() {
         return crate::boundary::guard(&step.prompt);
     }
-    let mut prompt = String::from("Results of the earlier steps this task builds on:\n");
+    let mut prompt = String::new();
+    if !deps.is_empty() {
+        prompt += "Results of the earlier steps this task builds on:\n";
+    }
     for (id, peer, output) in deps {
         let mut text: String = output.chars().take(MAX_DEP_CHARS).collect();
         if output.chars().count() > MAX_DEP_CHARS {
@@ -1579,6 +1968,9 @@ pub fn step_prompt(step: &Step, deps: &[(&str, &str, &str)]) -> String {
             "\n### Step {id} (done by {peer})\n{}\n",
             crate::boundary::wrap(&format!("step:{id} peer:{peer}"), &text)
         );
+    }
+    if !work.is_empty() {
+        prompt += &format!("\n{work}");
     }
     prompt += &format!("\n---\nYour task:\n{}", step.prompt);
     crate::boundary::guard(&prompt)
@@ -1623,6 +2015,7 @@ pub struct ReadyRun {
     kb: KnowledgeBase,
     recipients: Recipients,
     profile: crate::profile::Profile,
+    work: Option<Arc<dyn WorkContext>>,
 }
 
 /// Checks plan `text` as `/plan` and the web UI do (preflight against connected
@@ -1646,6 +2039,7 @@ pub fn start(agent: &Agent, profile: &crate::profile::Profile, text: &str) -> Re
         bail!("{}", errors.join("; "));
     }
     let ready = plan.prepare(&kb, &skills)?;
+    let work = work_context(profile, &plan)?;
     Ok(ReadyRun {
         text: text.to_owned(),
         plan,
@@ -1654,6 +2048,7 @@ pub fn start(agent: &Agent, profile: &crate::profile::Profile, text: &str) -> Re
         kb,
         recipients,
         profile: profile.clone(),
+        work,
     })
 }
 
@@ -1689,6 +2084,8 @@ impl ReadyRun {
                 .map(|t| t.refs.clone())
                 .unwrap_or_default(),
             recipients: self.recipients.clone(),
+            work_context: self.work.clone(),
+            work_log: WorkLog::default(),
         };
         let states = run_plan_with(agent, &self.squads, &self.ready, &ctx, |step, state| {
             if let Some(t) = &tracking {
@@ -1707,6 +2104,7 @@ impl ReadyRun {
         );
         run.id = run_id;
         run.peer_ids = crate::runs::peer_ids(agent);
+        run.workiq = ctx.work_log.records();
         if let Some(t) = tracking {
             let known = t.tracked.problems.len();
             let tracked = t.finish(&run).await;
@@ -1718,7 +2116,12 @@ impl ReadyRun {
         if let Err(e) = run.save(&self.profile.runs_dir()) {
             eprintln!("could not save the run: {e:#}");
         }
-        save_knowledge(&self.kb, &self.plan, &states, &run.id);
+        save_knowledge(
+            &self.kb,
+            &with_actual_labels(&self.plan, &ctx.work_log),
+            &states,
+            &run.id,
+        );
         run
     }
 }
@@ -1748,6 +2151,54 @@ pub struct RunContext {
     /// Who may receive Microsoft 365 content: each marked step is checked against it
     /// (with the allowlist as it is then) before its task is sent.
     pub recipients: Recipients,
+    /// Where `workiq=` steps search Microsoft 365 (see [`work_context`]); none if no step
+    /// uses it.
+    pub work_context: Option<Arc<dyn WorkContext>>,
+    /// What those searches found, by step: for the run record, kept on this machine.
+    pub work_log: WorkLog,
+}
+
+/// What a step's Work IQ search found, for the run record: the sources it got, how many
+/// results were kept and withheld, and the ids of Work IQ's responses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkRecord {
+    pub sources: Vec<Source>,
+    /// The labels of the kept results (`unlabeled`, `unknown`): what the step's output may
+    /// hold, as later steps' send-time checks see it.
+    pub labels: Vec<String>,
+    pub kept: usize,
+    pub withheld: usize,
+    pub request_ids: String,
+}
+
+/// The [`WorkRecord`]s of a run, by step.
+#[derive(Debug, Clone, Default)]
+pub struct WorkLog(Arc<Mutex<BTreeMap<String, WorkRecord>>>);
+
+impl WorkLog {
+    fn put(&self, step: &str, record: WorkRecord) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(step.to_owned(), record);
+    }
+
+    /// What was found so far, by step.
+    pub fn records(&self) -> BTreeMap<String, WorkRecord> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// What `plan`'s `workiq=` steps search with: Work IQ's hosted service for `profile`'s
+/// account, or none if no step uses `workiq=`. Fails if the account can't be used.
+pub fn work_context(
+    profile: &crate::profile::Profile,
+    plan: &Plan,
+) -> Result<Option<Arc<dyn WorkContext>>> {
+    if plan.steps.iter().all(|s| !s.brings_m365()) {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(ClientWork::for_profile(profile)?)))
 }
 
 /// Runs `plan` with `agent`, reporting every state change to `on_update`, and
@@ -1806,21 +2257,149 @@ async fn within<T>(secs: Option<u64>, work: impl Future<Output = Result<T>>) -> 
     }
 }
 
+/// The owner's allowlist as it is at this moment, for a check at send time.
+fn fresh_recipients(agent: &Agent, ctx: &RunContext) -> Recipients {
+    Recipients {
+        trust: agent.trusted(),
+        ..ctx.recipients.clone()
+    }
+}
+
 /// Why `step`'s Microsoft 365 content may not be sent to `name` (`id`) now, if it may not:
-/// the plan check's test again, against the allowlist as it is at this moment.
+/// the plan check's test again, against the allowlist as it is at this moment. A step that
+/// gets content from `workiq=` steps (its own, or those it waits for) is checked against the
+/// labels those found in this run, joined with the labels it was marked with.
 fn m365_refusal(
     agent: &Agent,
     ctx: &RunContext,
+    plan: &Plan,
     step: &Step,
     name: &str,
     id: &EndpointId,
 ) -> Option<String> {
-    step.m365.as_ref()?;
-    let recipients = Recipients {
-        trust: agent.trusted(),
-        ..ctx.recipients.clone()
+    let recipients = fresh_recipients(agent, ctx);
+    let earlier = ancestors(plan, &step.id);
+    let via_workiq = step.brings_m365()
+        || plan
+            .steps
+            .iter()
+            .any(|s| s.brings_m365() && earlier.contains(&s.id));
+    if !via_workiq {
+        step.m365.as_ref()?;
+        return recipients.refusal(step, name, id);
+    }
+    let found = ctx.work_log.records();
+    let mut labels = step.m365.clone().unwrap_or_default();
+    for before in &earlier {
+        if let Some(record) = found.get(before) {
+            labels = union_labels(&labels, &record.labels);
+        }
+    }
+    recipients.refusal_for_labels(step, &labels, name, id)
+}
+
+/// Searches Work IQ for `step` (which goes to `peer`) and returns the prompt section for
+/// what `peer` may receive. The labels kept and the sources are logged in `ctx`.
+async fn search_work(
+    agent: &Agent,
+    ctx: &RunContext,
+    step: &Step,
+    peer: &PeerInfo,
+) -> Result<String> {
+    let Some(work) = &ctx.work_context else {
+        bail!("Work IQ isn't set up for this run");
     };
-    recipients.refusal(step, name, id)
+    let Some((strategy, capabilities)) = step.workiq_request() else {
+        return Ok(String::new());
+    };
+    let audience = fresh_recipients(agent, ctx)
+        .audience_of(&peer.id)
+        .with_context(|| format!("{} has no Microsoft 365 grant", peer.name))?;
+    let purpose = Purpose::Step {
+        run: ctx.run_id.clone().unwrap_or_default(),
+        step: step.id.clone(),
+    };
+    let call = match &audience {
+        Audience::Local => CallContext::local(purpose),
+        Audience::Peer { labels } => CallContext::peer(&peer.name, labels.clone(), purpose),
+    };
+    let query = step.workiq_query();
+    let result = within(
+        step.timeout,
+        work.retrieve(&call, &query, strategy, &capabilities),
+    )
+    .await?;
+    let section = retrieval_section(&result, &audience, DEFAULT_CAP)?;
+    ctx.work_log.put(
+        &step.id,
+        WorkRecord {
+            sources: section.sources.clone(),
+            labels: section.labels.clone(),
+            kept: section.kept,
+            withheld: section.withheld.total(),
+            request_ids: result.ids.to_string(),
+        },
+    );
+    Ok(section.text)
+}
+
+/// Asks Work IQ for `step`, a `@workiq` step, as the owner's own agent: `question` is the
+/// step's words with the results of the steps before it, and the answer with its cited sources
+/// is the step's output. What the citations carry is logged in `ctx` for the run record.
+fn ask_workiq(
+    ctx: &RunContext,
+    step: &Step,
+    question: String,
+) -> impl Future<Output = Result<Delivered>> + Send + 'static {
+    let work = ctx.work_context.clone();
+    let log = ctx.work_log.clone();
+    let purpose = Purpose::Step {
+        run: ctx.run_id.clone().unwrap_or_default(),
+        step: step.id.clone(),
+    };
+    let (id, agent_id) = (step.id.clone(), step.agent.clone());
+    async move {
+        let Some(work) = work else {
+            bail!("Work IQ isn't set up for this run");
+        };
+        let call = CallContext::local(purpose);
+        let result = work.ask(&call, &question, agent_id.as_deref()).await?;
+        let section = answer_section(&result, &Audience::Local, DEFAULT_CAP)?;
+        log.put(
+            &id,
+            WorkRecord {
+                sources: section.sources.clone(),
+                labels: section.labels.clone(),
+                kept: section.kept,
+                withheld: section.withheld.total(),
+                request_ids: result.ids.to_string(),
+            },
+        );
+        Ok(Delivered {
+            ok: true,
+            output: section.text,
+            evidence: None,
+            patch: None,
+            verified: false,
+            refused: false,
+        })
+    }
+}
+
+/// `plan` with the labels each `workiq=` step's results turned out to have added to its
+/// mark, so what a step saves as knowledge is marked with them.
+pub fn with_actual_labels(plan: &Plan, log: &WorkLog) -> Plan {
+    let found = log.records();
+    let mut plan = plan.clone();
+    for step in &mut plan.steps {
+        if let Some(record) = found.get(&step.id) {
+            step.m365 = Some(union_labels(
+                step.m365.as_deref().unwrap_or_default(),
+                &record.labels,
+            ));
+        }
+    }
+    plan
 }
 
 /// The peer to run task `step` on: as [`choose_peer`], but never one the work came
@@ -1940,8 +2519,8 @@ pub async fn run_plan_with(
                     .collect();
                     match choose_approver(step, &agent.peers()) {
                         Ok((approver, name)) => {
-                            let refused =
-                                approver.and_then(|id| m365_refusal(agent, ctx, step, &name, &id));
+                            let refused = approver
+                                .and_then(|id| m365_refusal(agent, ctx, plan, step, &name, &id));
                             if let Some(why) = refused {
                                 let state = fail(why);
                                 on_update(&step.id, &state);
@@ -1969,6 +2548,12 @@ pub async fn run_plan_with(
                             continue;
                         }
                     }
+                } else if step.is_workiq() {
+                    // Asked of Work IQ by this agent: nothing is sent to a peer.
+                    (
+                        step.workiq_name(),
+                        Box::pin(ask_workiq(ctx, step, prompt.clone())),
+                    )
                 } else {
                     let peer = match pick_peer(agent, step, squads, ctx, tried.get(&step.id)) {
                         Ok(peer) => peer,
@@ -1980,13 +2565,27 @@ pub async fn run_plan_with(
                             continue;
                         }
                     };
-                    if let Some(why) = m365_refusal(agent, ctx, step, &peer.name, &peer.id) {
+                    if let Some(why) = m365_refusal(agent, ctx, plan, step, &peer.name, &peer.id) {
                         let state = StepState::failed(Some(peer.name), why);
                         on_update(&step.id, &state);
                         states.insert(step.id.clone(), state);
                         changed = true;
                         continue;
                     }
+                    let prompt = if step.workiq.is_empty() {
+                        prompt
+                    } else {
+                        match search_work(agent, ctx, step, &peer).await {
+                            Ok(work) => step_prompt_with(step, &deps, &work),
+                            Err(e) => {
+                                let state = StepState::failed(Some(peer.name), format!("{e:#}"));
+                                on_update(&step.id, &state);
+                                states.insert(step.id.clone(), state);
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    };
                     let mut task = LlmTask::new(step.provider, prompt.clone())
                         .with_checks(step.checks.clone(), step.attempts);
                     task.mcp = step.mcp.clone();
@@ -2104,7 +2703,7 @@ fn choose_approver(step: &Step, peers: &[PeerInfo]) -> Result<(Option<iroh::Endp
             .find(|p| &p.name == name)
             .map(|p| (Some(p.id), p.name.clone()))
             .ok_or_else(|| anyhow!("{name} is not connected")),
-        Target::Squad(_) => bail!("approvals need a person: @name or @me"),
+        Target::Squad(_) | Target::Workiq => bail!("approvals need a person: @name or @me"),
     }
 }
 
@@ -3048,6 +3647,365 @@ mod tests {
         // So a later step that uses the saved topic is marked too.
         let later = Plan::parse("d @x context=notes do").unwrap().marked(&kb);
         assert_eq!(step_labels(&later, "d"), hr);
+    }
+
+    #[test]
+    fn a_workiq_step_parses_and_everything_that_would_make_an_answer_proof_is_refused() {
+        let plan = Plan::parse(
+            "a @x do\nb after a @workiq agent=sales-agent:v1.2@acme save=notes What changed?",
+        )
+        .unwrap();
+        let step = &plan.steps[1];
+        assert_eq!(step.target, Target::Workiq);
+        assert!(step.is_workiq() && step.brings_m365());
+        assert_eq!(step.agent.as_deref(), Some("sales-agent:v1.2@acme"));
+        assert_eq!(step.workiq_name(), "workiq:sales-agent:v1.2@acme");
+        assert_eq!(step.target.to_string(), "@workiq");
+        assert_eq!(
+            Plan::parse("a @workiq hi").unwrap().steps[0].workiq_name(),
+            "workiq"
+        );
+        // The longest id is allowed; anything past it, or a stray character, is not.
+        let longest = "a".repeat(MAX_WORKIQ_AGENT_ID);
+        assert!(Plan::parse(&format!("a @workiq agent={longest} hi")).is_ok());
+        for bad in [format!("{longest}a"), "bad/id".to_owned(), "a#b".to_owned()] {
+            let err = Plan::parse(&format!("a @workiq agent={bad} hi"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs a Work IQ agent id"), "{bad}: {err}");
+        }
+
+        for option in [
+            "claims=C-1",
+            "verify=test",
+            "apply=x",
+            "mcp=docs",
+            "skill=adr",
+            "attempts=2",
+            "levels=2",
+        ] {
+            let err = Plan::parse(&format!("a @workiq {option} What changed?"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("@workiq step 'a'")
+                    && err.contains(option.split('=').next().unwrap())
+                    && err.contains("context and never proof"),
+                "{option}: {err}"
+            );
+        }
+        for text in ["a team @workiq do", "a approve @workiq ok?"] {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains("context and never proof"), "{text}: {err}");
+        }
+        for (text, what) in [
+            ("a @workiq context=hr do", "context="),
+            ("a @workiq workiq=all do", "workiq="),
+            ("a @workiq:app do", "a folder"),
+        ] {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains(what), "{text}: {err}");
+        }
+        // The round trip through JSON keeps the target.
+        let json = serde_json::to_string(&plan.steps[1].target).unwrap();
+        assert_eq!(json, r#"{"kind":"workiq"}"#);
+    }
+
+    #[test]
+    fn a_workiq_step_is_marked_and_save_keeps_the_mark_and_says_it_was_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path());
+        let plan = Plan::parse("a @workiq save=notes What changed?\nb after a @x use it").unwrap();
+        let marked = plan.marked(&kb);
+        assert_eq!(step_labels(&marked, "a"), Some(Vec::new()));
+        assert_eq!(step_labels(&marked, "b"), Some(Vec::new()));
+
+        let states: BTreeMap<String, StepState> = [(
+            "a".to_owned(),
+            StepState::Done {
+                peer: "workiq".into(),
+                output: "The launch moved to May.".into(),
+                evidence: None,
+                verified: false,
+                patch: None,
+            },
+        )]
+        .into();
+        assert_eq!(save_knowledge(&kb, &plan, &states, "r1"), ["notes"]);
+        let notes = kb.read("notes").unwrap();
+        assert_eq!(crate::knowledge::parse_mark(&notes), Some(Vec::new()));
+        assert!(
+            notes.contains("step a was a Work IQ answer from workiq"),
+            "{notes}"
+        );
+    }
+
+    #[test]
+    fn the_plan_check_needs_the_work_iq_account_for_workiq_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let peer = PeerInfo {
+            name: "plain".into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: vec![Provider::Copilot],
+            shares: vec![ShareInfo {
+                name: crate::shares::DATA_SHARE.into(),
+                access: Access::ReadOnly,
+                checks: Vec::new(),
+                worktrees: false,
+                mcp: Vec::new(),
+                mcp_about: Default::default(),
+                team: false,
+            }],
+            owner: None,
+            role: None,
+            load: None,
+        };
+        let mut trust = TrustStore::default();
+        trust.allow(crate::trust::TrustedPeer {
+            name: peer.name.clone(),
+            id: peer.id,
+            addrs: Default::default(),
+            can_delegate: false,
+            tasks_per_hour: 5,
+            access: Access::ReadOnly,
+            shares: vec![crate::shares::DATA_SHARE.into()],
+            m365: None,
+        });
+        let mut recipients = Recipients::new(trust, Vec::new());
+        recipients.profile = Some("boss".into());
+        let errors = |text: &str, recipients: &Recipients| -> Vec<String> {
+            preflight(
+                &Plan::parse(text).unwrap(),
+                std::slice::from_ref(&peer),
+                &SquadStore::default(),
+                &kb,
+                &skills,
+                recipients,
+            )
+            .into_iter()
+            .filter(|p| p.error)
+            .map(|p| p.message)
+            .collect()
+        };
+
+        let found = errors("a @workiq What changed?", &recipients);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("a @workiq step needs this profile's Work IQ sign-in")
+                && found[0].contains("proofkin auth login workiq --profile boss"),
+            "{}",
+            found[0]
+        );
+
+        recipients.workiq_account = true;
+        assert!(errors("a @workiq What changed?", &recipients).is_empty());
+
+        // A peer with no Microsoft 365 grant can't take a step after it.
+        let found = errors("a @workiq What changed?\nb after a @plain use", &recipients);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("step 'b'") && found[0].contains("no Microsoft 365 grant"),
+            "{}",
+            found[0]
+        );
+    }
+
+    #[test]
+    fn workiq_sources_pick_the_strategy_and_capabilities_and_bad_ones_are_refused() {
+        let request = |text: &str| {
+            let plan = Plan::parse(text).unwrap();
+            let (strategy, capabilities) = plan.steps[0].workiq_request().unwrap();
+            (strategy, capabilities, plan.steps[0].workiq.clone())
+        };
+        assert_eq!(
+            request("a @x workiq=all do"),
+            ("copilot", Vec::new(), vec!["all".to_owned()])
+        );
+        assert_eq!(
+            request("a @x workiq=email,files do").0,
+            "grounding",
+            "a list without connectors"
+        );
+        assert_eq!(
+            request("a @x workiq=files,email do").1,
+            ["Email", "OneDriveAndSharePoint"]
+        );
+        assert_eq!(
+            request("a @x workiq=meetings,connectors do").0,
+            "copilot",
+            "only copilot searches connectors"
+        );
+        assert_eq!(
+            request("a @x workiq=people workiq=teams,people do").1,
+            ["TeamsMessages", "People"],
+            "repeating the option adds to it"
+        );
+        let plain = Plan::parse("a @x do").unwrap();
+        assert!(plain.steps[0].workiq_request().is_none());
+
+        let long = format!("a @x workiq=all {}", "word ".repeat(400));
+        let plan = Plan::parse(&long).unwrap();
+        assert_eq!(plan.steps[0].workiq_query().chars().count(), 1000);
+
+        for (text, expected) in [
+            (
+                "a @x workiq=email,slack do",
+                "doesn't know the source \"slack\"",
+            ),
+            (
+                "a @x workiq=email,slack do",
+                "email, meetings, files, teams, people, connectors",
+            ),
+            (
+                "a @x workiq=all,email do",
+                "workiq=all already searches everything",
+            ),
+            ("a @x workiq=all workiq=files do", "workiq=all already"),
+            ("a approve @me workiq=all ok?", "approval step 'a'"),
+        ] {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_workiq_step_is_marked_and_its_grant_labels_go_to_the_steps_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path());
+        let plan = Plan::parse("w @x workiq=all find\nn after w @x use\nm @x other").unwrap();
+        let marked = plan.marked(&kb);
+        assert_eq!(
+            step_labels(&marked, "w"),
+            Some(Vec::new()),
+            "marked, labels not known"
+        );
+        assert_eq!(step_labels(&marked, "n"), Some(Vec::new()));
+        assert_eq!(step_labels(&marked, "m"), None);
+        let seeds = HashMap::from([("w".to_owned(), vec!["General".to_owned()])]);
+        let seeded = plan.marked_with(&kb, &seeds);
+        assert_eq!(step_labels(&seeded, "n"), Some(vec!["General".to_owned()]));
+        assert_eq!(
+            step_labels(&plan, "w"),
+            None,
+            "the plan itself isn't changed"
+        );
+    }
+
+    #[test]
+    fn the_plan_check_needs_a_sign_in_and_a_recipient_for_workiq_steps() {
+        use crate::trust::{M365Grant, TrustedPeer};
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let peer = |name: &str| PeerInfo {
+            name: name.into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: vec![Provider::Copilot],
+            shares: vec![ShareInfo {
+                name: crate::shares::DATA_SHARE.into(),
+                access: Access::ReadOnly,
+                checks: Vec::new(),
+                worktrees: false,
+                mcp: Vec::new(),
+                mcp_about: Default::default(),
+                team: false,
+            }],
+            owner: None,
+            role: None,
+            load: None,
+        };
+        let peers = vec![peer("open"), peer("plain"), peer("wide"), peer("helper")];
+        let grants = [
+            Some(vec!["General", "HR"]),
+            None,
+            Some(vec!["General"]),
+            None,
+        ];
+        let mut trust = TrustStore::default();
+        for (p, labels) in peers.iter().zip(grants) {
+            trust.allow(TrustedPeer {
+                name: p.name.clone(),
+                id: p.id,
+                addrs: Default::default(),
+                can_delegate: false,
+                tasks_per_hour: 5,
+                access: Access::ReadOnly,
+                shares: vec![crate::shares::DATA_SHARE.into()],
+                m365: labels.map(|labels| M365Grant {
+                    labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+                    tools: false,
+                }),
+            });
+        }
+        let helper = peers[3].id;
+        let mut recipients = Recipients::new(trust, vec![helper]);
+        recipients.profile = Some("boss".into());
+        let check = |text: &str, recipients: &Recipients| -> (Vec<String>, Vec<String>) {
+            let problems = preflight(
+                &Plan::parse(text).unwrap(),
+                &peers,
+                &SquadStore::default(),
+                &kb,
+                &skills,
+                recipients,
+            );
+            let by = |error: bool| {
+                problems
+                    .iter()
+                    .filter(|p| p.error == error)
+                    .map(|p| p.message.clone())
+                    .collect()
+            };
+            (by(true), by(false))
+        };
+
+        let (errors, _) = check("a @helper workiq=all find", &recipients);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("proofkin auth login workiq --profile boss"),
+            "{}",
+            errors[0]
+        );
+
+        recipients.workiq_account = true;
+        assert!(check("a @helper workiq=all find", &recipients).0.is_empty());
+        assert!(check("a @wide workiq=email find", &recipients).0.is_empty());
+        let (errors, _) = check("a @plain workiq=email find", &recipients);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        for part in [
+            "step 'a'",
+            "plain may not receive",
+            "no Microsoft 365 grant",
+            &format!("proofkin peers allow {} --name plain", peers[1].id),
+        ] {
+            assert!(errors[0].contains(part), "{part}: {}", errors[0]);
+        }
+
+        // A peer gets what its grant allows: a step after that goes to a peer with a
+        // narrower grant is an error now.
+        let (errors, _) = check("a @open workiq=all find\nb after a @wide use", &recipients);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("grant doesn't include HR"),
+            "{}",
+            errors[0]
+        );
+
+        // From an own worker the labels are only known when it runs: a warning, and the
+        // step is checked when it is sent.
+        let (errors, warnings) = check(
+            "a @helper workiq=all find\nb after a @wide use",
+            &recipients,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("checked when the step is sent")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
