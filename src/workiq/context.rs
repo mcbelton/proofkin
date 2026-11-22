@@ -7,9 +7,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::account::HostedTokens;
 use super::audit::{Audit, CallContext};
-use super::client::{Client, DEFAULT_URL, ToolResult};
+use super::client::{Client, ToolResult};
+use super::connect;
 use super::content::read_agents;
 use crate::profile::Profile;
 
@@ -68,18 +68,17 @@ impl ClientWork {
         ClientWork { client }
     }
 
-    /// Work IQ's hosted service with the account `profile` uses, audited for `profile`.
+    /// Work IQ through the account `profile` uses, audited for `profile`.
     pub fn for_profile(profile: &Profile) -> Result<Self> {
         Ok(Self::new(client_for_profile(profile)?))
     }
 }
 
-/// A client for Work IQ's hosted service with the account `profile` uses, audited for
+/// A client for Work IQ through the account `profile` uses (hosted or the CLI), audited for
 /// `profile`.
 pub fn client_for_profile(profile: &Profile) -> Result<Client> {
-    let tokens = Arc::new(HostedTokens::new(profile)?);
     let audit = Arc::new(Audit::for_profile(profile));
-    Ok(Client::new(DEFAULT_URL, tokens)?.with_audit(audit))
+    Ok(connect(profile)?.with_audit(audit))
 }
 
 impl fmt::Debug for ClientWork {

@@ -199,6 +199,16 @@ enum WorkiqCommand {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Check the Work IQ connection step by step (discovery, sign-in, token, tools, one small
+    /// retrieve) and stop at the first failure, saying what fixes it and who can do that.
+    /// The last step is one real call, counted in the audit and against the budget.
+    Doctor {
+        /// Print each check's name, result and fix as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Change how many Work IQ calls this profile may make (a limit you leave out is kept).
     #[command(after_help = "\
 examples:
@@ -1204,6 +1214,7 @@ examples:
   proofkin auth login codex   --profile worker1                 (browser sign-in)
   proofkin auth login codex   --profile worker2 --api-key
   proofkin auth login workiq  --profile worker1 --tenant contoso.com --client-id <app-id> [--device-code]
+  proofkin auth login workiq  --profile worker1 --cli [--tenant <id>]   (Microsoft's Work IQ CLI)
 Secrets are read from a hidden prompt, or from stdin when piped.")]
     Login {
         #[arg(value_enum)]
@@ -1219,6 +1230,9 @@ Secrets are read from a hidden prompt, or from stdin when piped.")]
         /// Work IQ: sign in with a device code instead of the browser.
         #[arg(long)]
         device_code: bool,
+        /// Work IQ: use Microsoft's Work IQ CLI, which signs in by itself.
+        #[arg(long, conflicts_with_all = ["client_id", "device_code"])]
+        cli: bool,
         /// Copilot: use this GitHub CLI account's token (add accounts with `gh auth login`).
         #[arg(long, conflicts_with_all = ["token", "api_key"])]
         gh_user: Option<String>,
@@ -1508,6 +1522,18 @@ async fn run_workiq(command: WorkiqCommand) -> Result<()> {
                 "{}",
                 proofkin::workiq::context::agents_listing(&client).await?
             );
+        }
+        WorkiqCommand::Doctor { json, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let report = proofkin::workiq::doctor::Doctor::new(&profile).run().await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+            } else {
+                print!("{}", report.describe());
+            }
+            if !report.passed() {
+                std::process::exit(1);
+            }
         }
         WorkiqCommand::Budget {
             per_day,
@@ -3693,6 +3719,7 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             tenant,
             client_id,
             device_code,
+            cli,
             profile,
             gh_user,
             host,
@@ -3701,8 +3728,23 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             bridge,
         } => {
             let Some(provider) = target.provider() else {
+                if cli {
+                    let mut profile = Profile::open(&profile.name)?;
+                    profile.check_can_sign_in()?;
+                    let who = proofkin::workiq::login::CliLogin::new(tenant.as_deref())
+                        .run(&mut profile)
+                        .await?;
+                    println!(
+                        "profile '{}': Work IQ signed in through the Work IQ CLI as {who}",
+                        profile.name
+                    );
+                    return Ok(());
+                }
                 let (Some(tenant), Some(client_id)) = (tenant, client_id) else {
-                    bail!("Work IQ sign-in needs --tenant <id-or-domain> and --client-id <app-id>");
+                    bail!(
+                        "Work IQ sign-in needs --tenant <id-or-domain> and --client-id <app-id>, \
+                         or --cli"
+                    );
                 };
                 let mut profile = Profile::open(&profile.name)?;
                 profile.check_can_sign_in()?;
