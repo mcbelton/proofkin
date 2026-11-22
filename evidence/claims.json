@@ -759,11 +759,12 @@
     {
       "id": "MCP-3",
       "area": "shared folders",
-      "claim": "Owners configure MCP servers in the web UI and the CLI: offer one by hand, from an MCP configuration (mcp.json, .mcp.json or VS Code's, placeholders filled in for the folder) or from a plugin, with secret values typed hidden and never shown again; pause, resume, change or remove it. Changes reach a running agent's peers within seconds, also when made from the CLI, and concurrent changes never overwrite each other.",
+      "claim": "Owners configure MCP servers in the web UI and the CLI: offer one by hand, from an MCP configuration (mcp.json, .mcp.json or VS Code's, placeholders filled in for the folder) or from a plugin, with secret values typed hidden and never shown again; pause, resume, change or remove it. Changes reach a running agent's peers within seconds, also when made from the CLI, and concurrent changes never overwrite each other (a lock file its last holder is still deleting is waited for, on Windows too).",
       "tests": [
         "lib::mcp::configurations_are_read_and_templates_filled_in_per_folder",
         "lib::mcp::servers_are_validated_and_secrets_never_listed",
         "lib::store::writes_are_atomic_and_locks_exclusive",
+        "lib::store::a_lock_file_still_open_while_it_is_deleted_is_waited_for",
         "agents::peers_use_only_the_mcp_servers_a_folder_offers_them",
         "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
       ],

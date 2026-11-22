@@ -55,6 +55,10 @@ impl FileLock {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Windows: a lock file still being deleted (its holder just let go, and another
+        // handle has it open) can't be created again until it is gone, and says access
+        // denied meanwhile; wait that out briefly, as for a held lock.
+        let mut denied = 0;
         for _ in 0..200 {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -74,6 +78,10 @@ impl FileLock {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
+                Err(e) if cfg!(windows) && in_transition(&e) && denied < 40 => {
+                    denied += 1;
+                    std::thread::sleep(Duration::from_millis(25));
+                }
                 Err(e) => {
                     return Err(e).with_context(|| format!("locking {}", target.display()));
                 }
@@ -90,6 +98,16 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Whether creating a lock file failed only because the last one is being deleted
+/// (Windows: access denied, a sharing violation or delete pending while its holder's
+/// delete is under way).
+fn in_transition(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ResourceBusy
+    ) || e.raw_os_error() == Some(303)
 }
 
 #[cfg(test)]
@@ -128,5 +146,32 @@ mod tests {
         // its thread started.
         assert!(waiter.join().unwrap() >= released, "waited for the first");
         assert!(!dir.path().join("x.json.lock").exists(), "released");
+    }
+
+    /// A lock file that is being deleted while another handle still has it open (on
+    /// Windows, access denied until it is gone) is waited for, not an error.
+    #[test]
+    fn a_lock_file_still_open_while_it_is_deleted_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.json");
+        let lock = dir.path().join("x.json.lock");
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Read, write and delete sharing, so it can be deleted while it is open.
+            open.share_mode(7);
+        }
+        let held = open.open(&lock).unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        let taken = FileLock::acquire(&file).unwrap();
+        release.join().unwrap();
+        drop(taken);
+        assert!(!lock.exists(), "released");
     }
 }
