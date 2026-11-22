@@ -1102,7 +1102,8 @@ GitHub CLI's own), and the profile then uses it. `grant` makes the profile's acc
 GitHub CLI's active one for the refresh only if it isn't already, and checks the token
 afterwards. Either way the account that was active before is active again when it ends,
 also if you cancel (Ctrl-C), it fails, it times out (after 15 minutes) or the agent stops.
-In the web UI: **Change account** → **Sign in another account**, and **Grant access** on the
+In the web UI: **Change account** → **Sign in another account** (with its host, for GitHub
+Enterprise), and **Grant access** on the
 Tracker card when its board lacks the `project` scope (or on the GitHub card, which lists
 what each scope of the account's token is for). The code shows in a dialog with **Copy
 code** and **Open GitHub**; closing the dialog cancels.
@@ -1150,7 +1151,7 @@ is tracked on GitHub, where your team already tracks work:
   and is closed once all its sub-issues are (checked every 10 minutes by a running
   agent, or now with `tracker sync`). The **Tracker** card lists those run issues under
   *Left open until their sub-issues close*: each run with how many of its sub-issues are
-  closed, and the open ones with the pull request that will close them, or *not started*.
+  closed, and the open ones with the pull request that will close them, or *no pull request yet*.
   **Check now** (`tracker sync`) closes what can be closed at once and says what is still
   open; `tracker status` prints the same list.
 

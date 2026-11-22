@@ -1965,8 +1965,11 @@ async function loadGithub() {
     : `Uses ${github.account.owner}'s GitHub account (digital worker)`));
   if (github.account.user) box.append(el("div", { id: "github-scopes" }));
   renderGithubScopes();
-  // A sign-in still waits for its code (e.g. the page was reloaded): show it again.
-  if (github.flow?.state === "waiting" && !$("#gh-flow-dialog").open) showGhFlow(github.flow);
+  // A sign-in still waits for its code (e.g. the page was reloaded): show it again, unless
+  // it is the one just closed here (it reads as waiting until gh is switched back).
+  if (github.flow?.state === "waiting" && !$("#gh-flow-dialog").open && github.flow.code !== ghFlow?.code) {
+    showGhFlow(github.flow);
+  }
   if (!github.serving) box.append(el("p", { class: "muted small", text: "This agent doesn't run peers' tasks (start it with --serve) so linked repositories are for your own use." }));
   if (!github.repos.length) box.append(el("p", { class: "muted small", text: "No linked repositories yet." }));
   for (const r of github.repos) {
@@ -2000,6 +2003,7 @@ function openGithubLogin() {
       el("input", { type: "radio", name: "gh-account", value: `${a.login}@${a.host}`, checked: i === picked || undefined }),
       el("span", { text: `${a.login} on ${a.host}${a.active ? " (active)" : ""}` })))
     : [el("span", { class: "muted small", text: "No GitHub CLI account on this machine yet: sign one in below." })]));
+  $("#github-new-host").value = github?.account?.host || "github.com";
   $("#github-dialog").showModal();
 }
 
@@ -2025,10 +2029,12 @@ function renderGithubScopes() {
     parts.push(el("p", { class: "muted small" }, known.length ? "Its token may: " : "Its token has none of the scopes Proofkin uses.",
       ...known.flatMap((s, i) => [i ? "; " : "", el("span", { class: "mono", text: s }), ` (${SCOPE_USES[s]})`]),
       known.length ? "." : ""));
-    if (!mine.scopes.includes("project") && tracker?.linked) {
-      parts.push(el("p", { class: "small" }, "It lacks ", el("span", { class: "mono", text: "project" }),
-        ", which the tracker's board needs. ",
-        el("button", { type: "button", class: "btn small primary", onclick: () => grantScope("project") }, "Grant access")));
+    // The Tracker card says so too; here it's next to the account it is about.
+    const need = tracker?.linked ? tracker.tracker?.board_scope : null;
+    if (need && !mine.scopes.includes(need)) {
+      parts.push(el("p", { class: "small" }, "It lacks ", el("span", { class: "mono", text: need }),
+        ", which the tracker's board needs."),
+      el("p", {}, el("button", { type: "button", class: "btn small", onclick: () => grantScope(need) }, "Grant access")));
     }
   }
   if (active && !same(active.login, github.account.user)) {
@@ -2059,7 +2065,7 @@ async function signInAnother() {
   $("#github-error").textContent = "";
   try {
     const res = await api("/api/github/login/new", {
-      method: "POST", body: JSON.stringify({ host: github?.account?.host || "github.com", scopes }),
+      method: "POST", body: JSON.stringify({ host: $("#github-new-host").value.trim() || "github.com", scopes }),
     });
     $("#github-dialog").close();
     showGhFlow(res.flow);
@@ -2349,7 +2355,7 @@ function waitingRuns(runs) {
         `: ${run.sub_issues.length - open.length} of ${nOf(run.sub_issues.length, "sub-issue")} closed`,
         open.length ? el("ul", {}, ...open.map((s) => el("li", {},
           externalLink(s.url, `#${s.number} ${s.title}`),
-          s.pull_requests.length ? `: pull request ${s.pull_requests.map((n) => `#${n}`).join(", ")}` : ": not started"))) : null);
+          s.pull_requests.length ? `: pull request ${s.pull_requests.map((n) => `#${n}`).join(", ")}` : ": no pull request yet"))) : null);
     })),
     el("p", { class: "muted small", text: "Proofkin closes each one when all its sub-issues are closed. It looks every 10 minutes; Check now looks at once." }),
     el("button", { type: "button", class: "btn small", onclick: (e) => syncTracker(e.currentTarget) }, "Check now"));

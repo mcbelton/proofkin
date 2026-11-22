@@ -2303,7 +2303,7 @@ fn print_waiting(waiting: &[proofkin::tracker::WaitingRun]) {
                 sub.number,
                 sub.title,
                 if prs.is_empty() {
-                    "not started".to_owned()
+                    "no pull request yet".to_owned()
                 } else {
                     format!("pull request {}", prs.join(", "))
                 }

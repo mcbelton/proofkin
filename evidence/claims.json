@@ -1022,7 +1022,7 @@
     {
       "id": "TRK-5",
       "area": "tracking",
-      "claim": "The Tracker card, tracker status and tracker sync say what each run issue left open is waiting for: the run's number, title and link, how many of its sub-issues are closed, and each open sub-issue with the pull request that will close it, or that it is not started. They are read in one GraphQL query and returned as waiting by GET /api/tracker and POST /api/tracker/sync, which also returns the run issues it closed. Runs that are closed or gone are left out.",
+      "claim": "The Tracker card, tracker status and tracker sync say what each run issue left open is waiting for: the run's number, title and link, how many of its sub-issues are closed, and each open sub-issue with the pull request that will close it, or that no pull request does yet. They are read in one GraphQL query and returned as waiting by GET /api/tracker and POST /api/tracker/sync, which also returns the run issues it closed. Runs that are closed or gone are left out.",
       "tests": [
         "lib::tracker::a_left_open_run_lists_its_sub_issues_with_the_pull_requests_that_close_them",
         "lib::tracker::a_sync_says_what_it_closed_and_what_is_still_open",
