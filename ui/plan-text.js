@@ -10,23 +10,23 @@ const planText = (() => {
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
     ["context", "context"], ["claims", "claims"], ["claim", "claims"], ["workiq", "workiq"]]);
-  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue", "model"]);
-  // A sign-off is a person's decision: no checks, retries, patches, saved result, agent, model or search.
-  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq", "model"]);
+  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue", "model", "effort"]);
+  // A sign-off is a person's decision: no checks, retries, patches, saved result, agent, model, effort or search.
+  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq", "model", "effort"]);
   // A team step is done and proven by the lead's team plan.
-  const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent", "model"]);
+  const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent", "model", "effort"]);
   // A @workiq step asks Microsoft 365 for an answer: context, never proof. Its agent= is a Work IQ
   // agent id; it has no skills, MCP servers, checks, claims, patches, folder, model or search of its own.
   const WORKIQ = "@workiq";
-  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq", "model"]);
+  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq", "model", "effort"]);
   /// What a new step does until you say: selected, so typing replaces it (the plan
   /// check refuses to run it as is, see src/plan.rs).
   const TODO = "What to do";
   const ERRORS = {
     squadSignoff: "A sign-off needs a person (@name or @me), not a squad.",
-    signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result, agent, model or Microsoft 365 search.",
-    teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers, agent or model of its own.",
-    workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, patches, skills, MCP servers, model or search of its own.",
+    signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result, agent, model, reasoning effort or Microsoft 365 search.",
+    teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers, agent, model or reasoning effort of its own.",
+    workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, patches, skills, MCP servers, model, reasoning effort or search of its own.",
     workiqKind: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it can't be a sign-off or a team step.",
     ownStep: (id) => `Step ${id} can't wait for itself.`,
   };
@@ -483,10 +483,35 @@ const planText = (() => {
     return out;
   }
 
+  /// How the plan's run is tracked, from its `track:` line (as src/plan.rs reads it):
+  /// { kind: "new", title } (no line: title "", or the new issue's title), { kind:
+  /// "issue", number }, or { kind: "off" }.
+  function trackOf(text) {
+    const line = linesOf(text).find((l) => l.kind === "track");
+    const value = line ? line.line.trim().slice("track:".length).trim() : "";
+    if (/^off$/i.test(value)) return { kind: "off" };
+    const n = value.match(/^#?(\d+)$/);
+    if (n && Number(n[1]) > 0) return { kind: "issue", number: Number(n[1]) };
+    return { kind: "new", title: value };
+  }
+
+  /// `text` with its `track:` line set to `value` (`track: value`), put first if it has
+  /// none; `value` null takes the line out.
+  function setTrack(text, value) {
+    const have = linesOf(text).find((l) => l.kind === "track");
+    if (!have) return value == null ? text : `track: ${value}\n${text}`;
+    if (value != null) return text.slice(0, have.start) + `track: ${value}` + text.slice(have.end);
+    // The line and the line break after it (before it, for the last line).
+    return have.end < text.length
+      ? text.slice(0, have.start) + text.slice(have.end + 1)
+      : text.slice(0, Math.max(0, have.start - 1));
+  }
+
   return {
     addPart, addLine, applyFix, stepIds, claimIds, parseStep, formatStep, ERRORS,
     parsePlan, formatPlan, valuesOf, setValues, renameStep, removeStep, renameClaim, removeClaim,
     dependents, needs, isTodo: (text) => blank(text, TODO), isTodoClaim: (text) => blank(text, TODO_CLAIM),
     taskOf, setTask, lineKinds: (text) => linesOf(text).map((l) => ({ kind: l.kind, head: l.head })),
+    trackOf, setTrack,
   };
 })();

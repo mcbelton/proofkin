@@ -76,6 +76,12 @@ function renderMarkdown(text) {
       root.append(mdEl("pre", {}, mdEl("code", { text: code.join("\n") })));
       continue;
     }
+    // A rule (---, *** or ___) on its own line; right under a text line it stays text.
+    if (!para.length && /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/.test(line)) {
+      endList();
+      root.append(mdEl("hr"));
+      continue;
+    }
     const heading = line.match(/^(#{1,4})\s+(.*)$/);
     if (heading) {
       flushPara(); endList();

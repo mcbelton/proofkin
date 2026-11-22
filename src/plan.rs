@@ -57,6 +57,8 @@ use crate::workiq::context::{ClientWork, WorkContext};
 
 /// Longest prerequisite result passed on to a dependent step.
 const MAX_DEP_CHARS: usize = 8_000;
+/// Longest prerequisite task passed on with its result.
+const MAX_DEP_TASK_CHARS: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Squad {
@@ -91,12 +93,18 @@ impl SquadStore {
 
     /// Creates or replaces squad `name`.
     pub fn set(&mut self, name: &str, members: Vec<String>) -> Result<()> {
-        validate_name(name).context("invalid squad name")?;
+        if !crate::profile::name_ok(name) {
+            bail!("squad names use letters, digits, '-', '_' or '.' (got {name:?})");
+        }
         if members.is_empty() {
             bail!("a squad needs at least one member");
         }
         for member in &members {
-            validate_name(member).with_context(|| format!("invalid member name {member:?}"))?;
+            if !crate::profile::name_ok(member) {
+                bail!(
+                    "{member:?} isn't a peer's name: peer names use letters, digits, '-', '_' or '.'"
+                );
+            }
         }
         let mut members = members;
         members.sort();
@@ -240,6 +248,10 @@ pub struct Step {
     /// [`crate::models`]). None: the peer's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The reasoning effort its task works at (`effort=max`, see
+    /// [`crate::models::EFFORTS`]). None: the peer's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// The `workiq=` sources, and the Work IQ capability each one names.
@@ -939,7 +951,7 @@ const TODO_CLAIM: &str = "What must be true at the end";
 /// Step options (`name=value`, before what to do).
 const STEP_OPTIONS: &[&str] = &[
     "verify", "attempts", "claims", "claim", "apply", "context", "skill", "skills", "mcp", "save",
-    "agent", "levels", "timeout", "issue", "workiq", "model",
+    "agent", "levels", "timeout", "issue", "workiq", "model", "effort",
 ];
 
 /// The longest `timeout=` a step may have (a week).
@@ -1123,7 +1135,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
     let mut agent = None;
     let mut workiq = Vec::new();
-    let mut model = None;
+    let (mut model, mut effort) = (None, None);
     let (mut levels, mut timeout, mut issue) = (None, None, None);
     let mut once = std::collections::HashSet::new();
     loop {
@@ -1146,6 +1158,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                         | "timeout"
                         | "issue"
                         | "model"
+                        | "effort"
                 ) && !once.insert(key)
                 {
                     bail!("{key}= is given twice; a step has one");
@@ -1159,6 +1172,15 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                             )
                         })?;
                         model = Some(value.to_owned());
+                    }
+                    "effort" => {
+                        crate::models::check_effort(value).map_err(|_| {
+                            anyhow!(
+                                "effort= needs a reasoning effort ({}), got {value:?}",
+                                crate::models::EFFORTS.join(", ")
+                            )
+                        })?;
+                        effort = Some(value.to_ascii_lowercase());
                     }
                     "attempts" => {
                         let n: u32 = value
@@ -1243,9 +1265,10 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     if levels.is_some() && !team {
         bail!("levels= is for team steps (name team @lead ...)");
     }
-    if model.is_some() && (approve || team || target == Target::Workiq) {
+    if (model.is_some() || effort.is_some()) && (approve || team || target == Target::Workiq) {
         bail!(
-            "model= is for steps a model runs; step '{id}' {}",
+            "{}= is for steps a model runs; step '{id}' {}",
+            if model.is_some() { "model" } else { "effort" },
             if approve {
                 "is a person's sign-off"
             } else if team {
@@ -1279,6 +1302,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         m365: None,
         workiq,
         model,
+        effort,
     };
     if let Some(why) = step.workiq_refusal() {
         bail!("{why}");
@@ -2061,10 +2085,22 @@ pub fn choose_peer(
                 .iter()
                 .filter(|p| squad.members.contains(&p.name))
                 .collect();
-            online
-                .iter()
-                .copied()
-                .filter(capable)
+            let able: Vec<&PeerInfo> = online.iter().copied().filter(capable).collect();
+            // Members that allow the step's model come first (their hello says which;
+            // one that doesn't say allows any): the others would turn it down.
+            let allows = |p: &&PeerInfo| {
+                step.model.as_deref().is_none_or(|model| {
+                    p.models
+                        .get(&step.provider)
+                        .is_none_or(|choice| choice.allows(model))
+                })
+            };
+            let pool: Vec<&PeerInfo> = if able.iter().any(allows) {
+                able.into_iter().filter(allows).collect()
+            } else {
+                able
+            };
+            pool.into_iter()
                 .min_by_key(|p| (busy.get(&p.name).copied().unwrap_or(0), p.name.clone()))
                 .cloned()
                 .ok_or_else(|| {
@@ -2083,16 +2119,35 @@ pub fn choose_peer(
     }
 }
 
-/// The prompt a step runs with: the results of its prerequisites, then its task.
-/// Those results (and any knowledge) are external content: other peers or models
-/// wrote them, so they are wrapped and the prompt starts with the rule for them.
-pub fn step_prompt(step: &Step, deps: &[(&str, &str, &str)]) -> String {
+/// A finished step a later one builds on: what it was asked, and what it returned.
+#[derive(Debug, Clone, Copy)]
+pub struct Earlier<'a> {
+    pub id: &'a str,
+    pub peer: &'a str,
+    /// The step's own words ([`Step::own_text`]).
+    pub task: &'a str,
+    pub output: &'a str,
+}
+
+/// `text` cut to `max` characters, saying so.
+fn cut_text(text: &str, max: usize) -> String {
+    let mut cut: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        cut += "\n[... truncated]";
+    }
+    cut
+}
+
+/// The prompt a step runs with: the tasks and results of its prerequisites, then its
+/// task. Those (and any knowledge) are external content: other peers or models wrote
+/// them, so they are wrapped and the prompt starts with the rule for them.
+pub fn step_prompt(step: &Step, deps: &[Earlier]) -> String {
     step_prompt_with(step, deps, "")
 }
 
 /// [`step_prompt`] with the Microsoft 365 `work` section (what the step's `workiq=`
 /// search found; empty if none) in front of the task.
-pub fn step_prompt_with(step: &Step, deps: &[(&str, &str, &str)], work: &str) -> String {
+pub fn step_prompt_with(step: &Step, deps: &[Earlier], work: &str) -> String {
     if deps.is_empty() && work.is_empty() {
         return crate::boundary::guard(&step.prompt);
     }
@@ -2100,11 +2155,17 @@ pub fn step_prompt_with(step: &Step, deps: &[(&str, &str, &str)], work: &str) ->
     if !deps.is_empty() {
         prompt += "Results of the earlier steps this task builds on:\n";
     }
-    for (id, peer, output) in deps {
-        let mut text: String = output.chars().take(MAX_DEP_CHARS).collect();
-        if output.chars().count() > MAX_DEP_CHARS {
-            text += "\n[... truncated]";
-        }
+    for dep in deps {
+        let (id, peer) = (dep.id, dep.peer);
+        let output = cut_text(dep.output, MAX_DEP_CHARS);
+        // What it was asked, so a review or a follow-up knows what the result answers.
+        let text = match dep.task.trim() {
+            "" => output,
+            task => format!(
+                "Its task:\n{}\n\nIts result:\n{output}",
+                cut_text(task, MAX_DEP_TASK_CHARS)
+            ),
+        };
         prompt += &format!(
             "\n### Step {id} (done by {peer})\n{}\n",
             crate::boundary::wrap(&format!("step:{id} peer:{peer}"), &text)
@@ -2369,7 +2430,7 @@ fn load(agent: &Agent, peers: &[PeerInfo]) -> HashMap<String, usize> {
 
 /// Why a squad step may move to another member: it never ran on its peer (refused,
 /// or the peer stopped first), or the peer dropped and didn't come back.
-fn movable(result: &Result<Delivered>) -> Option<String> {
+pub fn movable(result: &Result<Delivered>) -> Option<String> {
     match result {
         Ok(d) if d.refused => Some(
             d.output
@@ -2568,6 +2629,27 @@ fn pick_peer(
     choose_peer(step, &peers, squads, &load(agent, &peers))
 }
 
+/// The member of squad `squad` a task on its own goes to, as a plan step on `#squad`
+/// would: the least busy online member that can run it (its provider, folder, checks
+/// and MCP servers; those that allow its model first), none of those in `tried`.
+pub fn squad_member(
+    agent: &Agent,
+    squads: &SquadStore,
+    squad: &str,
+    task: &LlmTask,
+    tried: &HashSet<String>,
+) -> Result<PeerInfo> {
+    let mut step = Plan::parse(&format!("task #{squad} using {} the task", task.provider))?
+        .steps
+        .remove(0);
+    step.share = task.share.clone();
+    step.checks = task.checks.clone();
+    step.mcp = task.mcp.clone();
+    step.model = task.model.clone();
+    step.effort = task.effort.clone();
+    pick_peer(agent, &step, squads, &RunContext::default(), Some(tried))
+}
+
 /// [`run_plan`] as part of `ctx`: each step's request says which run and step it is,
 /// running steps report what their peer last said it is doing, squad steps go to the
 /// member with the least work (counting other agents' tasks) and move to another
@@ -2626,13 +2708,21 @@ pub async fn run_plan_with(
                 {
                     continue;
                 }
-                let deps: Vec<(&str, &str, &str)> = step
+                let deps: Vec<Earlier> = step
                     .after
                     .iter()
                     .filter_map(|d| match &states[d] {
-                        StepState::Done { peer, output, .. } => {
-                            Some((d.as_str(), peer.as_str(), output.as_str()))
-                        }
+                        StepState::Done { peer, output, .. } => Some(Earlier {
+                            id: d.as_str(),
+                            peer: peer.as_str(),
+                            task: plan
+                                .steps
+                                .iter()
+                                .find(|s| &s.id == d)
+                                .map(Step::own_text)
+                                .unwrap_or_default(),
+                            output: output.as_str(),
+                        }),
                         _ => None,
                     })
                     .collect();
@@ -2732,6 +2822,7 @@ pub async fn run_plan_with(
                         .with_checks(step.checks.clone(), step.attempts);
                     task.mcp = step.mcp.clone();
                     task.model = step.model.clone();
+                    task.effort = step.effort.clone();
                     task.title = Some(crate::llm::title_of(step.own_text()));
                     task.issues = ctx.issues.get(&step.id).cloned().unwrap_or_default();
                     if let Some(share) = &step.share {
@@ -3053,16 +3144,90 @@ mod tests {
             prompt: "Approve the facts".into(),
             ..Plan::parse("a @x Approve the facts").unwrap().steps[0].clone()
         };
-        let prompt = step_prompt(&step, &[("find", "worker", "the facts\nsecond line")]);
+        let prompt = step_prompt(
+            &step,
+            &[Earlier {
+                id: "find",
+                peer: "worker",
+                task: "Find the facts",
+                output: "the facts\nsecond line",
+            }],
+        );
         assert!(prompt.contains("<external_content source="), "{prompt}");
         let text = approval_text(&prompt);
         assert!(!text.contains("external_content"), "{text}");
         assert!(!text.contains("Rule for external content"), "{text}");
         assert!(
-            text.contains("### Step find (done by worker)\nthe facts\nsecond line\n"),
+            text.contains(
+                "### Step find (done by worker)\nIts task:\nFind the facts\n\nIts result:\nthe facts\nsecond line\n"
+            ),
             "{text}"
         );
         assert!(text.ends_with("Your task:\nApprove the facts"), "{text}");
+    }
+
+    /// A step gets what each step it waits for was asked (its own words, cut), with
+    /// what it returned, inside the same envelope; a task-less one only its result.
+    #[test]
+    fn a_step_gets_the_tasks_of_the_steps_it_waits_for_with_their_results() {
+        let plan =
+            Plan::parse("answer @a skill=x Reply: delta\nreview after answer @a Is it right?")
+                .unwrap();
+        let mut answer = plan.steps[0].clone();
+        answer.keep_brief();
+        answer.prompt = format!(
+            "Follow these instructions:\nbe terse\n---\n{}",
+            answer.prompt
+        );
+        let long = "y".repeat(MAX_DEP_TASK_CHARS + 5);
+        let prompt = step_prompt(
+            &plan.steps[1],
+            &[
+                Earlier {
+                    id: "answer",
+                    peer: "a",
+                    task: answer.own_text(),
+                    output: "delta",
+                },
+                Earlier {
+                    id: "long",
+                    peer: "b",
+                    task: &long,
+                    output: "ok",
+                },
+                Earlier {
+                    id: "bare",
+                    peer: "c",
+                    task: " ",
+                    output: "just this",
+                },
+            ],
+        );
+        assert!(
+            prompt.contains(
+                "### Step answer (done by a)\n<external_content source=\"step:answer peer:a\">\nIts task:\nReply: delta\n\nIts result:\ndelta\n</external_content>"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("be terse"),
+            "its skills stay out: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "{}\n[... truncated]\n\nIts result:\nok",
+                "y".repeat(MAX_DEP_TASK_CHARS)
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("peer:c\">\njust this\n</external_content>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.ends_with("---\nYour task:\nIs it right?"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -3203,6 +3368,20 @@ mod tests {
         fails("ok approve @me model=x Fine", "is a person's sign-off");
         fails("t team @lead:app model=x Do", "is a team step");
         fails("w @workiq model=x Ask", "is answered by Work IQ");
+        // effort= names one of the reasoning efforts, once, on steps a model runs.
+        let effort = Plan::parse("a @x model=gpt-5.5 effort=MAX Build it\nb @x Plain").unwrap();
+        assert_eq!(effort.steps[0].effort.as_deref(), Some("max"));
+        assert_eq!(effort.steps[1].effort, None);
+        fails("a @x effort=low effort=max do", "effort= is given twice");
+        fails(
+            "a @x effort=turbo do",
+            "effort= needs a reasoning effort (minimal, low, medium, high, xhigh, max)",
+        );
+        fails(
+            "ok approve @me effort=max Fine",
+            "effort= is for steps a model runs",
+        );
+        fails("t team @lead:app effort=max Do", "is a team step");
 
         // The check warns when the step's peer says it doesn't allow the model.
         let mut models = crate::models::Models::new();
@@ -3254,8 +3433,18 @@ mod tests {
             .unwrap();
         assert_eq!(store.get("qa").unwrap().members, ["alice", "bob"]);
         assert!(store.set("qa", vec![]).is_err());
+        let err = store.set("bad name!", vec!["a".into()]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "squad names use letters, digits, '-', '_' or '.' (got \"bad name!\")"
+        );
         assert!(store.set("../x", vec!["a".into()]).is_err());
-        assert!(store.set("dev", vec!["bad name".into()]).is_err());
+        let err = store.set("dev", vec!["bad name".into()]).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("\"bad name\" isn't a peer's name"),
+            "{err}"
+        );
         store.save(&path).unwrap();
         let loaded = SquadStore::load(&path).unwrap();
         assert_eq!(loaded, store);
@@ -3826,6 +4015,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("offers you no MCP server browser"), "{err}");
+
+        // A step's model goes to members that allow it (their hello says which), even
+        // when another is less busy; if none does, it goes as before and gets refused.
+        let mut picky = peers.clone();
+        picky[0].models.insert(
+            Provider::Copilot,
+            crate::models::ModelChoice {
+                default: Some("gpt-6".into()),
+                allowed: vec!["gpt-6".into()],
+                ..Default::default()
+            },
+        );
+        let busy = HashMap::new();
+        let opus = Plan::parse("t #qa:code model=claude-opus-5.5 test it")
+            .unwrap()
+            .steps
+            .remove(0);
+        assert_eq!(
+            choose_peer(&opus, &picky, &squads, &busy).unwrap().name,
+            "bob",
+            "alice is less busy but allows only gpt-6"
+        );
+        let gpt = Plan::parse("t #qa:code model=GPT-6 test it")
+            .unwrap()
+            .steps
+            .remove(0);
+        assert_eq!(
+            choose_peer(&gpt, &picky, &squads, &busy).unwrap().name,
+            "alice"
+        );
+        picky[1].models = picky[0].models.clone();
+        assert_eq!(
+            choose_peer(&opus, &picky, &squads, &busy).unwrap().name,
+            "alice",
+            "none allows it: the least busy, which will say why it refuses"
+        );
     }
 
     fn step_labels(plan: &Plan, id: &str) -> Option<Vec<String>> {

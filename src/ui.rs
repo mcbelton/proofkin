@@ -26,7 +26,7 @@ use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::agent::{Agent, Event, Network};
+use crate::agent::{Agent, Event, Network, PeerInfo};
 use crate::audit::{AuditLog, Outcome};
 use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
 use crate::plan::{Plan, SquadStore, StepState};
@@ -129,6 +129,9 @@ struct TaskView {
     issue: Option<crate::tracker::IssueRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_issue: Option<crate::tracker::IssueRef>,
+    /// For a task given to a squad: the squad (`target` is the member that has it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    squad: Option<String>,
 }
 
 /// A team step's team run as the page shows it.
@@ -200,6 +203,8 @@ struct StoredTask {
     issue: Option<crate::tracker::IssueRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_issue: Option<crate::tracker::IssueRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    squad: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -238,6 +243,7 @@ impl From<&TaskView> for StoredTask {
             for_peer: t.for_peer.clone(),
             issue: t.issue.clone(),
             plan_issue: t.plan_issue.clone(),
+            squad: t.squad.clone(),
         }
     }
 }
@@ -282,6 +288,7 @@ impl StoredTask {
             for_peer: self.for_peer,
             issue: self.issue,
             plan_issue: self.plan_issue,
+            squad: self.squad,
         }
     }
 }
@@ -477,8 +484,9 @@ impl Shared {
             "workspace": self.info.workspace.display().to_string(),
             "providers": self.info.providers,
             "accounts": accounts,
-            // Its providers' default models and the ones tasks may ask for (as it started).
-            "models": self.info.profile.config.models,
+            // Its providers' default models and efforts and the models tasks may ask for
+            // (as it started; a digital worker's include its owner's).
+            "models": self.info.profile.models(),
             "shares": if self.info.serving { self.shares_json() } else { json!([]) },
             "ticket": ticket,
         })
@@ -587,6 +595,7 @@ impl Shared {
                 for_peer: Some(from.to_owned()),
                 issue: None,
                 plan_issue: None,
+                squad: None,
             };
             self.add_task(view.clone());
             self.send(json!({ "type": "task", "task": view }));
@@ -961,6 +970,10 @@ pub async fn start_with_work(
         .route("/api/repos/{name}/pr", post(open_pr))
         .route("/api/repos/{name}/proof", get(branch_proof))
         .route(
+            "/api/repos/{name}/branches",
+            get(repo_branches).delete(delete_task_branch),
+        )
+        .route(
             "/api/tracker",
             get(tracker_state).put(link_tracker).delete(unlink_tracker),
         )
@@ -1014,7 +1027,7 @@ pub async fn start_with_work(
                 .delete(connect::turn_off),
         )
         .route("/api/trust", post(allow_peer))
-        .route("/api/trust/{id}", delete(remove_peer))
+        .route("/api/trust/{id}", delete(remove_peer).put(change_peer))
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             require_token,
@@ -1341,7 +1354,8 @@ async fn chat(
 struct TaskBody {
     provider: Provider,
     prompt: String,
-    /// "local", "auto" (first peer serving the provider), or a peer endpoint id.
+    /// "local", "auto" (first peer serving the provider), a peer endpoint id, or
+    /// "#squad" (the squad's least busy member that can run it).
     target: String,
     /// For peers: the shared folder to run in (default: their `data` folder).
     share: Option<String>,
@@ -1357,6 +1371,9 @@ struct TaskBody {
     /// The model it runs on (default: the agent's or the peer's default).
     #[serde(default)]
     model: Option<String>,
+    /// The reasoning effort it works at (default: the agent's or the peer's default).
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 async fn create_task(
@@ -1388,6 +1405,15 @@ fn start_task(
         crate::models::check_name(model).map_err(|e| bad_request(format!("{e:#}")))?;
         task.model = Some(model.to_owned());
     }
+    if let Some(effort) = body
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        crate::models::check_effort(effort).map_err(|e| bad_request(format!("{e:#}")))?;
+        task.effort = Some(effort.to_ascii_lowercase());
+    }
     if body.target != "local" {
         task.mcp = body.mcp;
     }
@@ -1417,6 +1443,8 @@ fn start_task(
     enum Route {
         Local(Arc<dyn Executor>),
         Peer(iroh::EndpointId, String),
+        /// A squad (by name) and the member it goes to first.
+        Squad(String, PeerInfo),
     }
     let route = match body.target.as_str() {
         "local" => match &s.executor {
@@ -1434,6 +1462,19 @@ fn start_task(
             })?;
             Route::Peer(peer.id, peer.name)
         }
+        squad if squad.starts_with('#') => {
+            let squad = &squad[1..];
+            let squads = SquadStore::load(&s.info.profile.squads_path()).map_err(internal)?;
+            let peer = crate::plan::squad_member(
+                &s.agent,
+                &squads,
+                squad,
+                &task,
+                &std::collections::HashSet::new(),
+            )
+            .map_err(|e| bad_request(format!("{e:#}")))?;
+            Route::Squad(squad.to_owned(), peer)
+        }
         id => {
             let peer = s
                 .agent
@@ -1448,6 +1489,7 @@ fn start_task(
     let target = match &route {
         Route::Local(_) => "this agent".to_owned(),
         Route::Peer(_, name) => name.clone(),
+        Route::Squad(_, peer) => peer.name.clone(),
     };
     let view = TaskView {
         id,
@@ -1474,66 +1516,45 @@ fn start_task(
         for_peer: None,
         issue: None,
         plan_issue: None,
+        squad: match &route {
+            Route::Squad(squad, _) => Some(squad.clone()),
+            _ => None,
+        },
     };
     s.add_task(view.clone());
     s.send(json!({ "type": "task", "task": view }));
 
     let shared = s.clone();
     let handle = tokio::spawn(async move {
-        let mut evidence = None;
-        let mut run = None;
-        let mut model = None;
         let started = crate::runs::unix_now();
-        let result = match route {
+        let settled = match route {
             Route::Local(executor) => {
                 let ctx = TaskContext::new(shared.info.access, shared.info.workspace.clone());
-                executor.execute(&task, &ctx).await.map(|ran| {
-                    model = ran.model;
-                    ran.output
-                })
+                match executor.execute(&task, &ctx).await {
+                    Ok(ran) => Settled {
+                        model: ran.shown_model(),
+                        ..Settled::of(Ok(ran.output))
+                    },
+                    Err(e) => Settled::of(Err(e)),
+                }
             }
             Route::Peer(peer, name) => {
-                let origin = crate::protocol::Origin {
-                    task: Some(id),
-                    ..Default::default()
-                };
-                let sent = shared.agent.send_task(peer, task.clone(), Some(origin));
-                let progress = shared.clone();
-                let delivered = match sent {
-                    Ok(delegation) => {
-                        delegation
-                            .finish(|p| progress.update_task(id, |t| t.progress = Some(p)))
-                            .await
-                    }
-                    Err(e) => Err(e),
-                };
-                match delivered {
-                    Ok(d) => {
-                        model = d.model.clone();
-                        if d.evidence.is_some() {
-                            evidence = Some(if d.verified { "verified" } else { "unverified" });
-                        }
-                        if RunRecord::worth_keeping(&task, &d) {
-                            run = save_task_run(&shared, &name, &task, d.clone(), started);
-                        }
-                        if d.ok {
-                            Ok(d.output)
-                        } else {
-                            Err(anyhow::anyhow!("{}", d.output))
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
+                let delivered = deliver(&shared, id, peer, &task).await;
+                settle(&shared, &name, &task, delivered, started)
+            }
+            Route::Squad(squad, peer) => {
+                let (name, delivered) = deliver_to_squad(&shared, id, &squad, peer, &task).await;
+                settle(&shared, &name, &task, delivered, started)
             }
         };
         shared.running.lock().unwrap().remove(&id);
         shared.update_task(id, |t| {
             t.finished_ms = Some(now_ms());
-            t.evidence = evidence;
-            t.run = run;
+            t.evidence = settled.evidence;
+            t.run = settled.run;
             t.progress = None;
-            t.model = model;
-            match result {
+            t.model = settled.model;
+            match settled.result {
                 Ok(out) => {
                     t.status = "done";
                     t.output = Some(out);
@@ -1553,6 +1574,113 @@ fn start_task(
         }
     }
     Ok(view)
+}
+
+/// How a task ended, for its card: its output (or why it failed), the model that did
+/// it, whether its peer signed it, and the evidence run kept of it.
+struct Settled {
+    result: anyhow::Result<String>,
+    model: Option<String>,
+    evidence: Option<&'static str>,
+    run: Option<String>,
+}
+
+impl Settled {
+    fn of(result: anyhow::Result<String>) -> Self {
+        Self {
+            result,
+            model: None,
+            evidence: None,
+            run: None,
+        }
+    }
+}
+
+/// Sends `task` to `peer` as this page's task `id`; what the peer says it is doing
+/// shows on the task's card.
+async fn deliver(
+    shared: &AppState,
+    id: u64,
+    peer: iroh::EndpointId,
+    task: &LlmTask,
+) -> anyhow::Result<crate::agent::Delivered> {
+    let origin = crate::protocol::Origin {
+        task: Some(id),
+        ..Default::default()
+    };
+    let delegation = shared.agent.send_task(peer, task.clone(), Some(origin))?;
+    let progress = shared.clone();
+    delegation
+        .finish(|p| progress.update_task(id, |t| t.progress = Some(p)))
+        .await
+}
+
+/// Sends `task` to `peer`, the member of squad `squad` it went to, and on to another
+/// member while one turns it down or goes away before running it, as a plan step on
+/// the squad moves; its card follows, saying why it moved. Returns who ran it.
+async fn deliver_to_squad(
+    shared: &AppState,
+    id: u64,
+    squad: &str,
+    mut peer: PeerInfo,
+    task: &LlmTask,
+) -> (String, anyhow::Result<crate::agent::Delivered>) {
+    let squads = SquadStore::load(&shared.info.profile.squads_path()).unwrap_or_default();
+    let mut tried = std::collections::HashSet::new();
+    loop {
+        let delivered = deliver(shared, id, peer.id, task).await;
+        if let Some(why) = crate::plan::movable(&delivered) {
+            tried.insert(peer.name.clone());
+            if let Ok(next) = crate::plan::squad_member(&shared.agent, &squads, squad, task, &tried)
+            {
+                let moved = format!("moved here: {}: {why}", peer.name);
+                shared.update_task(id, |t| {
+                    t.target = next.name.clone();
+                    t.progress = Some(crate::protocol::Progress::new(
+                        crate::protocol::Phase::Running,
+                        moved,
+                    ));
+                });
+                peer = next;
+                continue;
+            }
+        }
+        return (peer.name, delivered);
+    }
+}
+
+/// What a peer's answer means for its task's card (see [`Settled`]); a task that asked
+/// for checks, or whose peer committed work, is kept as an evidence run.
+fn settle(
+    shared: &Shared,
+    peer: &str,
+    task: &LlmTask,
+    delivered: anyhow::Result<crate::agent::Delivered>,
+    started: u64,
+) -> Settled {
+    let d = match delivered {
+        Ok(d) => d,
+        Err(e) => return Settled::of(Err(e)),
+    };
+    let evidence =
+        d.evidence
+            .is_some()
+            .then_some(if d.verified { "verified" } else { "unverified" });
+    let run = if RunRecord::worth_keeping(task, &d) {
+        save_task_run(shared, peer, task, d.clone(), started)
+    } else {
+        None
+    };
+    Settled {
+        model: d.model.clone(),
+        evidence,
+        run,
+        result: if d.ok {
+            Ok(d.output)
+        } else {
+            Err(anyhow::anyhow!("{}", d.output))
+        },
+    }
 }
 
 /// Saves a task delegated on its own as a one-step evidence run (see
@@ -1865,6 +1993,7 @@ fn start_plan(
             for_peer: None,
             issue: None,
             plan_issue: None,
+            squad: None,
         };
         s.add_task(view.clone());
         s.send(json!({ "type": "task", "task": view }));
@@ -2341,7 +2470,13 @@ async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         "checks": checks,
         "incidents": recent,
         "tasks": task_stats(&audit),
-        "runs": { "total": runs.len(), "passed": runs.iter().filter(|r| r.passed).count() },
+        // A run without claims proves nothing, so it neither passed nor failed.
+        "runs": {
+            "total": runs.len(),
+            "passed": runs.iter().filter(|r| r.passed).count(),
+            "failed": runs.iter().filter(|r| !r.passed && r.claims > 0).count(),
+            "unclaimed": runs.iter().filter(|r| r.claims == 0).count(),
+        },
         "knowledge": profile.knowledge().list(),
     })))
 }
@@ -2979,6 +3114,44 @@ struct ProofQuery {
     branch: String,
 }
 
+/// Where the work of each of a linked repository's task branches is (see
+/// [`crate::github::branch_states`]), asked of GitHub with the profile's account; what
+/// went wrong instead, if GitHub can't say.
+async fn repo_branches(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (repo, creds) = linked(&s, &name)?;
+    let branches = crate::github::task_branches(&repo)
+        .await
+        .unwrap_or_default();
+    let api = crate::tracker::GhApi::new(creds);
+    Ok(Json(
+        match crate::github::branch_states(&api, &repo, &branches).await {
+            Ok(states) => json!({ "states": states }),
+            Err(e) => json!({ "states": {}, "error": format!("{e:#}") }),
+        },
+    ))
+}
+
+/// Deletes a task branch of a linked repository, on GitHub and in the clone.
+async fn delete_task_branch(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<ProofQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (repo, creds) = linked(&s, &name)?;
+    creds
+        .delete_branch(&repo, &q.branch)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.system(
+        "info",
+        format!("Deleted task branch {} of {}", q.branch, repo.slug),
+    );
+    Ok(Json(json!({ "deleted": q.branch })))
+}
+
 /// The proof a pull request from task branch `branch` would carry (see
 /// [`crate::github::branch_proof`]), for the pull request form.
 async fn branch_proof(
@@ -3330,18 +3503,7 @@ async fn allow_peer(
     if ticket.addr.id == s.agent.id() {
         return Err(bad_request("that is this agent's own ticket"));
     }
-    let shares = body
-        .shares
-        .unwrap_or_else(|| vec![crate::shares::DATA_SHARE.to_owned()]);
-    // Folder grants only matter for peers that may delegate tasks.
-    let known = s.agent.shares();
-    if body.delegate
-        && let Some(missing) = shares.iter().find(|n| known.get(n).is_none())
-    {
-        return Err(bad_request(format!(
-            "this agent shares no folder named '{missing}'"
-        )));
-    }
+    let shares = granted_shares(&s, body.delegate, body.shares)?;
     let m365 = s.agent.trusted().m365_of(&ticket.addr.id, &name);
     s.agent.allow(TrustedPeer {
         name: name.clone(),
@@ -3364,15 +3526,92 @@ async fn allow_peer(
         "info",
         format!(
             "Allowlisted {name}{}",
-            if body.delegate {
-                format!(
-                    " (may delegate tasks, {} access, folders: {})",
-                    body.access,
-                    shares.join(", ")
-                )
-            } else {
-                String::new()
-            }
+            grant_words(body.delegate, body.access, &shares)
+                .map(|w| format!(" ({w})"))
+                .unwrap_or_default()
+        ),
+    );
+    s.broadcast_peers();
+    Ok(Json(json!({ "name": name })))
+}
+
+/// The folders a peer's grant names (default: the `data` share), each one this agent
+/// shares if the peer may delegate tasks (they only matter then).
+fn granted_shares(
+    s: &AppState,
+    delegate: bool,
+    shares: Option<Vec<String>>,
+) -> Result<Vec<String>, ApiError> {
+    let shares = shares.unwrap_or_else(|| vec![crate::shares::DATA_SHARE.to_owned()]);
+    let known = s.agent.shares();
+    if delegate && let Some(missing) = shares.iter().find(|n| known.get(n).is_none()) {
+        return Err(bad_request(format!(
+            "this agent shares no folder named '{missing}'"
+        )));
+    }
+    Ok(shares)
+}
+
+/// "may delegate tasks, full access, folders: data, repo" for a peer that may delegate.
+fn grant_words(delegate: bool, access: Access, shares: &[String]) -> Option<String> {
+    delegate.then(|| {
+        format!(
+            "may delegate tasks, {access} access, folders: {}",
+            shares.join(", ")
+        )
+    })
+}
+
+/// What an allowlisted peer may do, as the allowlist's Change… sets it.
+#[derive(Deserialize)]
+struct PeerGrantBody {
+    #[serde(default)]
+    delegate: bool,
+    tasks_per_hour: Option<u32>,
+    #[serde(default)]
+    access: Access,
+    shares: Option<Vec<String>>,
+}
+
+/// Changes what an allowlisted peer may do, keeping its name, addresses and Microsoft
+/// 365 grant: a connected peer stays connected and learns its folders at once.
+async fn change_peer(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PeerGrantBody>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(mut peer) = s
+        .agent
+        .trusted()
+        .peers
+        .into_iter()
+        .find(|p| p.id.to_string() == id)
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "not on the allowlist" })),
+        ));
+    };
+    let shares = granted_shares(&s, body.delegate, body.shares)?;
+    peer.can_delegate = body.delegate;
+    peer.tasks_per_hour = body
+        .tasks_per_hour
+        .unwrap_or(crate::trust::DEFAULT_TASKS_PER_HOUR);
+    peer.access = if body.delegate {
+        body.access
+    } else {
+        Access::ReadOnly
+    };
+    peer.shares = shares.clone();
+    let name = peer.name.clone();
+    s.agent.allow(peer);
+    s.save_trust()?;
+    s.system(
+        "info",
+        format!(
+            "Changed what {name} may do: {}",
+            grant_words(body.delegate, body.access, &shares)
+                .unwrap_or_else(|| "chat only (it may not delegate tasks)".to_owned())
         ),
     );
     s.broadcast_peers();
@@ -3435,6 +3674,7 @@ mod tests {
             for_peer: None,
             issue: None,
             plan_issue: None,
+            squad: None,
         }
     }
 

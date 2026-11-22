@@ -97,6 +97,11 @@ pub struct LlmTask {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The reasoning effort it works at (one of [`crate::models::EFFORTS`]; default: the
+    /// worker's for the provider, else the model's own). A model that supports fewer
+    /// takes the nearest it supports below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// For delegated tasks: the peer's shared folder to run in (default: its `data` share).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<String>,
@@ -173,6 +178,7 @@ impl LlmTask {
             provider,
             prompt: prompt.into(),
             model: None,
+            effort: None,
             share: None,
             checks: Vec::new(),
             attempts: None,
@@ -216,12 +222,14 @@ impl TaskContext {
     }
 }
 
-/// What a model run gave back: its answer, and the model that gave it, if the
-/// provider says (several, comma-separated, if the run used more than one).
+/// What a model run gave back: its answer, the model that gave it, if the provider
+/// says (several, comma-separated, if the run used more than one), and the reasoning
+/// effort it worked at, if known.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ran {
     pub output: String,
     pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 impl Ran {
@@ -229,7 +237,22 @@ impl Ran {
         Self {
             output: output.into(),
             model: model.map(|m| clean_model(&m)).filter(|m| !m.is_empty()),
+            effort: None,
         }
+    }
+
+    /// The run, saying it worked at `effort` (dropped if it isn't a reasoning effort).
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| crate::models::check_effort(e).is_ok());
+        self
+    }
+
+    /// The model as results name it: with the effort it worked at (see
+    /// [`crate::models::with_effort`]).
+    pub fn shown_model(&self) -> Option<String> {
+        crate::models::with_effort(self.model.clone(), self.effort.as_deref())
     }
 }
 
@@ -321,7 +344,7 @@ impl SdkExecutor {
         Ok(Arc::new(Self {
             providers,
             role: profile.config.role.clone(),
-            models: profile.config.models.clone(),
+            models: profile.models(),
             copilot,
             bridge,
             accounts,
@@ -359,9 +382,11 @@ impl Executor for SdkExecutor {
             bail!("Codex tasks can't use MCP servers here; use Copilot or Claude");
         }
         let mut task = with_role(self.role.as_deref(), task);
-        // The model it asked for, if this agent's owner allows it; else the default.
+        // The model it asked for, if this agent's owner allows it; else the default. The
+        // same for the reasoning effort.
         let choice = crate::models::choice(&self.models, task.provider);
         task.model = choice.pick(task.model.as_deref())?;
+        task.effort = choice.pick_effort(task.effort.as_deref())?;
         if !ctx.mcp.is_empty() {
             // MCP results reach the model as external content: the rule always leads.
             let names: Vec<String> = ctx.mcp.keys().cloned().collect();
@@ -377,7 +402,7 @@ impl Executor for SdkExecutor {
             );
         }
         let task = &task;
-        let mut model = None;
+        let (mut model, mut effort) = (None, None);
         let run = async {
             let ran = match task.provider {
                 Provider::Copilot => {
@@ -396,10 +421,11 @@ impl Executor for SdkExecutor {
                 }
             }?;
             model = ran.model;
+            effort = ran.effort;
             Ok(ran.output)
         };
         let output = changes::track_changes(&ctx.workspace, ctx.access, run).await?;
-        Ok(Ran::new(output, model))
+        Ok(Ran::new(output, model).with_effort(effort))
     }
 }
 

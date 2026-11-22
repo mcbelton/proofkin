@@ -205,6 +205,25 @@ impl GithubCredentials {
             .map(drop)
     }
 
+    /// Deletes task branch `branch`: on GitHub first (if it was pushed), then in the
+    /// clone, so a failure leaves it listed to try again.
+    pub async fn delete_branch(&self, repo: &Repo, branch: &str) -> Result<()> {
+        if !branch.starts_with("p2p/") {
+            bail!("only branches agents' tasks made (p2p/...) are deleted from here");
+        }
+        let head = format!("refs/heads/{branch}");
+        let dir = Some(repo.path.as_path());
+        if !self
+            .git(dir, &["ls-remote", "--heads", "origin", &head])
+            .await?
+            .is_empty()
+        {
+            self.git(dir, &["push", "-q", "origin", "--delete", &head])
+                .await?;
+        }
+        self.git(dir, &["branch", "-D", branch]).await.map(drop)
+    }
+
     /// Publishes the signed record of `branch`'s head commit, and only that one, to the
     /// repository's notes ref: it is added to a copy of the repository's notes, kept in
     /// a separate local ref, which is then pushed.
@@ -333,6 +352,141 @@ pub struct TaskBranch {
     /// The issues its commit is for (its `Refs:` trailers, see [`crate::tracker`]): a
     /// pull request from it closes them.
     pub issues: Vec<String>,
+}
+
+/// A pull request from a task branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BranchPr {
+    pub number: u64,
+    /// `OPEN`, `MERGED` or `CLOSED`.
+    pub state: String,
+    pub url: String,
+}
+
+/// Where a task branch's work is (see [`branch_states`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BranchState {
+    /// The newest pull request from it, if there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<BranchPr>,
+    /// Its commit is on the repository's branch already (merged some other way).
+    pub in_base: bool,
+    /// It is for issues of the repository (its `Refs:`), and all of them are closed.
+    pub issues_closed: bool,
+}
+
+/// The most issues one [`branch_states`] query asks about.
+const MAX_BRANCH_ISSUES: usize = 50;
+
+/// Where the work of each of `branches` (of `repo`) is: the newest of the repository's
+/// last 100 pull requests from it, whether its commit is on the repository's branch,
+/// and whether the issues it is for are closed. One GraphQL query for all of them.
+pub async fn branch_states(
+    api: &dyn crate::tracker::Api,
+    repo: &Repo,
+    branches: &[TaskBranch],
+) -> Result<std::collections::BTreeMap<String, BranchState>> {
+    let (owner, name) = repo
+        .slug
+        .split_once('/')
+        .with_context(|| format!("{} isn't owner/name", repo.slug))?;
+    // The issues of this repository its branches are for, by number.
+    let own = |r: &str| {
+        let (slug, n) = r.split_once('#')?;
+        slug.eq_ignore_ascii_case(&repo.slug)
+            .then(|| n.parse::<u64>().ok())
+            .flatten()
+    };
+    let numbers: std::collections::BTreeSet<u64> = branches
+        .iter()
+        .flat_map(|b| b.issues.iter().filter_map(|r| own(r)))
+        .take(MAX_BRANCH_ISSUES)
+        .collect();
+    let mut fields = String::from(
+        "pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { number state url headRefName } }",
+    );
+    for n in &numbers {
+        fields += &format!(
+            " i{n}: issueOrPullRequest(number: {n}) {{ ... on Issue {{ state }} ... on PullRequest {{ state }} }}"
+        );
+    }
+    let query = format!(
+        "query BranchStates($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}"
+    );
+    let reply = api
+        .graphql(&query, serde_json::json!({ "owner": owner, "name": name }))
+        .await?;
+    let data = &reply.data["repository"];
+    if data.is_null() {
+        bail!(
+            "{}",
+            reply
+                .errors
+                .first()
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| format!("GitHub has no repository {}", repo.slug))
+        );
+    }
+    let prs = data["pullRequests"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let closed = |n: u64| {
+        data[format!("i{n}")]["state"]
+            .as_str()
+            .is_some_and(|s| s != "OPEN")
+    };
+    let mut states = std::collections::BTreeMap::new();
+    for branch in branches {
+        let pull_request = prs
+            .iter()
+            .find(|p| p["headRefName"].as_str() == Some(branch.name.as_str()))
+            .and_then(|p| {
+                Some(BranchPr {
+                    number: p["number"].as_u64()?,
+                    state: p["state"].as_str()?.to_owned(),
+                    url: p["url"].as_str()?.to_owned(),
+                })
+            });
+        let refs: Vec<Option<u64>> = branch.issues.iter().map(|r| own(r)).collect();
+        let issues_closed = !refs.is_empty()
+            && refs
+                .iter()
+                .all(|n| n.is_some_and(|n| numbers.contains(&n) && closed(n)));
+        states.insert(
+            branch.name.clone(),
+            BranchState {
+                pull_request,
+                in_base: in_base(repo, &branch.name).await,
+                issues_closed,
+            },
+        );
+    }
+    Ok(states)
+}
+
+/// Whether `branch`'s commit is on the repository's branch (as last fetched, or the
+/// clone's own).
+async fn in_base(repo: &Repo, branch: &str) -> bool {
+    let head = format!("refs/heads/{branch}");
+    for base in [
+        format!("refs/remotes/origin/{}", repo.branch),
+        format!("refs/heads/{}", repo.branch),
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["merge-base", "--is-ancestor", &head, &base])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        if status.is_ok_and(|s| s.success()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The clone's `p2p/...` branches, newest first.

@@ -294,11 +294,12 @@
     {
       "id": "SQD-2",
       "area": "squads",
-      "claim": "Plans run steps in dependency order and in parallel where possible, give each step the results it depends on, skip steps whose prerequisites failed, and reject cycles and unknown steps before running anything.",
+      "claim": "Plans run steps in dependency order and in parallel where possible, give each step the tasks and results of the steps it depends on (each task cut at 1,000 characters, each result at 8,000, inside the same external-content envelope), skip steps whose prerequisites failed, and reject cycles and unknown steps before running anything.",
       "tests": [
         "lib::plan::parses_plan_text",
         "lib::plan::rejects_cycles_and_unknown_dependencies",
         "agents::plans_run_dependent_steps_across_squads",
+        "lib::plan::a_step_gets_the_tasks_of_the_steps_it_waits_for_with_their_results",
         "agents::plan_steps_after_a_failure_are_skipped"
       ],
       "live": ["boss's plan ran a dependent step with its prerequisite's result"]
@@ -451,7 +452,7 @@
     {
       "id": "UI-4",
       "area": "ui",
-      "claim": "The web UI shows a task's prompt and a team step's text as Markdown (code spans, bold, lists and paragraphs, built as DOM nodes so markup in the text stays text), compactly; a long prompt is cut at about four lines with a fade until Show all.",
+      "claim": "The web UI shows a task's prompt and a team step's text as Markdown (code spans, bold, lists, rules and paragraphs; a line of ---, *** or ___ after a blank line is a rule, so a signed result's summary shows under one; built as DOM nodes so markup in the text stays text), compactly; a long prompt is cut at about four lines with a fade until Show all.",
       "tests": ["ui::task_text_shows_as_markdown_and_markup_stays_text"]
     },
     {
@@ -1295,6 +1296,95 @@
         "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a",
         "ui::the_plan_editor_keeps_plans_valid",
         "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
+      "id": "UI-5",
+      "area": "web ui",
+      "claim": "The allowlist changes what a peer may do in place (Change…: whether it may delegate, its hourly limit, its access level and its folders), keeping its name, addresses and Microsoft 365 grant: saved to peers.json and applied at once, a connected peer stays connected and learns its folders; a folder this agent doesn't share, or a peer that isn't on the allowlist, is refused. Chat only says what it means when hovered.",
+      "tests": [
+        "ui::delegate_only_agents_allowlist_chat_peers_from_the_ui"
+      ]
+    },
+    {
+      "id": "SQD-5",
+      "area": "squads",
+      "claim": "A task on its own can go to a squad (the web UI's Run on lists squads with an online member serving the provider, /delegate <provider>@#squad, the MCP and A2A delegate with peer #squad): its least busy member that can run it, as a plan step on the squad would, moving to another member while one turns it down or goes away before running it; its card names the member and the squad. A squad that doesn't exist, or that no member can run the task for, is refused with the reason.",
+      "tests": [
+        "ui::ui_gives_tasks_to_a_squad_member_and_moves_them_when_one_refuses"
+      ]
+    },
+    {
+      "id": "SQD-6",
+      "area": "squads",
+      "claim": "A squad step or task that names a model goes to a member that allows it (as the members' hellos say; one that says nothing allows any), even when another member is less busy; if none does, it goes to the least busy as before, which refuses it saying why.",
+      "tests": [
+        "lib::plan::squad_steps_pick_the_least_busy_capable_member"
+      ]
+    },
+    {
+      "id": "SQD-7",
+      "area": "squads",
+      "claim": "Squads are changed in place (the web UI's Change… on a squad, its name fixed; proofkin squad create replaces one), and New squad refuses a name that is taken; members that left the allowlist are listed so they can be dropped. Bad squad and member names are refused in words about squads and peers.",
+      "tests": [
+        "lib::plan::squads_persist_and_validate"
+      ]
+    },
+    {
+      "id": "GH-4",
+      "area": "github",
+      "claim": "The GitHub card says where each task branch's work is, from one GraphQL query for all of a repository's branches: its newest pull request (open, merged or closed), its commit on the repository's branch already, or the issues it is for all closed; it offers Open PR only when no pull request is open or merged, Delete branch for finished work (on GitHub first, then in the clone, only p2p/ branches), and says how many older branches it doesn't show.",
+      "tests": [
+        "github::linked_repositories_clone_share_sync_push_and_open_pull_requests"
+      ]
+    },
+    {
+      "id": "TRK-6",
+      "area": "tracking",
+      "claim": "With a tracker linked, Plan mode and the plan editor say beside Run plan that the run is tracked in the tracker's repository (an issue for the run, a sub-issue per step), with a choice of a new issue, an issue it works on or not tracked, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's).",
+      "tests": [
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
+      "id": "OPS-6",
+      "area": "operations",
+      "claim": "The Health card's summary counts evidence runs as passed, failed and without claims (a run without claims proves nothing, so it neither passed nor failed), leaves out counts that are zero, and shows times as durations.",
+      "tests": [
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
+      ]
+    },
+    {
+      "id": "MDL-4",
+      "area": "models",
+      "claim": "A task works at a reasoning effort (minimal, low, medium, high, xhigh or max): the one it asks for (a plan step's effort=, given once and not on sign-offs, team steps or @workiq steps; /ask and /delegate --effort with --model in either order; the web UI's Reasoning field; the MCP and A2A delegate's effort), else the profile's default for the provider (proofkin models effort, or models default --effort), which peers learn from the hello (a hello without one reads as none). The worker refuses a name that isn't an effort. Copilot gets it fitted to what the task's model supports (the nearest it supports below the one asked for, none if it supports none, and the task runs at the model's own if the CLI refuses it); Claude gets low to max (minimal is low) and Codex all of them, through the bridge. The result names the model with its effort, e.g. claude-opus-5.5 (max reasoning), in characters every version of Proofkin shows as they are, and so do the signed output, the audit log and the CLI; models list shows the efforts each Copilot model supports.",
+      "tests": [
+        "lib::models::a_task_works_at_the_effort_it_asks_for_else_the_default_fitted_to_its_model",
+        "lib::models::what_copilot_says_about_a_model_is_read_leniently",
+        "lib::llm::copilot::the_models_that_answered_come_from_the_agents_own_usage_events",
+        "lib::plan::steps_name_their_model_or_take_their_agents_and_the_check_warns_when_peers_refuse_it",
+        "lib::protocol::hello_with_addresses_round_trips",
+        "bin::delegated_tasks_may_name_their_model_right_after_the_target",
+        "agents::tasks_work_at_the_owners_reasoning_effort_unless_they_ask_for_another",
+        "bridge::sends_task_fields_and_returns_text",
+        "bridge::claude_tool_policy_confines_paths_and_tools",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
+      "id": "MDL-5",
+      "area": "models",
+      "claim": "Wherever a model is chosen, the default model and reasoning effort are the selected choice, named when the agent that runs the task says them: the Run task form's Model list (the default, the models the chosen peer or this agent allows, or Another model… by name when it allows any; with Any peer or a squad, each peer's default) and Reasoning list (the default effort, then the levels), and the plan builder's Model and Reasoning fields for the step's peer. The This agent card lists the model and effort each provider's tasks run at; a boss that only delegates lists what its digital workers run.",
+      "tests": [
+        "ui::delegate_only_agents_allowlist_chat_peers_from_the_ui"
+      ]
+    },
+    {
+      "id": "MDL-6",
+      "area": "models",
+      "claim": "A digital worker runs on its owner's model settings (default model, allowed models and reasoning effort) for each provider it sets nothing for, as it runs on its owner's accounts: its agent, its executor, its hello and the web UI use them, and proofkin models list says which are its owner's; a provider it sets anything for runs on its own setting.",
+      "tests": [
+        "lib::profile::a_digital_worker_runs_on_its_owners_models_unless_it_sets_its_own"
       ]
     }
   ]

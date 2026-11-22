@@ -4,7 +4,13 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { pathRefusal, toolRefusal, claudeSandbox, claudeMcp, externalContent, wrapToolOutput, codexConfigModel } = await import("../../bridge/index.mjs");
+const { pathRefusal, toolRefusal, claudeSandbox, claudeMcp, externalContent, wrapToolOutput, codexConfigModel, claudeEffort } = await import("../../bridge/index.mjs");
+
+// A reasoning effort as the Claude Agent SDK takes it: it has no "minimal".
+assert.equal(claudeEffort("max"), "max");
+assert.equal(claudeEffort("minimal"), "low");
+assert.equal(claudeEffort("turbo"), undefined);
+assert.equal(claudeEffort(undefined), undefined);
 
 // The model Codex uses by default: the top-level `model` of the agent's own config.toml.
 const codexHome = mkdtempSync(join(tmpdir(), "p2p-codex-"));

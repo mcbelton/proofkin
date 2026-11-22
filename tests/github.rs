@@ -9,9 +9,29 @@ use std::process::Command;
 
 use proofkin::audit::{AuditEntry, AuditLog, Outcome};
 use proofkin::evidence::{Evidence, EvidenceKind};
-use proofkin::github::{GithubCredentials, RepoStore, link_url, task_branches, unlink};
+use proofkin::github::{
+    GithubCredentials, RepoStore, branch_states, link_url, task_branches, unlink,
+};
 use proofkin::worktree::Worktree;
 use proofkin::{Access, Profile, Provider, TrustStore, TrustedPeer};
+
+/// GitHub's GraphQL API answering `answer` to anything, keeping the last query.
+struct AnswerApi {
+    answer: serde_json::Value,
+    asked: std::sync::Mutex<String>,
+}
+
+#[async_trait::async_trait]
+impl proofkin::tracker::Api for AnswerApi {
+    async fn graphql(
+        &self,
+        query: &str,
+        _variables: serde_json::Value,
+    ) -> anyhow::Result<proofkin::tracker::Reply> {
+        *self.asked.lock().unwrap() = query.to_owned();
+        Ok(proofkin::tracker::Reply::from_value(self.answer.clone()))
+    }
+}
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -205,7 +225,7 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
         .unwrap();
     std::fs::write(other.path.join("other.txt"), "other\n").unwrap();
     let (other_made, _) = other
-        .commit("proofkin: task 2 from boss\n\nAnother change")
+        .commit("proofkin: task 2 from boss\n\nAnother change\n\nRefs: acme/app#5")
         .await
         .unwrap();
     other
@@ -213,6 +233,44 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
         .await
         .unwrap();
     drop(other);
+
+    // Where each task branch's work is, in one GraphQL query: 1-1 has a merged pull
+    // request (its newest), 2-1's issue is closed, and 3-1's commit is on main already.
+    git(&repo.path, &["branch", "p2p/boss/3-1", "main"]);
+    let fake = AnswerApi {
+        answer: serde_json::json!({ "data": { "repository": {
+            "pullRequests": { "nodes": [
+                { "number": 7, "state": "MERGED", "url": "https://github.com/acme/app/pull/7", "headRefName": "p2p/boss/1-1" },
+                { "number": 3, "state": "CLOSED", "url": "https://github.com/acme/app/pull/3", "headRefName": "p2p/boss/1-1" },
+            ] },
+            "i5": { "state": "CLOSED" },
+        } } }),
+        asked: Default::default(),
+    };
+    let branches = task_branches(&repo).await.unwrap();
+    let states = branch_states(&fake, &repo, &branches).await.unwrap();
+    let merged = states["p2p/boss/1-1"].pull_request.as_ref().unwrap();
+    assert_eq!((merged.number, merged.state.as_str()), (7, "MERGED"));
+    assert!(!states["p2p/boss/1-1"].in_base && !states["p2p/boss/1-1"].issues_closed);
+    assert!(states["p2p/boss/2-1"].issues_closed && states["p2p/boss/2-1"].pull_request.is_none());
+    assert!(states["p2p/boss/3-1"].in_base);
+    let asked = fake.asked.lock().unwrap().clone();
+    assert!(
+        asked.contains("i5: issueOrPullRequest(number: 5)"),
+        "{asked}"
+    );
+    // A finished one is deleted in the clone and on GitHub; only task branches are.
+    creds.push(&repo, "p2p/boss/3-1").await.unwrap();
+    creds.delete_branch(&repo, "p2p/boss/3-1").await.unwrap();
+    assert!(!git(&seed, &["ls-remote", "origin", "refs/heads/p2p/*"]).contains("p2p/boss/3-1"));
+    assert!(
+        !task_branches(&repo)
+            .await
+            .unwrap()
+            .iter()
+            .any(|b| b.name == "p2p/boss/3-1")
+    );
+    assert!(creds.delete_branch(&repo, "main").await.is_err());
     let proof = creds
         .pr_proof(&repo, "p2p/boss/1-1", &profile)
         .await

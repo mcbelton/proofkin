@@ -2,9 +2,10 @@
 //
 // Protocol: one JSON object per line.
 //   stdin : {"id":1,"provider":"claude"|"codex","prompt":"...","cwd":"...","access":"read-only"|"workspace-write"|"full","model":null,
+//            "effort":"minimal"|"low"|"medium"|"high"|"xhigh"|"max" (optional),
 //            "mcp":{"name":{"type":"stdio","command":"...","args":[],"env":{},"tools":[]}}}  (mcp optional)
-//   stdout: {"id":1,"ok":true,"text":"...","model":"..."} or {"id":1,"ok":false,"error":"..."}
-//           (model: the model that answered, when the SDK says)
+//   stdout: {"id":1,"ok":true,"text":"...","model":"...","effort":"..."} or {"id":1,"ok":false,"error":"..."}
+//           (model: the model that answered, when the SDK says; effort: the effort it was given)
 // stdout is reserved for protocol lines; all logging goes to stderr.
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -235,9 +236,16 @@ export function claudeSandbox(access) {
   };
 }
 
-async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
+/** A reasoning effort as the Claude Agent SDK takes it (it has no "minimal"). */
+export function claudeEffort(effort) {
+  if (!effort) return undefined;
+  return effort === "minimal" ? "low" : ["low", "medium", "high", "xhigh", "max"].includes(effort) ? effort : undefined;
+}
+
+async function runClaude({ prompt, cwd, model, effort, access, mcp }, abortController) {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const servers = claudeMcp(mcp);
+  const level = claudeEffort(effort);
   const guard = async (input) => {
     const reason = toolRefusal(cwd, access, input.tool_name, input.tool_input, mcp);
     if (!reason) return {};
@@ -268,6 +276,7 @@ async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
     options: {
       cwd,
       model: model ?? undefined,
+      effort: level,
       // Deny anything not pre-approved; no user/project settings can widen it.
       permissionMode: "dontAsk",
       allowedTools: [...CLAUDE_TOOLS[access], ...servers.allowed],
@@ -291,7 +300,7 @@ async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
     const detail = result.result ?? (result.errors ?? []).join("; ");
     throw new Error(`Claude ${result.subtype}: ${detail}`);
   }
-  return { text: result.result, model: used ?? model ?? undefined };
+  return { text: result.result, model: used ?? model ?? undefined, effort: level };
 }
 
 /** The model Codex uses when a task names none: `model` at the top of this agent's own
@@ -313,7 +322,7 @@ export function codexConfigModel(home = process.env.CODEX_HOME ?? join(homedir()
 }
 
 let codex;
-async function runCodex({ prompt, cwd, model, access, mcp }, abortController) {
+async function runCodex({ prompt, cwd, model, effort, access, mcp }, abortController) {
   if (Object.keys(mcp ?? {}).length > 0) throw new Error("Codex tasks can't use MCP servers here");
   const { Codex } = await import("@openai/codex-sdk");
   codex ??= new Codex({
@@ -323,6 +332,7 @@ async function runCodex({ prompt, cwd, model, access, mcp }, abortController) {
   const thread = codex.startThread({
     workingDirectory: cwd,
     model: model ?? undefined,
+    modelReasoningEffort: effort ?? undefined,
     sandboxMode: CODEX_SANDBOX[access],
     approvalPolicy: "never",
     networkAccessEnabled: false,
@@ -330,7 +340,7 @@ async function runCodex({ prompt, cwd, model, access, mcp }, abortController) {
     skipGitRepoCheck: true,
   });
   const turn = await thread.run(prompt, { signal: abortController.signal });
-  return { text: turn.finalResponse, model: model ?? codexConfigModel() };
+  return { text: turn.finalResponse, model: model ?? codexConfigModel(), effort: effort ?? undefined };
 }
 
 const PROVIDERS = { claude: runClaude, codex: runCodex };
@@ -361,8 +371,8 @@ async function handle(line) {
     const run = PROVIDERS[provider];
     if (!run) throw new Error(`unknown provider: ${provider}`);
     if (!CLAUDE_TOOLS[access]) throw new Error(`unknown access: ${access}`);
-    const { text, model } = await run(request, controller);
-    reply({ id, ok: true, text, model: model || undefined });
+    const { text, model, effort } = await run(request, controller);
+    reply({ id, ok: true, text, model: model || undefined, effort: effort || undefined });
   } catch (err) {
     reply({ id, ok: false, error: controller.signal.aborted ? "cancelled" : String(err?.message ?? err) });
   } finally {

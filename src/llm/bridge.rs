@@ -25,6 +25,10 @@ struct Request<'a> {
     cwd: &'a Path,
     access: Access,
     model: Option<&'a str>,
+    /// The reasoning effort (see [`crate::models::EFFORTS`]); the bridge maps it to what
+    /// each SDK takes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'a str>,
     /// MCP servers by name, as `{type, command|url, ..., tools}`.
     #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
     mcp: serde_json::Map<String, serde_json::Value>,
@@ -41,6 +45,9 @@ struct Response {
     /// The model that answered, if the SDK says.
     #[serde(default)]
     model: Option<String>,
+    /// The reasoning effort it was given, as the SDK took it.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 /// Client for `bridge/index.mjs`, a long-lived Node process that runs tasks
@@ -101,7 +108,7 @@ impl Bridge {
                     .and_then(|p| p.remove(&resp.id));
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(if resp.ok {
-                        Ok(Ran::new(resp.text, resp.model))
+                        Ok(Ran::new(resp.text, resp.model).with_effort(resp.effort))
                     } else {
                         Err(resp.error)
                     });
@@ -160,6 +167,7 @@ impl Bridge {
             cwd,
             access,
             model: task.model.as_deref(),
+            effort: task.effort.as_deref(),
             mcp: mcp
                 .iter()
                 .map(|(name, server)| (name.clone(), server.to_json()))

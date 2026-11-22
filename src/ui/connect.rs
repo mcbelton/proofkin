@@ -689,10 +689,11 @@ fn tools() -> Value {
             "Run a task on a peer's agent, in a folder it shares with this agent; the result is signed by that peer. Without a peer, any connected peer that runs tasks (with the provider, if given) takes it. With a progress token (_meta.progressToken) and Accept listing text/event-stream, it streams notifications/progress while the task runs, then the result.",
             json!({
                 "prompt": text("What to do"),
-                "peer": text("The peer's name (see list_peers)"),
+                "peer": text("The peer's name (see list_peers), or #squad: the squad's least busy member that can run it"),
                 "folder": text("A folder the peer shares (default: its data folder)"),
                 "provider": { "type": "string", "enum": ["copilot", "claude", "codex"], "description": "Which provider runs it (default: the peer's first)" },
                 "model": text("The model it runs on (list_peers says which ones each peer allows; default: the peer's default)"),
+                "effort": { "type": "string", "enum": ["minimal", "low", "medium", "high", "xhigh", "max"], "description": "The reasoning effort it works at (default: the peer's default; a model that supports fewer takes the nearest below)" },
                 "mcp": { "type": "array", "items": { "type": "string" }, "description": "MCP servers of that folder the model may use" },
                 "wait_seconds": wait,
             }),
@@ -852,6 +853,7 @@ struct Ask {
     folder: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
     mcp: Vec<String>,
 }
 
@@ -877,6 +879,22 @@ fn start_delegation(s: &AppState, ask: &Ask, via: &'static str) -> Result<Work, 
         ),
         None => None,
     };
+    // A squad (`#name`): its least busy member that can run it, as a plan step would.
+    if let Some(squad) = ask.peer.as_deref().filter(|p| p.starts_with('#')) {
+        let body = TaskBody {
+            provider: provider.unwrap_or(Provider::Copilot),
+            prompt: ask.text.clone(),
+            target: squad.to_owned(),
+            share: ask.folder.clone(),
+            mcp: ask.mcp.clone(),
+            checks: Vec::new(),
+            attempts: None,
+            model: ask.model.clone(),
+            effort: ask.effort.clone(),
+        };
+        let view = start_task(s, body, Some(via)).map_err(api_error)?;
+        return Ok(Work::Task(view.id));
+    }
     let peers = s.agent.peers();
     let peer = match &ask.peer {
         Some(name) => peers.iter().find(|p| &p.name == name).ok_or_else(|| {
@@ -919,6 +937,7 @@ fn start_delegation(s: &AppState, ask: &Ask, via: &'static str) -> Result<Work, 
         checks: Vec::new(),
         attempts: None,
         model: ask.model.clone(),
+        effort: ask.effort.clone(),
     };
     let view = start_task(s, body, Some(via)).map_err(api_error)?;
     Ok(Work::Task(view.id))
@@ -1108,6 +1127,7 @@ fn start_job(s: &AppState, name: &str, args: &Value) -> Result<Job, String> {
                 folder: opt_text(args, "folder"),
                 provider: opt_text(args, "provider"),
                 model: opt_text(args, "model"),
+                effort: opt_text(args, "effort"),
                 mcp: text_list(args.get("mcp")),
             };
             let job = new_job(start_delegation(s, &ask, "MCP")?, "MCP", None, None);
@@ -1457,6 +1477,7 @@ fn start_message(s: &AppState, params: &Value, streaming: bool) -> Result<Job, A
         folder: opt_text(&meta, "folder"),
         provider: opt_text(&meta, "provider"),
         model: opt_text(&meta, "model"),
+        effort: opt_text(&meta, "effort"),
         mcp: text_list(meta.get("mcp")),
     };
     let plan = match opt_text(&meta, "kind").as_deref() {

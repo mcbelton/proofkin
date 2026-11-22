@@ -106,6 +106,9 @@ pub struct CopilotBackend {
     client: Client,
     login: Option<String>,
     sandbox: SandboxSupport,
+    /// The models this account may use, as last listed: what reasoning efforts each
+    /// supports, to fit a task's effort to its model.
+    models: tokio::sync::Mutex<Option<Vec<crate::models::Offered>>>,
 }
 
 impl CopilotBackend {
@@ -150,6 +153,7 @@ impl CopilotBackend {
             client,
             login,
             sandbox,
+            models: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -188,11 +192,28 @@ impl CopilotBackend {
             .list_models()
             .await
             .context("listing Copilot's models")?;
-        Ok(models
+        let offered: Vec<crate::models::Offered> = models
             .iter()
             .filter_map(|m| serde_json::to_value(m).ok())
             .filter_map(|m| crate::models::Offered::from_json(&m))
-            .collect())
+            .collect();
+        *self.models.lock().await = Some(offered.clone());
+        Ok(offered)
+    }
+
+    /// The reasoning efforts `model` supports (empty: none can be set), as the model
+    /// list says; `None` if the list doesn't have it (or can't be read).
+    async fn efforts_of(&self, model: &str) -> Option<Vec<String>> {
+        let cached = self.models.lock().await.clone();
+        let models = match cached {
+            Some(models) if models.iter().any(|m| m.id.eq_ignore_ascii_case(model)) => models,
+            // A model the list didn't have: it may be new, so read the list again.
+            _ => self.list_models().await.ok()?,
+        };
+        models
+            .into_iter()
+            .find(|m| m.id.eq_ignore_ascii_case(model))
+            .map(|m| m.efforts)
     }
 
     /// Runs `task` in `workspace` with `access` (tools, permissions and sandbox follow
@@ -248,26 +269,63 @@ impl CopilotBackend {
         if !allowed.is_empty() {
             config = config.with_allowed_models(allowed.iter().cloned());
         }
-        let session = Arc::new(
-            self.client
-                .create_session(config)
-                .await
-                .context("creating Copilot session")?,
-        );
-        // Which models answer: the CLI says in a usage event after each model call.
+        // The reasoning effort as the model takes it: one it supports (the nearest below
+        // the one asked for), none if it supports none. A model the list doesn't know
+        // gets it as asked, and if the CLI refuses that, the task runs at the model's own.
+        let mut effort = match (&task.effort, &task.model) {
+            (Some(effort), Some(model)) => match self.efforts_of(model).await {
+                Some(supported) => crate::models::fit_effort(effort, &supported),
+                None => Some(effort.clone()),
+            },
+            (effort, _) => effort.clone(),
+        };
+        let without = config.clone();
+        if let Some(effort) = &effort {
+            config = config.with_reasoning_effort(effort.clone());
+        }
+        let session = match self.client.create_session(config).await {
+            Ok(session) => session,
+            Err(e)
+                if effort.is_some() && format!("{e:#}").to_ascii_lowercase().contains("effort") =>
+            {
+                eprintln!(
+                    "  copilot: reasoning effort {} refused ({e:#}); running at the model's own",
+                    effort.as_deref().unwrap_or_default()
+                );
+                effort = None;
+                self.client
+                    .create_session(without)
+                    .await
+                    .context("creating Copilot session")?
+            }
+            Err(e) => return Err(e).context("creating Copilot session"),
+        };
+        let session = Arc::new(session);
+        // Which models answer, and at what effort: the CLI says in a usage event after
+        // each model call.
         let models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let efforts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let mut events = session.subscribe();
         let _watcher = AbortTaskOnDrop(tokio::spawn({
-            let models = models.clone();
+            let (models, efforts) = (models.clone(), efforts.clone());
             async move {
                 loop {
                     match events.recv().await {
-                        Ok(event) => add_usage_model(
-                            &mut models.lock().unwrap(),
-                            &event.event_type,
-                            event.agent_id.is_some(),
-                            &event.data,
-                        ),
+                        Ok(event) => {
+                            let sub_agent = event.agent_id.is_some();
+                            add_usage_model(
+                                &mut models.lock().unwrap(),
+                                &event.event_type,
+                                sub_agent,
+                                &event.data,
+                            );
+                            add_usage_effort(
+                                &mut efforts.lock().unwrap(),
+                                &event.event_type,
+                                sub_agent,
+                                &event.data,
+                            );
+                        }
                         Err(e) if matches!(e.kind(), RecvErrorKind::Lagged(_)) => {}
                         Err(_) => break,
                     }
@@ -281,19 +339,19 @@ impl CopilotBackend {
             .await;
         guard.0 = None;
         let mut used = models.lock().unwrap().clone();
+        let mut used_efforts = efforts.lock().unwrap().clone();
         if used.is_empty() && reply.is_ok() {
             // Missed while the subscription lagged: the session's history has them.
             if let Ok(history) = session.get_raw_events().await {
                 for event in &history {
-                    add_usage_model(
-                        &mut used,
-                        event
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default(),
-                        event.get("agentId").is_some_and(|a| !a.is_null()),
-                        event.get("data").unwrap_or(&Value::Null),
-                    );
+                    let kind = event
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let sub_agent = event.get("agentId").is_some_and(|a| !a.is_null());
+                    let data = event.get("data").unwrap_or(&Value::Null);
+                    add_usage_model(&mut used, kind, sub_agent, data);
+                    add_usage_effort(&mut used_efforts, kind, sub_agent, data);
                 }
             }
         }
@@ -310,7 +368,25 @@ impl CopilotBackend {
         } else {
             Some(used.join(", "))
         };
-        Ok(Ran::new(text, model))
+        // The effort of the last model call, as the CLI says; else the one it was given.
+        Ok(Ran::new(text, model).with_effort(used_efforts.pop().or(effort)))
+    }
+}
+
+/// Adds the reasoning effort of a usage event of the session's own agent (not a
+/// sub-agent's) to `efforts`, unless it is the last one there.
+fn add_usage_effort(efforts: &mut Vec<String>, kind: &str, sub_agent: bool, data: &Value) {
+    if kind != "assistant.usage" || sub_agent {
+        return;
+    }
+    if let Some(effort) = data
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        && efforts.last().map(String::as_str) != Some(effort)
+    {
+        efforts.push(effort.to_owned());
     }
 }
 
@@ -1046,6 +1122,28 @@ mod tests {
         add_usage_model(&mut models, "assistant.usage", false, &json!({}));
         add_usage_model(&mut models, "assistant.usage", false, &usage("gpt-5.5"));
         assert_eq!(models, ["claude-sonnet-5.5", "gpt-5.5"]);
+
+        // So does the reasoning effort they worked at: the last call's is the result's.
+        let mut efforts = Vec::new();
+        let at = |effort: &str| json!({ "model": "m", "reasoningEffort": effort });
+        add_usage_effort(&mut efforts, "assistant.usage", false, &at("high"));
+        add_usage_effort(&mut efforts, "assistant.usage", false, &at("high"));
+        add_usage_effort(&mut efforts, "assistant.usage", true, &at("low"));
+        add_usage_effort(&mut efforts, "assistant.message", false, &at("low"));
+        add_usage_effort(&mut efforts, "assistant.usage", false, &usage("no-effort"));
+        add_usage_effort(&mut efforts, "assistant.usage", false, &at("max"));
+        assert_eq!(efforts, ["high", "max"]);
+        let ran = Ran::new("ok", Some("claude-opus-5.5".into())).with_effort(efforts.pop());
+        assert_eq!(
+            ran.shown_model().as_deref(),
+            Some("claude-opus-5.5 (max reasoning)")
+        );
+        assert_eq!(
+            Ran::new("ok", None)
+                .with_effort(Some("turbo".into()))
+                .effort,
+            None
+        );
     }
 
     #[test]

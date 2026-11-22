@@ -19,8 +19,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 const COMMANDS: &str = "\
 commands:
   <text>                                broadcast a chat message
-  /ask <provider> [--model <name>] <prompt>  run a task locally (provider: copilot|claude|codex)
-  /delegate <provider>[@peer[:folder]] [--model <name>] <prompt>  run a task on a peer, in a folder it shares with you (default: data), on a model it allows (default: its default)
+  /ask <provider> [--model <name>] [--effort <level>] <prompt>  run a task locally (provider: copilot|claude|codex; level: minimal|low|medium|high|xhigh|max)
+  /delegate <provider>[@peer[:folder]] [--model <name>] [--effort <level>] <prompt>  run a task on a peer, in a folder it shares with you (default: data), on a model it allows (default: its default); @#squad: the squad's least busy member that can run it
   /tasks                                list your running tasks
   /cancel <n>                           cancel your running task n (the peer stops it too)
   /plan <file>                          run a plan: steps on peers (@name) or squads (#squad), in dependency order
@@ -431,13 +431,31 @@ enum ModelsCommand {
     /// Set the model tasks that name none run on (`none`: the provider's own default).
     #[command(after_help = "\
 examples:
-  proofkin models default copilot claude-sonnet-5.5 --profile worker
+  proofkin models default copilot claude-opus-5.5 --effort max --profile worker
   proofkin models default claude none --profile worker")]
     Default {
         #[arg(value_enum)]
         provider: Provider,
         /// A model's name (see `models list`), or `none`.
         model: String,
+        /// Also set the reasoning effort tasks work at (see `models effort`).
+        #[arg(long)]
+        effort: Option<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Set the reasoning effort tasks that ask for none work at: minimal, low, medium,
+    /// high, xhigh or max (`none`: the model's own). A model that supports fewer takes
+    /// the nearest it supports below it.
+    #[command(after_help = "\
+examples:
+  proofkin models effort copilot max --profile worker
+  proofkin models effort codex none --profile worker")]
+    Effort {
+        #[arg(value_enum)]
+        provider: Provider,
+        /// A reasoning effort, or `none`.
+        effort: String,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -2095,11 +2113,20 @@ fn describe_models(choice: &proofkin::models::ModelChoice) -> String {
     } else {
         format!("only {} may be asked for", choice.allowed.join(", "))
     };
-    format!("{default}; {allowed}")
+    let effort = match &choice.effort {
+        Some(effort) => format!("tasks that ask for no effort work at {effort} reasoning"),
+        None => "tasks that ask for no effort work at the model's own".to_owned(),
+    };
+    format!("{default}; {allowed}; {effort}")
+}
+
+/// `none` (any case) as no value.
+fn unless_none(value: &str) -> Option<&str> {
+    Some(value.trim()).filter(|v| !v.eq_ignore_ascii_case("none"))
 }
 
 async fn run_models(command: ModelsCommand) -> Result<()> {
-    use proofkin::models::{choice, set_allowed, set_default};
+    use proofkin::models::{choice, set_allowed, set_default, set_effort};
     let apply_note = |profile: &Profile| {
         if profile.is_running() {
             println!(
@@ -2111,16 +2138,33 @@ async fn run_models(command: ModelsCommand) -> Result<()> {
         ModelsCommand::List { profile } => {
             let profile = Profile::open(&profile.name)?;
             let accounts = profile.account_profile()?;
+            let models = profile.models();
+            let inherited = profile.inherited_models();
             let mut any = false;
             for provider in [Provider::Copilot, Provider::Claude, Provider::Codex] {
                 if !accounts.is_configured(provider) {
                     continue;
                 }
                 any = true;
-                let set = choice(&profile.config.models, provider);
-                println!("{provider}: {}", describe_models(&set));
+                let set = choice(&models, provider);
+                println!(
+                    "{provider}: {}{}",
+                    describe_models(&set),
+                    if inherited.contains(&provider) {
+                        format!(" (its owner {}'s settings)", accounts.name)
+                    } else {
+                        String::new()
+                    }
+                );
                 if provider != Provider::Copilot {
-                    println!("  (its SDK takes any model name it knows; there is no list to show)");
+                    println!(
+                        "  (its SDK takes any model name it knows, and the efforts {}; there is no list to show)",
+                        if provider == Provider::Claude {
+                            "low to max (minimal is low)"
+                        } else {
+                            "minimal to max"
+                        }
+                    );
                     continue;
                 }
                 let backend =
@@ -2149,6 +2193,16 @@ async fn run_models(command: ModelsCommand) -> Result<()> {
                     about.extend(m.vendor.clone());
                     about.extend(m.multiplier.map(|x| format!("{x}x")));
                     about.extend(m.policy.as_ref().map(|p| format!("policy: {p}")));
+                    if !m.efforts.is_empty() {
+                        about.push(format!(
+                            "reasoning {}{}",
+                            m.efforts.join("/"),
+                            m.default_effort
+                                .as_ref()
+                                .map(|e| format!(" (its own: {e})"))
+                                .unwrap_or_default()
+                        ));
+                    }
                     println!(
                         "  {:width$}  {}{}",
                         m.id,
@@ -2179,11 +2233,29 @@ async fn run_models(command: ModelsCommand) -> Result<()> {
         ModelsCommand::Default {
             provider,
             model,
+            effort,
             profile,
         } => {
             let mut profile = Profile::open(&profile.name)?;
-            let model = Some(model.trim()).filter(|m| !m.eq_ignore_ascii_case("none"));
-            set_default(&mut profile.config.models, provider, model)?;
+            set_default(&mut profile.config.models, provider, unless_none(&model))?;
+            if let Some(effort) = &effort {
+                set_effort(&mut profile.config.models, provider, unless_none(effort))?;
+            }
+            profile.save()?;
+            println!(
+                "profile '{}': {provider}: {}",
+                profile.name,
+                describe_models(&choice(&profile.config.models, provider))
+            );
+            apply_note(&profile);
+        }
+        ModelsCommand::Effort {
+            provider,
+            effort,
+            profile,
+        } => {
+            let mut profile = Profile::open(&profile.name)?;
+            set_effort(&mut profile.config.models, provider, unless_none(&effort))?;
             profile.save()?;
             println!(
                 "profile '{}': {provider}: {}",
@@ -4214,7 +4286,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.trust = profile.trust()?;
         config.owner = profile.config.owner.clone();
         config.role = profile.config.role.clone();
-        config.models = profile.config.models.clone();
+        config.models = profile.models();
         config.worktrees_dir = profile.worktrees_dir();
         if let Some(secs) =
             proofkin::profile::env_setting("TASK_GRACE_SECS").and_then(|v| v.parse::<u64>().ok())
@@ -4695,26 +4767,35 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 }
             },
             "/delegate" => {
-                match parse_task(rest).and_then(|(task, peer)| pick_peer(&agent, &task, peer)) {
+                let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
+                match parse_task(rest)
+                    .and_then(|(task, peer)| pick_peer(&agent, &squads, &task, peer))
+                {
                     Err(e) => eprintln!("{e:#}"),
-                    Ok((task, peer)) => {
+                    Ok((task, peer, squad)) => {
                         let agent = agent.clone();
-                        let label = format!("{} on {}", task.provider, peer.name);
+                        let to = squad
+                            .as_ref()
+                            .map_or(peer.name.clone(), |s| format!("#{s}"));
+                        let label = format!("{} on {to}", task.provider);
+                        let note = if squad.is_some() {
+                            format!(", the least busy member of {to}")
+                        } else {
+                            String::new()
+                        };
+                        let (provider, name, short) =
+                            (task.provider, peer.name.clone(), peer.id.fmt_short());
                         let n = tasks.spawn(label.clone(), async move {
-                            let result =
-                                agent.delegate_verified(peer.id, task).await.and_then(|d| {
-                                    if d.ok {
-                                        Ok(proofkin::Ran::new(d.output, d.model))
-                                    } else {
-                                        Err(anyhow!("{}", d.output))
-                                    }
-                                });
+                            let (ran_on, result) =
+                                delegate_cli(&agent, &squads, squad.as_deref(), peer, task).await;
+                            let label = match ran_on {
+                                Some(member) => format!("{provider} on {member} ({to})"),
+                                None => label,
+                            };
                             print_result(&label, result);
                         });
                         println!(
-                            "delegating to {} ({}) as task {n} (/cancel {n} to stop it)",
-                            peer.name,
-                            peer.id.fmt_short()
+                            "delegating to {name} ({short}){note} as task {n} (/cancel {n} to stop it)"
                         );
                     }
                 }
@@ -4732,10 +4813,11 @@ async fn run_agent(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Parses `<provider>[@peer[:folder]] <prompt>`.
+/// Parses `<provider>[@peer[:folder]] [--model <name>] [--effort <level>] <prompt>`.
 fn parse_task(rest: &str) -> Result<(LlmTask, Option<String>)> {
-    const USAGE: &str = "usage: <provider>[@peer[:folder]] [--model <name>] <prompt>";
-    let (target, prompt) = rest.trim().split_once(' ').context(USAGE)?;
+    const USAGE: &str =
+        "usage: <provider>[@peer[:folder]] [--model <name>] [--effort <level>] <prompt>";
+    let (target, mut prompt) = rest.trim().split_once(' ').context(USAGE)?;
     let (provider, peer) = match target.split_once('@') {
         Some((provider, peer)) => (provider, Some(peer)),
         None => (target, None),
@@ -4745,21 +4827,43 @@ fn parse_task(rest: &str) -> Result<(LlmTask, Option<String>)> {
         None => (None, None),
     };
     let provider = Provider::from_str(provider, true).map_err(|e| anyhow!("{e}"))?;
-    // `--model <name>` right after the target picks the model.
-    let (model, prompt) = match prompt.trim_start().strip_prefix("--model") {
-        Some(rest) if rest.starts_with(char::is_whitespace) => {
-            let (model, prompt) = rest.trim_start().split_once(' ').context(USAGE)?;
-            proofkin::models::check_name(model)?;
-            (Some(model.to_owned()), prompt)
+    // `--model <name>` and `--effort <level>` right after the target pick them.
+    let (mut model, mut effort) = (None, None);
+    loop {
+        let start = prompt.trim_start();
+        let (flag, after) = match (
+            start.strip_prefix("--model"),
+            start.strip_prefix("--effort"),
+        ) {
+            (Some(after), _) => ("--model", after),
+            (_, Some(after)) => ("--effort", after),
+            _ => break,
+        };
+        if !after.starts_with(char::is_whitespace) {
+            bail!("{USAGE}");
         }
-        Some(_) => bail!("{USAGE}"),
-        None => (None, prompt),
-    };
+        let (value, rest) = after.trim_start().split_once(' ').context(USAGE)?;
+        if flag == "--model" {
+            if model.is_some() {
+                bail!("--model is given twice");
+            }
+            proofkin::models::check_name(value)?;
+            model = Some(value.to_owned());
+        } else {
+            if effort.is_some() {
+                bail!("--effort is given twice");
+            }
+            proofkin::models::check_effort(value)?;
+            effort = Some(value.to_ascii_lowercase());
+        }
+        prompt = rest;
+    }
     if prompt.trim().is_empty() {
         bail!("{USAGE}");
     }
     let mut task = LlmTask::new(provider, prompt.trim());
     task.model = model;
+    task.effort = effort;
     task.title = Some(proofkin::llm::title_of(prompt.trim()));
     if let Some(share) = share {
         task = task.in_share(share);
@@ -4767,11 +4871,19 @@ fn parse_task(rest: &str) -> Result<(LlmTask, Option<String>)> {
     Ok((task, peer))
 }
 
+/// The peer `/delegate` gives `task` to: the named one, the least busy member that can
+/// run it of a squad named `#squad` (and the squad's name), or the first that serves
+/// its provider.
 fn pick_peer(
     agent: &Agent,
+    squads: &SquadStore,
     task: &LlmTask,
     name: Option<String>,
-) -> Result<(LlmTask, proofkin::PeerInfo)> {
+) -> Result<(LlmTask, proofkin::PeerInfo, Option<String>)> {
+    if let Some(squad) = name.as_deref().and_then(|n| n.strip_prefix('#')) {
+        let peer = proofkin::plan::squad_member(agent, squads, squad, task, &Default::default())?;
+        return Ok((task.clone(), peer, Some(squad.to_owned())));
+    }
     let peer = match name {
         Some(name) => agent
             .peers()
@@ -4782,7 +4894,41 @@ fn pick_peer(
             .find_peer(task.provider)
             .ok_or_else(|| anyhow!("no peer serves {}", task.provider))?,
     };
-    Ok((task.clone(), peer))
+    Ok((task.clone(), peer, None))
+}
+
+/// Delegates `task` to `peer`. A squad's task moves on to another member while one
+/// turns it down or goes away before running it, as a plan step on the squad does;
+/// then it says which member ran it.
+async fn delegate_cli(
+    agent: &Agent,
+    squads: &SquadStore,
+    squad: Option<&str>,
+    mut peer: proofkin::PeerInfo,
+    task: LlmTask,
+) -> (Option<String>, Result<proofkin::Ran>) {
+    let mut tried = std::collections::HashSet::new();
+    loop {
+        let delivered = agent.delegate_verified(peer.id, task.clone()).await;
+        if let Some(squad) = squad
+            && let Some(why) = proofkin::plan::movable(&delivered)
+        {
+            tried.insert(peer.name.clone());
+            if let Ok(next) = proofkin::plan::squad_member(agent, squads, squad, &task, &tried) {
+                println!("task moves from {} to {}: {why}", peer.name, next.name);
+                peer = next;
+                continue;
+            }
+        }
+        let result = delivered.and_then(|d| {
+            if d.ok {
+                Ok(proofkin::Ran::new(d.output, d.model))
+            } else {
+                Err(anyhow!("{}", d.output))
+            }
+        });
+        return (squad.map(|_| peer.name), result);
+    }
 }
 
 /// Last task number, and running tasks by number with their label and abort handle.
@@ -4909,7 +5055,9 @@ fn print_result(label: &str, result: Result<proofkin::Ran>) {
     match result {
         Ok(ran) => println!(
             "=== {label}{} ===\n{}\n=== end ===",
-            ran.model.map(|m| format!(" · {m}")).unwrap_or_default(),
+            ran.shown_model()
+                .map(|m| format!(" · {m}"))
+                .unwrap_or_default(),
             ran.output
         ),
         Err(e) => eprintln!("=== {label} failed: {e:#}"),
@@ -4948,9 +5096,24 @@ mod tests {
             "copilot --model gpt-5.5",
             "copilot --model `x` Do it",
             "copilot --modelx Do it",
+            "copilot --effort turbo Do it",
+            "copilot --effort max --effort low Do it",
+            "copilot --effort max",
         ] {
             assert!(parse_task(bad).is_err(), "{bad}");
         }
+        // --effort goes with --model, in either order.
+        let (task, _) = parse_task("copilot@worker --effort MAX --model gpt-5.5 Fix it").unwrap();
+        assert_eq!(
+            (
+                task.model.as_deref(),
+                task.effort.as_deref(),
+                task.prompt.as_str()
+            ),
+            (Some("gpt-5.5"), Some("max"), "Fix it")
+        );
+        let (task, _) = parse_task("codex --effort low Fix it").unwrap();
+        assert_eq!((task.model, task.effort.as_deref()), (None, Some("low")));
     }
 
     #[test]

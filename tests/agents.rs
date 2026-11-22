@@ -50,13 +50,13 @@ impl Executor for FakeExecutor {
 
     async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<Ran> {
         // The model it ran on, as a provider says; "which model": a provider that says
-        // which model answered a task that named none.
+        // which model answered a task that named none. It works at the effort it is given.
         let model = task.model.clone().or_else(|| {
             task.prompt
                 .ends_with("which model")
                 .then(|| "fake-model-7".to_owned())
         });
-        Ok(Ran::new(self.answer(task, ctx).await?, model))
+        Ok(Ran::new(self.answer(task, ctx).await?, model).with_effort(task.effort.clone()))
     }
 }
 
@@ -626,6 +626,54 @@ async fn owners_set_the_default_model_and_which_ones_tasks_may_ask_for() {
     assert_eq!(
         refused.output,
         "worker refused the task: o9 isn't a model allowed here: fake-small, fake-big"
+    );
+}
+
+/// An owner sets the reasoning effort its tasks work at; a task may ask for another.
+/// The result names it with the model (in characters every version shows as they are),
+/// its signed output says it, and a name that isn't an effort is refused.
+#[tokio::test]
+async fn tasks_work_at_the_owners_reasoning_effort_unless_they_ask_for_another() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    proofkin::models::set_default(&mut worker.models, Provider::Copilot, Some("fake-big")).unwrap();
+    proofkin::models::set_effort(&mut worker.models, Provider::Copilot, Some("max")).unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    // Peers learn the effort from the hello.
+    let peer = boss.peers().into_iter().next().unwrap();
+    assert_eq!(
+        peer.models[&Provider::Copilot].effort.as_deref(),
+        Some("max")
+    );
+    let plain = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(plain.model.as_deref(), Some("fake-big (max reasoning)"));
+    assert!(plain.verified, "{plain:?}");
+    assert_eq!(
+        plain.output,
+        "copilot did: hello\n\n---\n**Model** `fake-big` (copilot), max reasoning\n"
+    );
+    let mut low = LlmTask::new(Provider::Copilot, "hello");
+    low.effort = Some("low".into());
+    let done = boss.delegate_verified(worker.id(), low).await.unwrap();
+    assert_eq!(done.model.as_deref(), Some("fake-big (low reasoning)"));
+    let mut odd = LlmTask::new(Provider::Copilot, "hello");
+    odd.effort = Some("turbo".into());
+    let refused = boss.delegate_verified(worker.id(), odd).await.unwrap();
+    assert!(refused.refused && !refused.ok, "{refused:?}");
+    assert!(
+        refused
+            .output
+            .starts_with("worker refused the task: \"turbo\" isn't a reasoning effort"),
+        "{}",
+        refused.output
     );
 }
 
@@ -1236,11 +1284,11 @@ async fn plans_run_dependent_steps_across_squads() {
             .iter()
             .all(|p| p.starts_with("qa"))
     );
-    // Each step got the result of the step it depends on, as external content
-    // under the rule for it (another peer's model wrote it).
+    // Each step got the task and result of the step it depends on, as external
+    // content under the rule for it (another peer's model wrote it).
     assert!(
         unit_out.contains(
-            "### Step api (done by lead)\n<external_content source=\"step:api peer:lead\">\ncopilot did: summarize the api\n</external_content>"
+            "### Step api (done by lead)\n<external_content source=\"step:api peer:lead\">\nIts task:\nsummarize the api\n\nIts result:\ncopilot did: summarize the api\n</external_content>"
         ),
         "{unit_out}"
     );

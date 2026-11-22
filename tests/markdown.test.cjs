@@ -48,4 +48,12 @@ assert.ok(hostile.textContent.includes('<img src=x onerror="alert(1)">'));
 assert.ok(hostile.textContent.includes("<script>bad()</script>"));
 assert.strictEqual(all(hostile)[2].textContent, "<b>x</b>");
 
-console.log("ok: task text becomes code, list items and paragraphs, and markup stays text");
+// A signed result's summary sits under a rule; a rule right under a text line stays text.
+const signed = renderMarkdown("pong\n\n---\n**Model** `claude-opus-5.5` (copilot)\n\n* * *\n- a\n___");
+assert.deepStrictEqual(tags(signed), ["p", "hr", "p", "hr", "ul", "hr"]);
+assert.strictEqual(signed.children[2].textContent, "Model claude-opus-5.5 (copilot)");
+const under = renderMarkdown("Title\n---\nbody");
+assert.deepStrictEqual(tags(under), ["p"]);
+assert.strictEqual(under.textContent, "Title --- body");
+
+console.log("ok: task text becomes code, list items, rules and paragraphs, and markup stays text");

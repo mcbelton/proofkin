@@ -355,6 +355,7 @@ mod tests {
             crate::models::ModelChoice {
                 default: Some("claude-sonnet-5.5".into()),
                 allowed: vec!["claude-sonnet-5.5".into(), "claude-opus-5.5".into()],
+                effort: Some("max".into()),
             },
         );
         let msg = Message::Hello {
@@ -370,7 +371,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
         // An older peer's hello has no models: it reads as saying nothing about them.
         let older = json.replace(
-            r#","models":{"claude":{"default":"claude-sonnet-5.5","allowed":["claude-sonnet-5.5","claude-opus-5.5"]}}"#,
+            r#","models":{"claude":{"default":"claude-sonnet-5.5","allowed":["claude-sonnet-5.5","claude-opus-5.5"],"effort":"max"}}"#,
             "",
         );
         assert_ne!(older, json);
@@ -378,5 +379,12 @@ mod tests {
             panic!("a hello");
         };
         assert!(models.is_empty());
+        // One that has models but no effort (older than efforts) reads as no default effort.
+        let no_effort = json.replace(r#","effort":"max""#, "");
+        assert_ne!(no_effort, json);
+        let Message::Hello { models, .. } = serde_json::from_str(&no_effort).unwrap() else {
+            panic!("a hello");
+        };
+        assert_eq!(models[&Provider::Claude].effort, None);
     }
 }

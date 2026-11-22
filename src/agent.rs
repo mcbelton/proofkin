@@ -1525,12 +1525,16 @@ impl Inner {
         if !mcp.is_empty() && task.provider == Provider::Codex {
             bail!("Codex tasks can't use MCP servers; ask for copilot or claude");
         }
-        // The model it asks for must be one this agent's owner allows (a team step runs none).
-        if task.team.is_none()
-            && let Err(e) =
-                crate::models::choice(&self.models, task.provider).pick(task.model.as_deref())
-        {
-            bail!("{} refused the task: {e:#}", self.name);
+        // The model it asks for must be one this agent's owner allows, and its effort a
+        // reasoning effort (a team step runs no model).
+        if task.team.is_none() {
+            let choice = crate::models::choice(&self.models, task.provider);
+            if let Err(e) = choice
+                .pick(task.model.as_deref())
+                .and_then(|_| choice.pick_effort(task.effort.as_deref()))
+            {
+                bail!("{} refused the task: {e:#}", self.name);
+            }
         }
         let now = Instant::now();
         let mut log = self.task_log.lock().unwrap();
@@ -1881,14 +1885,17 @@ impl Inner {
             .collect();
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();
-        // The model it asked for (allowed: checked when it was admitted), else the default.
-        prompt.model =
-            crate::models::choice(&self.models, task.provider).pick(task.model.as_deref())?;
+        // The model it asked for (allowed: checked when it was admitted), else the
+        // default; the same for its reasoning effort.
+        let choice = crate::models::choice(&self.models, task.provider);
+        prompt.model = choice.pick(task.model.as_deref())?;
+        prompt.effort = choice.pick_effort(task.effort.as_deref())?;
         let mut results = Vec::<crate::evidence::CheckResult>::new();
         let (mut reports, mut used) = (Vec::<String>::new(), 0);
         let mut failed_before = Vec::<String>::new();
-        // The model that did the work: the latest attempt's, as its provider says.
-        let mut model = None;
+        // The model that did the work, and its effort: the latest attempt's, as its
+        // provider says.
+        let (mut model, mut effort) = (None, None);
         while used < attempts {
             used += 1;
             let text = match (attempts, used) {
@@ -1910,6 +1917,7 @@ impl Inner {
             );
             let ran = executor.execute(&prompt, &ctx).await?;
             model = ran.model.or(model);
+            effort = ran.effort.or(effort);
             reports.push(ran.output);
             results.clear();
             for (i, (name, command)) in checks.iter().enumerate() {
@@ -2026,11 +2034,21 @@ impl Inner {
             evidence.git = Some(commit);
             patch = text;
         }
-        // The model is named in the signed output, so the record vouches for it too
-        // (older requesters verify it as before: it is part of the output's hash).
+        // The model is named in the signed output, with its reasoning effort, so the
+        // record vouches for them too (older requesters verify it as before: it is part
+        // of the output's hash).
         let mut summary = model
             .as_deref()
-            .map(|m| format!("**Model** `{m}` ({})\n", task.provider))
+            .map(|m| {
+                format!(
+                    "**Model** `{m}` ({}){}\n",
+                    task.provider,
+                    effort
+                        .as_deref()
+                        .map(|e| format!(", {e} reasoning"))
+                        .unwrap_or_default()
+                )
+            })
             .unwrap_or_default();
         summary += &evidence.summary();
         if !summary.is_empty() {
@@ -2051,13 +2069,15 @@ impl Inner {
             output,
             evidence,
             patch,
-            model,
+            // Results name the model with its effort: every version shows it as it is.
+            model: crate::models::with_effort(model, effort.as_deref()),
         })
     }
 }
 
 /// A peer's models as its hello says, kept only as far as they make sense: well-formed
-/// names, at most 50 per provider, and a default only if it is one of the allowed.
+/// names, at most 50 per provider, a default only if it is one of the allowed, and a
+/// reasoning effort only if it is one.
 fn clean_models(models: crate::models::Models) -> crate::models::Models {
     let ok = |m: &String| crate::models::check_name(m).is_ok();
     models
@@ -2067,7 +2087,18 @@ fn clean_models(models: crate::models::Models) -> crate::models::Models {
             let default = choice.default.filter(ok).filter(|d| {
                 allowed.is_empty() || allowed.iter().any(|m| m.eq_ignore_ascii_case(d))
             });
-            (provider, crate::models::ModelChoice { default, allowed })
+            let effort = choice
+                .effort
+                .filter(|e| crate::models::check_effort(e).is_ok())
+                .map(|e| e.to_ascii_lowercase());
+            (
+                provider,
+                crate::models::ModelChoice {
+                    default,
+                    allowed,
+                    effort,
+                },
+            )
         })
         .filter(|(_, choice)| !choice.is_empty())
         .collect()

@@ -210,7 +210,13 @@ function stamp(ms) {
 }
 function duration(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+// "2 done, 1 failed": the counts that aren't zero, named.
+function counts(pairs) {
+  return pairs.filter(([n]) => n).map(([n, what]) => `${n} ${what}`).join(", ");
 }
 
 function toast(text, kind = "") {
@@ -280,6 +286,14 @@ function renderMe() {
   if (me.providers.length) {
     fact("Providers", me.providers.map(providerLabel).join(", "));
     for (const a of me.accounts) fact(providerLabel(a.provider), a.account);
+    // The model and reasoning effort each provider's tasks run at unless they ask for others.
+    const models = me.providers.map((p) => {
+      const m = me.models?.[p] ?? {};
+      const model = m.default ?? m.allowed?.[0] ?? "its default model";
+      const only = m.allowed?.length ? ` · only ${m.allowed.join(", ")}` : "";
+      return `${providerLabel(p)}: ${model}${m.effort ? ` · ${m.effort} reasoning` : ""}${only}`;
+    });
+    fact("Models", el("ul", { class: "share-list" }, ...models.map((t) => el("li", { text: t }))));
     fact("Serves peers", me.serving ? "Yes" : "No");
     fact("Your own tasks", el("span", {}, `${ACCESS_SHORT[me.access] ?? me.access} in `,
       el("span", { class: "mono", text: me.workspace })));
@@ -311,6 +325,10 @@ function renderMe() {
     }
   } else {
     fact("Providers", "None (delegates only)");
+    // Its settings are its digital workers' (they run on its accounts) unless they set their own.
+    const set = Object.entries(me.models ?? {}).map(([p, m]) =>
+      `${providerLabel(p)}: ${m.default ?? m.allowed?.[0] ?? "its default model"}${m.effort ? ` · ${m.effort} reasoning` : ""}`);
+    if (set.length) fact("Digital workers run", el("ul", { class: "share-list" }, ...set.map((t) => el("li", { text: t }))));
   }
 }
 
@@ -365,11 +383,16 @@ function renderPeers() {
           el("span", { text: t.connected ? "Connected" : "Offline" }),
           t.can_delegate
             ? el("span", { class: "badge ok", title: `May run tasks in: ${(t.shares ?? []).join(", ")}`, text: `Tasks: ${ACCESS_SHORT[t.access] ?? "Read only"} · ${t.tasks_per_hour}/h · ${(t.shares ?? []).join(", ")}` })
-            : el("span", { class: "badge neutral", text: "Chat only" }))),
-      el("button", {
-        type: "button", class: "icon-btn", title: `Remove ${t.name}`, "aria-label": `Remove ${t.name} from the allowlist`,
-        onclick: () => removePeer(t),
-      }, icon(ICONS.trash))));
+            : el("span", { class: "badge neutral", title: "It can connect and chat, but can't run tasks on this agent's accounts", text: "Chat only" }))),
+      el("div", { class: "row-actions" },
+        el("button", {
+          type: "button", class: "btn small", "aria-label": `Change what ${t.name} may do`,
+          onclick: (e) => openGrantDialog(t, e.currentTarget),
+        }, "Change…"),
+        el("button", {
+          type: "button", class: "icon-btn", title: `Remove ${t.name}`, "aria-label": `Remove ${t.name} from the allowlist`,
+          onclick: () => removePeer(t),
+        }, icon(ICONS.trash)))));
   }
   // The first steps are done once a peer is on the allowlist, online or not.
   if (state.trusted.length && $("#feed .get-started")) renderFeed();
@@ -530,7 +553,7 @@ function taskNode(t) {
   const runs = (label) => t.model ? `${label} · ${t.model}` : label;
   const title = t.step
     ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : runs(providerLabel(t.provider))} → ${t.target}`
-    : `#${t.id} · ${runs(providerLabel(t.provider))} → ${t.target}`;
+    : `#${t.id} · ${runs(providerLabel(t.provider))} → ${t.target}${t.squad ? ` · #${t.squad}` : ""}`;
   // Started by another agent (over MCP or A2A), not in this UI; or a step of a team
   // run this agent leads for a peer.
   const via = t.via ? ` · asked by another agent (${t.via})` : t.for_peer ? ` · for ${t.for_peer}'s team step` : "";
@@ -749,10 +772,15 @@ function renderSquads() {
             el("span", { text: m.name }),
             el("span", { class: "muted small", text: m.online ? (busy ? ` · ${busy} running` : " · idle") : " · offline" }));
         }))),
-      el("button", {
-        type: "button", class: "icon-btn", title: `Remove squad ${s.name}`, "aria-label": `Remove squad ${s.name}`,
-        onclick: () => removeSquad(s.name),
-      }, icon(ICONS.trash))));
+      el("div", { class: "row-actions" },
+        el("button", {
+          type: "button", class: "btn small", "aria-label": `Change squad ${s.name}`,
+          onclick: (e) => openSquadDialog(s, e.currentTarget),
+        }, "Change…"),
+        el("button", {
+          type: "button", class: "icon-btn", title: `Remove squad ${s.name}`, "aria-label": `Remove squad ${s.name}`,
+          onclick: () => removeSquad(s.name),
+        }, icon(ICONS.trash)))));
   }
 }
 
@@ -826,17 +854,32 @@ async function removeTeamPlan() {
     (name) => `Removed the team plan for ${name}`);
 }
 
-function openSquadDialog() {
+// The squad the dialog changes (null: a new one), and the button that opened it.
+let squadEditing = null;
+let squadOpener = null;
+
+function openSquadDialog(squad = null, opener = $("#add-squad-btn")) {
+  squadEditing = squad;
+  squadOpener = opener;
   $("#squad-form").reset();
   $("#squad-error").textContent = "";
+  $("#squad-h").textContent = squad ? `Change squad #${squad.name}` : "New squad";
+  const name = $("#squad-name");
+  name.value = squad?.name ?? "";
+  name.readOnly = !!squad;
+  const members = new Set((squad?.members ?? []).map((m) => m.name));
+  const check = (value, label) => el("label", { class: "check" },
+    el("input", { type: "checkbox", value, ...(members.has(value) ? { checked: "" } : {}) }),
+    el("span", { text: label }));
+  // Members that left the allowlist stay listed, so they can be dropped.
+  const gone = [...members].filter((m) => !state.trusted.some((t) => t.name === m));
   const box = $("#squad-members");
-  box.replaceChildren(...(state.trusted.length
-    ? state.trusted.map((t) => el("label", { class: "check" },
-      el("input", { type: "checkbox", value: t.name }),
-      el("span", { text: `${t.name}${t.connected ? "" : " (offline)"}` })))
+  box.replaceChildren(...(state.trusted.length || gone.length
+    ? [...state.trusted.map((t) => check(t.name, `${t.name}${t.connected ? "" : " (offline)"}`)),
+      ...gone.map((m) => check(m, `${m} (not on the allowlist)`))]
     : [el("span", { class: "muted small", text: "Add peers to the allowlist first." })]));
   $("#squad-dialog").showModal();
-  $("#squad-name").focus();
+  (squad ? box.querySelector("input") ?? name : name).focus();
 }
 
 async function submitSquad(e) {
@@ -845,6 +888,10 @@ async function submitSquad(e) {
   const members = [...document.querySelectorAll("#squad-members input:checked")].map((i) => i.value);
   if (!name || !members.length) {
     $("#squad-error").textContent = "Enter a name and pick at least one member.";
+    return;
+  }
+  if (!squadEditing && (state.squads ?? []).some((s) => s.name === name)) {
+    $("#squad-error").textContent = `There is already a squad #${name}: use Change… on it instead.`;
     return;
   }
   try {
@@ -1645,6 +1692,61 @@ function schedulePlanCheck() {
   planCheckTimer = setTimeout(() => checkPlan($("#composer-input").value).catch(() => {}), 900);
 }
 
+// ---------- how a plan's run is tracked ----------
+/// The choice beside Run plan (in the composer and the plan editor) of how a run is
+/// tracked on GitHub, when a tracker is linked: a new issue, an issue it works on, or
+/// not at all. It reads and writes the plan's track: line in `input`, then `changed()`;
+/// `shown()` says when it applies. Returns what brings it up to date with the text.
+function trackChoice(box, input, changed, shown) {
+  const kind = el("select", { "aria-label": "How this run is tracked" },
+    el("option", { value: "new", text: "a new issue, a sub-issue per step" }),
+    el("option", { value: "issue", text: "an issue it works on, a sub-issue per step" }),
+    el("option", { value: "off", text: "not tracked" }));
+  const number = el("input", {
+    type: "text", inputmode: "numeric", placeholder: "#12", size: "6", spellcheck: "false",
+    "aria-label": "The issue's number",
+  });
+  const where = el("strong");
+  box.replaceChildren(el("span", { class: "small" }, "Tracked in ", where, ":"), kind, number);
+  // "An issue it works on" picked, its number not typed yet: the text has no line for it.
+  let picking = false;
+  const write = (value) => {
+    input.value = planText.setTrack(input.value, value);
+    changed();
+  };
+  kind.addEventListener("change", () => {
+    picking = kind.value === "issue";
+    if (kind.value === "off") write("off");
+    else if (kind.value === "new") write(null);
+    else {
+      number.hidden = false;
+      number.focus();
+      const n = Number(number.value.trim().replace(/^#/, ""));
+      if (Number.isInteger(n) && n > 0) write(`#${n}`);
+    }
+  });
+  number.addEventListener("input", () => {
+    const n = Number(number.value.trim().replace(/^#/, ""));
+    if (number.value.trim() && Number.isInteger(n) && n > 0) {
+      picking = false;
+      write(`#${n}`);
+    }
+  });
+  const sync = () => {
+    box.hidden = !tracker?.linked || !shown();
+    if (box.hidden) return;
+    where.textContent = tracker.tracker.repo;
+    const now = planText.trackOf(input.value);
+    kind.value = picking && now.kind === "new" ? "issue" : now.kind;
+    number.hidden = kind.value !== "issue";
+    if (now.kind === "issue" && document.activeElement !== number) number.value = `#${now.number}`;
+  };
+  input.addEventListener("input", sync);
+  return sync;
+}
+let syncPlanTrack = () => {};
+let syncEditorTrack = () => {};
+
 // ---------- plan editor ----------
 /// Opens the plan in a large editor: as forms (the builder) or as text with what can go
 /// into it beside it, whichever was used last.
@@ -1654,6 +1756,7 @@ function openPlanEditor() {
   planBuilder.reset();
   $("#plan-editor").showModal();
   planBuilder.setView(planBuilder.view());
+  syncEditorTrack();
 }
 
 /// Makes a palette change in the plan editor (see ui/plan-text.js) and selects what
@@ -1778,7 +1881,14 @@ async function loadOps() {
   }
   health.append(list);
   const t = ops.tasks;
-  health.append(el("p", { class: "task-meta", text: `Last 24 h: ${t.total} peer tasks (${t.done} done, ${t.failed} failed, ${t.refused} refused)${t.avg_secs != null ? `, ${t.avg_secs.toFixed(1)}s avg` : ""} · evidence runs ${ops.runs.passed}/${ops.runs.total} passed` }));
+  const r = ops.runs;
+  const tasks = t.total
+    ? `${t.total} peer task${t.total === 1 ? "" : "s"} (${counts([[t.done, "done"], [t.failed, "failed"], [t.refused, "refused"]]) || "none finished"})${t.avg_secs != null ? `, ${duration(t.avg_secs * 1000)} on average` : ""}`
+    : "no peer tasks";
+  const runs = r.total
+    ? `evidence runs: ${counts([[r.passed, "passed"], [r.failed, "failed"], [r.unclaimed, "without claims"]])}`
+    : "no evidence runs";
+  health.append(el("p", { class: "task-meta", text: `Last 24 h: ${tasks} · ${runs}` }));
   if (ops.incidents.length) {
     health.append(el("details", {}, el("summary", { text: `Incident log (${ops.incidents.length})` }),
       el("ol", { class: "incident-log" }, ...ops.incidents.map((e) => el("li", { class: `incident ${e.kind}` },
@@ -1975,11 +2085,16 @@ async function loadGithub() {
   if (!github.serving) box.append(el("p", { class: "muted small", text: "This agent doesn't run peers' tasks (start it with --serve) so linked repositories are for your own use." }));
   if (!github.repos.length) box.append(el("p", { class: "muted small", text: "No linked repositories yet." }));
   for (const r of github.repos) {
-    const branches = r.branches.slice(0, 5).map((b) => el("li", { class: "branch" },
+    const branches = r.branches.slice(0, 5).map((b) => el("li", { class: "branch", "data-branch": b.name },
       el("span", { class: "mono small", text: b.name }),
       el("span", { class: "muted small", text: ` ${stamp(b.unix * 1000)} · ${b.subject}` }),
       b.issues?.length ? el("span", { class: "muted small", text: ` · closes ${shortRefs(b.issues, r.slug).join(", ")}` }) : null,
-      el("button", { type: "button", class: "btn small", onclick: () => openPr(r, b) }, "Open PR")));
+      el("span", { class: "muted small branch-state" }),
+      el("span", { class: "branch-actions" },
+        el("button", { type: "button", class: "btn small", onclick: () => openPr(r, b) }, "Open PR"))));
+    const more = r.branches.length - branches.length;
+    if (more > 0) branches.push(el("li", { class: "muted small", text: `${more} older task branch${more === 1 ? "" : "es"} not shown` }));
+    const list = branches.length ? el("ul", { class: "branch-list" }, ...branches) : null;
     box.append(el("div", { class: "repo" },
       el("div", { class: "task-top" },
         el("span", { class: "task-title", text: `${r.name} · ${r.slug}` }),
@@ -1987,8 +2102,61 @@ async function loadGithub() {
       el("div", { class: "repo-actions" },
         el("button", { type: "button", class: "btn small", onclick: (e) => syncRepo(r, e.currentTarget) }, "Sync"),
         el("button", { type: "button", class: "btn small danger", onclick: () => unlinkRepo(r) }, "Unlink")),
-      branches.length ? el("ul", { class: "branch-list" }, ...branches)
-        : el("p", { class: "muted small", text: "No task branches yet: agents' editing tasks in this folder commit to p2p/… branches." })));
+      list ?? el("p", { class: "muted small", text: "No task branches yet: agents' editing tasks in this folder commit to p2p/… branches." })));
+    if (list) loadBranchStates(r, list);
+  }
+}
+
+/// Says where each listed task branch's work is (a pull request open or merged, on the
+/// repository's branch already, its issues closed, or no pull request yet), offering
+/// Open PR only when no pull request is open or merged, and Delete branch for finished work.
+async function loadBranchStates(r, list) {
+  let res;
+  try {
+    res = await api(`/api/repos/${encodeURIComponent(r.name)}/branches`);
+  } catch {
+    return;
+  }
+  for (const li of list.querySelectorAll("li[data-branch]")) {
+    const b = r.branches.find((x) => x.name === li.dataset.branch);
+    const st = res.states?.[b?.name];
+    if (!st) continue;
+    const pr = st.pull_request;
+    const link = pr ? externalLink(pr.url, `#${pr.number}`) : null;
+    const where = pr?.state === "OPEN" ? ["pull request ", link, " is open"]
+      : pr?.state === "MERGED" ? ["merged in ", link]
+      : st.in_base ? [`on ${r.branch} already`]
+      : st.issues_closed ? ["its issues are closed"]
+      : pr?.state === "CLOSED" ? ["pull request ", link, " was closed"]
+      : ["no pull request yet"];
+    li.querySelector(".branch-state").replaceChildren(" · ", ...where);
+    const finished = pr?.state === "MERGED" || pr?.state === "CLOSED" || st.in_base || st.issues_closed;
+    li.querySelector(".branch-actions").replaceChildren(...[
+      pr?.state === "OPEN" || pr?.state === "MERGED" ? null
+        : el("button", { type: "button", class: "btn small", onclick: () => openPr(r, b) }, "Open PR"),
+      finished ? el("button", {
+        type: "button", class: "btn small danger", "aria-label": `Delete branch ${b.name}`,
+        onclick: () => deleteBranch(r, b),
+      }, "Delete branch") : null,
+    ].filter(Boolean));
+  }
+  if (res.error) list.append(el("li", { class: "muted small", text: `GitHub can't say where their work is now: ${res.error}` }));
+}
+
+async function deleteBranch(r, b) {
+  const ok = await confirmDialog({
+    title: `Delete ${b.name}?`,
+    body: `It goes from this agent's clone of ${r.slug} and from GitHub, if it was pushed. Its commits stay wherever they were merged.`,
+    confirm: "Delete branch",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/repos/${encodeURIComponent(r.name)}/branches?branch=${encodeURIComponent(b.name)}`, { method: "DELETE" });
+    toast(`Deleted ${b.name}`);
+    await loadGithub();
+  } catch (err) {
+    toast(err.message, "error");
   }
 }
 
@@ -2309,6 +2477,8 @@ function externalLink(href, text, label = text, attrs = {}) {
 let tracker = null;
 async function loadTracker() {
   tracker = await api("/api/tracker");
+  syncPlanTrack();
+  syncEditorTrack();
   const box = $("#tracker");
   box.replaceChildren();
   const btn = $("#tracker-btn");
@@ -2596,47 +2766,97 @@ function renderTaskOptions() {
   const serving = state.peers.filter((p) => p.capabilities.includes(provider));
   if (serving.length > 1) targets.push(["auto", "Any peer"]);
   for (const p of serving) targets.push([p.id, p.name]);
-  targetSel.replaceChildren(...targets.map(([v, label]) => el("option", { value: v, text: label })));
-  if (targets.some(([v]) => v === prevTarget)) targetSel.value = prevTarget;
+  // Squads with an online member that serves the provider: the task goes to the least busy.
+  const squads = (state.squads ?? []).filter((s) => squadServing(s, provider).length)
+    .map((s) => [`#${s.name}`, `#${s.name} · ${s.members.filter((m) => m.online).length}/${s.members.length} online`]);
+  const option = ([v, label]) => el("option", { value: v, text: label });
+  targetSel.replaceChildren(...targets.map(option),
+    ...(squads.length ? [el("optgroup", { label: "Squads" }, ...squads.map(option))] : []));
+  if ([...targets, ...squads].some(([v]) => v === prevTarget)) targetSel.value = prevTarget;
   renderShareOptions();
   renderModelOptions();
   updateComposer();
 }
 
-/** The model a task runs on: the default, or one its agent allows (it says which: a
- * peer in its hello, this agent in its own settings); a name of your own when it allows
- * any. With "Any peer" the default: it isn't known which peer takes it. */
+/** The connected members of `squad` that serve `provider`. */
+function squadServing(squad, provider) {
+  const names = new Set(squad.members.filter((m) => m.online).map((m) => m.name));
+  return state.peers.filter((p) => names.has(p.name) && p.capabilities.includes(provider));
+}
+
+/** The squad the task form's Run on names, if it names one. */
+function targetSquad() {
+  const target = $("#target").value;
+  return target.startsWith("#") ? (state.squads ?? []).find((s) => `#${s.name}` === target) : null;
+}
+
+// Reasoning efforts, least to most (src/models.rs EFFORTS), and the Model list's
+// choice that takes a model by name.
+const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const OTHER_MODEL = "*other*";
+
+/** The model and reasoning effort a task runs at: its agent's defaults, selected and
+ * named when it says them (a peer in its hello, this agent in its settings), a model it
+ * allows, or one by name when it allows any. With "Any peer" or a squad it isn't known
+ * which peer takes it: each peer's defaults, or a model by name. */
 function renderModelOptions() {
   const provider = $("#provider").value;
   const target = $("#target").value;
+  const one = target === "local" || Boolean(target && target !== "auto" && !target.startsWith("#"));
   const said = target === "local" ? state.me?.models?.[provider]
     : state.peers.find((p) => p.id === target)?.models?.[provider];
   const list = said?.allowed ?? [];
-  const deflt = said?.default ? `Default (${said.default})` : "Default";
+  const deflt = said?.default ?? list[0] ?? null;
+  const theirs = one ? "Its default" : "Each peer's default";
   const sel = $("#model");
   const prev = sel.value;
-  sel.replaceChildren(el("option", { value: "", text: deflt }), ...list.map((m) => el("option", { value: m, text: m })));
-  if (list.includes(prev)) sel.value = prev;
-  $("#model-field").hidden = !target || target === "auto" || !list.length;
-  $("#model-name-field").hidden = !target || target === "auto" || Boolean(list.length);
-  $("#model-name").placeholder = deflt;
+  sel.replaceChildren(
+    el("option", { value: "", text: deflt ? `${deflt} (default)` : theirs }),
+    ...list.filter((m) => m !== deflt).map((m) => el("option", { value: m, text: m })),
+    ...(list.length ? [] : [el("option", { value: OTHER_MODEL, text: "Another model…" })]));
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  $("#model-field").hidden = !target;
+  $("#model-name-field").hidden = !target || sel.value !== OTHER_MODEL;
+  const effort = $("#effort");
+  const prevEffort = effort.value;
+  const deffort = said?.effort ?? null;
+  effort.replaceChildren(
+    el("option", { value: "", text: deffort ? `${deffort} (default)` : theirs }),
+    ...EFFORTS.filter((e) => e !== deffort).map((e) => el("option", { value: e, text: e })));
+  if ([...effort.options].some((o) => o.value === prevEffort)) effort.value = prevEffort;
+  $("#effort-field").hidden = !target;
 }
 
 function selectedModel() {
-  if (!$("#model-field").hidden) return $("#model").value || null;
-  if (!$("#model-name-field").hidden) return $("#model-name").value.trim() || null;
-  return null;
+  if ($("#model-field").hidden) return null;
+  const chosen = $("#model").value;
+  return chosen === OTHER_MODEL ? $("#model-name").value.trim() || null : chosen || null;
 }
 
-/** Folder picker for a peer target: the folders that peer shares with this agent. */
+function selectedEffort() {
+  return $("#effort-field").hidden ? null : $("#effort").value || null;
+}
+
+/** Folder picker for a peer target: the folders that peer shares with this agent; for
+ * a squad, those its members that serve the provider share (the task goes to one that
+ * shares the folder). */
 function renderShareOptions() {
   const sel = $("#share");
   const prev = sel.value;
   const peer = state.peers.find((p) => p.id === $("#target").value);
-  const shares = peer?.shares ?? [];
-  $("#share-field").hidden = !peer || !shares.length;
+  const squad = targetSquad();
+  let shares = peer?.shares ?? [];
+  if (squad) {
+    const members = squadServing(squad, $("#provider").value);
+    const names = [...new Set(members.flatMap((m) => m.shares.map((s) => s.name)))];
+    shares = names.map((name) => {
+      const n = members.filter((m) => m.shares.some((s) => s.name === name)).length;
+      return { name, label: `${name} (${n} of ${members.length} member${members.length === 1 ? "" : "s"})` };
+    });
+  }
+  $("#share-field").hidden = !(peer || squad) || !shares.length;
   sel.replaceChildren(...shares.map((s) =>
-    el("option", { value: s.name, text: `${s.name} (${(ACCESS_SHORT[s.access] ?? s.access).toLowerCase()})` })));
+    el("option", { value: s.name, text: s.label ?? `${s.name} (${(ACCESS_SHORT[s.access] ?? s.access).toLowerCase()})` })));
   if (shares.some((s) => s.name === prev)) sel.value = prev;
   renderMcpOptions();
   renderCheckOptions();
@@ -2715,6 +2935,7 @@ function updateComposer() {
   $("#composer-hint").textContent = plan
     ? "Ctrl+Enter to run · claims are proven only by checks peers run (verify=) or a sign-off (approve) · the run is saved under Evidence runs"
     : "Enter to send · Shift+Enter for a new line";
+  syncPlanTrack();
 }
 
 async function submitComposer(e) {
@@ -2749,6 +2970,7 @@ async function submitComposer(e) {
           checks,
           attempts: checks.length ? Number($("#attempts").value) : null,
           model: selectedModel(),
+          effort: selectedEffort(),
           prompt: text,
         }),
       });
@@ -2783,18 +3005,39 @@ function syncDelegateFields() {
   $("#access-hint").textContent = hint.join(" ");
 }
 
-function renderShareChecks() {
+/** Ticks the folders in `selected` (default: the data folder). */
+function renderShareChecks(selected = ["data"]) {
   const box = $("#add-shares");
   box.replaceChildren(...(state.me?.shares ?? []).map((s) =>
     el("label", { class: "check" },
-      el("input", { type: "checkbox", value: s.name, checked: s.name === "data" || undefined }),
+      el("input", { type: "checkbox", value: s.name, checked: selected.includes(s.name) || undefined }),
       el("span", {}, el("strong", { text: s.name }), ` · at most ${(ACCESS_SHORT[s.max_access] ?? s.max_access).toLowerCase()} · `,
         el("span", { class: "mono", text: s.path })))));
+}
+
+// The allowlisted peer the dialog changes (null: it adds one), and what opened it.
+let grantPeer = null;
+let grantOpener = null;
+
+/** The dialog adds a peer (`peer` null) or changes what `peer` may do. */
+function setAddMode(peer) {
+  grantPeer = peer;
+  $("#add-h").textContent = peer ? `Change what ${peer.name} may do` : "Add a peer to the allowlist";
+  $("#add-intro").hidden = !!peer;
+  $("#grant-intro").hidden = !peer;
+  $("#grant-intro").textContent = peer
+    ? `${peer.name} stays ${peer.connected ? "connected" : "on the allowlist"}, and the change applies at once.`
+    : "";
+  $("#ticket-field").hidden = !!peer;
+  $("#name-field").hidden = !!peer;
+  $("#add-submit").textContent = peer ? "Save" : "Add peer";
 }
 
 /** `endpoint`: a peer's endpoint id to start from (one that tried to connect). */
 function openAddDialog(endpoint) {
   $("#add-form").reset();
+  setAddMode(null);
+  grantOpener = null;
   renderShareChecks();
   syncDelegateFields();
   $("#add-error").textContent = "";
@@ -2807,27 +3050,51 @@ function openAddDialog(endpoint) {
   }
 }
 
+function openGrantDialog(peer, opener) {
+  $("#add-form").reset();
+  setAddMode(peer);
+  grantOpener = opener;
+  renderShareChecks(peer.shares?.length ? peer.shares : ["data"]);
+  $("#add-delegate").checked = !!peer.can_delegate;
+  $("#add-rate").value = peer.tasks_per_hour ?? 20;
+  $("#add-access").value = peer.can_delegate ? peer.access ?? "read-only" : "read-only";
+  syncDelegateFields();
+  $("#add-error").textContent = "";
+  $("#add-dialog").showModal();
+  $("#add-delegate").focus();
+}
+
 async function submitAdd(e) {
   e.preventDefault();
-  const ticket = $("#add-ticket").value.trim();
   const errorBox = $("#add-error");
+  const delegate = $("#add-delegate").checked;
+  const grant = {
+    delegate,
+    tasks_per_hour: delegate ? Number($("#add-rate").value) || 20 : null,
+    access: delegate ? $("#add-access").value : "read-only",
+    shares: delegate ? [...document.querySelectorAll("#add-shares input:checked")].map((i) => i.value) : null,
+  };
+  if (grantPeer) {
+    const peer = grantPeer;
+    try {
+      await api(`/api/trust/${encodeURIComponent(peer.id)}`, { method: "PUT", body: JSON.stringify(grant) });
+      $("#add-dialog").close();
+      toast(`Saved what ${peer.name} may do`);
+    } catch (err) {
+      errorBox.textContent = err.message;
+    }
+    return;
+  }
+  const ticket = $("#add-ticket").value.trim();
   if (!ticket) {
     errorBox.textContent = "Paste the peer's ticket or endpoint id.";
     $("#add-ticket").focus();
     return;
   }
-  const delegate = $("#add-delegate").checked;
   try {
     const res = await api("/api/trust", {
       method: "POST",
-      body: JSON.stringify({
-        ticket,
-        name: $("#add-name").value.trim() || null,
-        delegate,
-        tasks_per_hour: delegate ? Number($("#add-rate").value) || 20 : null,
-        access: delegate ? $("#add-access").value : "read-only",
-        shares: delegate ? [...document.querySelectorAll("#add-shares input:checked")].map((i) => i.value) : null,
-      }),
+      body: JSON.stringify({ ticket, name: $("#add-name").value.trim() || null, ...grant }),
     });
     $("#add-dialog").close();
     toast(`${res.name} added to the allowlist`);
@@ -2942,7 +3209,7 @@ function init() {
     // In a plan Enter starts a new step; Ctrl/Cmd+Enter runs it.
     if (state.mode === "plan" ? e.ctrlKey || e.metaKey : !e.shiftKey) submitComposer(e);
   });
-  $("#add-squad-btn").addEventListener("click", openSquadDialog);
+  $("#add-squad-btn").addEventListener("click", () => openSquadDialog());
   $("#playbook-pick").addEventListener("click", openPlaybookPicker);
   $("#playbook-cancel").addEventListener("click", () => $("#playbook-dialog").close());
   $("#playbook-back").addEventListener("click", () => {
@@ -2960,6 +3227,14 @@ function init() {
     if (!$("#composer-input").value.trim()) state.playbook = null;
     if (!state.playbook) renderPlanExplain();
   });
+  syncPlanTrack = trackChoice($("#plan-track"), $("#composer-input"),
+    () => $("#composer-input").dispatchEvent(new Event("input", { bubbles: true })),
+    () => state.mode === "plan");
+  syncEditorTrack = trackChoice($("#plan-editor-track"), $("#plan-editor-text"), () => {
+    const editor = $("#plan-editor-text");
+    if (planBuilder.active()) planBuilder.load(editor.value);
+    editor.dispatchEvent(new Event("input", { bubbles: true }));
+  }, () => $("#plan-editor").open);
   loadPlaybooks().catch((err) => toast(err.message, "error"));
   loadSkills().catch((err) => toast(err.message, "error"));
   loadGithub().catch((err) => toast(err.message, "error"));
@@ -2984,7 +3259,12 @@ function init() {
   setInterval(() => { if (!document.hidden) loadOps().catch(() => {}); }, 20000);
   $("#run-close").addEventListener("click", () => $("#run-dialog").close());
   $("#squad-cancel").addEventListener("click", () => $("#squad-dialog").close());
-  $("#squad-dialog").addEventListener("close", () => $("#add-squad-btn").focus());
+  // Back to the button that opened it (a squad's own, if it is still there).
+  $("#squad-dialog").addEventListener("close", () => {
+    const back = squadOpener?.isConnected ? squadOpener
+      : [...document.querySelectorAll("#squad-list button")].find((b) => b.getAttribute("aria-label") === squadOpener?.getAttribute("aria-label"));
+    (back ?? $("#add-squad-btn")).focus();
+  });
   $("#squad-form").addEventListener("submit", submitSquad);
   $("#team-cancel").addEventListener("click", () => $("#team-dialog").close());
   $("#team-form").addEventListener("submit", submitTeamPlan);
@@ -3042,12 +3322,23 @@ function init() {
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); renderModelOptions(); updateComposer(); });
+  $("#model").addEventListener("change", () => {
+    const other = $("#model").value === OTHER_MODEL;
+    $("#model-name-field").hidden = !other;
+    if (other) $("#model-name").focus();
+  });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
   $("#copy-ticket").addEventListener("click", copyTicket);
-  $("#add-peer-btn").addEventListener("click", openAddDialog);
+  $("#add-peer-btn").addEventListener("click", () => openAddDialog());
   $("#add-cancel").addEventListener("click", () => $("#add-dialog").close());
-  $("#add-dialog").addEventListener("close", () => $("#add-peer-btn").focus());
+  // Back to the button that opened it: a peer's Change… (rebuilt by then: found by its label), or Add peer.
+  $("#add-dialog").addEventListener("close", () => {
+    const label = grantOpener?.getAttribute("aria-label");
+    const back = grantOpener?.isConnected ? grantOpener
+      : label ? [...document.querySelectorAll("#trust-list button")].find((b) => b.getAttribute("aria-label") === label) : null;
+    (back ?? $("#add-peer-btn")).focus();
+  });
   $("#add-form").addEventListener("submit", submitAdd);
   $("#add-delegate").addEventListener("change", syncDelegateFields);
   $("#add-access").addEventListener("change", syncDelegateFields);
