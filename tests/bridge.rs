@@ -16,7 +16,26 @@ async fn sends_task_fields_and_returns_text() {
         .run(&task, Path::new("."), Access::WorkspaceWrite)
         .await
         .unwrap();
-    assert_eq!(out, "codex|workspace-write|true|fix the build");
+    assert_eq!(out.output, "codex|workspace-write|true|fix the build");
+    // The reply names the model that answered: the one asked for, else the SDK's.
+    assert_eq!(out.model.as_deref(), Some("codex-default-model"));
+    let mut chosen = LlmTask::new(Provider::Claude, "review it");
+    chosen.model = Some("claude-opus-5.5".into());
+    let out = bridge
+        .run(&chosen, Path::new("."), Access::ReadOnly)
+        .await
+        .unwrap();
+    assert_eq!(out.model.as_deref(), Some("claude-opus-5.5"));
+    // An older bridge's reply, without a model, still reads.
+    let older = bridge
+        .run(
+            &LlmTask::new(Provider::Claude, "cancelled?"),
+            Path::new("."),
+            Access::ReadOnly,
+        )
+        .await
+        .unwrap();
+    assert_eq!(older.model, None);
 }
 
 #[tokio::test]
@@ -28,8 +47,8 @@ async fn multiplexes_concurrent_requests() {
         bridge.run(&slow, Path::new("."), Access::ReadOnly),
         bridge.run(&fast, Path::new("."), Access::ReadOnly),
     );
-    assert_eq!(slow.unwrap(), "claude|read-only|true|slow");
-    assert_eq!(fast.unwrap(), "codex|read-only|true|fast");
+    assert_eq!(slow.unwrap().output, "claude|read-only|true|slow");
+    assert_eq!(fast.unwrap().output, "codex|read-only|true|fast");
 }
 
 #[tokio::test]
@@ -74,7 +93,7 @@ async fn cancelling_a_request_tells_the_bridge_to_abort() {
         )
         .await
         .unwrap();
-    assert_eq!(seen, "1", "bridge received cancel for request 1");
+    assert_eq!(seen.output, "1", "bridge received cancel for request 1");
 }
 
 #[test]

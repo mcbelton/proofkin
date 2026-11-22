@@ -759,7 +759,7 @@ impl Ops {
             .execute(&LlmTask::new(provider, prompt), &ctx)
             .await
         {
-            Ok(text) => text,
+            Ok(ran) => ran.output,
             Err(e) => {
                 self.event(
                     incident,
@@ -1060,7 +1060,7 @@ mod tests {
         fn providers(&self) -> Vec<crate::llm::Provider> {
             vec![crate::llm::Provider::Copilot]
         }
-        async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<String> {
+        async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<crate::llm::Ran> {
             assert_eq!(
                 ctx.access,
                 Access::ReadOnly,
@@ -1071,7 +1071,7 @@ mod tests {
                 task.prompt.contains("### Skill: incident-debugging"),
                 "it follows the skill"
             );
-            Ok(self.0.clone())
+            Ok(self.0.clone().into())
         }
     }
 

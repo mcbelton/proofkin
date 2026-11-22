@@ -14,8 +14,8 @@ use proofkin::protocol::Phase;
 use proofkin::runs::{RunRecord, Verdict};
 use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
 use proofkin::{
-    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, SecretKey,
-    TaskContext, TrustStore, TrustedPeer,
+    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, Ran,
+    SecretKey, TaskContext, TrustStore, TrustedPeer,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
@@ -48,7 +48,18 @@ impl Executor for FakeExecutor {
         self.providers.clone()
     }
 
-    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<Ran> {
+        // "which model": the provider says which model answered (the others don't).
+        let model = task
+            .prompt
+            .ends_with("which model")
+            .then(|| "fake-model-7".to_owned());
+        Ok(Ran::new(self.answer(task, ctx).await?, model))
+    }
+}
+
+impl FakeExecutor {
+    async fn answer(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
         // "create <file>" as a plan step's own task (after the earlier steps' results).
         let own = task
             .prompt
@@ -516,6 +527,48 @@ async fn delegates_tasks_to_a_peer_that_serves_the_provider() {
         "{}",
         leaked.output
     );
+}
+
+#[tokio::test]
+async fn the_worker_says_which_model_did_the_work() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    worker.audit = Some(Arc::new(AuditLog::new(audit_path.clone())));
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    // The result names the model, and so does its signed output (so older requesters,
+    // which don't read the field, verify it as before).
+    let done = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "which model"))
+        .await
+        .unwrap();
+    assert_eq!(done.model.as_deref(), Some("fake-model-7"));
+    assert!(done.verified, "{done:?}");
+    assert_eq!(
+        done.output,
+        "copilot did: which model\n\n---\n**Model** `fake-model-7` (copilot)\n"
+    );
+    // A provider that doesn't say leaves it out, and the output as it was.
+    let plain = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(plain.model, None);
+    assert_eq!(plain.output, "copilot did: hello");
+    // The worker's audit log records it.
+    let entries = AuditLog::read(&audit_path, 10).unwrap();
+    assert_eq!(entries[0].model.as_deref(), Some("fake-model-7"));
+    assert_eq!(entries[1].model, None);
+    // A plan step keeps it with its result.
+    let plan = Plan::parse("a @worker which model").unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert_eq!(states["a"].model(), Some("fake-model-7"));
 }
 
 #[tokio::test]

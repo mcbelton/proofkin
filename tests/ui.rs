@@ -8,7 +8,7 @@ use proofkin::audit::{AuditEntry, AuditLog};
 use proofkin::shares::ShareStore;
 use proofkin::ui::{self, UiInfo};
 use proofkin::{
-    Access, Agent, AgentConfig, Executor, LlmTask, Network, Profile, Provider, SecretKey,
+    Access, Agent, AgentConfig, Executor, LlmTask, Network, Profile, Provider, Ran, SecretKey,
     TaskContext, TrustedPeer,
 };
 use serde_json::Value;
@@ -23,11 +23,14 @@ impl Executor for Echo {
         vec![Provider::Copilot]
     }
 
-    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<Ran> {
         if task.prompt == "hang" {
             std::future::pending::<()>().await;
         }
-        Ok(format!("echo: {}", task.prompt))
+        // The provider says which model answered (only for "hello", so peers' results
+        // elsewhere keep their exact output).
+        let model = (task.prompt == "hello").then(|| "echo-model-1".to_owned());
+        Ok(Ran::new(format!("echo: {}", task.prompt), model))
     }
 }
 
@@ -166,6 +169,8 @@ async fn ui_requires_token_and_local_host_and_runs_tasks() {
     .expect("task finished");
     assert_eq!(done["status"], "done");
     assert_eq!(done["output"], "echo: hello");
+    // The task names the model that did the work, as its provider said.
+    assert_eq!(done["model"], "echo-model-1");
     agent.shutdown().await;
 }
 

@@ -181,6 +181,8 @@ pub struct Delivered {
     pub verified: bool,
     /// The task didn't run to the end there: the peer refused it, or stopped first.
     pub refused: bool,
+    /// The model that did the work, as the peer says (older peers don't).
+    pub model: Option<String>,
 }
 
 /// A delegated task failed because its peer dropped and didn't come back in time.
@@ -287,6 +289,8 @@ struct Served {
     patch: Option<String>,
     /// It did what was asked: every check passed (or the team run passed).
     ok: bool,
+    /// The model that did the work, if the provider said (none for a team step).
+    model: Option<String>,
 }
 
 /// A served task's place: waiting for a slot, or holding one (see
@@ -972,6 +976,7 @@ impl Agent {
                     patch: None,
                     verified: true,
                     refused: false,
+                    model: None,
                 }),
             );
         } else {
@@ -982,6 +987,7 @@ impl Agent {
                 evidence: Some(Box::new(evidence)),
                 patch: None,
                 refused: false,
+                model: None,
             };
             self.inner.deliver(request.requester, msg).await;
         }
@@ -1225,6 +1231,7 @@ impl Inner {
                         evidence: None,
                         patch: None,
                         refused: true,
+                        model: None,
                     })
                     .is_ok();
             }
@@ -1570,6 +1577,7 @@ impl Inner {
             entry.outcome = Outcome::Cancelled;
         }
         entry.origin = origin.as_ref().and_then(Origin::describe);
+        entry.model = result.as_ref().ok().and_then(|s| s.model.clone());
         if let Some(audit) = &self.audit {
             audit.record(&entry);
         }
@@ -1742,6 +1750,7 @@ impl Inner {
             output,
             patch: outcome.patch,
             ok: outcome.ok,
+            model: None,
         })
     }
 
@@ -1847,6 +1856,8 @@ impl Inner {
         let mut results = Vec::<crate::evidence::CheckResult>::new();
         let (mut reports, mut used) = (Vec::<String>::new(), 0);
         let mut failed_before = Vec::<String>::new();
+        // The model that did the work: the latest attempt's, as its provider says.
+        let mut model = None;
         while used < attempts {
             used += 1;
             let text = match (attempts, used) {
@@ -1866,7 +1877,9 @@ impl Inner {
                     ..Progress::new(Phase::Running, text)
                 },
             );
-            reports.push(executor.execute(&prompt, &ctx).await?);
+            let ran = executor.execute(&prompt, &ctx).await?;
+            model = ran.model.or(model);
+            reports.push(ran.output);
             results.clear();
             for (i, (name, command)) in checks.iter().enumerate() {
                 let mut text = match attempts {
@@ -1982,7 +1995,13 @@ impl Inner {
             evidence.git = Some(commit);
             patch = text;
         }
-        let summary = evidence.summary();
+        // The model is named in the signed output, so the record vouches for it too
+        // (older requesters verify it as before: it is part of the output's hash).
+        let mut summary = model
+            .as_deref()
+            .map(|m| format!("**Model** `{m}` ({})\n", task.provider))
+            .unwrap_or_default();
+        summary += &evidence.summary();
         if !summary.is_empty() {
             output = format!("{}\n\n---\n{summary}", output.trim_end());
         }
@@ -2001,6 +2020,7 @@ impl Inner {
             output,
             evidence,
             patch,
+            model,
         })
     }
 }
@@ -2178,6 +2198,7 @@ async fn run_connection(
                                 evidence: Some(Box::new(served.evidence)),
                                 patch: served.patch,
                                 refused: false,
+                                model: served.model,
                             },
                             Err(e) => Message::TaskResult {
                                 task_id,
@@ -2186,6 +2207,7 @@ async fn run_connection(
                                 evidence: None,
                                 patch: None,
                                 refused,
+                                model: None,
                             },
                         };
                         {
@@ -2228,6 +2250,7 @@ async fn run_connection(
                             evidence: None,
                             patch: None,
                             refused: true,
+                            model: None,
                         };
                         let _ = tx.send(msg);
                     }
@@ -2246,6 +2269,7 @@ async fn run_connection(
                     evidence,
                     patch,
                     refused,
+                    model,
                 } => {
                     let verified = evidence.as_ref().is_some_and(|e| {
                         e.verify(&peer_id, &output).is_ok()
@@ -2272,6 +2296,10 @@ async fn run_connection(
                             patch,
                             verified,
                             refused,
+                            // A peer's word, shown as such: a short, single-line name.
+                            model: model
+                                .map(|m| crate::llm::clean_model(&m))
+                                .filter(|m| !m.is_empty()),
                         }),
                     );
                 }

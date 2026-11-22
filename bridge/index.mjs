@@ -3,9 +3,10 @@
 // Protocol: one JSON object per line.
 //   stdin : {"id":1,"provider":"claude"|"codex","prompt":"...","cwd":"...","access":"read-only"|"workspace-write"|"full","model":null,
 //            "mcp":{"name":{"type":"stdio","command":"...","args":[],"env":{},"tools":[]}}}  (mcp optional)
-//   stdout: {"id":1,"ok":true,"text":"..."} or {"id":1,"ok":false,"error":"..."}
+//   stdout: {"id":1,"ok":true,"text":"...","model":"..."} or {"id":1,"ok":false,"error":"..."}
+//           (model: the model that answered, when the SDK says)
 // stdout is reserved for protocol lines; all logging goes to stderr.
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -261,6 +262,7 @@ async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
     };
   };
   let result;
+  let used;
   for await (const message of query({
     prompt,
     options: {
@@ -280,6 +282,8 @@ async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
       hooks: { PreToolUse: [{ hooks: [guard] }], PostToolUse: [{ hooks: [spotlight] }] },
     },
   })) {
+    // The session's first message says which model answers.
+    if (message.type === "system" && message.subtype === "init") used = message.model;
     if (message.type === "result") result = message;
   }
   if (!result) throw new Error("Claude returned no result");
@@ -287,7 +291,25 @@ async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
     const detail = result.result ?? (result.errors ?? []).join("; ");
     throw new Error(`Claude ${result.subtype}: ${detail}`);
   }
-  return result.result;
+  return { text: result.result, model: used ?? model ?? undefined };
+}
+
+/** The model Codex uses when a task names none: `model` at the top of this agent's own
+ * `config.toml` (in `CODEX_HOME`), if it sets one. */
+export function codexConfigModel(home = process.env.CODEX_HOME ?? join(homedir(), ".codex")) {
+  let text;
+  try {
+    text = readFileSync(join(home, "config.toml"), "utf8");
+  } catch {
+    return undefined;
+  }
+  for (const line of text.split(/\r?\n/)) {
+    // Keys after a [table] header belong to it, not to the top level.
+    if (/^\s*\[/.test(line)) break;
+    const found = line.match(/^\s*model\s*=\s*(?:"([^"]+)"|'([^']+)')/);
+    if (found) return found[1] ?? found[2];
+  }
+  return undefined;
 }
 
 let codex;
@@ -308,7 +330,7 @@ async function runCodex({ prompt, cwd, model, access, mcp }, abortController) {
     skipGitRepoCheck: true,
   });
   const turn = await thread.run(prompt, { signal: abortController.signal });
-  return turn.finalResponse;
+  return { text: turn.finalResponse, model: model ?? codexConfigModel() };
 }
 
 const PROVIDERS = { claude: runClaude, codex: runCodex };
@@ -339,7 +361,8 @@ async function handle(line) {
     const run = PROVIDERS[provider];
     if (!run) throw new Error(`unknown provider: ${provider}`);
     if (!CLAUDE_TOOLS[access]) throw new Error(`unknown access: ${access}`);
-    reply({ id, ok: true, text: await run(request, controller) });
+    const { text, model } = await run(request, controller);
+    reply({ id, ok: true, text, model: model || undefined });
   } catch (err) {
     reply({ id, ok: false, error: controller.signal.aborted ? "cancelled" : String(err?.message ?? err) });
   } finally {

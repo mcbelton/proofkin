@@ -55,6 +55,9 @@ pub struct AuditEntry {
     /// than a model of `provider`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub team: bool,
+    /// The model that did the work, as its provider said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl AuditEntry {
@@ -98,6 +101,7 @@ impl AuditEntry {
             error,
             origin: None,
             team: task.team.is_some(),
+            model: None,
         }
     }
 }

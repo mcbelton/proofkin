@@ -216,11 +216,47 @@ impl TaskContext {
     }
 }
 
+/// What a model run gave back: its answer, and the model that gave it, if the
+/// provider says (several, comma-separated, if the run used more than one).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ran {
+    pub output: String,
+    pub model: Option<String>,
+}
+
+impl Ran {
+    pub fn new(output: impl Into<String>, model: Option<String>) -> Self {
+        Self {
+            output: output.into(),
+            model: model.map(|m| clean_model(&m)).filter(|m| !m.is_empty()),
+        }
+    }
+}
+
+/// A model name as a provider or a peer gives it, safe to show anywhere (the web UI,
+/// Markdown, a terminal): only the characters model names use (letters, digits,
+/// `-._:/@+()`, and spaces and commas between several), at most 100 of them.
+pub fn clean_model(model: &str) -> String {
+    model
+        .chars()
+        .filter(|c| c.is_alphanumeric() || " -._:/@+,()".contains(*c))
+        .take(100)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+impl From<String> for Ran {
+    fn from(output: String) -> Self {
+        Self::new(output, None)
+    }
+}
+
 /// Runs [`LlmTask`]s. Implemented by [`SdkExecutor`]; tests can supply fakes.
 #[async_trait]
 pub trait Executor: Send + Sync {
     fn providers(&self) -> Vec<Provider>;
-    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<String>;
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<Ran>;
 }
 
 pub struct ExecutorConfig {
@@ -301,7 +337,7 @@ impl Executor for SdkExecutor {
         self.providers.clone()
     }
 
-    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<String> {
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<Ran> {
         if !self.providers.contains(&task.provider) {
             bail!("provider {} is not enabled on this agent", task.provider);
         }
@@ -327,8 +363,9 @@ impl Executor for SdkExecutor {
             );
         }
         let task = &task;
+        let mut model = None;
         let run = async {
-            match task.provider {
+            let ran = match task.provider {
                 Provider::Copilot => {
                     self.copilot
                         .as_ref()
@@ -343,9 +380,12 @@ impl Executor for SdkExecutor {
                         .run_with(task, &ctx.workspace, ctx.access, &ctx.mcp)
                         .await
                 }
-            }
+            }?;
+            model = ran.model;
+            Ok(ran.output)
         };
-        changes::track_changes(&ctx.workspace, ctx.access, run).await
+        let output = changes::track_changes(&ctx.workspace, ctx.access, run).await?;
+        Ok(Ran::new(output, model))
     }
 }
 
@@ -385,6 +425,21 @@ mod tests {
         assert_eq!(title_of(&early), format!("{}…", &early[..99]));
         assert_eq!(title_of("  Add a flag  \nmore"), "Add a flag");
         assert_eq!(title_of(""), "");
+    }
+
+    #[test]
+    fn model_names_keep_only_what_model_names_use() {
+        assert_eq!(clean_model(" claude-sonnet-5.5 "), "claude-sonnet-5.5");
+        assert_eq!(
+            clean_model("gpt-5.5, claude-opus-5.5"),
+            "gpt-5.5, claude-opus-5.5"
+        );
+        assert_eq!(
+            clean_model("x`](https://evil)\n<b>**y**</b>"),
+            "x(https://evil)by/b"
+        );
+        assert_eq!(clean_model(&"m".repeat(300)).len(), 100);
+        assert_eq!(Ran::new("out", Some("`".into())).model, None);
     }
 
     #[test]

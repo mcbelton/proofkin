@@ -24,7 +24,7 @@ async fn bridge_gets_only_the_profile_credentials() {
         .await
         .unwrap();
     assert_eq!(
-        out,
+        out.output,
         "ANTHROPIC_API_KEY=<unset>;GH_TOKEN=<unset>;CODEX_HOME=profile-codex-home"
     );
 }

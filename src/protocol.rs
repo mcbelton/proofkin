@@ -62,6 +62,10 @@ pub enum Message {
         /// so another worker may take it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         refused: bool,
+        /// The model that did the work, as its provider said (older peers don't say).
+        /// The worker also names it in the signed output's evidence summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// Where a task the receiver delegated is now (sent while it runs, when it moves on).
     TaskProgress {
@@ -267,8 +271,8 @@ mod tests {
         );
     }
 
-    /// Progress, load and origins are new: older peers skip them (an unknown message
-    /// type, unknown fields), and phases from newer peers still read.
+    /// Progress, load, origins and models are new: older peers skip them (an unknown
+    /// message type, unknown fields), and phases from newer peers still read.
     #[test]
     fn progress_load_and_origins_keep_older_peers_working() {
         let msg = Message::TaskProgress {
@@ -303,12 +307,28 @@ mod tests {
             origin.and_then(|o| o.describe()).as_deref(),
             Some("step a of run r")
         );
-        // What an older peer sends still reads (no origin, not refused, no `yours`).
+        // What an older peer sends still reads (no origin, not refused, no `yours`, no model).
         let old = r#"{"type":"task_result","task_id":1,"ok":false,"output":"no"}"#;
         assert!(matches!(
             serde_json::from_str::<Message>(old).unwrap(),
-            Message::TaskResult { refused: false, .. }
+            Message::TaskResult {
+                refused: false,
+                model: None,
+                ..
+            }
         ));
+        let with_model = Message::TaskResult {
+            task_id: 2,
+            ok: true,
+            output: "done".into(),
+            evidence: None,
+            patch: None,
+            refused: false,
+            model: Some("claude-sonnet-5.5".into()),
+        };
+        let json = serde_json::to_string(&with_model).unwrap();
+        assert!(json.contains(r#""model":"claude-sonnet-5.5""#), "{json}");
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), with_model);
         let load = r#"{"type":"load","running":2,"queued":1,"slots":2}"#;
         assert_eq!(
             serde_json::from_str::<Message>(load).unwrap(),

@@ -1320,6 +1320,9 @@ pub enum StepState {
         /// The step's commit as a patch (kept out of JSON; saved next to run reports).
         #[serde(skip)]
         patch: Option<String>,
+        /// The model that did the work, as `peer` said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Failed {
         peer: Option<String>,
@@ -1328,6 +1331,8 @@ pub enum StepState {
         evidence: Option<Evidence>,
         #[serde(default)]
         verified: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Skipped {
         reason: String,
@@ -1345,6 +1350,15 @@ impl StepState {
             error,
             evidence: None,
             verified: false,
+            model: None,
+        }
+    }
+
+    /// The model that did the step's work, if its peer said.
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            StepState::Done { model, .. } | StepState::Failed { model, .. } => model.as_deref(),
+            _ => None,
         }
     }
 
@@ -1365,6 +1379,7 @@ impl StepState {
                 evidence: d.evidence,
                 verified: d.verified,
                 patch: d.patch,
+                model: d.model,
             };
         }
         StepState::Failed {
@@ -1375,6 +1390,7 @@ impl StepState {
             },
             evidence: d.evidence,
             verified: d.verified,
+            model: d.model,
         }
     }
 }
@@ -2442,6 +2458,7 @@ fn ask_workiq(
             patch: None,
             verified: false,
             refused: false,
+            model: None,
         })
     }
 }
@@ -3021,6 +3038,7 @@ mod tests {
             evidence: None,
             verified,
             patch: None,
+            model: None,
         };
         let states: BTreeMap<String, StepState> = [
             ("design".to_owned(), done(true)),
@@ -3735,6 +3753,7 @@ mod tests {
             evidence: None,
             verified: true,
             patch: None,
+            model: None,
         };
         let states: BTreeMap<String, StepState> = [
             ("a".to_owned(), done("Bands are fixed.")),
@@ -3840,6 +3859,7 @@ mod tests {
                 evidence: None,
                 verified: false,
                 patch: None,
+                model: None,
             },
         )]
         .into();

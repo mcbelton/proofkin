@@ -9,6 +9,7 @@ use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::hooks::{HookContext, PostToolUseInput, PostToolUseOutput, SessionHooks};
 use github_copilot_sdk::rpc::SandboxConfig;
 use github_copilot_sdk::session::Session;
+use github_copilot_sdk::subscription::RecvErrorKind;
 use github_copilot_sdk::types::{
     McpHttpServerConfig, McpServerConfig, McpStdioServerConfig, MessageOptions,
     PermissionRequestData, PermissionRequestKind, RequestId, SessionConfig, SessionId,
@@ -17,7 +18,7 @@ use github_copilot_sdk::{Client, ClientOptions};
 use serde_json::{Value, json};
 
 use super::policy::{Workspace, home_secret_paths};
-use super::{Access, LlmTask};
+use super::{Access, LlmTask, Ran};
 use crate::mcp::McpServer;
 use crate::profile::{
     CopilotCredentials, DEFAULT_GITHUB_HOST, INHERITED_CREDENTIAL_VARS, github_login,
@@ -181,14 +182,15 @@ impl CopilotBackend {
     }
 
     /// Runs `task` in `workspace` with `access` (tools, permissions and sandbox follow
-    /// it) and the MCP servers `mcp`.
+    /// it) and the MCP servers `mcp`. The result names the models that answered, as
+    /// the CLI's usage events say (else the one the task asked for).
     pub async fn run(
         &self,
         task: &LlmTask,
         access: Access,
         workspace: &Path,
         mcp: &BTreeMap<String, McpServer>,
-    ) -> Result<String> {
+    ) -> Result<Ran> {
         let access = match (&self.sandbox, access) {
             (SandboxSupport::Unsupported(reason), Access::Full) => {
                 eprintln!(
@@ -232,20 +234,89 @@ impl CopilotBackend {
                 .await
                 .context("creating Copilot session")?,
         );
+        // Which models answer: the CLI says in a usage event after each model call.
+        let models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut events = session.subscribe();
+        let _watcher = AbortTaskOnDrop(tokio::spawn({
+            let models = models.clone();
+            async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => add_usage_model(
+                            &mut models.lock().unwrap(),
+                            &event.event_type,
+                            event.agent_id.is_some(),
+                            &event.data,
+                        ),
+                        Err(e) if matches!(e.kind(), RecvErrorKind::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        }));
         // If this future is dropped (the task was cancelled), stop the model too.
         let mut guard = AbortOnDrop(Some(session.clone()));
         let reply = session
             .send_and_wait(MessageOptions::new(task.prompt.clone()).with_wait_timeout(TASK_TIMEOUT))
             .await;
         guard.0 = None;
+        let mut used = models.lock().unwrap().clone();
+        if used.is_empty() && reply.is_ok() {
+            // Missed while the subscription lagged: the session's history has them.
+            if let Ok(history) = session.get_raw_events().await {
+                for event in &history {
+                    add_usage_model(
+                        &mut used,
+                        event
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        event.get("agentId").is_some_and(|a| !a.is_null()),
+                        event.get("data").unwrap_or(&Value::Null),
+                    );
+                }
+            }
+        }
         let _ = session.disconnect().await;
         let event = reply.context("Copilot task failed")?;
-        event
+        let text = event
             .as_ref()
             .and_then(|e| e.data.get("content"))
             .and_then(|c| c.as_str())
             .map(str::to_owned)
-            .ok_or_else(|| anyhow!("Copilot returned no assistant message"))
+            .ok_or_else(|| anyhow!("Copilot returned no assistant message"))?;
+        let model = if used.is_empty() {
+            task.model.clone()
+        } else {
+            Some(used.join(", "))
+        };
+        Ok(Ran::new(text, model))
+    }
+}
+
+/// Adds the model of a usage event of the session's own agent (not a sub-agent's)
+/// to `models`, once.
+fn add_usage_model(models: &mut Vec<String>, kind: &str, sub_agent: bool, data: &Value) {
+    if kind != "assistant.usage" || sub_agent {
+        return;
+    }
+    if let Some(model) = data
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        && !models.iter().any(|m| m == model)
+    {
+        models.push(model.to_owned());
+    }
+}
+
+/// Stops a background task when dropped.
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -916,6 +987,45 @@ mod tests {
         assert_eq!(config["mcp-browser"]["env"]["TOKEN"], "t");
         assert_eq!(config["mcp-docs"]["type"], "sse");
         assert_eq!(config["mcp-docs"]["tools"], json!(["*"]));
+    }
+
+    #[test]
+    fn the_models_that_answered_come_from_the_agents_own_usage_events() {
+        let mut models = Vec::new();
+        let usage = |model: &str| json!({ "model": model, "inputTokens": 10 });
+        add_usage_model(
+            &mut models,
+            "assistant.usage",
+            false,
+            &usage("claude-sonnet-5.5"),
+        );
+        add_usage_model(
+            &mut models,
+            "assistant.usage",
+            false,
+            &usage("claude-sonnet-5.5"),
+        );
+        add_usage_model(
+            &mut models,
+            "assistant.message",
+            false,
+            &usage("not-a-usage"),
+        );
+        add_usage_model(
+            &mut models,
+            "assistant.usage",
+            true,
+            &usage("a-sub-agents-model"),
+        );
+        add_usage_model(
+            &mut models,
+            "assistant.usage",
+            false,
+            &json!({ "model": " " }),
+        );
+        add_usage_model(&mut models, "assistant.usage", false, &json!({}));
+        add_usage_model(&mut models, "assistant.usage", false, &usage("gpt-5.5"));
+        assert_eq!(models, ["claude-sonnet-5.5", "gpt-5.5"]);
     }
 
     #[test]

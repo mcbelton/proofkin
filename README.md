@@ -887,6 +887,13 @@ review @alice:app verify=test Check the change:
   number of attempts, the commit, and hashes of the prompt and output. The worker **signs**
   it with its identity key. The boss accepts it only if it is signed by the peer the task
   was sent to, for exactly the output received. Results show `Signed ✓` in the web UI.
+- Every result **names the model** that did the work, as its provider says (Copilot: the
+  models the session's usage events name; Claude: the Agent SDK's init message; Codex: the
+  thread's model, else `model` at the top of the profile's own `config.toml`). The web UI
+  shows it on the task card after the provider (`Step md · Copilot · claude-sonnet-5.5 →
+  worker`), and so do the worker's audit log, run records and reports, tracker comments and
+  the CLI. A worker also writes it in the signed output's summary
+  (``**Model** `claude-sonnet-5.5` (copilot)``), so the record vouches for it.
 - An `apply=` patch may not create symlinks or touch files the model itself may not write
   (credentials, git and editor config, agent settings).
 - **Worktrees** (`share add --worktrees`, for a git repository): each editing task runs on

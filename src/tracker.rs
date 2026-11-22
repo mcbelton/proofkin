@@ -1971,6 +1971,7 @@ impl Run {
                 output,
                 evidence,
                 verified,
+                model,
                 ..
             } => {
                 let who = if step.approve {
@@ -1990,6 +1991,7 @@ impl Run {
                     evidence.as_ref(),
                     *verified,
                     &self.run_id,
+                    model.as_deref(),
                 )));
                 if to_merge {
                     (Status::InReview, who, true)
@@ -2003,6 +2005,7 @@ impl Run {
                 error,
                 evidence,
                 verified,
+                model,
             } => {
                 let who = peer
                     .as_deref()
@@ -2015,6 +2018,7 @@ impl Run {
                     evidence.as_ref(),
                     *verified,
                     &self.run_id,
+                    model.as_deref(),
                 )));
                 (Status::Todo, who, issue.open)
             }
@@ -2341,6 +2345,7 @@ fn done_comment(
     evidence: Option<&Evidence>,
     verified: bool,
     run_id: &str,
+    model: Option<&str>,
 ) -> String {
     if step.approve {
         let mut md = format!(
@@ -2353,7 +2358,11 @@ fn done_comment(
         }
         return md;
     }
-    let mut md = format!("✅ **{who}** did step `{}` of run `{run_id}`.", step.id);
+    let mut md = format!(
+        "✅ **{who}** did step `{}` of run `{run_id}`{}.",
+        step.id,
+        with_model(model)
+    );
     if let Some(e) = evidence {
         md += &format!("\n\n{}", evidence_line(e, verified));
     }
@@ -2382,6 +2391,16 @@ fn done_comment(
     md
 }
 
+/// " with `model`" for a step's comment, if its peer said which model did the work
+/// (the name is cleaned: it can't leave the code span).
+fn with_model(model: Option<&str>) -> String {
+    model
+        .map(crate::llm::clean_model)
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(" with `{m}`"))
+        .unwrap_or_default()
+}
+
 fn failed_comment(
     step: &Step,
     who: Option<&str>,
@@ -2389,6 +2408,7 @@ fn failed_comment(
     evidence: Option<&Evidence>,
     verified: bool,
     run_id: &str,
+    model: Option<&str>,
 ) -> String {
     let mut md = if step.approve {
         format!(
@@ -2398,9 +2418,10 @@ fn failed_comment(
         )
     } else {
         format!(
-            "❌ Step `{}` of run `{run_id}` failed{}. This issue is back to do.",
+            "❌ Step `{}` of run `{run_id}` failed{}{}. This issue is back to do.",
             step.id,
-            who.map(|w| format!(" on **{w}**")).unwrap_or_default()
+            who.map(|w| format!(" on **{w}**")).unwrap_or_default(),
+            with_model(model)
         )
     };
     if let Some(e) = evidence {
@@ -2969,6 +2990,7 @@ mod tests {
             evidence,
             verified: true,
             patch: None,
+            model: Some("claude-sonnet-5.5".into()),
         }
     }
 
@@ -3092,8 +3114,10 @@ mod tests {
             .iter()
             .map(|c| c["body"].as_str().unwrap().to_owned())
             .collect();
+        // A step's comment names the model that did its work, as its peer said.
         assert!(
-            comments[0].starts_with("✅ **worker** did step `api` of run `r1`."),
+            comments[0]
+                .starts_with("✅ **worker** did step `api` of run `r1` with `claude-sonnet-5.5`."),
             "{}",
             comments[0]
         );

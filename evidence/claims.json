@@ -1248,6 +1248,22 @@
         "ui::the_workiq_import_route_saves_a_marked_topic_and_needs_replace_to_overwrite",
         "ui::the_workiq_import_route_writes_nothing_when_every_result_was_withheld"
       ]
+    },
+    {
+      "id": "MDL-1",
+      "area": "models",
+      "claim": "Every task result names the model that did the work, as its provider says: Copilot from the CLI's usage events of the session's own agent (else the model the task asked for), Claude from the Agent SDK's init message, Codex from the thread's model or the top-level model of the profile's own config.toml. A worker sends it with the result (a field older peers ignore) and names it in the signed output's evidence summary, so the record vouches for it and older requesters verify it as before; names are cleaned to the characters model names use before they are shown. The web UI's task and step cards (after the provider), the worker's audit log, run records and reports, the tracker's step comments and the CLI's printed results show it; without a model the result is as before.",
+      "tests": [
+        "lib::llm::copilot::the_models_that_answered_come_from_the_agents_own_usage_events",
+        "lib::llm::model_names_keep_only_what_model_names_use",
+        "lib::protocol::progress_load_and_origins_keep_older_peers_working",
+        "lib::runs::tasks_on_their_own_keep_what_proves_them_as_one_step_runs",
+        "lib::tracker::a_tracked_run_has_an_issue_with_a_sub_issue_per_step_and_the_board_follows_it",
+        "agents::the_worker_says_which_model_did_the_work",
+        "bridge::sends_task_fields_and_returns_text",
+        "bridge::claude_tool_policy_confines_paths_and_tools",
+        "ui::ui_requires_token_and_local_host_and_runs_tasks"
+      ]
     }
   ]
 }

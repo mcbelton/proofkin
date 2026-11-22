@@ -4,7 +4,17 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { pathRefusal, toolRefusal, claudeSandbox, claudeMcp, externalContent, wrapToolOutput } = await import("../../bridge/index.mjs");
+const { pathRefusal, toolRefusal, claudeSandbox, claudeMcp, externalContent, wrapToolOutput, codexConfigModel } = await import("../../bridge/index.mjs");
+
+// The model Codex uses by default: the top-level `model` of the agent's own config.toml.
+const codexHome = mkdtempSync(join(tmpdir(), "p2p-codex-"));
+assert.equal(codexConfigModel(codexHome), undefined);
+writeFileSync(join(codexHome, "config.toml"), '# mine\nmodel = "gpt-5.5"\n\n[profiles.fast]\nmodel = "gpt-5.5-mini"\n');
+assert.equal(codexConfigModel(codexHome), "gpt-5.5");
+writeFileSync(join(codexHome, "config.toml"), "[profiles.fast]\nmodel = 'gpt-5.5-mini'\n");
+assert.equal(codexConfigModel(codexHome), undefined);
+writeFileSync(join(codexHome, "config.toml"), "model_provider = \"x\"\nmodel = 'o9'\n");
+assert.equal(codexConfigModel(codexHome), "o9");
 
 assert.equal(claudeSandbox("read-only"), undefined);
 assert.equal(claudeSandbox("workspace-write"), undefined);

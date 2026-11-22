@@ -526,9 +526,11 @@ function teamResult(t) {
 
 function taskNode(t) {
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
+  // The model that did the work, after the provider, once its provider (or peer) said.
+  const runs = (label) => t.model ? `${label} · ${t.model}` : label;
   const title = t.step
-    ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : providerLabel(t.provider)} → ${t.target}`
-    : `#${t.id} · ${providerLabel(t.provider)} → ${t.target}`;
+    ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : runs(providerLabel(t.provider))} → ${t.target}`
+    : `#${t.id} · ${runs(providerLabel(t.provider))} → ${t.target}`;
   // Started by another agent (over MCP or A2A), not in this UI; or a step of a team
   // run this agent leads for a peer.
   const via = t.via ? ` · asked by another agent (${t.via})` : t.for_peer ? ` · for ${t.for_peer}'s team step` : "";
@@ -2564,7 +2566,7 @@ async function loadAudit() {
     const access = e.access ? ACCESS_SHORT[e.access] ?? e.access : "no access";
     list.append(el("li", { class: "audit-item" },
       el("div", { class: "task-top" },
-        el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${e.team ? "Team step" : providerLabel(e.provider)}` }),
+        el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${e.team ? "Team step" : providerLabel(e.provider)}${e.model ? ` · ${e.model}` : ""}` }),
         el("span", { class: `status ${OUTCOME_CLASS[e.outcome] ?? ""}`, text: OUTCOME_TEXT[e.outcome] ?? e.outcome })),
       el("div", { class: "task-meta", text: `${stamp(e.ts_ms)} · ${access} · ${duration(e.duration_ms)} · ${e.prompt_chars} chars, sha256 ${e.prompt_sha256.slice(0, 10)}` }),
       e.origin ? el("div", { class: "task-meta", text: `Part of ${e.origin} on ${e.peer}` }) : null,

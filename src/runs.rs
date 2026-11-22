@@ -607,6 +607,9 @@ impl RunRecord {
             md += &format!("- Applied the commit of step {apply}\n");
         }
         md += &format!("- Task: {}\n", step.prompt);
+        if let Some(model) = s.state.model() {
+            md += &format!("- Model: `{}`\n", crate::llm::clean_model(model));
+        }
         let (evidence, verified, text) = match &s.state {
             StepState::Done {
                 evidence,
@@ -909,6 +912,7 @@ mod tests {
             evidence,
             verified,
             patch: None,
+            model: None,
         }
     }
 
@@ -1040,6 +1044,7 @@ mod tests {
             patch: None,
             verified: true,
             refused: false,
+            model: Some("claude-sonnet-5.5".into()),
         };
         assert!(RunRecord::worth_keeping(&task, &delivered));
         let mut run = RunRecord::for_task(
@@ -1053,6 +1058,16 @@ mod tests {
         run.peer_ids
             .insert("worker".into(), key.public().to_string());
         assert!(run.passed(), "{}", run.verdict_line());
+        // The record and its report name the model that did the work.
+        assert!(
+            matches!(&run.steps[0].state, StepState::Done { model: Some(m), .. } if m == "claude-sonnet-5.5")
+        );
+        assert!(
+            run.render_markdown()
+                .contains("- Model: `claude-sonnet-5.5`"),
+            "{}",
+            run.render_markdown()
+        );
         assert_eq!(run.title(), "test passes after: Fix the parser");
         assert_eq!(run.summary().title, run.title());
         assert_eq!(
@@ -1081,6 +1096,7 @@ mod tests {
             patch: None,
             verified: true,
             refused: false,
+            model: None,
         };
         assert!(!RunRecord::worth_keeping(&question, &answer));
         // Without checks, a run's title is its task.

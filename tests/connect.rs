@@ -28,7 +28,7 @@ impl Executor for Echo {
         vec![Provider::Copilot]
     }
 
-    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<proofkin::Ran> {
         if task.prompt == "hang" {
             std::future::pending::<()>().await;
         }
@@ -38,7 +38,7 @@ impl Executor for Echo {
         if task.prompt == "gated" {
             GATE.notified().await;
         }
-        Ok(format!("echo: {}", task.prompt))
+        Ok(format!("echo: {}", task.prompt).into())
     }
 }
 

@@ -77,6 +77,9 @@ pub struct UiInfo {
 struct TaskView {
     id: u64,
     provider: Provider,
+    /// The model that did the work, as its provider (or peer) said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     prompt: String,
     target: String,
     status: &'static str,
@@ -163,6 +166,8 @@ impl TaskView {
 struct StoredTask {
     id: u64,
     provider: Provider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     prompt: String,
     target: String,
     status: String,
@@ -208,6 +213,7 @@ impl From<&TaskView> for StoredTask {
         Self {
             id: t.id,
             provider: t.provider,
+            model: t.model.clone(),
             prompt: t.prompt.clone(),
             target: t.target.clone(),
             status: t.status.to_owned(),
@@ -250,6 +256,7 @@ impl StoredTask {
         TaskView {
             id: self.id,
             provider: self.provider,
+            model: self.model,
             prompt: self.prompt,
             target: self.target,
             status: finished.unwrap_or("cancelled"),
@@ -547,6 +554,7 @@ impl Shared {
             let view = TaskView {
                 id,
                 provider: step.provider,
+                model: None,
                 prompt: step.prompt.clone(),
                 target: format!(
                     "{}{}",
@@ -1428,6 +1436,7 @@ fn start_task(
     let view = TaskView {
         id,
         provider: body.provider,
+        model: None,
         prompt,
         target: target.clone(),
         status: "running",
@@ -1457,11 +1466,15 @@ fn start_task(
     let handle = tokio::spawn(async move {
         let mut evidence = None;
         let mut run = None;
+        let mut model = None;
         let started = crate::runs::unix_now();
         let result = match route {
             Route::Local(executor) => {
                 let ctx = TaskContext::new(shared.info.access, shared.info.workspace.clone());
-                executor.execute(&task, &ctx).await
+                executor.execute(&task, &ctx).await.map(|ran| {
+                    model = ran.model;
+                    ran.output
+                })
             }
             Route::Peer(peer, name) => {
                 let origin = crate::protocol::Origin {
@@ -1480,6 +1493,7 @@ fn start_task(
                 };
                 match delivered {
                     Ok(d) => {
+                        model = d.model.clone();
                         if d.evidence.is_some() {
                             evidence = Some(if d.verified { "verified" } else { "unverified" });
                         }
@@ -1502,6 +1516,7 @@ fn start_task(
             t.evidence = evidence;
             t.run = run;
             t.progress = None;
+            t.model = model;
             match result {
                 Ok(out) => {
                     t.status = "done";
@@ -1686,12 +1701,14 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
             evidence,
             verified,
             patch,
+            model,
         } => {
             t.status = "done";
             t.target = step_target(&t.target, peer);
             t.output = Some(output.clone());
             t.finished_ms = Some(now_ms());
             t.progress = None;
+            t.model = model.clone();
             t.evidence = evidence
                 .as_ref()
                 .map(|_| if *verified { "verified" } else { "unverified" });
@@ -1710,6 +1727,7 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
             error,
             evidence,
             verified,
+            model,
         } => {
             t.status = "failed";
             if let Some(peer) = peer {
@@ -1718,6 +1736,7 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
             t.output = Some(error.clone());
             t.finished_ms = Some(now_ms());
             t.progress = None;
+            t.model = model.clone();
             t.evidence = evidence
                 .as_ref()
                 .map(|_| if *verified { "verified" } else { "unverified" });
@@ -1801,6 +1820,7 @@ fn start_plan(
         let view = TaskView {
             id,
             provider: step.provider,
+            model: None,
             prompt: step.prompt.clone(),
             target: format!(
                 "{}{}",
@@ -3377,6 +3397,7 @@ mod tests {
         TaskView {
             id,
             provider: Provider::Copilot,
+            model: None,
             prompt: String::new(),
             target: String::new(),
             status,

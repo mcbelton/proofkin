@@ -4525,7 +4525,15 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                         let agent = agent.clone();
                         let label = format!("{} on {}", task.provider, peer.name);
                         let n = tasks.spawn(label.clone(), async move {
-                            print_result(&label, agent.delegate(peer.id, task).await);
+                            let result =
+                                agent.delegate_verified(peer.id, task).await.and_then(|d| {
+                                    if d.ok {
+                                        Ok(proofkin::Ran::new(d.output, d.model))
+                                    } else {
+                                        Err(anyhow!("{}", d.output))
+                                    }
+                                });
+                            print_result(&label, result);
                         });
                         println!(
                             "delegating to {} ({}) as task {n} (/cancel {n} to stop it)",
@@ -4659,9 +4667,16 @@ fn print_step(id: &str, state: &StepState) {
             output,
             evidence,
             verified,
+            model,
             ..
         } => {
-            println!("=== step {id} on {peer} ===\n{output}\n=== end ===");
+            println!(
+                "=== step {id} on {peer}{} ===\n{output}\n=== end ===",
+                model
+                    .as_deref()
+                    .map(|m| format!(" · {m}"))
+                    .unwrap_or_default()
+            );
             print_evidence(evidence.as_ref(), *verified);
         }
         StepState::Failed {
@@ -4669,11 +4684,16 @@ fn print_step(id: &str, state: &StepState) {
             error,
             evidence,
             verified,
+            model,
         } => {
             println!(
-                "=== step {id}{} failed: {error}",
+                "=== step {id}{}{} failed: {error}",
                 peer.as_deref()
                     .map(|p| format!(" on {p}"))
+                    .unwrap_or_default(),
+                model
+                    .as_deref()
+                    .map(|m| format!(" · {m}"))
                     .unwrap_or_default()
             );
             print_evidence(evidence.as_ref(), *verified);
@@ -4697,9 +4717,13 @@ fn print_evidence(evidence: Option<&proofkin::evidence::Evidence>, verified: boo
     }
 }
 
-fn print_result(label: &str, result: Result<String>) {
+fn print_result(label: &str, result: Result<proofkin::Ran>) {
     match result {
-        Ok(output) => println!("=== {label} ===\n{output}\n=== end ==="),
+        Ok(ran) => println!(
+            "=== {label}{} ===\n{}\n=== end ===",
+            ran.model.map(|m| format!(" · {m}")).unwrap_or_default(),
+            ran.output
+        ),
         Err(e) => eprintln!("=== {label} failed: {e:#}"),
     }
 }
