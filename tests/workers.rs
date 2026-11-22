@@ -260,6 +260,7 @@ async fn owners_create_start_stop_and_delete_digital_workers_from_the_web_ui() {
         tasks_per_hour: DEFAULT_TASKS_PER_HOUR,
         access: Access::ReadOnly,
         shares: Vec::new(),
+        m365: None,
     });
     for (squad, members) in [
         ("mixed", json!(["helper", "alice"])),

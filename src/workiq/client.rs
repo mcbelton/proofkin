@@ -15,6 +15,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use super::audit::{Audit, CallContext};
+
 /// Work IQ's hosted MCP endpoint.
 pub const DEFAULT_URL: &str = "https://workiq.svc.cloud.microsoft/mcp";
 /// The MCP protocol version the client asks for.
@@ -140,6 +142,8 @@ pub enum WorkIqErrorKind {
     Protocol,
     /// The tool ran and reported a failure.
     Tool,
+    /// The call was refused before it was sent, because a budget is used up.
+    Budget,
 }
 
 /// What kind of failure this is, which decides what Proofkin does about it.
@@ -161,6 +165,8 @@ pub enum Class {
     UncertainChange,
     /// Any other error from the tool or the protocol.
     Tool,
+    /// A call budget is used up; the call was not sent.
+    OverBudget,
 }
 
 /// Who can do what is needed.
@@ -431,6 +437,10 @@ fn fix_for(class: &Class, text: &str) -> Fix {
             Who::Support,
             "check the request; if it looks right, give the ids to support",
         ),
+        Class::OverBudget => (
+            Who::User,
+            "raise the budget with `proofkin workiq budget`, or wait for it to reset",
+        ),
     };
     Fix {
         who,
@@ -654,6 +664,8 @@ pub struct Client {
     tools: Mutex<Option<Vec<Tool>>>,
     sleeper: Arc<dyn Sleeper>,
     next_id: AtomicU64,
+    audit: Option<Arc<Audit>>,
+    context: CallContext,
 }
 
 /// Whether a call may be sent again after a failure that leaves it unknown whether it ran.
@@ -692,7 +704,22 @@ impl Client {
             tools: Mutex::new(None),
             sleeper: Arc::new(TokioSleeper),
             next_id: AtomicU64::new(1),
+            audit: None,
+            context: CallContext::command(),
         }
+    }
+
+    /// Audits every tool call in `audit`, and refuses the calls its budgets don't allow.
+    pub fn with_audit(mut self, audit: Arc<Audit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// The purpose and audience of the calls that don't give their own (see
+    /// [`Client::call_tool_in`]); a command for the owner when not set.
+    pub fn with_context(mut self, context: CallContext) -> Self {
+        self.context = context;
+        self
     }
 
     /// Waits between attempts with `sleeper` instead of the clock.
@@ -736,6 +763,27 @@ impl Client {
     /// `Err` with a [`WorkIqError`]. Only the tools in [`READ_TOOLS`] are sent again after a
     /// transient failure; any other call is sent once.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolResult> {
+        self.call_tool_in(&self.context, name, arguments).await
+    }
+
+    /// [`Client::call_tool`] for a given purpose and audience. With an audit, the call is
+    /// refused before it is sent when a budget is used up, and is recorded however it ends.
+    pub async fn call_tool_in(
+        &self,
+        context: &CallContext,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolResult> {
+        let Some(audit) = &self.audit else {
+            return self.send_tool(name, arguments).await;
+        };
+        let pending = audit.begin(context, name, &arguments)?;
+        let result = self.send_tool(name, arguments).await;
+        pending.finish(&result);
+        result
+    }
+
+    async fn send_tool(&self, name: &str, arguments: Value) -> Result<ToolResult> {
         let reply = self
             .rpc(
                 "tools/call",
@@ -2023,5 +2071,209 @@ mod tests {
         assert!(text.contains("client-request-id "), "{text}");
         let ids = &run.error().ids;
         assert!(ids.request_id.is_some() && ids.correlation_id.is_some());
+    }
+
+    use crate::profile::WorkIqBudget;
+    use crate::workiq::audit::{self, Audit, CallContext, Clock, Purpose};
+    use chrono::{DateTime, Local, TimeZone};
+    use sha2::{Digest, Sha256};
+
+    const SECRET_QUERY: &str = "salary review for project nightingale";
+
+    struct TestClock(std::sync::Mutex<DateTime<Local>>);
+
+    impl TestClock {
+        fn at_noon(day: u32) -> Arc<Self> {
+            let noon = Local
+                .with_ymd_and_hms(2026, 11, day, 12, 0, 0)
+                .single()
+                .unwrap();
+            Arc::new(TestClock(std::sync::Mutex::new(noon)))
+        }
+
+        fn next_day(&self) {
+            let mut now = self.0.lock().unwrap();
+            *now += chrono::Duration::days(1);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now(&self) -> DateTime<Local> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    fn budget(per_day: u32, per_run: u32) -> WorkIqBudget {
+        WorkIqBudget {
+            calls_per_day: Some(per_day),
+            calls_per_run: Some(per_run),
+        }
+    }
+
+    /// A client whose calls are audited in `dir`.
+    fn audited(url: &str, dir: &std::path::Path, budget: WorkIqBudget) -> (Client, Arc<Audit>) {
+        let audit = Arc::new(Audit::new(dir.join(audit::FILE), "alice", budget));
+        (client(url).with_audit(audit.clone()), audit)
+    }
+
+    fn step(run: &str) -> CallContext {
+        CallContext::local(Purpose::Step {
+            run: run.to_string(),
+            step: "research".to_string(),
+        })
+    }
+
+    fn retrieval(results: Value) -> Canned {
+        Canned::result(json!({
+            "content": [],
+            "structuredContent": { "application/vnd.ms-workiq.retrieval": { "results": results } },
+            "isError": false,
+        }))
+    }
+
+    async fn query(client: &Client, context: &CallContext) -> Result<ToolResult> {
+        let arguments = json!({ "query": SECRET_QUERY });
+        client.call_tool_in(context, "retrieve", arguments).await
+    }
+
+    #[tokio::test]
+    async fn every_call_is_one_audit_line_and_none_holds_the_query_text() {
+        let (fake, url) = start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (client, audit) = audited(&url, dir.path(), WorkIqBudget::default());
+        fake.canned.lock().unwrap().extend([
+            retrieval(json!([
+                { "contentProtection": "allowed", "sensitivityLabel": "General" },
+                { "contentProtection": "allowed" },
+                { "contentProtection": "blocked", "sensitivityLabel": "Secret" },
+            ])),
+            Canned::failed("the tool broke"),
+            Canned::http(403, r#"{"error":"forbidden"}"#),
+        ]);
+        let peer = CallContext::peer("bob", vec!["General".to_string()], Purpose::Gateway);
+
+        assert!(query(&client, &step("run-1")).await.is_ok());
+        assert!(query(&client, &CallContext::command()).await.is_err());
+        assert!(query(&client, &peer).await.is_err());
+
+        let text = std::fs::read_to_string(audit.path()).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert!(
+            !text.contains("nightingale") && !text.contains("salary"),
+            "{text}"
+        );
+        let entries = audit::read(audit.path()).unwrap();
+        let outcomes: Vec<&str> = entries.iter().map(|e| e.outcome.as_str()).collect();
+        assert_eq!(outcomes, ["ok", "tool", "denied-by-policy"]);
+
+        let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(SECRET_QUERY.as_bytes()));
+        let first = &entries[0];
+        assert_eq!(
+            (first.tool.as_str(), first.purpose.as_str()),
+            ("retrieve", "step")
+        );
+        assert_eq!(first.run.as_deref(), Some("run-1"));
+        assert_eq!(first.step.as_deref(), Some("research"));
+        assert_eq!(first.audience, "local");
+        assert_eq!(first.query_sha256, sha);
+        assert_eq!(first.query_chars, SECRET_QUERY.chars().count());
+        assert_eq!((first.results, first.withheld), (Some(3), Some(1)));
+        assert_eq!(first.labels, ["General", "Secret", "unknown"]);
+        assert!(first.request_id.as_deref().unwrap().starts_with("req-"));
+        assert!(
+            first
+                .correlation_id
+                .as_deref()
+                .unwrap()
+                .starts_with("corr-")
+        );
+        assert!(first.client_request_id.is_some() && first.ts_ms > 0);
+
+        assert_eq!(entries[1].purpose, "command");
+        assert_eq!(entries[1].results, None);
+        assert_eq!(entries[2].audience, "bob");
+        assert!(entries[2].request_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_daily_budget_refuses_the_next_call_before_it_is_sent() {
+        let (fake, url) = start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (client, audit) = audited(&url, dir.path(), budget(2, 25));
+        let context = CallContext::command();
+
+        assert!(query(&client, &context).await.is_ok());
+        assert!(query(&client, &context).await.is_ok());
+        let refused = query(&client, &context).await.unwrap_err();
+
+        let failure = refused.downcast_ref::<WorkIqError>().unwrap();
+        assert_eq!(failure.class, Class::OverBudget);
+        assert!(failure.message.contains("daily"), "{failure}");
+        assert!(failure.message.contains("2 calls"), "{failure}");
+        assert!(
+            failure.message.contains("proofkin workiq budget --per-day"),
+            "{failure}"
+        );
+        assert!(failure.message.contains("--profile alice"), "{failure}");
+        assert_eq!(fake.count("tools/call"), 2);
+        let entries = audit::read(audit.path()).unwrap();
+        let outcomes: Vec<&str> = entries.iter().map(|e| e.outcome.as_str()).collect();
+        assert_eq!(outcomes, ["ok", "ok", "refused"]);
+        assert_eq!(audit.usage(None).today, 2);
+    }
+
+    #[tokio::test]
+    async fn the_per_run_budget_refuses_the_next_call_of_that_run_only() {
+        let (fake, url) = start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (client, audit) = audited(&url, dir.path(), budget(100, 2));
+
+        assert!(query(&client, &step("run-1")).await.is_ok());
+        assert!(query(&client, &step("run-1")).await.is_ok());
+        let refused = query(&client, &step("run-1")).await.unwrap_err();
+
+        let failure = refused.downcast_ref::<WorkIqError>().unwrap();
+        assert_eq!(failure.class, Class::OverBudget);
+        assert!(failure.message.contains("per run"), "{failure}");
+        assert!(failure.message.contains("run run-1"), "{failure}");
+        assert!(
+            failure.message.contains("proofkin workiq budget --per-run"),
+            "{failure}"
+        );
+        assert_eq!(fake.count("tools/call"), 2);
+
+        assert!(query(&client, &step("run-2")).await.is_ok());
+        assert!(query(&client, &CallContext::command()).await.is_ok());
+        let outcomes: Vec<String> = audit::read(audit.path())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.outcome)
+            .collect();
+        assert_eq!(outcomes, ["ok", "ok", "refused", "ok", "ok"]);
+        assert_eq!(audit.usage(Some("run-1")).run, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_new_day_resets_the_daily_count() {
+        let (_fake, url) = start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let clock = TestClock::at_noon(20);
+        let audit = Arc::new(
+            Audit::new(dir.path().join(audit::FILE), "alice", budget(1, 25))
+                .with_clock(clock.clone()),
+        );
+        let client = client(&url).with_audit(audit.clone());
+        let context = CallContext::command();
+
+        assert!(query(&client, &context).await.is_ok());
+        assert!(query(&client, &context).await.is_err());
+        assert_eq!(audit.usage(None).today, 1);
+
+        clock.next_day();
+        assert_eq!(audit.usage(None).today, 0);
+        assert!(query(&client, &context).await.is_ok());
+        assert!(query(&client, &context).await.is_err());
+        assert_eq!(audit.usage(None).today, 1);
+        assert_eq!(audit.report().unwrap().today, 1);
     }
 }

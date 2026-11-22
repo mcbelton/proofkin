@@ -42,11 +42,13 @@ use tokio::task::JoinSet;
 
 use crate::agent::{Agent, Delivered, PeerInfo};
 use crate::evidence::Evidence;
-use crate::knowledge::{KnowledgeBase, check_topics};
+use crate::knowledge::{KnowledgeBase, check_topics, union_labels, with_mark};
 use crate::llm::{LlmTask, Provider};
 use crate::profile::validate_name;
 use crate::protocol::{Origin, Phase, Progress};
 use crate::skills::Skills;
+use crate::trust::TrustStore;
+use crate::workiq::content::{Audience, UNLABELED};
 
 /// Longest prerequisite result passed on to a dependent step.
 const MAX_DEP_CHARS: usize = 8_000;
@@ -200,6 +202,11 @@ pub struct Step {
     /// of a sub-issue made for it (see [`crate::tracker`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<u64>,
+    /// Set when the step gets Microsoft 365 (Work IQ) content: the union of its sensitivity
+    /// labels (empty: not known). A marked `context=` topic sets it, so will the `workiq=`
+    /// option and `@workiq` steps, and [`Plan::marked`] passes it on to the steps after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub m365: Option<Vec<String>>,
 }
 
 impl Step {
@@ -498,7 +505,7 @@ impl Plan {
     /// The plan with each step's `context=` knowledge put in front of its prompt.
     /// Fails if a topic doesn't exist.
     pub fn with_knowledge(&self, kb: &KnowledgeBase) -> Result<Plan> {
-        let mut plan = self.clone();
+        let mut plan = self.marked(kb);
         for step in &mut plan.steps {
             if step.context.is_empty() {
                 continue;
@@ -513,10 +520,133 @@ impl Plan {
         }
         Ok(plan)
     }
+
+    /// The plan with its Microsoft 365 marks set: a step is marked when it already is (the
+    /// `workiq=` option and `@workiq` steps set it) or when a `context=` topic is, with
+    /// the union of the labels, and a step is marked when a step it runs `after` is,
+    /// because it gets that step's output. Topics that don't exist are left out here;
+    /// the plan check reports them.
+    pub fn marked(&self, kb: &KnowledgeBase) -> Plan {
+        let mut plan = self.clone();
+        for step in &mut plan.steps {
+            if let Some(labels) = kb.marks(&step.context) {
+                step.m365 = Some(union_labels(
+                    step.m365.as_deref().unwrap_or_default(),
+                    &labels,
+                ));
+            }
+        }
+        loop {
+            let marked: HashMap<String, Vec<String>> = plan
+                .steps
+                .iter()
+                .filter_map(|s| Some((s.id.clone(), s.m365.clone()?)))
+                .collect();
+            let mut changed = false;
+            for step in &mut plan.steps {
+                for labels in step.after.iter().filter_map(|d| marked.get(d)) {
+                    let merged = union_labels(step.m365.as_deref().unwrap_or_default(), labels);
+                    if step.m365.as_ref() != Some(&merged) {
+                        step.m365 = Some(merged);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                return plan;
+            }
+        }
+    }
+}
+
+/// Who may receive Microsoft 365 content (docs/work-iq.md, section 4): the peers the
+/// allowlist grants it to, for the labels it names, and the owner's own digital workers,
+/// who may have all of it.
+#[derive(Debug, Clone, Default)]
+pub struct Recipients {
+    pub trust: TrustStore,
+    /// The endpoint ids of the owner's digital workers.
+    pub workers: Vec<EndpointId>,
+    /// The profile the grants are made in, for the command that adds one.
+    pub profile: Option<String>,
+}
+
+impl Recipients {
+    pub fn new(trust: TrustStore, workers: Vec<EndpointId>) -> Self {
+        Self {
+            trust,
+            workers,
+            profile: None,
+        }
+    }
+
+    /// `agent`'s allowlist now and `profile`'s digital workers. If the workers can't be
+    /// read, none counts as one: the check gets stricter, not looser.
+    pub fn of(agent: &Agent, profile: &crate::profile::Profile) -> Self {
+        Self {
+            trust: agent.trusted(),
+            workers: crate::workers::worker_ids(profile).unwrap_or_default(),
+            profile: Some(profile.name.clone()),
+        }
+    }
+
+    /// Why `step`'s content may not go to the peer `name` (`id`), if it may not: it has no
+    /// grant, or a label is outside it. Names the step, the peer, the labels and the command
+    /// that grants them.
+    pub fn refusal(&self, step: &Step, name: &str, id: &EndpointId) -> Option<String> {
+        let labels = step.m365.as_ref()?;
+        let needed = if labels.is_empty() {
+            vec![UNLABELED.to_owned()]
+        } else {
+            labels.clone()
+        };
+        let (granted, why) = match self.trust.audience_for(id, &self.workers) {
+            Some(Audience::Local) => return None,
+            Some(Audience::Peer { labels: granted }) => {
+                let outside: Vec<String> = needed
+                    .iter()
+                    .filter(|l| !granted.iter().any(|g| g.trim().eq_ignore_ascii_case(l)))
+                    .cloned()
+                    .collect();
+                if outside.is_empty() {
+                    return None;
+                }
+                (
+                    granted,
+                    format!("its grant doesn't include {}", outside.join(", ")),
+                )
+            }
+            None => (Vec::new(), "it has no Microsoft 365 grant".to_owned()),
+        };
+        let mut command = format!("proofkin peers allow {id} --name {name}");
+        if let Some(profile) = &self.profile {
+            command += &format!(" --profile {profile}");
+        }
+        let entry = self.trust.get(id);
+        if let Some(peer) = entry.filter(|p| p.can_delegate) {
+            command += &format!(
+                " --delegate --access {} --tasks-per-hour {} --share {}",
+                peer.access,
+                peer.tasks_per_hour,
+                peer.shares.join(",")
+            );
+        }
+        command += &format!(" --m365 {}", union_labels(&granted, &needed).join(","));
+        if entry.and_then(|p| p.m365.as_ref()).is_some_and(|g| g.tools) {
+            command += " --m365-tools";
+        }
+        Some(format!(
+            "step '{}' gets Microsoft 365 content (labels: {}) that {name} may not receive: {why}. \
+             Grant it with: {command}",
+            step.id,
+            needed.join(", ")
+        ))
+    }
 }
 
 /// Saves the result of every finished step with `save=` into `kb`, if its evidence
-/// was verified (or it ran locally); returns the topics written.
+/// was verified (or it ran locally); returns the topics written. A step with Microsoft 365
+/// content saves its topic marked as such, with the step's labels.
 pub fn save_knowledge(
     kb: &KnowledgeBase,
     plan: &Plan,
@@ -524,6 +654,7 @@ pub fn save_knowledge(
     run_id: &str,
 ) -> Vec<String> {
     let mut saved = Vec::new();
+    let plan = plan.marked(kb);
     for step in &plan.steps {
         let (
             Some(topic),
@@ -541,7 +672,11 @@ pub fn save_knowledge(
             "run {run_id}, step {} by {peer} (signed, verified)",
             step.id
         );
-        if kb.write(topic, output, &source).is_ok() {
+        let text = match &step.m365 {
+            Some(labels) => with_mark(output, labels),
+            None => output.clone(),
+        };
+        if kb.write(topic, &text, &source).is_ok() {
             saved.push(topic.clone());
         }
     }
@@ -817,6 +952,7 @@ fn parse_step(line: &str) -> Result<Step> {
         team: team.then(|| levels.unwrap_or(1)),
         timeout,
         issue,
+        m365: None,
     })
 }
 
@@ -1176,7 +1312,9 @@ pub fn preflight(
     squads: &SquadStore,
     kb: &KnowledgeBase,
     skills: &Skills,
+    recipients: &Recipients,
 ) -> Vec<Problem> {
+    let marked = plan.marked(kb);
     let mut problems: Vec<Problem> = plan
         .steps
         .iter()
@@ -1200,7 +1338,7 @@ pub fn preflight(
             fixes: Vec::new(),
         })
     };
-    for own in &plan.steps {
+    for own in &marked.steps {
         let step = &match with_agent(own, skills) {
             Ok(step) => step,
             Err(e) => {
@@ -1261,6 +1399,35 @@ pub fn preflight(
                 }
             },
         };
+        if step.m365.is_some() {
+            let receivers: Vec<(String, EndpointId)> = match &step.target {
+                Target::Squad(name) => squads
+                    .get(name)
+                    .map(|squad| {
+                        squad
+                            .members
+                            .iter()
+                            .filter_map(|member| {
+                                let id = peers
+                                    .iter()
+                                    .find(|p| &p.name == member)
+                                    .map(|p| p.id)
+                                    .or_else(|| {
+                                        recipients.trust.get_by_name(member).map(|p| p.id)
+                                    })?;
+                                Some((member.clone(), id))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Target::Peer(_) => candidates.iter().map(|p| (p.name.clone(), p.id)).collect(),
+            };
+            for (name, id) in receivers {
+                if let Some(why) = recipients.refusal(step, &name, &id) {
+                    report(Some(step), true, why);
+                }
+            }
+        }
         if step.approve {
             continue;
         }
@@ -1454,6 +1621,7 @@ pub struct ReadyRun {
     ready: Plan,
     squads: SquadStore,
     kb: KnowledgeBase,
+    recipients: Recipients,
     profile: crate::profile::Profile,
 }
 
@@ -1465,7 +1633,8 @@ pub fn start(agent: &Agent, profile: &crate::profile::Profile, text: &str) -> Re
     let kb = profile.knowledge();
     let skills = profile.skills();
     let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
-    let errors: Vec<String> = preflight(&plan, &agent.peers(), &squads, &kb, &skills)
+    let recipients = Recipients::of(agent, profile);
+    let errors: Vec<String> = preflight(&plan, &agent.peers(), &squads, &kb, &skills, &recipients)
         .into_iter()
         .filter(|p| p.error)
         .map(|p| match p.step {
@@ -1483,6 +1652,7 @@ pub fn start(agent: &Agent, profile: &crate::profile::Profile, text: &str) -> Re
         ready,
         squads,
         kb,
+        recipients,
         profile: profile.clone(),
     })
 }
@@ -1518,6 +1688,7 @@ impl ReadyRun {
                 .as_ref()
                 .map(|t| t.refs.clone())
                 .unwrap_or_default(),
+            recipients: self.recipients.clone(),
         };
         let states = run_plan_with(agent, &self.squads, &self.ready, &ctx, |step, state| {
             if let Some(t) = &tracking {
@@ -1574,6 +1745,9 @@ pub struct RunContext {
     /// The issues each step's task carries, by step (`owner/repo#N`, see
     /// [`crate::tracker`]): its commit references them, a pull request closes them.
     pub issues: HashMap<String, Vec<String>>,
+    /// Who may receive Microsoft 365 content: each marked step is checked against it
+    /// (with the allowlist as it is then) before its task is sent.
+    pub recipients: Recipients,
 }
 
 /// Runs `plan` with `agent`, reporting every state change to `on_update`, and
@@ -1630,6 +1804,23 @@ async fn within<T>(secs: Option<u64>, work: impl Future<Output = Result<T>>) -> 
                 ))
             }),
     }
+}
+
+/// Why `step`'s Microsoft 365 content may not be sent to `name` (`id`) now, if it may not:
+/// the plan check's test again, against the allowlist as it is at this moment.
+fn m365_refusal(
+    agent: &Agent,
+    ctx: &RunContext,
+    step: &Step,
+    name: &str,
+    id: &EndpointId,
+) -> Option<String> {
+    step.m365.as_ref()?;
+    let recipients = Recipients {
+        trust: agent.trusted(),
+        ..ctx.recipients.clone()
+    };
+    recipients.refusal(step, name, id)
 }
 
 /// The peer to run task `step` on: as [`choose_peer`], but never one the work came
@@ -1749,6 +1940,15 @@ pub async fn run_plan_with(
                     .collect();
                     match choose_approver(step, &agent.peers()) {
                         Ok((approver, name)) => {
+                            let refused =
+                                approver.and_then(|id| m365_refusal(agent, ctx, step, &name, &id));
+                            if let Some(why) = refused {
+                                let state = fail(why);
+                                on_update(&step.id, &state);
+                                states.insert(step.id.clone(), state);
+                                changed = true;
+                                continue;
+                            }
                             let (agent, title) = (agent.clone(), format!("Plan step {}", step.id));
                             // A person reads it: the rule for models is left out.
                             let text = approval_text(&prompt);
@@ -1780,6 +1980,13 @@ pub async fn run_plan_with(
                             continue;
                         }
                     };
+                    if let Some(why) = m365_refusal(agent, ctx, step, &peer.name, &peer.id) {
+                        let state = StepState::failed(Some(peer.name), why);
+                        on_update(&step.id, &state);
+                        states.insert(step.id.clone(), state);
+                        changed = true;
+                        continue;
+                    }
                     let mut task = LlmTask::new(step.provider, prompt.clone())
                         .with_checks(step.checks.clone(), step.attempts);
                     task.mcp = step.mcp.clone();
@@ -2288,7 +2495,7 @@ mod tests {
         let squads = SquadStore::default();
         let warned = |task: &str| -> Vec<String> {
             let plan = Plan::parse(&format!("a @alice:app {task}")).unwrap();
-            preflight(&plan, &[], &squads, &kb, &skills)
+            preflight(&plan, &[], &squads, &kb, &skills, &Recipients::default())
                 .into_iter()
                 .map(|p| p.message)
                 .filter(|m| m.contains("task text"))
@@ -2343,18 +2550,26 @@ mod tests {
         squads
             .set("qa", vec!["bob".into(), "carol".into()])
             .unwrap();
+        let none = Recipients::default();
         let check = |text: &str| {
-            preflight(&Plan::parse(text).unwrap(), &peers, &squads, &kb, &skills)
-                .into_iter()
-                .map(|p| {
-                    format!(
-                        "{}{}: {}",
-                        if p.error { "E " } else { "W " },
-                        p.step.unwrap_or_default(),
-                        p.message
-                    )
-                })
-                .collect::<Vec<_>>()
+            preflight(
+                &Plan::parse(text).unwrap(),
+                &peers,
+                &squads,
+                &kb,
+                &skills,
+                &none,
+            )
+            .into_iter()
+            .map(|p| {
+                format!(
+                    "{}{}: {}",
+                    if p.error { "E " } else { "W " },
+                    p.step.unwrap_or_default(),
+                    p.message
+                )
+            })
+            .collect::<Vec<_>>()
         };
         let good = "claim: C-1 tests pass\nfix @alice:app verify=test skill=implement-change claims=C-1 Fix it\nok after fix approve @me claims=C-1 Approve\nlook @alice:app mcp=browser Open the app";
         assert!(check(good).is_empty(), "{:?}", check(good));
@@ -2436,10 +2651,17 @@ mod tests {
 
         // Claim problems come with the changes that fix them.
         let fixes = |text: &str| {
-            preflight(&Plan::parse(text).unwrap(), &peers, &squads, &kb, &skills)
-                .into_iter()
-                .map(|p| (p.step, p.message, p.fixes))
-                .collect::<Vec<_>>()
+            preflight(
+                &Plan::parse(text).unwrap(),
+                &peers,
+                &squads,
+                &kb,
+                &skills,
+                &none,
+            )
+            .into_iter()
+            .map(|p| (p.step, p.message, p.fixes))
+            .collect::<Vec<_>>()
         };
         let remove = |step: &str, option: &str| Edit::Remove {
             step: step.into(),
@@ -2542,10 +2764,17 @@ mod tests {
         );
         // Coded, for the plan builder to say on the field instead.
         let coded = |text: &str| {
-            preflight(&Plan::parse(text).unwrap(), &peers, &squads, &kb, &skills)
-                .into_iter()
-                .map(|p| (p.code, p.step, p.claim))
-                .collect::<Vec<_>>()
+            preflight(
+                &Plan::parse(text).unwrap(),
+                &peers,
+                &squads,
+                &kb,
+                &skills,
+                &none,
+            )
+            .into_iter()
+            .map(|p| (p.code, p.step, p.claim))
+            .collect::<Vec<_>>()
         };
         assert_eq!(
             coded("claim: C-1 What must be true at the end\na @alice:app claims=C-1 What to do"),
@@ -2609,11 +2838,18 @@ mod tests {
         let kb = KnowledgeBase::new(dir.path().join("kb"));
         let skills = Skills::new(dir.path().join("skills"));
         let problems = |peer: PeerInfo| -> Vec<String> {
-            preflight(&plan, &[peer], &SquadStore::default(), &kb, &skills)
-                .into_iter()
-                .filter(|p| p.step.as_deref() == Some("build"))
-                .map(|p| p.message)
-                .collect()
+            preflight(
+                &plan,
+                &[peer],
+                &SquadStore::default(),
+                &kb,
+                &skills,
+                &Recipients::default(),
+            )
+            .into_iter()
+            .filter(|p| p.step.as_deref() == Some("build"))
+            .map(|p| p.message)
+            .collect()
         };
         assert!(problems(lead(false, Access::Full))[0].contains("has no team plan"));
         assert!(problems(lead(true, Access::ReadOnly))[0].contains("needs edit access"));
@@ -2714,5 +2950,234 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("offers you no MCP server browser"), "{err}");
+    }
+
+    fn step_labels(plan: &Plan, id: &str) -> Option<Vec<String>> {
+        plan.steps.iter().find(|s| s.id == id).unwrap().m365.clone()
+    }
+
+    #[test]
+    fn steps_with_microsoft_365_content_are_marked_through_context_and_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path());
+        kb.write("hr", &with_mark("Pay bands", &["HR".into()]), "")
+            .unwrap();
+        kb.write(
+            "pub",
+            &with_mark("Press", &["Public".into(), "hr".into()]),
+            "",
+        )
+        .unwrap();
+        kb.write("plain", "Architecture", "").unwrap();
+        let plan = Plan::parse(
+            "a @x context=hr do\nb @x context=plain do\nc after a @x do\n\
+             d after c,b @x context=pub do\ne after b @x do\nf @x context=all do\n\
+             g @x context=gone do",
+        )
+        .unwrap();
+        let marked = plan.marked(&kb);
+        let labels = |id: &str| step_labels(&marked, id);
+        let list = |names: &[&str]| -> Option<Vec<String>> {
+            Some(names.iter().map(|l| (*l).to_owned()).collect())
+        };
+        assert_eq!(labels("a"), list(&["HR"]), "a marked context topic");
+        assert_eq!(labels("b"), None, "an unmarked topic");
+        assert_eq!(labels("c"), list(&["HR"]), "after a marked step");
+        assert_eq!(labels("d"), list(&["Public", "hr"]), "the union, once each");
+        assert_eq!(labels("e"), None, "after an unmarked step");
+        assert_eq!(labels("f"), list(&["HR", "Public"]), "context=all");
+        assert_eq!(labels("g"), None, "a topic that doesn't exist");
+        assert_eq!(
+            step_labels(&plan, "a"),
+            None,
+            "the plan itself isn't changed"
+        );
+
+        // What the coming workiq= option and @workiq steps will set is passed on too.
+        let mut plan = Plan::parse("w @x do\nn after w @x do\nm @x do").unwrap();
+        plan.steps[0].m365 = Some(vec!["Confidential".into()]);
+        let marked = plan.marked(&kb);
+        assert_eq!(step_labels(&marked, "n"), list(&["Confidential"]));
+        assert_eq!(step_labels(&marked, "m"), None);
+
+        // The plan that is sent carries the marks.
+        let ready = Plan::parse("a @x context=hr do\nb after a @x do")
+            .unwrap()
+            .with_knowledge(&kb)
+            .unwrap();
+        assert_eq!(step_labels(&ready, "b"), list(&["HR"]));
+    }
+
+    #[test]
+    fn save_writes_a_marked_steps_mark_into_its_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path());
+        kb.write("hr", &with_mark("Pay bands", &["HR".into()]), "")
+            .unwrap();
+        let plan = Plan::parse(
+            "a @x context=hr save=notes do\nb after a @x save=more do\nc @x save=plain do",
+        )
+        .unwrap();
+        let done = |output: &str| StepState::Done {
+            peer: "x".into(),
+            output: output.into(),
+            evidence: None,
+            verified: true,
+            patch: None,
+        };
+        let states: BTreeMap<String, StepState> = [
+            ("a".to_owned(), done("Bands are fixed.")),
+            ("b".to_owned(), done("Follow-up.")),
+            ("c".to_owned(), done("Architecture.")),
+        ]
+        .into();
+        assert_eq!(
+            save_knowledge(&kb, &plan, &states, "r1"),
+            ["notes", "more", "plain"]
+        );
+        let hr = Some(vec!["HR".to_owned()]);
+        let notes = kb.read("notes").unwrap();
+        assert_eq!(crate::knowledge::parse_mark(&notes), hr);
+        assert!(notes.contains("Bands are fixed."), "{notes}");
+        assert_eq!(crate::knowledge::parse_mark(&kb.read("more").unwrap()), hr);
+        assert_eq!(
+            crate::knowledge::parse_mark(&kb.read("plain").unwrap()),
+            None,
+            "a step without Microsoft 365 content saves a plain topic"
+        );
+        // So a later step that uses the saved topic is marked too.
+        let later = Plan::parse("d @x context=notes do").unwrap().marked(&kb);
+        assert_eq!(step_labels(&later, "d"), hr);
+    }
+
+    #[test]
+    fn the_plan_check_stops_marked_steps_for_peers_that_may_not_have_them() {
+        use crate::trust::{M365Grant, TrustedPeer};
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        kb.write(
+            "hr",
+            &with_mark("Pay bands", &["HR".into(), "General".into()]),
+            "",
+        )
+        .unwrap();
+        let peer = |name: &str| PeerInfo {
+            name: name.into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: vec![Provider::Copilot],
+            shares: vec![ShareInfo {
+                name: crate::shares::DATA_SHARE.into(),
+                access: Access::ReadOnly,
+                checks: Vec::new(),
+                worktrees: false,
+                mcp: Vec::new(),
+                mcp_about: Default::default(),
+                team: false,
+            }],
+            owner: None,
+            role: None,
+            load: None,
+        };
+        let granted = |labels: &[&str]| {
+            Some(M365Grant {
+                labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+                tools: false,
+            })
+        };
+        let peers = vec![peer("open"), peer("plain"), peer("wide"), peer("helper")];
+        let mut trust = TrustStore::default();
+        let grants = [
+            granted(&["general", "hr"]),
+            None,
+            granted(&["General"]),
+            None,
+        ];
+        for (p, m365) in peers.iter().zip(grants) {
+            trust.allow(TrustedPeer {
+                name: p.name.clone(),
+                id: p.id,
+                addrs: Default::default(),
+                can_delegate: false,
+                tasks_per_hour: 5,
+                access: Access::ReadOnly,
+                shares: vec![crate::shares::DATA_SHARE.into()],
+                m365,
+            });
+        }
+        let id = |name: &str| peers.iter().find(|p| p.name == name).unwrap().id;
+        let recipients = Recipients::new(trust, vec![id("helper")]);
+        let mut squads = SquadStore::default();
+        squads
+            .set("mixed", vec!["open".into(), "wide".into()])
+            .unwrap();
+        squads
+            .set("friends", vec!["open".into(), "helper".into()])
+            .unwrap();
+        let errors = |text: &str| -> Vec<String> {
+            preflight(
+                &Plan::parse(text).unwrap(),
+                &peers,
+                &squads,
+                &kb,
+                &skills,
+                &recipients,
+            )
+            .into_iter()
+            .filter(|p| p.error)
+            .map(|p| p.message)
+            .collect()
+        };
+
+        assert!(
+            errors("a @open context=hr do").is_empty(),
+            "labels match without case"
+        );
+        assert!(
+            errors("a @helper context=hr do").is_empty(),
+            "a digital worker is the owner's"
+        );
+        assert!(errors("a #friends context=hr do").is_empty());
+        assert!(
+            errors("a @plain do").is_empty(),
+            "nothing marked, nothing to refuse"
+        );
+
+        let found = errors("a @plain context=hr do");
+        assert_eq!(found.len(), 1, "{found:?}");
+        for part in [
+            "step 'a'".to_owned(),
+            "plain may not receive".to_owned(),
+            "labels: HR, General".to_owned(),
+            "no Microsoft 365 grant".to_owned(),
+            format!(
+                "proofkin peers allow {} --name plain --m365 HR,General",
+                id("plain")
+            ),
+        ] {
+            assert!(found[0].contains(&part), "{part}: {}", found[0]);
+        }
+
+        let found = errors("a @wide context=hr do");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("grant doesn't include HR"),
+            "{}",
+            found[0]
+        );
+        assert!(found[0].contains("--m365 General,HR"), "{}", found[0]);
+
+        let found = errors("a @helper context=hr do\nb after a @plain do");
+        assert_eq!(found.len(), 1, "after a marked step: {found:?}");
+        assert!(
+            found[0].contains("step 'b'") && found[0].contains("plain"),
+            "{found:?}"
+        );
+        let found = errors("a @helper context=hr do\nb after a approve @plain Approve it");
+        assert_eq!(found.len(), 1, "a person's approval sees it too: {found:?}");
+
+        let found = errors("a #mixed context=hr do");
+        assert_eq!(found.len(), 1, "any member the squad may pick: {found:?}");
+        assert!(found[0].contains("wide may not receive"), "{}", found[0]);
     }
 }

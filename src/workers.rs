@@ -185,6 +185,7 @@ fn finish(
             .max()
             .unwrap_or(Access::ReadOnly),
         shares: granted,
+        m365: None,
     });
     trust.save(&worker.trust_path())?;
     let entry = TrustedPeer {
@@ -195,6 +196,7 @@ fn finish(
         tasks_per_hour: DEFAULT_TASKS_PER_HOUR,
         access: Access::ReadOnly,
         shares: vec![DATA_SHARE.to_owned()],
+        m365: None,
     };
     Ok(Created { worker, id, entry })
 }
@@ -229,6 +231,14 @@ pub fn workers_of(owner: &Profile) -> Result<Vec<Profile>> {
         .collect();
     workers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(workers)
+}
+
+/// The endpoint ids of `owner`'s digital workers.
+pub fn worker_ids(owner: &Profile) -> Result<Vec<EndpointId>> {
+    workers_of(owner)?
+        .iter()
+        .map(|w| Ok(w.identity()?.public()))
+        .collect()
 }
 
 /// The folders `worker` shares besides its data folder.
@@ -601,6 +611,7 @@ mod tests {
             tasks_per_hour: 1,
             access: Access::ReadOnly,
             shares: Vec::new(),
+            m365: None,
         });
         assert!(refused(spec("alice"), &allowlist).contains("already on your allowlist"));
         let copilot = WorkerSpec {

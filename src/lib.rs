@@ -44,4 +44,4 @@ pub use iroh::{EndpointAddr, EndpointId, SecretKey};
 pub use llm::{Access, Executor, ExecutorConfig, LlmTask, Provider, SdkExecutor, TaskContext};
 pub use profile::Profile;
 pub use protocol::Message;
-pub use trust::{Ticket, TrustStore, TrustedPeer};
+pub use trust::{M365Grant, Ticket, TrustStore, TrustedPeer};

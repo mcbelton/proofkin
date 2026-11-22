@@ -141,7 +141,9 @@ Every result goes through one function before it reaches a prompt (`src/workiq/c
 2. Keep only `contentProtection: "allowed"`. Count the rest as withheld, by reason.
 3. Filter by the audience's labels. The owner's own agent and digital workers get every label;
    a peer gets only the labels the owner allowed for it (`unlabeled` is one of the choices).
-   Labels are names each tenant defines, so the rule is an allowlist, not a ranking.
+   Labels are names each tenant defines, so the rule is an allowlist, not a ranking. A
+   result without label information (no `sensitivityLabel`) has an unknown sensitivity, so
+   it goes to no peer; Work IQ marks unlabeled content with an empty one.
 4. Redact secrets (`redact`), cap the size (highest relevance first, 16 000 characters by
    default) and wrap each result in the external-content envelope (`boundary`) with its
    source: title, type, date, label and link.
@@ -160,7 +162,9 @@ local.
 - **Origin**: content from Work IQ is marked, and so is everything made from it: a step that
   got work context or used the gateway, its output, a `@workiq` step's answer, and a
   knowledge topic imported or saved from them (front matter `origin: workiq` and `labels:`).
-  Dependents (`after`) and `context=` inherit the mark.
+  Dependents (`after`) and `context=` inherit the mark. A step's mark is the union of the
+  labels it got (`Step.m365`; the `workiq=` option and `@workiq` steps set the same field);
+  a mark without labels counts as `unlabeled`.
 - **Checked twice**: the plan check fails a step that would send marked content to a peer
   without a grant, or above its labels, naming the step, the peer and the grant to add. The
   runner checks again when it sends each task, and filters by labels then.
@@ -234,8 +238,10 @@ skills and plugins with Work IQ's `discover` and add them through the usual plug
 Every call is a line in `<profile>/workiq-audit.jsonl`: time, tool, purpose (a run's step,
 knowledge import, a gateway task, doctor), audience, the query's SHA-256 and length (not its
 text), outcome class, results and withheld counts, labels, request and correlation ids, and
-duration. Budgets in `profile.json` (`workiq.calls_per_day`, default 200;
-`workiq.calls_per_run`, default 25) stop calls with a clear error. The web UI shows today's
+duration. Budgets in `profile.json` (`workiq_budget.calls_per_day`, default 200;
+`workiq_budget.calls_per_run`, default 25) stop calls with a clear error before they are
+sent, and the call is audited as refused; `proofkin workiq usage` and `proofkin workiq
+budget` show and change them. The web UI shows today's
 use.
 
 ### 10. Diagnostics and the web UI
