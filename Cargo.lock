@@ -3073,13 +3073,17 @@ dependencies = [
  "libc",
  "pulldown-cmark",
  "regex",
+ "reqwest",
  "rpassword",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

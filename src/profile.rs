@@ -156,6 +156,35 @@ pub enum GithubAuth {
     Gh { user: String, host: String },
 }
 
+/// Secret store key of the Work IQ refresh token.
+const WORKIQ_TOKEN: &str = "workiq";
+
+/// How a profile reaches Work IQ.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum WorkIqConnection {
+    /// Proofkin signs in to Entra ID itself, with the organization's own client app.
+    Hosted { tenant: String, client_id: String },
+    /// Microsoft's Work IQ CLI over stdio; it signs in by itself.
+    Cli {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+    },
+}
+
+/// A profile's Work IQ account. Nothing secret: the refresh token is in the secret store
+/// (see [`Profile::workiq_refresh_token`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkIqAccount {
+    pub connection: WorkIqConnection,
+    /// The user's principal name (UPN).
+    pub upn: String,
+    pub display_name: String,
+    pub tenant_id: String,
+    /// When the account was added, in seconds since the Unix epoch.
+    pub added: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +211,12 @@ pub struct ProfileConfig {
     /// For a digital worker: its owner's agent starts it whenever it starts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub start_with_owner: bool,
+    /// Microsoft 365 work context through Work IQ (see docs/work-iq.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workiq: Option<WorkIqAccount>,
+    /// For a digital worker: its owner turned on its use of the owner's Work IQ account.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workiq_from_owner: bool,
 }
 
 /// Held while an agent runs with a profile, so a profile runs in one agent at a
@@ -482,6 +517,61 @@ impl Profile {
         self.secret_delete(INTEGRATION_TOKEN)
     }
 
+    pub fn workiq_login_hint(&self) -> String {
+        format!("proofkin auth login workiq --profile {}", self.name)
+    }
+
+    /// The profile whose Work IQ account this profile uses: itself, or for a digital worker
+    /// its owner, when the owner turned that on for it.
+    pub fn workiq_profile(&self) -> Result<Profile> {
+        let Some(owner) = &self.config.owner else {
+            return Ok(self.clone());
+        };
+        if !self.config.workiq_from_owner {
+            bail!(
+                "digital worker '{}' may not use '{owner}''s Work IQ account; its owner turns that \
+                 on when creating it: proofkin worker create {} --owner {owner} --workiq",
+                self.name,
+                self.name
+            );
+        }
+        self.account_profile()
+    }
+
+    /// The Work IQ account this profile uses (see [`Profile::workiq_profile`]), with the
+    /// profile that holds it and its token.
+    pub fn workiq_account(&self) -> Result<(Profile, WorkIqAccount)> {
+        let holder = self.workiq_profile()?;
+        let account = holder.config.workiq.clone().ok_or_else(|| {
+            anyhow!(
+                "Work IQ is not signed in for profile '{}'; run: {}",
+                holder.name,
+                holder.workiq_login_hint()
+            )
+        })?;
+        Ok((holder, account))
+    }
+
+    /// The Work IQ refresh token of this profile's own account.
+    pub fn workiq_refresh_token(&self) -> Result<String> {
+        self.secret_get(WORKIQ_TOKEN)?.ok_or_else(|| {
+            anyhow!(
+                "the Work IQ token of profile '{}' is missing; run: {}",
+                self.name,
+                self.workiq_login_hint()
+            )
+        })
+    }
+
+    pub fn set_workiq_refresh_token(&self, token: &str) -> Result<()> {
+        self.secret_set(WORKIQ_TOKEN, token)
+            .context("saving the Work IQ token")
+    }
+
+    pub fn delete_workiq_token(&self) -> Result<()> {
+        self.secret_delete(WORKIQ_TOKEN)
+    }
+
     /// Where the running agent's web UI listens (other agents connect there).
     pub fn ui_port_path(&self) -> PathBuf {
         self.dir.join("ui-port")
@@ -668,6 +758,7 @@ impl Profile {
             self.delete_secret(provider)?;
         }
         self.delete_integration_token()?;
+        self.delete_workiq_token()?;
         self.delete_identity()?;
         if self.dir.exists() {
             std::fs::remove_dir_all(&self.dir)

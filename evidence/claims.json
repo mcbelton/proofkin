@@ -971,6 +971,83 @@
         "ui::the_plan_editor_keeps_plans_valid",
         "ui::the_page_follows_the_ux_guidelines"
       ]
+    },
+    {
+      "id": "WIQ-1",
+      "area": "work-iq",
+      "claim": "The Work IQ client speaks MCP over streamable HTTP to a configurable endpoint (default https://workiq.svc.cloud.microsoft/mcp). It sends initialize (protocol 2025-06-18, client info proofkin and its version) and then notifications/initialized, keeps the Mcp-Session-Id and sends it with the MCP-Protocol-Version on later requests, and starts a new session once, sending the request again, when a request with a session gets 404. Every request carries Accept, Content-Type, a bearer token from the TokenSource and a new client-request-id in UUID v4 form. JSON and Server-Sent Events replies are both read (the SSE response is the event answering the request, skipping notifications). tools/list is cached per client and a tool the server doesn't offer is a clear error. The request-id, x-ms-request-id, client-request-id and x-ms-correlation-id of a response are kept with the result and with errors. The messages go through a Transport trait so a stdio transport can reuse the client.",
+      "tests": [
+        "lib::workiq::client::every_request_sends_the_bearer_and_content_headers_with_a_fresh_client_request_id",
+        "lib::workiq::client::initialize_announces_the_protocol_and_client_then_sends_initialized",
+        "lib::workiq::client::the_session_id_is_kept_and_sent_on_later_requests",
+        "lib::workiq::client::a_forgotten_session_is_renewed_and_the_request_sent_again",
+        "lib::workiq::client::a_session_that_is_forgotten_again_fails_after_one_renewal",
+        "lib::workiq::client::json_replies_are_read_as_one_response",
+        "lib::workiq::client::sse_replies_skip_notifications_and_find_the_matching_response",
+        "lib::workiq::client::sse_events_split_on_blank_lines_and_join_data_lines",
+        "lib::workiq::client::tools_list_is_cached_per_client",
+        "lib::workiq::client::a_tool_the_server_does_not_offer_is_a_clear_error",
+        "lib::workiq::client::request_and_correlation_ids_are_kept_with_results_and_errors"
+      ]
+    },
+    {
+      "id": "WIQ-2",
+      "area": "work-iq",
+      "claim": "Work IQ errors are classified and only the safe ones are retried. A WorkIqError has a class (sign in again, consent, denied by policy, billing, throttled with its delay, transient, uncertain change, other tool error), the request and correlation ids and a fix saying what to do and who can do it, and its message is one line: what happened, the fix, the ids. The class comes from the HTTP status (401, 402, 403, 429, 5xx), a WWW-Authenticate invalid_token or insufficient_claims challenge, JSON-RPC errors, tool results with isError, and payloads with stoppedReason error, errorCode, recoveryAction and retryAfterSeconds (under application/vnd.ms-workiq.retrieval and at the top level); AADSTS65001 and consent_required mean consent, AADSTS50105 and AADSTS53003 a denial with the admin's fix, spending policy and billing errors billing. A 401 makes the TokenSource refresh once and the call is sent once more (a failed refresh is reported with its reason). A throttled read waits for Retry-After or retryAfterSeconds when it is at most 60 seconds, at most twice. A transient failure of a read tool (retrieve, ask, fetch, fetch_blob, search_paths, get_schema, list_agents, discover) is retried at most twice with exponential backoff and jitter. Policy denials, consent, billing and every other tool, including the change tools, are never sent again after a failure, and a change that timed out or lost its connection is reported as uncertain. Waiting goes through an injectable Sleeper so tests don't wait.",
+      "tests": [
+        "lib::workiq::client::a_401_refreshes_the_token_once_and_sends_the_call_again",
+        "lib::workiq::client::a_change_rejected_with_401_is_sent_again_after_the_refresh",
+        "lib::workiq::client::a_401_after_the_refresh_is_sign_in_again_and_not_refreshed_twice",
+        "lib::workiq::client::a_failed_refresh_is_reported_with_its_reason",
+        "lib::workiq::client::a_claims_challenge_is_sign_in_again_and_sent_once",
+        "lib::workiq::client::a_policy_denial_is_sent_exactly_once_and_names_the_admin",
+        "lib::workiq::client::aadsts_and_consent_codes_in_error_text_are_classified_and_never_retried",
+        "lib::workiq::client::spending_policy_and_billing_errors_are_billing_and_never_retried",
+        "lib::workiq::client::a_429_with_a_two_second_delay_is_sent_again_after_it",
+        "lib::workiq::client::retry_after_seconds_in_the_payload_is_waited_for_in_both_places",
+        "lib::workiq::client::throttling_is_waited_for_at_most_twice_then_reported",
+        "lib::workiq::client::a_delay_over_60_seconds_or_none_at_all_is_reported_without_waiting",
+        "lib::workiq::client::a_transient_failure_of_a_read_is_retried_with_backoff",
+        "lib::workiq::client::a_read_is_retried_at_most_twice_with_growing_backoff",
+        "lib::workiq::client::a_read_that_timed_out_is_retried",
+        "lib::workiq::client::every_read_tool_is_retried_after_a_transient_failure",
+        "lib::workiq::client::a_change_that_timed_out_is_sent_exactly_once_and_reported_uncertain",
+        "lib::workiq::client::change_tools_are_never_sent_again_after_a_5xx_or_a_throttle",
+        "lib::workiq::client::a_tool_that_reports_an_error_is_a_tool_error_sent_once",
+        "lib::workiq::client::stopped_reason_error_with_a_policy_code_is_a_denial_sent_once",
+        "lib::workiq::client::a_stopped_reason_that_is_not_error_is_not_a_failure",
+        "lib::workiq::client::json_rpc_errors_are_classified_from_their_text_and_sent_once",
+        "lib::workiq::client::an_error_is_one_line_with_what_happened_the_fix_and_the_ids"
+      ]
+    },
+    {
+      "id": "WIQ-3",
+      "area": "work-iq",
+      "claim": "A profile can have a Work IQ account: ProfileConfig.workiq, left out of profile.json when absent, with the connection (hosted with tenant and client id, or the CLI with an optional tenant), the user (UPN, display name, tenant id) and when it was added. Nothing secret is in profile.json: the refresh token is in the profile's secret store under the key workiq. The token source for a hosted account keeps the access token and its expiry in memory only, and refreshes it at the tenant's Entra token endpoint (grant_type refresh_token, client_id, refresh_token and the WorkIQAgent.Ask offline_access openid profile scope) five minutes before it expires. A new refresh token from Entra is saved and used for the next refresh. Callers at the same moment wait for one refresh, which also holds for the client's 401 refresh. invalid_grant and interaction_required are the sign-in-again class with the fix proofkin auth login workiq --profile P. A digital worker uses its owner's Work IQ account only when the owner turned that on for it (workiq_from_owner, set by proofkin worker create --workiq, which needs the owner signed in to Work IQ); otherwise the error says how. proofkin auth status shows the account, and proofkin auth logout workiq removes the account and its token.",
+      "tests": [
+        "workiq_account::a_token_is_refreshed_five_minutes_before_it_expires",
+        "workiq_account::a_rotated_refresh_token_is_saved_and_used_next",
+        "workiq_account::two_callers_at_once_cause_one_refresh",
+        "workiq_account::refresh_replaces_a_token_that_work_iq_rejected",
+        "workiq_account::invalid_grant_and_interaction_required_are_sign_in_again",
+        "workiq_account::a_worker_without_the_grant_is_refused_and_one_with_it_gets_its_owners_token",
+        "workiq_account::profile_json_holds_no_token",
+        "workiq_account::logout_removes_the_account_and_its_token"
+      ]
+    },
+    {
+      "id": "WIQ-4",
+      "area": "work-iq",
+      "claim": "proofkin auth login workiq --tenant T --client-id C [--device-code] --profile P signs a profile in to Work IQ. The browser flow is the authorization code flow with PKCE (S256 over a random verifier, a random state): a loopback listener on 127.0.0.1 with the redirect http://localhost:<port>, the browser opened (through a hook) and the URL printed, the authorize request with response type code, response mode query and the WorkIQAgent.Ask offline_access openid profile scopes and no resource parameter, the state checked (a wrong state is refused and the code is not used), the code exchanged with the verifier, and a page saying the window can be closed. The device code flow with --device-code prints Entra's message and polls the token endpoint at the interval given through authorization_pending and slow_down, and ends on expired_token and authorization_declined. The account (user, name and tenant from the unverified id token) is saved with the refresh token in the secret store, and the sign-in is checked right away with tools/list against Work IQ; if that fails the profile is signed out again. AADSTS65001 and consent_required (with the admin consent URL for the client id and tenant), AADSTS50105, AADSTS700016, AADSTS90002 and AADSTS7000218 are explained in clear words, also when Entra reports them in the browser redirect.",
+      "tests": [
+        "workiq_login::the_browser_flow_signs_in_with_pkce_and_checks_work_iq",
+        "workiq_login::a_sign_in_answer_with_the_wrong_state_is_refused",
+        "workiq_login::the_device_code_flow_waits_through_pending_and_slow_down_then_signs_in",
+        "workiq_login::an_expired_or_declined_device_code_ends_the_sign_in",
+        "workiq_login::entra_errors_become_clear_messages",
+        "workiq_login::an_error_in_the_browser_redirect_is_explained_too",
+        "workiq_login::a_sign_in_work_iq_refuses_is_signed_out_again"
+      ]
     }
   ]
 }

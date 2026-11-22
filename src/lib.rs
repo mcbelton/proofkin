@@ -36,6 +36,7 @@ pub mod tracker;
 pub mod trust;
 pub mod ui;
 pub mod workers;
+pub mod workiq;
 pub mod worktree;
 
 pub use agent::{Agent, AgentConfig, ApprovalInfo, Delivered, Event, Network, PeerInfo};

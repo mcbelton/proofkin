@@ -127,6 +127,12 @@ Errors are classified, and only the safe ones are retried:
 | Transient | 5xx and timeouts on read tools | Backs off with jitter, at most twice |
 | Uncertain change | a change that timed out | Reported as uncertain; never sent again |
 
+Only the read tools (`retrieve`, `ask`, `fetch`, `fetch_blob`, `search_paths`, `get_schema`,
+`list_agents`, `discover`) are sent again after a throttle or a transient failure. A change
+tool, or any tool not in that list, is sent once; the one exception is a 401, which is
+rejected before it runs, so it is sent once more after the token is refreshed. Each error
+has a class, a fix (what to do and who can do it) and the ids, and its message is one line.
+
 ### 3. Content policy
 
 Every result goes through one function before it reaches a prompt (`src/workiq/content.rs`):
