@@ -43,6 +43,7 @@ const APP_CSS: &str = include_str!("../ui/app.css");
 const APP_JS: &str = include_str!("../ui/app.js");
 const TOOLS_JS: &str = include_str!("../ui/tools.js");
 const PLAN_TEXT_JS: &str = include_str!("../ui/plan-text.js");
+const MARKDOWN_JS: &str = include_str!("../ui/markdown.js");
 const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
 const WORKERS_JS: &str = include_str!("../ui/workers.js");
 const CONNECT_JS: &str = include_str!("../ui/connect.js");
@@ -1030,6 +1031,10 @@ pub async fn start_with_work(
         .route(
             "/plan-text.js",
             get(|| async { asset("text/javascript; charset=utf-8", PLAN_TEXT_JS) }),
+        )
+        .route(
+            "/markdown.js",
+            get(|| async { asset("text/javascript; charset=utf-8", MARKDOWN_JS) }),
         )
         .route(
             "/plan-builder.js",

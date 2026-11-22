@@ -441,10 +441,22 @@ impl Plan {
         let mut claims = Vec::new();
         let mut track = None;
         let mut errors = Vec::new();
-        for (n, line) in text.lines().enumerate() {
-            let line = line.trim();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut n = 0;
+        while n < lines.len() {
+            let raw = lines[n];
+            let line = raw.trim();
+            let at = n;
+            n += 1;
             if line.is_empty() || line.starts_with("//") {
                 continue;
+            }
+            let is_step = !line.starts_with("claim:") && !line.starts_with("track:");
+            let mut continuation = String::new();
+            if is_step {
+                let (text, next) = continuation_after(&lines, at);
+                continuation = text;
+                n = next;
             }
             let parsed = if let Some(rest) = line.strip_prefix("claim:") {
                 parse_claim(rest).map(|c| claims.push(c))
@@ -455,10 +467,10 @@ impl Plan {
                     parse_track(rest).map(|t| track = Some(t))
                 }
             } else {
-                parse_step(line).map(|s| steps.push(s))
+                parse_step(line, &continuation).map(|s| steps.push(s))
             };
             if let Err(e) = parsed {
-                errors.push(format!("line {}: {e}", n + 1));
+                errors.push(format!("line {}: {e}", at + 1));
             }
         }
         if !errors.is_empty() {
@@ -1002,7 +1014,47 @@ fn add(list: &mut Vec<String>, value: &str) {
     }
 }
 
-fn parse_step(line: &str) -> Result<Step> {
+/// The lines after the step line `lines[at]` that are indented more than it, with their
+/// common indentation removed and blank lines between them kept, and the index of the
+/// first line after them. A blank line followed by a line not indented more ends the step.
+fn continuation_after(lines: &[&str], at: usize) -> (String, usize) {
+    let indent = |l: &str| l.chars().take_while(|c| c.is_whitespace()).count();
+    let base = indent(lines[at]);
+    let mut end = at + 1;
+    let mut last = at;
+    while end < lines.len() {
+        let l = lines[end];
+        if l.trim().is_empty() {
+            end += 1;
+        } else if indent(l) > base {
+            end += 1;
+            last = end - 1;
+        } else {
+            break;
+        }
+    }
+    if last == at {
+        return (String::new(), at + 1);
+    }
+    let body = &lines[at + 1..=last];
+    let common = body
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| indent(l))
+        .min()
+        .unwrap_or(0);
+    let text = body
+        .iter()
+        .map(|l| {
+            let l = l.trim_end();
+            l.char_indices().nth(common).map_or("", |(i, _)| &l[i..])
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (text, last + 1)
+}
+
+fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     let mut words = line.split_whitespace().peekable();
     let id = words.next().context("missing step id")?.to_owned();
     if validate_name(&id).is_err() {
@@ -1146,7 +1198,15 @@ fn parse_step(line: &str) -> Result<Step> {
             _ => break,
         }
     }
-    let prompt = words.collect::<Vec<_>>().join(" ");
+    let mut prompt = words.collect::<Vec<_>>().join(" ");
+    if !continuation.is_empty() {
+        let lead = continuation.trim_start_matches('\n');
+        prompt = if prompt.is_empty() {
+            lead.to_owned()
+        } else {
+            format!("{prompt}\n{continuation}")
+        };
+    }
     if prompt.is_empty() {
         bail!("missing the task prompt: what to do comes last, after who runs it and the options");
     }
@@ -3067,6 +3127,58 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("step 'a'")
+        );
+    }
+
+    #[test]
+    fn indented_lines_after_a_step_continue_its_task_text() {
+        let text = |plan: &str| Plan::parse(plan).unwrap().steps[0].prompt.clone();
+        assert_eq!(
+            text("a @x Do these:\n  - one\n  - two\nb @x Next"),
+            "Do these:\n- one\n- two"
+        );
+        assert_eq!(
+            text("a @x Intro\n  first\n\n  second\n\nb @x Next"),
+            "Intro\nfirst\n\nsecond"
+        );
+        assert_eq!(
+            text("a @x Plan:\n    - top\n      - nested\n    - more"),
+            "Plan:\n- top\n  - nested\n- more"
+        );
+        let plan = Plan::parse("a @x One\n  more\nb @x Two").unwrap();
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[1].prompt, "Two");
+        assert_eq!(
+            text("a @x\n  Starts here\n  - and a list"),
+            "Starts here\n- and a list"
+        );
+    }
+
+    #[test]
+    fn plans_indented_uniformly_parse_as_before() {
+        let plan = Plan::parse("  a @x One\n  b after a @x Two\n  // note\n").unwrap();
+        let tasks: Vec<_> = plan.steps.iter().map(|s| s.prompt.as_str()).collect();
+        assert_eq!(tasks, ["One", "Two"]);
+    }
+
+    #[test]
+    fn option_looking_words_in_continuation_lines_are_text() {
+        let plan = Plan::parse("a @x Run it\n  verify=test using claude").unwrap();
+        let step = &plan.steps[0];
+        assert!(step.checks.is_empty());
+        assert_eq!(step.provider, Provider::Copilot);
+        assert_eq!(step.prompt, "Run it\nverify=test using claude");
+    }
+
+    #[test]
+    fn a_step_error_names_its_first_line() {
+        let err = Plan::parse("ok @x Fine\nbad nobody text\n  more\n  lines").unwrap_err();
+        let err = err.to_string();
+        assert!(err.starts_with("line 2: who runs it"), "{err}");
+        let err = Plan::parse("a @x Fine\n\nb @x attempts=x\n  more").unwrap_err();
+        assert!(
+            err.to_string().contains("line 3: attempts must be"),
+            "{err}"
         );
     }
 

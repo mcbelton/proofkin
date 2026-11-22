@@ -2120,6 +2120,7 @@ async fn the_page_follows_the_ux_guidelines() {
     let page = request(port, "GET", "/", &host, None, None).await.body;
     assert!(page.contains(r#"<meta name="theme-color""#));
     assert!(page.contains(r#"<script src="/tools.js" defer>"#));
+    assert!(page.contains(r#"<script src="/markdown.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     assert!(page.contains(r#"<script src="/workers.js" defer>"#));
@@ -2178,6 +2179,7 @@ async fn the_page_follows_the_ux_guidelines() {
     let mut declarations = std::collections::HashMap::new();
     for script in [
         "/app.js",
+        "/markdown.js",
         "/tools.js",
         "/plan-text.js",
         "/plan-builder.js",
@@ -2252,6 +2254,24 @@ fn the_plan_editor_keeps_plans_valid() {
         .arg(&cases)
         .output()
         .expect("node must be installed to run the plan editor's tests");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("ok: "), "{stdout}");
+}
+
+/// Task and step text shows as Markdown: backticks become code, lists and blank-line
+/// paragraphs become list items and paragraphs, and markup in the text stays text. The
+/// cases (tests/markdown.test.cjs) run in node, which loads ui/markdown.js as the page does.
+#[test]
+fn task_text_shows_as_markdown_and_markup_stays_text() {
+    let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/markdown.test.cjs");
+    let out = std::process::Command::new("node")
+        .arg(&cases)
+        .output()
+        .expect("node must be installed to run the Markdown tests");
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
