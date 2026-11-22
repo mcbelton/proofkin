@@ -615,6 +615,39 @@ fn is_option(word: &str) -> bool {
         .is_some_and(|(key, value)| !value.is_empty() && STEP_OPTIONS.contains(&key))
 }
 
+/// `text` without its backtick code spans (one or more backticks, closed by a run of the
+/// same length; an unclosed one quotes to the end), each replaced by a space.
+fn without_code_spans(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let open = chars[i..].iter().take_while(|&&c| c == '`').count();
+        let mut j = i + open;
+        let mut end = chars.len();
+        while j < chars.len() {
+            if chars[j] == '`' {
+                let run = chars[j..].iter().take_while(|&&c| c == '`').count();
+                if run == open {
+                    end = j + run;
+                    break;
+                }
+                j += run;
+            } else {
+                j += 1;
+            }
+        }
+        out.push(' ');
+        i = end;
+    }
+    out
+}
+
 /// Adds an option's comma-separated values to `list`: repeating an option adds to it.
 fn add(list: &mut Vec<String>, value: &str) {
     for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
@@ -1175,12 +1208,13 @@ pub fn preflight(
                 own.clone()
             }
         };
-        if let Some(word) = step.prompt.split_whitespace().find(|w| is_option(w)) {
+        let prose = without_code_spans(&step.prompt);
+        if let Some(word) = prose.split_whitespace().find(|w| is_option(w)) {
             report(
                 Some(step),
                 false,
                 format!(
-                    "{word} is in the task text, so it isn't used as an option: options go before what to do"
+                    "{word} is in the task text, so it isn't used as an option: options go before what to do; put it in backticks if it is an example"
                 ),
             );
         }
@@ -2247,6 +2281,31 @@ mod tests {
     }
 
     #[test]
+    fn words_in_backticks_are_examples_not_misplaced_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let squads = SquadStore::default();
+        let warned = |task: &str| -> Vec<String> {
+            let plan = Plan::parse(&format!("a @alice:app {task}")).unwrap();
+            preflight(&plan, &[], &squads, &kb, &skills)
+                .into_iter()
+                .map(|p| p.message)
+                .filter(|m| m.contains("task text"))
+                .collect()
+        };
+        assert!(warned("Explain `skill=adr` to the model").is_empty());
+        assert!(warned("Explain ``a skill=adr b`` to the model").is_empty());
+        assert!(warned("Explain `unclosed skill=adr").is_empty());
+        assert_eq!(
+            warned("Explain `skill=adr` and verify=test"),
+            [
+                "verify=test is in the task text, so it isn't used as an option: options go before what to do; put it in backticks if it is an example"
+            ]
+        );
+    }
+
+    #[test]
     fn preflight_finds_what_would_fail_before_anything_runs() {
         let dir = tempfile::tempdir().unwrap();
         let kb = KnowledgeBase::new(dir.path().join("kb"));
@@ -2466,7 +2525,7 @@ mod tests {
         assert_eq!(
             late,
             [
-                "W a: skill=implement-change is in the task text, so it isn't used as an option: options go before what to do"
+                "W a: skill=implement-change is in the task text, so it isn't used as an option: options go before what to do; put it in backticks if it is an example"
             ]
         );
         assert!(check("a @alice:app Set the=value and verify the result").is_empty());

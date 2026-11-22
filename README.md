@@ -726,7 +726,8 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
 
 A step line is `name [after steps] [team] @peer[:folder] or #squad [options] what to do`: options
-go before the task text (the plan check warns about one typed after it). Repeating an
+go before the task text (the plan check warns about one typed after it, but not text in
+backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
 `skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels` and `timeout` are given once.
 
@@ -1775,7 +1776,10 @@ to the claims and writes a report:
 ```
 
 It fails when a gate fails, any claim has missing or failing evidence, or a test or live
-check proves no claim. Every claim needs evidence, and every test must prove a claim. CI
+check proves no claim. Every claim needs evidence, and every test must prove a claim. When
+`cargo test` fails, the output also lists each failed test as `TEST FAILED` with its id and
+the first 30 lines of its output (if the tests didn't build, the last 40 lines of the test
+log), and `report.json` (`failed_tests`) and `report.md` list them too. CI
 runs it on every push, publishes the report in the run summary and keeps it as the
 `evidence-report` artifact.
 

@@ -66,10 +66,41 @@ def parse_tests(output):
             continue
         test = re.match(r"^test (\S+) \.\.\. (ok|FAILED|ignored)\b", line)
         if test:
-            name = test.group(1).replace("::tests::", "::")
-            name = name[len("tests::"):] if name.startswith("tests::") else name
-            results[f"{target}::{name}"] = test.group(2)
+            results[f"{target}::{short_name(test.group(1))}"] = test.group(2)
     return results
+
+
+def short_name(name):
+    """A test name as cargo prints it, without the `tests` module."""
+    name = name.replace("::tests::", "::")
+    return name[len("tests::"):] if name.startswith("tests::") else name
+
+
+def failed_output(output):
+    """{test id: its lines of `cargo test` output} for each failed test.
+
+    A section runs from the `---- name stdout ----` line to the next such line, the
+    `failures:` list or the next test target.
+    """
+    sections, target, current = {}, "?", None
+    for line in output.splitlines():
+        running = re.match(r"^\s*Running (?:unittests )?(\S+)", line)
+        if running:
+            target, current = target_of(running.group(1)), None
+            continue
+        if re.match(r"^\s*Doc-tests ", line):
+            target, current = "doc", None
+            continue
+        header = re.match(r"^---- (\S+) stdout ----$", line)
+        if header:
+            current = sections.setdefault(f"{target}::{short_name(header.group(1))}", [])
+            current.append(line)
+            continue
+        if re.match(r"^failures:\s*$", line):
+            current = None
+        if current is not None:
+            current.append(line)
+    return sections
 
 
 def applies(evidence):
@@ -116,6 +147,9 @@ def main():
     tests_ok, test_out = run("test", ["cargo", "test", "--locked", "--no-fail-fast", "--color", "never"])
     gates.append(("tests", tests_ok))
     tests = parse_tests(test_out)
+    sections = failed_output(test_out)
+    failed_tests = [{"id": t, "output": sections.get(t, [])}
+                    for t in dict.fromkeys([*sections, *(t for t, s in tests.items() if s == "FAILED")])]
 
     live = None
     if args.live:
@@ -180,7 +214,7 @@ def main():
         "live_passed": sum(bool(v) for v in (live or {}).values()),
     }
     report = {"meta": meta, "gates": [{"gate": g, "ok": o} for g, o in gates], "claims": report_claims,
-              "orphan_tests": orphan_tests, "orphan_live_checks": orphan_live}
+              "orphan_tests": orphan_tests, "orphan_live_checks": orphan_live, "failed_tests": failed_tests}
     with open(os.path.join(OUT, "report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1)
     with open(os.path.join(OUT, "report.md"), "w", encoding="utf-8") as f:
@@ -189,6 +223,14 @@ def main():
     print()
     for claim in report_claims:
         print(f"  {claim['status']:<22} {claim['id']:<7} {claim['claim'][:90]}")
+    for failed in failed_tests:
+        print(f"  TEST FAILED            {failed['id']}")
+        for line in failed["output"][:30]:
+            print(f"    {line}")
+    if not tests_ok and not failed_tests:
+        print("  TEST FAILED            cargo test did not run its tests; end of its log:")
+        for line in test_out.splitlines()[-40:]:
+            print(f"    {line}")
     for name in orphan_tests:
         print(f"  ORPHAN TEST            {name} (add it to a claim in evidence/claims.json)")
     for name in orphan_live:
@@ -226,6 +268,10 @@ def render_markdown(report):
         lines += [f"### {claim['id']}: {claim['claim']}", ""]
         lines += [f"- {e['kind']} `{e['id']}`: {e['status']}" for e in claim["evidence"]]
         lines.append("")
+    if report.get("failed_tests"):
+        lines += ["## Failed tests", ""]
+        for failed in report["failed_tests"]:
+            lines += [f"### `{failed['id']}`", "", "```", *failed["output"][:30], "```", ""]
     if report["orphan_tests"] or report["orphan_live_checks"]:
         lines += ["## Evidence not tied to a claim", ""]
         lines += [f"- test `{t}`" for t in report["orphan_tests"]]
