@@ -1,6 +1,7 @@
 //! Which models an agent's providers run (see `proofkin models`): per provider, the
-//! profile's default model, used when a task names none, and the models tasks may
-//! ask for. Peers learn them from the agent's hello, so they can offer them.
+//! profile's default model, used when a task names none, the models tasks may ask for,
+//! and the reasoning effort tasks work at unless they ask for another. Peers learn them
+//! from the agent's hello, so they can offer them.
 
 use std::collections::BTreeMap;
 
@@ -8,6 +9,10 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::Provider;
+
+/// Reasoning efforts, least to most: what Copilot, the Claude Agent SDK and Codex call
+/// them. A model takes the ones it supports (see [`fit_effort`]).
+pub const EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// A provider's models, as the profile's owner set them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +24,10 @@ pub struct ModelChoice {
     /// The models tasks may ask for; empty: any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed: Vec<String>,
+    /// The reasoning effort tasks that ask for none work at (one of [`EFFORTS`]; none:
+    /// the model's own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// Every provider's models, as kept in `profile.json` and sent to peers.
@@ -26,7 +35,7 @@ pub type Models = BTreeMap<Provider, ModelChoice>;
 
 impl ModelChoice {
     pub fn is_empty(&self) -> bool {
-        self.default.is_none() && self.allowed.is_empty()
+        self.default.is_none() && self.allowed.is_empty() && self.effort.is_none()
     }
 
     /// Whether a task may ask for `model` (names compare without case).
@@ -50,6 +59,69 @@ impl ModelChoice {
                 .clone()
                 .or_else(|| self.allowed.first().cloned())),
         }
+    }
+
+    /// The reasoning effort a task that asked for `asked` works at: the one it asked
+    /// for, else the default; `None` leaves it to the model.
+    pub fn pick_effort(&self, asked: Option<&str>) -> Result<Option<String>> {
+        match asked.map(str::trim).filter(|e| !e.is_empty()) {
+            Some(effort) => {
+                check_effort(effort)?;
+                Ok(Some(effort.to_ascii_lowercase()))
+            }
+            None => Ok(self.effort.clone()),
+        }
+    }
+}
+
+/// Checks a reasoning effort's name: one of [`EFFORTS`] (in any case).
+pub fn check_effort(effort: &str) -> Result<()> {
+    if !EFFORTS
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(effort.trim()))
+    {
+        bail!(
+            "{effort:?} isn't a reasoning effort: use one of {}",
+            EFFORTS.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Where `effort` stands among [`EFFORTS`] (none for a name that isn't one).
+fn effort_rank(effort: &str) -> Option<usize> {
+    EFFORTS.iter().position(|e| e.eq_ignore_ascii_case(effort))
+}
+
+/// `effort` as a model that supports only `supported` takes it: itself if supported,
+/// else the most it supports below it, else the least it supports; `None` when it
+/// supports none (it doesn't reason, or doesn't let it be set).
+pub fn fit_effort(effort: &str, supported: &[String]) -> Option<String> {
+    if supported.iter().any(|s| s.eq_ignore_ascii_case(effort)) {
+        return Some(effort.to_ascii_lowercase());
+    }
+    let want = effort_rank(effort)?;
+    let mut known: Vec<(usize, &String)> = supported
+        .iter()
+        .filter_map(|s| effort_rank(s).map(|rank| (rank, s)))
+        .collect();
+    known.sort();
+    known
+        .iter()
+        .rev()
+        .find(|(rank, _)| *rank <= want)
+        .or(known.first())
+        .map(|(_, s)| s.to_ascii_lowercase())
+}
+
+/// What a result names as the model that did the work: the model and the reasoning
+/// effort it worked at, e.g. `claude-opus-5.5 (max reasoning)`. Only characters model
+/// names use, so every version of Proofkin shows it as it is.
+pub fn with_effort(model: Option<String>, effort: Option<&str>) -> Option<String> {
+    match (model, effort.map(str::trim).filter(|e| !e.is_empty())) {
+        (Some(model), Some(effort)) => Some(format!("{model} ({effort} reasoning)")),
+        (None, Some(effort)) => Some(format!("{effort} reasoning")),
+        (model, None) => model,
     }
 }
 
@@ -114,6 +186,21 @@ pub fn set_allowed(models: &mut Models, provider: Provider, allowed: &[String]) 
     Ok(())
 }
 
+/// Sets the reasoning effort `provider`'s tasks work at unless they ask for another
+/// (`None`: the model's own).
+pub fn set_effort(models: &mut Models, provider: Provider, effort: Option<&str>) -> Result<()> {
+    let mut choice = choice(models, provider);
+    choice.effort = match effort.map(str::trim) {
+        Some(effort) => {
+            check_effort(effort)?;
+            Some(effort.to_ascii_lowercase())
+        }
+        None => None,
+    };
+    store(models, provider, choice);
+    Ok(())
+}
+
 fn store(models: &mut Models, provider: Provider, choice: ModelChoice) {
     if choice.is_empty() {
         models.remove(&provider);
@@ -136,6 +223,11 @@ pub struct Offered {
     /// Its policy state when it isn't simply enabled (e.g. `disabled`, `unconfigured`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
+    /// The reasoning efforts it supports (none: it doesn't let them be set), and its own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
 }
 
 impl Offered {
@@ -159,6 +251,21 @@ impl Offered {
                 .and_then(|p| p.get("state"))
                 .and_then(text)
                 .filter(|s| s != "enabled"),
+            efforts: model
+                .get("supportedReasoningEfforts")
+                .and_then(serde_json::Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(text)
+                        .filter(|e| e.len() <= 20 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                        .take(20)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            default_effort: model
+                .get("defaultReasoningEffort")
+                .and_then(text)
+                .filter(|e| e.len() <= 20 && e.chars().all(|c| c.is_ascii_alphanumeric())),
             id,
         })
     }
@@ -204,7 +311,7 @@ mod tests {
             models[&Provider::Copilot],
             ModelChoice {
                 default: Some("gpt-5.5".into()),
-                allowed: Vec::new()
+                ..Default::default()
             }
         );
         // Unset, the provider leaves profile.json.
@@ -215,6 +322,52 @@ mod tests {
     }
 
     #[test]
+    fn a_task_works_at_the_effort_it_asks_for_else_the_default_fitted_to_its_model() {
+        let mut models = Models::new();
+        set_effort(&mut models, Provider::Copilot, Some("MAX")).unwrap();
+        let choice = choice(&models, Provider::Copilot);
+        assert_eq!(choice.effort.as_deref(), Some("max"));
+        assert_eq!(choice.pick_effort(None).unwrap().as_deref(), Some("max"));
+        assert_eq!(
+            choice.pick_effort(Some(" Low ")).unwrap().as_deref(),
+            Some("low")
+        );
+        let err = choice.pick_effort(Some("turbo")).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "\"turbo\" isn't a reasoning effort: use one of minimal, low, medium, high, xhigh, max"
+        );
+        assert!(set_effort(&mut models, Provider::Copilot, Some("turbo")).is_err());
+        assert_eq!(ModelChoice::default().pick_effort(None).unwrap(), None);
+        // A model takes what it supports: the asked effort, else the most below it, else
+        // its least; none if it supports none.
+        let three = ["low".to_owned(), "medium".into(), "high".into()];
+        assert_eq!(fit_effort("medium", &three).as_deref(), Some("medium"));
+        assert_eq!(fit_effort("max", &three).as_deref(), Some("high"));
+        assert_eq!(fit_effort("minimal", &three).as_deref(), Some("low"));
+        assert_eq!(
+            fit_effort("max", &["xhigh".to_owned(), "odd".into()]).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(fit_effort("high", &[]), None);
+        // A result names the effort with the model, in characters every version shows.
+        assert_eq!(
+            with_effort(Some("claude-opus-5.5".into()), Some("max")).as_deref(),
+            Some("claude-opus-5.5 (max reasoning)")
+        );
+        let shown = with_effort(Some("claude-opus-5.5".into()), Some("max")).unwrap();
+        assert_eq!(crate::llm::clean_model(&shown), shown);
+        assert_eq!(
+            with_effort(None, Some("low")).as_deref(),
+            Some("low reasoning")
+        );
+        assert_eq!(with_effort(Some("m".into()), None).as_deref(), Some("m"));
+        // Unset, the provider leaves profile.json.
+        set_effort(&mut models, Provider::Copilot, None).unwrap();
+        assert!(models.is_empty());
+    }
+
+    #[test]
     fn a_task_runs_on_the_model_it_asks_for_if_allowed_else_the_default() {
         let any = ModelChoice::default();
         assert_eq!(any.pick(None).unwrap(), None, "the provider's own default");
@@ -222,6 +375,7 @@ mod tests {
         let some = ModelChoice {
             default: None,
             allowed: vec!["claude-sonnet-5.5".into(), "gpt-5.5".into()],
+            effort: None,
         };
         // The provider's own default may not be allowed: the first allowed one is used.
         assert_eq!(
@@ -274,12 +428,16 @@ mod tests {
         let model = serde_json::json!({
             "id": "claude-sonnet-5.5", "name": "Claude Sonnet 5.5", "vendor": "Anthropic",
             "billing": { "multiplier": 1.0 }, "policy": { "state": "enabled" },
-            "capabilities": {}
+            "capabilities": {},
+            "supportedReasoningEfforts": ["low", "medium", "high", "not valid!"],
+            "defaultReasoningEffort": "medium"
         });
         let offered = Offered::from_json(&model).unwrap();
         assert_eq!(offered.id, "claude-sonnet-5.5");
         assert_eq!(offered.multiplier, Some(1.0));
         assert_eq!(offered.policy, None);
+        assert_eq!(offered.efforts, ["low", "medium", "high"]);
+        assert_eq!(offered.default_effort.as_deref(), Some("medium"));
         let bare = Offered::from_json(
             &serde_json::json!({ "id": "o9", "policy": { "state": "disabled" } }),
         )

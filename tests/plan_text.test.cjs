@@ -193,6 +193,13 @@ cases.push(
   ["no model on @workiq", part("a @workiq Do| it", "model=gpt-5.5"), `error: ${ERRORS.workiqOption}`],
   ["a step's model comes back as it was", text(planText.parsePlan("a @x using claude model=claude-opus-5.5 Do it")),
     "a @x using claude model=claude-opus-5.5 Do it"],
+  // effort= says how hard the model reasons, with the same limits as model=.
+  ["a step's effort", part("a @x model=gpt-5.5 Do| it", "effort=max"), "a @x model=gpt-5.5 effort=max Do it[]"],
+  ["a step's effort replaces its effort", part("a @x effort=low Do| it", "effort=max"), "a @x effort=max Do it[]"],
+  ["no effort on a sign-off", part("ok approve @me Approve| it", "effort=max"), `error: ${ERRORS.signoffOption}`],
+  ["no effort on a team step", part("build team @alice:app Build| it", "effort=max"), `error: ${ERRORS.teamOption}`],
+  ["a step's effort comes back as it was", text(planText.parsePlan("a @x model=claude-opus-5.5 effort=max Do it")),
+    "a @x model=claude-opus-5.5 effort=max Do it"],
   // How the run is tracked on GitHub: one track: line, kept as written; issue= is a step's.
   ["a tracked plan comes back as it was", text(planText.parsePlan("// The feature\ntrack: #12\nclaim: C-1 x\na @x issue=#15 Do it")),
     "// The feature\ntrack: #12\n\nclaim: C-1 x\n\na @x issue=#15 Do it"],
@@ -221,6 +228,18 @@ cases.push(
     planText.setTask(plan.steps[0], "One\n- two\n\n  - three");
     return text(plan);
   })(), "a @x One\n  - two\n\n    - three"],
+  // How a run is tracked: read from its track: line, and set by the choice beside Run plan.
+  ["no track: line is a new issue", JSON.stringify(planText.trackOf("a @x Do it")), JSON.stringify({ kind: "new", title: "" })],
+  ["track: #12 and 12 work on issue 12", JSON.stringify([planText.trackOf("track: #12\na @x Do it"), planText.trackOf("track: 12")]),
+    JSON.stringify([{ kind: "issue", number: 12 }, { kind: "issue", number: 12 }])],
+  ["track: OFF leaves it untracked", planText.trackOf("a @x Do it\ntrack: OFF").kind, "off"],
+  ["track: a title is a new issue with it", JSON.stringify(planText.trackOf("track: Ship it\na @x Do it")),
+    JSON.stringify({ kind: "new", title: "Ship it" })],
+  ["a track: line in a step's text isn't the plan's", planText.trackOf("a @x Do it\n  track: off").kind, "new"],
+  ["setting it adds the line first", planText.setTrack("a @x Do it", "off"), "track: off\na @x Do it"],
+  ["setting it again replaces the line", planText.setTrack("// c\ntrack: off\na @x Do it", "#4"), "// c\ntrack: #4\na @x Do it"],
+  ["no value takes it out", planText.setTrack("track: #4\na @x Do it", null), "a @x Do it"],
+  ["no value takes out a last line too", planText.setTrack("a @x Do it\ntrack: off", null), "a @x Do it"],
 );
 
 const failed = cases.filter(([, got, want]) => got !== want);

@@ -180,9 +180,21 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
     let mut config = AgentConfig::new("boss", SecretKey::generate());
     config.network = Network::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.shares = ShareStore::with_data(home.path().join("data"));
     let (agent, events) = Agent::bind(config).await.unwrap();
+    // The models it sets are what its digital workers run; the page selects them.
+    let mut profile = Profile::open_in(home.path(), "boss").unwrap();
+    proofkin::models::set_default(
+        &mut profile.config.models,
+        Provider::Copilot,
+        Some("claude-opus-5.5"),
+    )
+    .unwrap();
+    proofkin::models::set_effort(&mut profile.config.models, Provider::Copilot, Some("max"))
+        .unwrap();
+    profile.save().unwrap();
     let info = UiInfo {
-        profile: Profile::open_in(home.path(), "boss").unwrap(),
+        profile,
         network: Network::Local,
         serving: false,
         access: Access::ReadOnly,
@@ -249,6 +261,13 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
     stranger.shutdown().await;
 
     let chat = format!(r#"{{"ticket":"{peer}","name":"pal"}}"#);
+    let me = request(port, "GET", "/api/state", &host, Some(token), None)
+        .await
+        .json();
+    assert_eq!(
+        me["me"]["models"]["copilot"],
+        serde_json::json!({ "default": "claude-opus-5.5", "effort": "max" })
+    );
     let added = request(port, "POST", "/api/trust", &host, Some(token), Some(&chat)).await;
     assert_eq!(added.status, 200, "{}", added.body);
     assert!(agent.trusted().get(&peer).is_some_and(|p| !p.can_delegate));
@@ -270,6 +289,61 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
         "{}",
         refused.body
     );
+
+    // Change… lets pal delegate without removing it: its name stays, and it is saved.
+    let put = |id: String, body: &'static str| {
+        let (host, token) = (host.clone(), token.to_owned());
+        async move {
+            let path = format!("/api/trust/{id}");
+            request(port, "PUT", &path, &host, Some(&token), Some(body)).await
+        }
+    };
+    let grant =
+        r#"{"delegate":true,"tasks_per_hour":5,"access":"workspace-write","shares":["data"]}"#;
+    let changed = put(peer.to_string(), grant).await;
+    assert_eq!(changed.status, 200, "{}", changed.body);
+    let pal = agent.trusted().get(&peer).cloned().unwrap();
+    assert_eq!(
+        (
+            pal.name.as_str(),
+            pal.can_delegate,
+            pal.tasks_per_hour,
+            pal.access,
+            pal.shares.as_slice()
+        ),
+        (
+            "pal",
+            true,
+            5,
+            Access::WorkspaceWrite,
+            ["data".to_owned()].as_slice()
+        )
+    );
+    let saved = Profile::open_in(home.path(), "boss")
+        .unwrap()
+        .trust()
+        .unwrap();
+    assert!(
+        saved
+            .get(&peer)
+            .is_some_and(|p| p.can_delegate && p.tasks_per_hour == 5)
+    );
+    // Back to chat only; a folder this agent doesn't share, or a peer that isn't on the
+    // allowlist, is refused.
+    assert_eq!(
+        put(peer.to_string(), r#"{"delegate":false}"#).await.status,
+        200
+    );
+    assert!(
+        agent
+            .trusted()
+            .get(&peer)
+            .is_some_and(|p| !p.can_delegate && p.access == Access::ReadOnly)
+    );
+    let bad = put(peer.to_string(), r#"{"delegate":true,"shares":["nope"]}"#).await;
+    assert_eq!(bad.status, 400, "{}", bad.body);
+    let unknown = SecretKey::generate().public().to_string();
+    assert_eq!(put(unknown, r#"{"delegate":false}"#).await.status, 404);
 
     agent.shutdown().await;
 }
@@ -504,6 +578,151 @@ async fn tasks_outlive_a_restart_and_finished_ones_can_be_cleared() {
     agent.shutdown().await;
 }
 
+/// A task on its own can go to a squad (`#name`): its least busy member that can run
+/// it, as a plan step would; it moves on to another member when that one refuses it,
+/// and its card names the squad and the member that ran it.
+#[tokio::test]
+async fn ui_gives_tasks_to_a_squad_member_and_moves_them_when_one_refuses() {
+    let home = tempfile::tempdir().unwrap();
+    let boss_key = SecretKey::generate();
+    let grant = |name: &str, id: iroh::EndpointId, delegate: bool, per_hour: u32| TrustedPeer {
+        name: name.into(),
+        id,
+        addrs: Default::default(),
+        can_delegate: delegate,
+        tasks_per_hour: per_hour,
+        access: Access::ReadOnly,
+        shares: vec!["data".into()],
+        m365: None,
+    };
+    let mut config = AgentConfig::new("boss", boss_key.clone());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let mut members = Vec::new();
+    // m1 lets the boss delegate 0 tasks an hour, so it refuses them; m2 takes them.
+    for (name, per_hour) in [("m1", 0), ("m2", 100)] {
+        let key = SecretKey::generate();
+        let mut member = AgentConfig::new(name, key.clone());
+        member.network = Network::Local;
+        member.bind = Some("127.0.0.1:0".parse().unwrap());
+        member
+            .trust
+            .allow(grant("boss", boss_key.public(), true, per_hour));
+        member.executor = Some(Arc::new(Echo));
+        member.shares = ShareStore::with_data(home.path().join(name));
+        config.trust.allow(grant(name, key.public(), false, 100));
+        members.push(Agent::bind(member).await.unwrap());
+    }
+    let (boss, events) = Agent::bind(config).await.unwrap();
+    for (member, _) in &members {
+        boss.connect(member.addr()).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while boss.peers().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(home.path(), "boss").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        boss.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let post = |path: &'static str, body: &'static str| {
+        let host = host.clone();
+        let token = token.to_owned();
+        async move { request(port, "POST", path, &host, Some(&token), Some(body)).await }
+    };
+    let made = post("/api/squads", r#"{"name":"devs","members":["m1","m2"]}"#).await;
+    assert_eq!(made.status, 200, "{}", made.body);
+
+    let started = post(
+        "/api/tasks",
+        r##"{"provider":"copilot","target":"#devs","prompt":"count the files"}"##,
+    )
+    .await;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let started = started.json();
+    assert_eq!(
+        (&started["target"], &started["squad"]),
+        (&Value::from("m1"), &Value::from("devs")),
+        "both are idle: the tie goes by name"
+    );
+    let task = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            let task = state["tasks"][0].clone();
+            if task["status"] != "running" {
+                return task;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the task finishes");
+    assert_eq!(task["status"], "done", "{task}");
+    assert_eq!(task["target"], "m2", "m1 refused it, so it moved: {task}");
+    assert_eq!(task["squad"], "devs");
+    assert!(
+        task["output"]
+            .as_str()
+            .unwrap()
+            .contains("echo: count the files"),
+        "{task}"
+    );
+
+    // A squad that doesn't exist, or that nobody in it can run the task for, is refused.
+    let unknown = post(
+        "/api/tasks",
+        r##"{"provider":"copilot","target":"#ops","prompt":"x"}"##,
+    )
+    .await;
+    assert_eq!(unknown.status, 400);
+    assert!(
+        unknown.body.contains("no squad named ops"),
+        "{}",
+        unknown.body
+    );
+    let claude = post(
+        "/api/tasks",
+        r##"{"provider":"claude","target":"#devs","prompt":"x"}"##,
+    )
+    .await;
+    assert_eq!(claude.status, 400);
+    assert!(
+        claude
+            .body
+            .contains("no online member of squad devs can run it"),
+        "{}",
+        claude.body
+    );
+    boss.shutdown().await;
+    for (member, _) in members {
+        member.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn ui_runs_plans_and_shows_squads() {
     let home = tempfile::tempdir().unwrap();
@@ -623,7 +842,7 @@ async fn ui_runs_plans_and_shows_squads() {
     let sum = step("sum")["output"].as_str().unwrap().to_owned();
     assert!(
         sum.contains(
-            "### Step find (done by worker)\n<external_content source=\"step:find peer:worker\">\necho: find the facts\n</external_content>"
+            "### Step find (done by worker)\n<external_content source=\"step:find peer:worker\">\nIts task:\nfind the facts\n\nIts result:\necho: find the facts\n</external_content>"
         ),
         "{sum}"
     );
@@ -1149,6 +1368,20 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     assert_eq!(
         ops["runs"]["total"], 1,
         "only the last 24 hours' runs: {}",
+        ops["runs"]
+    );
+    assert_eq!(
+        (
+            &ops["runs"]["passed"],
+            &ops["runs"]["failed"],
+            &ops["runs"]["unclaimed"]
+        ),
+        (
+            &serde_json::json!(0),
+            &serde_json::json!(0),
+            &serde_json::json!(1)
+        ),
+        "a run without claims neither passed nor failed: {}",
         ops["runs"]
     );
     assert_eq!(ops["knowledge"][0]["name"], "architecture");

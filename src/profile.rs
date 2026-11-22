@@ -313,14 +313,19 @@ pub fn profiles_root() -> Result<PathBuf> {
     Ok(data_root()?.join("profiles"))
 }
 
-pub fn validate_name(name: &str) -> Result<()> {
-    let ok = !name.is_empty()
+/// Whether `name` can name a profile, peer or squad: letters, digits, '-', '_' and '.',
+/// at most 64 characters, not starting with '.'.
+pub fn name_ok(name: &str) -> bool {
+    !name.is_empty()
         && name.len() <= 64
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        && !name.starts_with('.');
-    if !ok {
+        && !name.starts_with('.')
+}
+
+pub fn validate_name(name: &str) -> Result<()> {
+    if !name_ok(name) {
         bail!("invalid profile name {name:?}: use letters, digits, '-', '_' or '.'");
     }
     Ok(())
@@ -859,6 +864,34 @@ impl Profile {
         Ok(account)
     }
 
+    /// The models this profile's providers run (see [`crate::models`]): its own
+    /// settings, and for a digital worker, its owner's for each provider it sets
+    /// nothing for (it runs on the owner's accounts, so on the owner's choice too).
+    pub fn models(&self) -> crate::models::Models {
+        let mut models = self.config.models.clone();
+        if self.config.owner.is_some()
+            && let Ok(owner) = self.account_profile()
+        {
+            for (provider, choice) in owner.config.models {
+                models.entry(provider).or_insert(choice);
+            }
+        }
+        models
+    }
+
+    /// The providers whose models this profile takes from its owner (a digital worker
+    /// that sets nothing for them).
+    pub fn inherited_models(&self) -> Vec<crate::llm::Provider> {
+        if self.config.owner.is_none() {
+            return Vec::new();
+        }
+        let own = &self.config.models;
+        self.models()
+            .into_keys()
+            .filter(|p| !own.contains_key(p))
+            .collect()
+    }
+
     /// Creates digital worker `name` owned by this profile: its own identity,
     /// allowlist, folders and audit log, but this profile's accounts.
     pub fn create_digital_worker(&self, name: &str, role: Option<String>) -> Result<Profile> {
@@ -1109,6 +1142,41 @@ mod tests {
         assert_eq!(get("CLAUDE_CONFIG_DIR"), Some(root.path().join("w/claude")));
         assert_eq!(get("CODEX_HOME"), Some(root.path().join("w/codex")));
         assert!(get("ANTHROPIC_API_KEY").is_none());
+    }
+
+    /// A digital worker runs on its owner's model settings for each provider it sets
+    /// nothing for, and on its own where it does; its owner's are read as they are now.
+    #[test]
+    fn a_digital_worker_runs_on_its_owners_models_unless_it_sets_its_own() {
+        let root = tempfile::tempdir().unwrap();
+        let mut alice = Profile::open_in(root.path(), "alice").unwrap();
+        crate::models::set_default(&mut alice.config.models, Provider::Copilot, Some("opus"))
+            .unwrap();
+        crate::models::set_effort(&mut alice.config.models, Provider::Copilot, Some("max"))
+            .unwrap();
+        crate::models::set_default(&mut alice.config.models, Provider::Claude, Some("sonnet"))
+            .unwrap();
+        alice.save().unwrap();
+        alice.create_digital_worker("helper", None).unwrap();
+        let mut helper = Profile::open_in(root.path(), "helper").unwrap();
+        let models = helper.models();
+        assert_eq!(models[&Provider::Copilot].default.as_deref(), Some("opus"));
+        assert_eq!(models[&Provider::Copilot].effort.as_deref(), Some("max"));
+        assert_eq!(
+            helper.inherited_models(),
+            [Provider::Copilot, Provider::Claude]
+        );
+        // Its own setting for a provider wins, whole; the others stay its owner's.
+        crate::models::set_effort(&mut helper.config.models, Provider::Claude, Some("low"))
+            .unwrap();
+        helper.save().unwrap();
+        let models = helper.models();
+        assert_eq!(models[&Provider::Claude].effort.as_deref(), Some("low"));
+        assert_eq!(models[&Provider::Claude].default, None);
+        assert_eq!(helper.inherited_models(), [Provider::Copilot]);
+        // The owner's own models are its own: it inherits nothing.
+        assert!(alice.inherited_models().is_empty());
+        assert_eq!(alice.models(), alice.config.models);
     }
 
     #[test]

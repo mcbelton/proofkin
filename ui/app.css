@@ -310,6 +310,7 @@ textarea { resize: vertical; }
 .status.waiting, .status.skipped { background: var(--surface-2); color: var(--muted); }
 .who .role { font-size: 12px; color: var(--accent); overflow-wrap: anywhere; }
 .squad { align-items: flex-start; }
+.row-actions { display: flex; align-items: center; gap: 4px; flex: none; }
 .list li.worker { align-items: flex-start; }
 .worker-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
 .worker-head .name { min-width: 0; }
@@ -359,6 +360,7 @@ fieldset.field legend { padding: 0; margin-bottom: 6px; font-weight: 600; font-s
 .md code { font-family: var(--mono); font-size: 12px; background: var(--surface-3); padding: 1px 5px; border-radius: 4px; }
 .md pre { margin: 8px 0; padding: 8px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: auto; }
 .md pre code { background: none; padding: 0; }
+.md hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
 .task .btn.small { margin-top: 6px; }
 .md details { margin: 6px 0; }
 .md summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 12.5px; }
@@ -723,6 +725,9 @@ dialog.editor-dialog { width: min(1240px, calc(100vw - 32px)); height: calc(100v
 }
 .insert:hover { border-color: var(--accent); color: var(--accent); }
 .editor-foot { display: flex; justify-content: flex-end; gap: 8px; }
+.plan-track { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 6px; color: var(--muted); }
+.plan-track select, .plan-track input { font-size: 12.5px; padding: 3px 6px; }
+.editor-foot .plan-track { margin: 0 auto 0 0; }
 
 /* Plugins & tools */
 dialog.tall { height: calc(100vh - 64px); overflow: hidden; }

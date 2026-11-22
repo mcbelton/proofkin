@@ -61,7 +61,8 @@ const planBuilder = (() => {
   /// The folder a step runs in, as its peer (or a squad's online members) share it:
   /// checks, MCP servers, worktrees and access.
   /// What the step's peer (or a squad's members, merged) says about its models for
-  /// `provider`: its default and the models it allows (none: it didn't say, or any).
+  /// `provider`: its default, the models it allows (none: it didn't say, or any) and its
+  /// default reasoning effort.
   function modelsOf(target, provider) {
     if (!target) return null;
     const [who] = target.slice(1).split(":");
@@ -73,6 +74,7 @@ const planBuilder = (() => {
     return {
       default: said.length === 1 ? said[0].default ?? null : null,
       allowed: [...new Set(said.flatMap((c) => c.allowed ?? []))],
+      effort: said.length === 1 ? said[0].effort ?? null : null,
     };
   }
 
@@ -388,20 +390,51 @@ const planBuilder = (() => {
       provider.addEventListener("change", () => { s.using = provider.value === "copilot" ? null : provider.value; changed(true); });
       items.push(field(`${k}-using`, "Provider", provider, "Which of the peer's providers runs it"));
       set += Boolean(s.using);
-      // The model: its peer's default, or one the peer allows (it says which in its hello).
+      // The model: its peer's default (selected, named when it says it), one the peer
+      // allows (it says which in its hello), or another by name when it allows any.
       const offer = modelsOf(s.target, provider.value);
-      const model = el("input", {
-        type: "text", class: "mono", spellcheck: "false", autocomplete: "off", list: `pb-${k}-models`,
-        placeholder: offer?.default ? `Its default (${offer.default})` : "Its default",
+      const list = offer?.allowed ?? [];
+      const deflt = offer?.default ?? list[0] ?? null;
+      const theirs = s.target?.startsWith("#") ? "Each member's default" : "Its default";
+      const current = planText.valuesOf(s, "model")[0] ?? "";
+      const model = el("select", {},
+        el("option", { value: "", text: deflt ? `${deflt} (default)` : theirs }),
+        ...list.filter((m) => m !== deflt).map((m) => el("option", { value: m, text: m })),
+        ...(list.length ? [] : [el("option", { value: OTHER_MODEL, text: "Another model…" })]));
+      if (current && ![...model.options].some((o) => o.value === current)) {
+        model.append(el("option", { value: current, text: current }));
+      }
+      model.value = current;
+      const name = el("input", {
+        type: "text", class: "mono", spellcheck: "false", autocomplete: "off",
+        placeholder: "e.g. claude-sonnet-5.5", "aria-label": `Step ${s.id}'s model, by name`,
       });
-      model.value = planText.valuesOf(s, "model")[0] ?? "";
-      model.addEventListener("change", () => { planText.setValues(s, "model", model.value.trim() || null); changed(); });
-      const modelField = field(`${k}-model`, "Model", model, offer?.allowed?.length
-        ? `${s.target} allows ${offer.allowed.join(", ")}; it refuses others`
-        : "A model's name, e.g. claude-sonnet-5.5; empty: the peer's default");
-      modelField.append(el("datalist", { id: `pb-${k}-models` }, ...(offer?.allowed ?? []).map((m) => el("option", { value: m }))));
+      name.hidden = true;
+      model.addEventListener("change", () => {
+        name.hidden = model.value !== OTHER_MODEL;
+        if (!name.hidden) {
+          name.focus();
+          return;
+        }
+        planText.setValues(s, "model", model.value || null);
+        changed();
+      });
+      name.addEventListener("change", () => { planText.setValues(s, "model", name.value.trim() || null); changed(); });
+      const modelField = field(`${k}-model`, "Model", model, list.length
+        ? `${s.target} allows ${list.join(", ")}; it refuses others`
+        : "Its peer's default, or another model by name");
+      modelField.append(name);
       items.push(modelField);
-      set += Boolean(model.value);
+      set += Boolean(current);
+      // How hard it reasons: its peer's default (selected), or another level.
+      const effortNow = planText.valuesOf(s, "effort")[0] ?? "";
+      const effort = el("select", {},
+        el("option", { value: "", text: offer?.effort ? `${offer.effort} (default)` : theirs }),
+        ...EFFORTS.filter((e) => e !== offer?.effort).map((e) => el("option", { value: e, text: e })));
+      effort.value = effortNow;
+      effort.addEventListener("change", () => { planText.setValues(s, "effort", effort.value || null); changed(); });
+      items.push(field(`${k}-effort`, "Reasoning", effort, "A model that supports fewer levels takes the nearest it supports below"));
+      set += Boolean(effortNow);
     }
     const context = planText.valuesOf(s, "context");
     const topics = [...new Set(["all", ...(state.knowledge ?? []).map((t) => t.name), ...context])];

@@ -328,28 +328,41 @@ proofkin auth logout workiq --profile me   # removes the Work IQ account and its
 ### Models
 
 Unless a task names a model, each provider runs on its own default (Copilot's is whatever
-the CLI picks for the account). A profile's owner can set each provider's **default model**
-and **which models tasks may ask for**:
+the CLI picks for the account). A profile's owner can set each provider's **default model**,
+**which models tasks may ask for** and the **reasoning effort** tasks work at:
 
 ```powershell
-proofkin models list --profile worker1                     # Copilot lists the models the account may use
+proofkin models list --profile worker1                     # Copilot lists the models the account may use, with their efforts
 proofkin models allow copilot claude-sonnet-5.5,gpt-6-sol --profile worker1
 proofkin models default copilot claude-sonnet-5.5 --profile worker1
+proofkin models default copilot claude-opus-5.5 --effort max --profile worker1
+proofkin models effort copilot high --profile worker1      # minimal, low, medium, high, xhigh or max
 proofkin models default copilot none --profile worker1     # back to the provider's own
+proofkin models effort copilot none --profile worker1      # back to the model's own effort
 proofkin models allow copilot any --profile worker1        # any model again
 ```
 
 A default must be one of the allowed models. With a list and no default, tasks that name
 none run on the first in the list (a provider's own default may not be allowed). A task
 asking for another model is refused, with the ones allowed, so a squad step can go to
-another member; Copilot sessions are also limited to the list. Peers learn the defaults and
-the lists from the agent's hello when they connect. The settings are kept in
-`profile.json`; a running agent uses them once it restarts.
+another member (squad steps that name a model go first to members that allow it); Copilot
+sessions are also limited to the list. Peers learn the defaults and the lists from the
+agent's hello when they connect. The settings are kept in `profile.json`; a running agent
+uses them once it restarts. A [digital worker](#digital-workers) runs on its owner's
+settings for each provider it sets nothing for, as it runs on the owner's accounts.
 
-A task picks its model with `model=` in a plan step (or its agent's `model:`), `/delegate
---model <name>`, the **Model** field of the web UI's Run task form (the models the chosen
-peer allows, or a name when it allows any) or the `model` argument of the MCP and A2A
-`delegate`. The result names the model that did the work.
+**Reasoning effort** is how hard the model thinks: `minimal`, `low`, `medium`, `high`,
+`xhigh` or `max`. Copilot gets it per session, as each model supports it (`models list`
+shows which): a model that supports fewer levels takes the nearest it supports below the
+one asked for, and one that supports none runs at its own. Claude takes `low` to `max`
+(`minimal` is `low`); Codex takes them all.
+
+A task picks its model and effort with `model=` and `effort=` in a plan step (or its agent's
+`model:`), `/ask` and `/delegate --model <name> --effort <level>`, the **Model** and
+**Reasoning** fields of the web UI's Run task form (the chosen peer's defaults selected and
+named, the models it allows, or another by name when it allows any) or the `model` and
+`effort` arguments of the MCP and A2A `delegate`. The result names the model that did the
+work and its effort, e.g. `claude-opus-5.5 (max reasoning)`, and so does the signed output.
 
 ### Example: two workers on two accounts
 
@@ -521,8 +534,8 @@ In terminal 2, once `+ worker` appears:
 | Command | Description |
 | --- | --- |
 | `<text>` | Broadcast a chat message |
-| `/ask <provider> [--model <name>] <prompt>` | Run a task locally (needs `--providers`), on that model if given |
-| `/delegate <provider>[@peer[:folder]] [--model <name>] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder); `--model` picks one of the [models](#models) the peer allows (default: its default) |
+| `/ask <provider> [--model <name>] [--effort <level>] <prompt>` | Run a task locally (needs `--providers`), on that model and [reasoning effort](#models) if given |
+| `/delegate <provider>[@peer[:folder]] [--model <name>] [--effort <level>] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder); `--model` picks one of the [models](#models) the peer allows (default: its default) and `--effort` its reasoning effort. `@#squad` gives it to the squad's least busy member that can run it, as a plan step on `#squad` would, and moves it to another member if that one turns it down |
 | `/plan <file>` | Run a [plan](#squads-and-plans): steps on peers (`@name`) or squads (`#squad`), in dependency order |
 | `/squads` | List your squads and which members are online |
 | `/runs` | List saved evidence runs ([EDD with agents](#evidence-driven-development-with-agents)) |
@@ -668,8 +681,9 @@ report after api,tests @helper Write a one-paragraph status report
   **moved here** and why. A step on a named `@peer` fails instead.
 - `timeout=30m` (`s`, `m`, `h` or `d`, up to 7 days) cancels a step that takes longer, on
   every peer working on it; it fails with the reason.
-- A step starts when the steps it waits for (`after`) are done, and gets their results
-  (up to 8,000 characters each) ahead of its prompt. Steps without dependencies run at once.
+- A step starts when the steps it waits for (`after`) are done, and gets what each was asked
+  (up to 1,000 characters) and its result (up to 8,000 characters) ahead of its prompt.
+  Steps without dependencies run at once.
 - If a step fails, the steps that depend on it are **skipped**; independent steps still run.
   Unknown steps, duplicate ids and dependency cycles are rejected before anything runs.
 - Every step is an ordinary delegated task, so each peer's allowlist, folder grants, hourly
@@ -881,6 +895,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
 | `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step names one). Not on sign-offs. |
 | `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (default: the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
+| `effort=level` | The reasoning effort its model works at: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (default: the peer's default; a model that supports fewer takes the nearest below, see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
@@ -1538,7 +1553,7 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
-`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
@@ -1558,9 +1573,9 @@ proofkin --name me --providers copilot --serve --ui
 - **Connected peers** with the providers they serve and how busy they are ("idle",
   "1/2 busy", "2/2 busy · 1 waiting"; hover for how many of those tasks are yours), live.
 - **Allowlist**: add a peer by pasting their ticket (optionally letting them delegate, with an
-  hourly limit and an access level: read only, edit files, or full) or remove one; changes
-  are saved to the profile's `peers.json` and take effect at once (removed peers are
-  disconnected).
+  hourly limit and an access level: read only, edit files, or full), change what one may do
+  (**Change…**: it stays connected), or remove one; changes are saved to the profile's
+  `peers.json` and take effect at once (removed peers are disconnected).
 - **Digital workers**: create [digital workers](#digital-workers) that run on your
   sign-ins (sign in to Copilot right there with a GitHub CLI account), in the folders you
   pick; start and stop them, choose whether they start with this agent, read why one
@@ -1589,8 +1604,9 @@ proofkin --name me --providers copilot --serve --ui
 - **Activity feed**: chat with all connected peers, joins and leaves, refused connections
   (with **Allowlist…** for a teammate who allowlisted you first: their endpoint id is
   filled in; only add people you know), tasks peers delegate to you.
-- **Run task**: pick a provider and where to run it (*This agent*, a named peer, or *Any peer*
-  when several serve it), and the peer's folder. If that folder offers MCP servers, tick
+- **Run task**: pick a provider and where to run it (*This agent*, a named peer, *Any peer*
+  when several serve it, or a squad: its least busy member that can run it, moving to another
+  member if that one turns it down), and the peer's folder. If that folder offers MCP servers, tick
   the ones the task may use (each shows what its owner says it is for). Where you have
   full access to the folder, tick the checks its runtime runs after the model
   (**Verify with**, and how many attempts it gets while they fail): the task is proven
@@ -1629,7 +1645,10 @@ proofkin --name me --providers copilot --serve --ui
   The plan is checked as you go, and problems with a clear fix come with a button that
   makes it (in the builder, on the card they are about).
   Steps show which steps they wait for, and skipped steps are flagged. **Schedule…** runs
-  the plan on its own at set times ([scheduled plans](#scheduled-plans)). "What is a
+  the plan on its own at set times ([scheduled plans](#scheduled-plans)). With a
+  [tracker](#tracked-work) linked, **Tracked in owner/repo** beside it says the run gets an
+  issue with a sub-issue per step, and lets you pick an issue it works on instead, or leave
+  the run untracked (it writes the plan's `track:` line). "What is a
   plan?" stays folded until you open it.
 - **Schedules**: each schedule in plain words, its next run, its last run's result (with
   a link to the evidence run), and Run now, Pause/Resume, Edit and Delete.
@@ -1642,7 +1661,8 @@ proofkin --name me --providers copilot --serve --ui
   A2A client) hand work to your peers: turn it on or off, copy the addresses and ready-made
   client setups, show or replace the token ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
   Their tasks show up under **Tasks**, marked *asked by another agent*.
-- **Squads**: create, view (members, who is online, running tasks) and remove squads.
+- **Squads**: create, view (members, who is online, running tasks), change (**Change…**: who
+  is in it) and remove squads.
   Digital workers show their owner and role in the peer list.
 - **Waiting for your approval**: approval requests from plans (yours or teammates'), with
   what you're approving and Approve / Reject (a rejection needs a reason).

@@ -26,6 +26,18 @@ async fn sends_task_fields_and_returns_text() {
         .await
         .unwrap();
     assert_eq!(out.model.as_deref(), Some("claude-opus-5.5"));
+    assert_eq!(out.effort, None, "no effort asked for: the model's own");
+    // The reasoning effort goes to the bridge, and the reply says the one it took.
+    chosen.effort = Some("max".into());
+    let out = bridge
+        .run(&chosen, Path::new("."), Access::ReadOnly)
+        .await
+        .unwrap();
+    assert_eq!(out.effort.as_deref(), Some("max"));
+    assert_eq!(
+        out.shown_model().as_deref(),
+        Some("claude-opus-5.5 (max reasoning)")
+    );
     // An older bridge's reply, without a model, still reads.
     let older = bridge
         .run(

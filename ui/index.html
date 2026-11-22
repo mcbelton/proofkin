@@ -155,14 +155,19 @@
               <select id="target"></select>
             </label>
             <label class="field-inline" id="model-field" hidden
-                   title="The model it runs on: the default, or one of those its agent allows (it refuses others)">
+                   title="The model it runs on: its default (selected), one its agent allows, or another by name (its agent refuses models it doesn't allow)">
               <span>Model</span>
               <select id="model"></select>
             </label>
             <label class="field-inline" id="model-name-field" hidden
-                   title="The model it runs on, by name (e.g. claude-sonnet-5.5); empty: the default">
-              <span>Model</span>
-              <input id="model-name" type="text" class="mono model-name" placeholder="Default" spellcheck="false" autocomplete="off">
+                   title="Another model, by name (e.g. claude-sonnet-5.5)">
+              <span>Name</span>
+              <input id="model-name" type="text" class="mono model-name" placeholder="e.g. claude-sonnet-5.5" spellcheck="false" autocomplete="off">
+            </label>
+            <label class="field-inline" id="effort-field" hidden
+                   title="How hard the model reasons: its default (selected) or another level; a model that supports fewer takes the nearest it supports below">
+              <span>Reasoning</span>
+              <select id="effort"></select>
             </label>
             <label class="field-inline" id="share-field" hidden>
               <span>Folder</span>
@@ -206,6 +211,7 @@
           </button>
         </div>
         <p class="hint" id="composer-hint">Enter to send · Shift+Enter for a new line</p>
+        <div class="plan-track" id="plan-track" hidden></div>
       </form>
     </main>
     </div>
@@ -284,12 +290,13 @@
   <dialog id="add-dialog" aria-labelledby="add-h">
     <form method="dialog" id="add-form" novalidate>
       <h2 id="add-h">Add a peer to the allowlist</h2>
-      <p class="muted small">Paste the peer's ticket (<span class="mono">p2pa1…</span>) or endpoint id. Both sides must allowlist each other.</p>
-      <label class="field">
+      <p class="muted small" id="add-intro">Paste the peer's ticket (<span class="mono">p2pa1…</span>) or endpoint id. Both sides must allowlist each other.</p>
+      <p class="muted small" id="grant-intro" hidden></p>
+      <label class="field" id="ticket-field">
         <span>Ticket or endpoint id</span>
         <textarea id="add-ticket" rows="3" required spellcheck="false" class="mono"></textarea>
       </label>
-      <label class="field">
+      <label class="field" id="name-field">
         <span>Name <span class="muted">(optional with a ticket)</span></span>
         <input id="add-name" type="text" maxlength="64" spellcheck="false">
       </label>
@@ -415,6 +422,7 @@
         </aside>
       </div>
       <div class="editor-foot">
+        <div class="plan-track" id="plan-editor-track" hidden></div>
         <button type="button" class="btn" id="plan-editor-schedule">Schedule…</button>
         <button type="button" class="btn primary" id="plan-editor-run">Run plan</button>
       </div>
