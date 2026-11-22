@@ -10,6 +10,7 @@ pub mod auth;
 pub mod boundary;
 pub mod design;
 pub mod evidence;
+pub mod gh_auth;
 pub mod github;
 pub mod knowledge;
 pub mod llm;

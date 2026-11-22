@@ -175,7 +175,7 @@ const planBuilder = (() => {
       }, label)));
     radioGroup(kind, (btn) => setKind(s, btn.dataset.key.slice(btn.dataset.key.lastIndexOf("-") + 1)));
     const remove = removeButton(`Remove step ${s.id}`, async () => {
-      if (!planText.isTodo(s.todo) && !(await confirmDialog({
+      if (!planText.isTodo(planText.taskOf(s)) && !(await confirmDialog({
         title: `Remove step ${s.id}?`,
         body: "What it does goes, and steps that wait for it no longer do.",
         confirm: "Remove step", danger: true,
@@ -196,14 +196,13 @@ const planBuilder = (() => {
       changed(true);
     });
     const todo = el("textarea", {
-      rows: 2, spellcheck: "true",
+      rows: 3, spellcheck: "true",
       placeholder: s.approve ? "What the approver checks, e.g. The ADRs cover every decision and the contract has examples"
         : "What the agent does, e.g. Write the ADRs for the login change, and its REST API contract",
     });
-    todo.value = planText.isTodo(s.todo) ? "" : s.todo;
-    // A step is one line of the plan: Enter doesn't break it (Ctrl+Enter runs the plan).
-    todo.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.ctrlKey && !e.metaKey) e.preventDefault(); });
-    todo.addEventListener("input", () => { s.todo = todo.value.replace(/\s*\n\s*/g, " "); changed(); });
+    todo.value = planText.isTodo(planText.taskOf(s)) ? "" : planText.taskOf(s);
+    // The text may go on over several lines: they are written under the step, indented.
+    todo.addEventListener("input", () => { planText.setTask(s, todo.value); changed(); });
 
     const body = s.team
       ? [field(`${k}-target`, "Whose team does it", who, "A peer's folder with a team plan: its agent runs the plan on its own team, and you see each of its steps as it goes"),
@@ -668,10 +667,11 @@ const planBuilder = (() => {
   function sourceLines(text) {
     let claim = 0;
     let step = 0;
-    return text.split("\n").map((line) => {
-      const t = line.trim();
-      if (!t || t.startsWith("//")) return null;
-      return t.startsWith("claim:") ? { claim: plan.claims[claim++]?.id } : { step: plan.steps[step++]?.id };
+    let last = null;
+    return planText.lineKinds(text).map(({ kind }) => {
+      if (kind === "text") return last;
+      if (kind === "empty" || kind === "comment" || kind === "track") return null;
+      return (last = kind === "claim" ? { claim: plan.claims[claim++]?.id } : { step: plan.steps[step++]?.id });
     });
   }
 

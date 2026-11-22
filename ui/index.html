@@ -8,6 +8,7 @@
   <title>Proofkin</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/plan-text.js" defer></script>
+  <script src="/markdown.js" defer></script>
 <script src="/app.js" defer></script>
   <script src="/tools.js" defer></script>
 <script src="/plan-builder.js" defer></script>
@@ -602,14 +603,41 @@
   <dialog id="github-dialog" aria-labelledby="github-dialog-h">
     <form method="dialog" id="github-form" novalidate>
       <h2 id="github-dialog-h">Sign in to GitHub</h2>
-      <p class="muted small">Pick an account of the GitHub CLI on this machine. Its token is fetched from <span class="mono">gh</span> when needed and never stored by Proofkin. Add accounts with <span class="mono">gh auth login</span>.</p>
+      <p class="muted small">Pick an account of the GitHub CLI on this machine, or sign in another one below. Its token is fetched from <span class="mono">gh</span> when needed and never stored by Proofkin.</p>
       <fieldset class="field"><legend>Account</legend><div id="github-accounts" class="share-checks"></div></fieldset>
+      <fieldset class="field">
+        <legend>Not listed?</legend>
+        <p class="muted small">Sign in another account with the GitHub CLI: you enter a code on GitHub, in your browser. Its token also gets:</p>
+        <div class="share-checks">
+          <label class="check"><input type="checkbox" id="github-new-project" checked><span><span class="mono">project</span>: the tracker's board</span></label>
+          <label class="check"><input type="checkbox" id="github-new-workflow" checked><span><span class="mono">workflow</span>: changes to GitHub Actions workflows</span></label>
+        </div>
+        <label class="field"><span>Host <span class="muted">(GitHub Enterprise: its host name)</span></span><input id="github-new-host" type="text" value="github.com" spellcheck="false" autocomplete="off"></label>
+        <button type="button" class="btn small" id="github-new-btn">Sign in another account</button>
+      </fieldset>
       <p class="form-error" id="github-error" role="alert"></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="github-cancel">Cancel</button>
         <button type="submit" class="btn primary">Sign in</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="gh-flow-dialog" aria-labelledby="gh-flow-h" aria-describedby="gh-flow-what">
+    <div class="dialog-body">
+      <h2 id="gh-flow-h">Approve on GitHub</h2>
+      <p id="gh-flow-what"></p>
+      <div class="device-code-row">
+        <code id="gh-flow-code" class="device-code"></code>
+        <button type="button" class="btn small" id="gh-flow-copy">Copy code</button>
+        <a id="gh-flow-open" class="btn small primary" href="https://github.com/login/device" target="_blank" rel="noopener">Open GitHub</a>
+      </div>
+      <p class="muted small" id="gh-flow-note"></p>
+      <p class="small gh-flow-status" id="gh-flow-status" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="gh-flow-cancel">Cancel</button>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="repo-dialog" aria-labelledby="repo-h">
@@ -641,7 +669,7 @@
       <p class="muted small">Each plan run gets an issue in this repository and each step a sub-issue, assigned to your GitHub account. On the project's board their status follows the run, and pull requests from the steps' branches close them.</p>
       <label class="field"><span>Repository for the issues</span><input id="tracker-repo" type="text" placeholder="owner/repo" spellcheck="false" autocomplete="off" required></label>
       <label class="field"><span>Project board <span class="muted">(optional: its address)</span></span><input id="tracker-project" type="url" placeholder="https://github.com/users/you/projects/1" spellcheck="false" autocomplete="off"></label>
-      <p class="muted small">The board needs the <span class="mono">project</span> scope on your GitHub CLI token: <span class="mono">gh auth refresh --scopes project</span>. Without it, the runs are tracked as issues only.</p>
+      <p class="muted small">The board needs the <span class="mono">project</span> scope on your GitHub account's token. Without it, the runs are tracked as issues only, and the Tracker card offers to grant it.</p>
       <p class="form-error" id="tracker-error" role="alert"></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="tracker-cancel">Cancel</button>

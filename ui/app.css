@@ -293,7 +293,13 @@ textarea { resize: vertical; }
 .task-top { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .task-title { font-weight: 600; font-size: 13px; }
 .task-prompt { margin: 6px 0; overflow-wrap: anywhere; }
-.task-prompt.clamped { display: -webkit-box; -webkit-line-clamp: 4; line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.task-prompt .md, .team-step-text .md { font-size: inherit; }
+.task-prompt .md > :first-child, .team-step-text .md > :first-child { margin-top: 0; }
+.task-prompt .md > :last-child, .team-step-text .md > :last-child { margin-bottom: 0; }
+.task-prompt .md p, .team-step-text .md p { margin: 4px 0; }
+.task-prompt .md ul, .task-prompt .md ol, .team-step-text .md ul, .team-step-text .md ol { margin: 4px 0; padding-left: 18px; }
+/* About 4 lines, fading out so it's clear the text goes on (line-clamp doesn't work on block children). */
+.task-prompt.clamped { max-height: 5.9em; line-height: 1.45; overflow: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent); mask-image: linear-gradient(to bottom, #000 60%, transparent); }
 .task-meta { font-size: 12px; color: var(--muted); }
 .status { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; }
 .status.running { background: var(--accent-soft); color: var(--accent); }
@@ -496,9 +502,20 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .branch .btn { margin-left: auto; }
 .issue-link { flex: none; min-width: 24px; padding: 0 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; line-height: 24px; text-align: center; text-decoration: none; white-space: nowrap; }
 .issue-link:hover { text-decoration: underline; }
+.tracker-waiting { margin: 6px 0; }
+.tracker-waiting p { margin: 4px 0; }
+.tracker-waiting-h { font-weight: 600; }
+.tracker-waiting ul { margin: 2px 0; padding-left: 18px; }
 .tracker-problem { margin: 6px 0; padding: 6px 10px; border-left: 3px solid var(--warn); border-radius: 4px; background: var(--warn-soft); }
 .tracker-problem p { margin: 0; }
 .tracker-problem .command { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; }
+.tracker-problem details { margin-top: 6px; }
+.tracker-problem summary { cursor: pointer; }
+.tracker-problem pre { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+#github-scopes p { margin: 4px 0; }
+.device-code-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.device-code { font-family: var(--mono); font-size: 22px; font-weight: 700; letter-spacing: 2px; padding: 4px 12px; border-radius: 6px; background: var(--surface-3); user-select: all; }
+.gh-flow-status { display: flex; align-items: center; gap: 6px; min-height: 1.5em; margin: 0; }
 .tracker-problem code { overflow-wrap: anywhere; font-size: 12px; font-weight: 400; }
 .tracker-groups { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; max-height: 60vh; overflow: auto; overscroll-behavior: contain; }
 .tracker-group h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }

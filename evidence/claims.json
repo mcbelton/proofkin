@@ -449,6 +449,24 @@
       "tests": ["ui::tasks_outlive_a_restart_and_finished_ones_can_be_cleared"]
     },
     {
+      "id": "UI-4",
+      "area": "ui",
+      "claim": "The web UI shows a task's prompt and a team step's text as Markdown (code spans, bold, lists and paragraphs, built as DOM nodes so markup in the text stays text), compactly; a long prompt is cut at about four lines with a fade until Show all.",
+      "tests": ["ui::task_text_shows_as_markdown_and_markup_stays_text"]
+    },
+    {
+      "id": "PLAN-1",
+      "area": "plans",
+      "claim": "A plan step's task text continues on the lines indented under it, keeping lists, paragraphs and deeper indentation, with options only on the step line and errors naming the step's first line; the plan editor and builder read and write those lines with their step.",
+      "tests": [
+        "lib::plan::indented_lines_after_a_step_continue_its_task_text",
+        "lib::plan::plans_indented_uniformly_parse_as_before",
+        "lib::plan::option_looking_words_in_continuation_lines_are_text",
+        "lib::plan::a_step_error_names_its_first_line",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
       "id": "LRN-1",
       "area": "knowledge",
       "claim": "The system keeps learning: the ops summary (health, incidents, usage) is written into the knowledge base (kb learn, and hourly by agents with monitors) for context=all and the learn playbook, and learned TSGs fix repeats without the model.",
@@ -491,6 +509,35 @@
         "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
       ],
       "live": ["linked a GitHub repository with the profile's GitHub sign-in"]
+    },
+    {
+      "id": "GH-2",
+      "area": "github",
+      "claim": "A profile's GitHub account gets a scope it lacks without a terminal: Grant access (on the Tracker card when the board lacks the project scope, which the tracker names, or on the GitHub card) and proofkin github grant run the GitHub CLI's device flow and show its one-time code and where to enter it. gh's active account is switched to the profile's for the refresh only if needed, and switched back afterwards, also when the flow fails, is cancelled, times out or the agent stops; afterwards the token is checked for the scopes. One flow runs at a time, scope names are checked, an account the GitHub CLI doesn't have is refused, and a profile not signed in to GitHub (or a digital worker) can't grant.",
+      "tests": [
+        "lib::gh_auth::accounts_are_read_with_their_scopes",
+        "lib::gh_auth::gh_output_gives_the_code_and_where_to_enter_it",
+        "lib::gh_auth::a_grant_switches_to_the_account_refreshes_and_switches_back",
+        "lib::gh_auth::a_grant_for_the_active_account_switches_nothing",
+        "lib::gh_auth::gh_is_switched_back_when_a_grant_fails_is_cancelled_or_times_out",
+        "lib::gh_auth::the_agent_stopping_mid_flow_still_switches_gh_back",
+        "lib::gh_auth::one_flow_waits_at_a_time_and_unknown_accounts_are_refused",
+        "lib::gh_auth::the_github_cli_runner_passes_the_arguments_and_reads_the_output",
+        "lib::tracker::without_the_project_scope_tracking_keeps_to_issues_and_says_how_to_fix_it",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
+      ]
+    },
+    {
+      "id": "GH-3",
+      "area": "github",
+      "claim": "Another GitHub account signs in from the web UI (Sign in another account, with the project and workflow scopes ticked) or with proofkin github login --new: the GitHub CLI's device flow shows its code in a dialog, the profile then uses the new account, and gh's previously active account is made active again. A new sign-in's host and scopes are checked before gh starts. The GitHub card shows what each scope of the profile's token is for, and gh's active account when it is another one.",
+      "tests": [
+        "lib::gh_auth::signing_in_another_account_switches_gh_back_and_names_the_new_account",
+        "lib::gh_auth::gh_output_gives_the_code_and_where_to_enter_it",
+        "lib::gh_auth::the_github_cli_runner_passes_the_arguments_and_reads_the_output",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
     },
     {
       "id": "SPEC-1",
@@ -969,6 +1016,16 @@
         "lib::tracker::projects_refs_and_statuses_are_read_strictly",
               "lib::tracker::existing_issues_and_pull_requests_go_on_the_board_with_a_status_from_their_state",
         "ui::the_plan_editor_keeps_plans_valid",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
+      "id": "TRK-5",
+      "area": "tracking",
+      "claim": "The Tracker card, tracker status and tracker sync say what each run issue left open is waiting for: the run's number, title and link, how many of its sub-issues are closed, and each open sub-issue with the pull request that will close it, or that no pull request does yet. They are read in one GraphQL query and returned as waiting by GET /api/tracker and POST /api/tracker/sync, which also returns the run issues it closed. Runs that are closed or gone are left out.",
+      "tests": [
+        "lib::tracker::a_left_open_run_lists_its_sub_issues_with_the_pull_requests_that_close_them",
+        "lib::tracker::a_sync_says_what_it_closed_and_what_is_still_open",
         "ui::the_page_follows_the_ux_guidelines"
       ]
     },

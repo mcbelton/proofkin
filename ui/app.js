@@ -118,95 +118,7 @@ function radioGroup(container, onSelect) {
   });
 }
 
-// Minimal, safe Markdown for task results: builds DOM nodes with textContent only.
-function inlineMd(text) {
-  const nodes = [];
-  const re = /(`[^`]+`|\*\*[^*]+\*\*)/g;
-  let last = 0;
-  let m;
-  while ((m = re.exec(text))) {
-    if (m.index > last) nodes.push(text.slice(last, m.index));
-    const t = m[0];
-    nodes.push(t.startsWith("`") ? el("code", { text: t.slice(1, -1) }) : el("strong", { text: t.slice(2, -2) }));
-    last = m.index + t.length;
-  }
-  if (last < text.length) nodes.push(text.slice(last));
-  return nodes;
-}
-
-function mdTable(rows) {
-  const cells = (row) => row.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
-  const [head, ...body] = rows.filter((r) => !/^\s*\|?\s*:?-{3,}/.test(r));
-  // Not a real table (e.g. only a separator line): show the text as is.
-  if (head === undefined) return el("p", { text: rows.join("\n") });
-  return el("div", { class: "table-wrap" }, el("table", {},
-    el("thead", {}, el("tr", {}, ...cells(head).map((c) => el("th", { scope: "col" }, inlineMd(c))))),
-    el("tbody", {}, ...body.map((r) => el("tr", {}, ...cells(r).map((c) => el("td", {}, inlineMd(c))))))));
-}
-
-function renderMarkdown(text) {
-  const root = el("div", { class: "md" });
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
-  let list = null;
-  let listType = null;
-  let para = [];
-  const flushPara = () => {
-    if (para.length) root.append(el("p", {}, inlineMd(para.join(" "))));
-    para = [];
-  };
-  const endList = () => { list = null; listType = null; };
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // Collapsible sections in evidence reports: rendered as <details>, content as Markdown.
-    const details = line.match(/^<details><summary>(.*)<\/summary>$/);
-    if (details) {
-      flushPara(); endList();
-      const inner = [];
-      for (i++; i < lines.length && lines[i].trim() !== "</details>"; i++) inner.push(lines[i]);
-      root.append(el("details", {}, el("summary", { text: details[1] }), renderMarkdown(inner.join("\n"))));
-      continue;
-    }
-    if (/^\s*\|/.test(line)) {
-      flushPara(); endList();
-      const rows = [];
-      for (; i < lines.length && /^\s*\|/.test(lines[i]); i++) rows.push(lines[i]);
-      i--;
-      root.append(mdTable(rows));
-      continue;
-    }
-    if (/^\s*```/.test(line)) {
-      flushPara(); endList();
-      const code = [];
-      for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
-      root.append(el("pre", {}, el("code", { text: code.join("\n") })));
-      continue;
-    }
-    const heading = line.match(/^(#{1,4})\s+(.*)$/);
-    if (heading) {
-      flushPara(); endList();
-      root.append(el(`h${Math.min(6, heading[1].length + 2)}`, {}, inlineMd(heading[2])));
-      continue;
-    }
-    const item = line.match(/^\s*([-*+]|\d+[.)])\s+(.*)$/);
-    if (item) {
-      flushPara();
-      const type = /\d/.test(item[1]) ? "ol" : "ul";
-      if (!list || listType !== type) {
-        list = el(type);
-        listType = type;
-        root.append(list);
-      }
-      list.append(el("li", {}, inlineMd(item[2])));
-      continue;
-    }
-    if (!line.trim()) { flushPara(); endList(); continue; }
-    if (list && /^\s{2,}/.test(line)) { list.lastChild.append(" ", ...inlineMd(line.trim())); continue; }
-    endList();
-    para.push(line.trim());
-  }
-  flushPara();
-  return root;
-}
+// Markdown rendering (renderMarkdown, inlineMd) lives in ui/markdown.js.
 
 // ---------- API ----------
 const hashToken = new URLSearchParams(location.hash.slice(1)).get("t");
@@ -563,17 +475,22 @@ const expandedPrompts = new Set();
 const PROMPT_LINES = 4;
 
 function promptNode(t) {
-  const text = el("p", { class: "task-prompt", text: t.prompt });
+  const text = el("div", { class: "task-prompt" }, renderMarkdown(t.prompt));
   const long = t.prompt.split("\n").length > PROMPT_LINES || t.prompt.length > PROMPT_LINES * 80;
-  if (!expandedPrompts.has(t.id)) text.classList.add("clamped");
   if (!long) return text;
-  const more = el("button", { type: "button", class: "btn small link" },
-    expandedPrompts.has(t.id) ? "Show less" : "Show all");
-  more.addEventListener("click", () => {
-    const open = text.classList.toggle("clamped") === false;
-    if (open) expandedPrompts.add(t.id); else expandedPrompts.delete(t.id);
-    more.textContent = open ? "Show less" : "Show all";
-  });
+  const open = expandedPrompts.has(t.id);
+  text.classList.toggle("clamped", !open);
+  const more = el("button", { type: "button", class: "btn small link", "aria-expanded": String(open) },
+    open ? "Show less" : "Show all");
+  const setOpen = (on) => {
+    text.classList.toggle("clamped", !on);
+    if (on) expandedPrompts.add(t.id); else expandedPrompts.delete(t.id);
+    more.setAttribute("aria-expanded", String(on));
+    more.textContent = on ? "Show less" : "Show all";
+  };
+  more.addEventListener("click", () => setOpen(more.getAttribute("aria-expanded") !== "true"));
+  // Keyboard focus never stays on something clipped out of sight.
+  text.addEventListener("focusin", () => setOpen(true));
   return el("div", { class: "task-prompt-box" }, text, more);
 }
 const openPlans = new Map();
@@ -595,7 +512,7 @@ function teamStepsNode(steps, label) {
         statusNode(s.status),
         el("span", { class: "mono", text: s.id }),
         el("span", { class: "muted small", text: `on ${s.target}${s.signed ? " · signed ✓" : ""}` })),
-      s.text ? el("p", { class: "team-step-text", text: s.text }) : null,
+      s.text ? el("div", { class: "team-step-text" }, renderMarkdown(s.text)) : null,
       s.steps?.length ? teamStepsNode(s.steps, `Team run of step ${s.id}`) : null)));
 }
 
@@ -837,10 +754,9 @@ function renderSquads() {
   }
 }
 
-/** The steps of a team plan: its lines that are neither blank, comments nor claims. */
+/** The steps of a team plan: its lines that are neither blank, comments nor claims, nor the continuation of a step's text. */
 function teamStepCount(plan) {
-  return plan.split("\n").map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("//") && !l.startsWith("claim:")).length;
+  return planText.lineKinds(plan).filter(({ kind }) => kind === "step").length;
 }
 
 let teamFolder = null;
@@ -2047,6 +1963,13 @@ async function loadGithub() {
     ? ["Signed in as ", el("strong", { text: `${github.account.user}@${github.account.host}` }), " ",
       el("button", { type: "button", class: "btn small", onclick: openGithubLogin }, "Change account")]
     : `Uses ${github.account.owner}'s GitHub account (digital worker)`));
+  if (github.account.user) box.append(el("div", { id: "github-scopes" }));
+  renderGithubScopes();
+  // A sign-in still waits for its code (e.g. the page was reloaded): show it again, unless
+  // it is the one just closed here (it reads as waiting until gh is switched back).
+  if (github.flow?.state === "waiting" && !$("#gh-flow-dialog").open && github.flow.code !== ghFlow?.code) {
+    showGhFlow(github.flow);
+  }
   if (!github.serving) box.append(el("p", { class: "muted small", text: "This agent doesn't run peers' tasks (start it with --serve) so linked repositories are for your own use." }));
   if (!github.repos.length) box.append(el("p", { class: "muted small", text: "No linked repositories yet." }));
   for (const r of github.repos) {
@@ -2079,8 +2002,162 @@ function openGithubLogin() {
     ? accounts.map((a, i) => el("label", { class: "check" },
       el("input", { type: "radio", name: "gh-account", value: `${a.login}@${a.host}`, checked: i === picked || undefined }),
       el("span", { text: `${a.login} on ${a.host}${a.active ? " (active)" : ""}` })))
-    : [el("span", { class: "muted small", text: "No GitHub CLI account found. Run gh auth login in a terminal, then try again." })]));
+    : [el("span", { class: "muted small", text: "No GitHub CLI account on this machine yet: sign one in below." })]));
+  $("#github-new-host").value = github?.account?.host || "github.com";
   $("#github-dialog").showModal();
+}
+
+// ---------- GitHub token scopes and sign-ins without a terminal ----------
+/** What each scope of the GitHub account's token is for, in Proofkin. */
+const SCOPE_USES = {
+  repo: "clone, push branches and open pull requests",
+  workflow: "push changes to GitHub Actions workflows",
+  project: "the tracker's board",
+};
+
+/** The GitHub card's account details: its token's scopes, a Grant access button when
+ * the linked tracker's board needs one it lacks, and gh's active account if another. */
+function renderGithubScopes() {
+  const box = $("#github-scopes");
+  if (!box || !github?.account?.user) return;
+  const same = (a, b) => a?.toLowerCase() === b?.toLowerCase();
+  const mine = github.accounts.find((a) => same(a.login, github.account.user) && a.host === github.account.host);
+  const active = github.accounts.find((a) => a.active && a.host === github.account.host);
+  const parts = [];
+  if (mine) {
+    const known = Object.keys(SCOPE_USES).filter((s) => mine.scopes.includes(s));
+    parts.push(el("p", { class: "muted small" }, known.length ? "Its token may: " : "Its token has none of the scopes Proofkin uses.",
+      ...known.flatMap((s, i) => [i ? "; " : "", el("span", { class: "mono", text: s }), ` (${SCOPE_USES[s]})`]),
+      known.length ? "." : ""));
+    // The Tracker card says so too; here it's next to the account it is about.
+    const need = tracker?.linked ? tracker.tracker?.board_scope : null;
+    if (need && !mine.scopes.includes(need)) {
+      parts.push(el("p", { class: "small" }, "It lacks ", el("span", { class: "mono", text: need }),
+        ", which the tracker's board needs."),
+      el("p", {}, el("button", { type: "button", class: "btn small", onclick: () => grantScope(need) }, "Grant access")));
+    }
+  }
+  if (active && !same(active.login, github.account.user)) {
+    parts.push(el("p", { class: "muted small", text: `The GitHub CLI's active account here is ${active.login}; Proofkin uses ${github.account.user}'s token without switching to it.` }));
+  }
+  box.replaceChildren(...parts);
+}
+
+let ghFlow = null;
+let ghFlowTimer = null;
+
+/** Gives the profile's GitHub account `scope` (gh's device flow, shown in a dialog). */
+async function grantScope(scope) {
+  try {
+    const res = await api("/api/github/grant", { method: "POST", body: JSON.stringify({ scopes: [scope] }) });
+    showGhFlow(res.flow);
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+/** Signs another account in to the GitHub CLI for this agent (from the Change account dialog). */
+async function signInAnother() {
+  const scopes = [["#github-new-project", "project"], ["#github-new-workflow", "workflow"]]
+    .filter(([id]) => $(id).checked).map(([, scope]) => scope);
+  const button = $("#github-new-btn");
+  button.disabled = true;
+  $("#github-error").textContent = "";
+  try {
+    const res = await api("/api/github/login/new", {
+      method: "POST", body: JSON.stringify({ host: $("#github-new-host").value.trim() || "github.com", scopes }),
+    });
+    $("#github-dialog").close();
+    showGhFlow(res.flow);
+  } catch (err) {
+    $("#github-error").textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function showGhFlow(flow) {
+  ghFlow = flow;
+  const grant = flow.kind === "grant";
+  $("#gh-flow-h").textContent = grant ? "Grant access on GitHub" : "Sign in to GitHub";
+  $("#gh-flow-what").textContent = grant
+    ? `Enter this code on GitHub to give ${flow.login}'s token the ${flow.scopes.join(", ")} scope.`
+    : "Enter this code on GitHub while signed in there as the account to add.";
+  $("#gh-flow-code").textContent = flow.code;
+  const open = $("#gh-flow-open");
+  open.href = flow.url;
+  open.setAttribute("aria-label", `Open ${flow.url} (opens a new tab)`);
+  const back = flow.active_before;
+  $("#gh-flow-note").textContent = grant
+    ? (back && back.toLowerCase() !== flow.login.toLowerCase()
+      ? `Until you finish, the GitHub CLI's active account here is ${flow.login}; then it is ${back} again.` : "")
+    : `When you finish, this agent uses the new account${back ? `, and the GitHub CLI's active account here is ${back} again` : ""}.`;
+  setGhFlowStatus(flow);
+  const dialog = $("#gh-flow-dialog");
+  if (!dialog.open) dialog.showModal();
+  if (flow.state === "waiting") pollGhFlow();
+}
+
+function setGhFlowStatus(flow) {
+  const waiting = flow.state === "waiting";
+  const status = $("#gh-flow-status");
+  status.replaceChildren(...(waiting
+    ? [el("span", { class: "spinner", "aria-hidden": "true" }), "Waiting for you to approve on GitHub…"]
+    : flow.state === "failed" ? [`It didn't work: ${flow.reason}`] : []));
+  status.classList.toggle("warn-text", flow.state === "failed");
+  $("#gh-flow-cancel").textContent = waiting ? "Cancel" : "Close";
+}
+
+function pollGhFlow() {
+  clearTimeout(ghFlowTimer);
+  ghFlowTimer = setTimeout(async () => {
+    let flow;
+    try {
+      flow = (await api("/api/github/flow")).flow;
+    } catch {
+      pollGhFlow();
+      return;
+    }
+    if (!flow || flow.code !== ghFlow?.code) return;
+    ghFlow = flow;
+    if (flow.state === "waiting") pollGhFlow();
+    else ghFlowEnded(flow);
+  }, 2000);
+}
+
+async function ghFlowEnded(flow) {
+  clearTimeout(ghFlowTimer);
+  const dialog = $("#gh-flow-dialog");
+  if (flow.state === "done") {
+    if (dialog.open) dialog.close();
+    toast(flow.kind === "grant"
+      ? `${flow.login}'s token now has the ${flow.scopes.join(", ")} scope`
+      : `Signed in to GitHub as ${flow.login}`);
+  } else if (flow.state === "cancelled") {
+    if (dialog.open) dialog.close();
+  } else {
+    setGhFlowStatus(flow);
+  }
+  // A new account is the profile's once GitHub accepts its token: look until it is.
+  for (let i = 0; i < 5; i++) {
+    await loadGithub().catch(() => {});
+    if (flow.kind === "grant" || flow.state !== "done" || github?.account?.user?.toLowerCase() === flow.login?.toLowerCase()) break;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  loadTracker().catch(() => {});
+}
+
+/** Closing the dialog while the sign-in waits cancels it, so gh is switched back now. */
+async function ghFlowClosed() {
+  clearTimeout(ghFlowTimer);
+  if (ghFlow?.state !== "waiting") return;
+  ghFlow = { ...ghFlow, state: "cancelled" };
+  try {
+    await api("/api/github/flow", { method: "DELETE" });
+  } catch {
+    // It ended meanwhile.
+  }
+  loadGithub().catch(() => {});
 }
 
 async function submitGithubLogin(e) {
@@ -2251,19 +2328,37 @@ async function loadTracker() {
     box.append(el("p", { class: "small" }, "On the board ", link(t.board.url, t.board.title),
       t.board.statuses.length ? ` (${t.board.statuses.join(", ")})` : ""));
   } else if (t.board_problem) {
-    box.append(boardProblem(t.board_problem));
+    box.append(boardProblem(t));
   } else {
     box.append(el("p", { class: "muted small", text: "No board: issues only. Choose Change to add your project's address." }));
   }
-  if (t.open_runs?.length) {
-    box.append(el("p", { class: "muted small" },
-      `Waiting for pull requests: ${t.open_runs.map((n) => `#${n}`).join(", ")}. `,
-      el("button", { type: "button", class: "btn small", onclick: (e) => syncTracker(e.currentTarget) }, "Check now")));
+  if (tracker.waiting_error) {
+    box.append(el("p", { class: "warn-text small", text: `What the open runs wait for can't be read now: ${tracker.waiting_error}` }));
   }
+  if (tracker.waiting?.length) box.append(waitingRuns(tracker.waiting));
   box.append(el("div", { class: "repo-actions" },
     el("button", { type: "button", class: "btn small", onclick: openTrackerItems }, t.board ? "Board items" : "Open issues"),
     t.board ? el("button", { type: "button", class: "btn small", onclick: (e) => addAllToBoard(t, e.currentTarget) }, "Add existing issues") : null,
     el("button", { type: "button", class: "btn small danger", onclick: unlinkTracker }, "Stop tracking")));
+  // The GitHub card offers Grant access only when a linked tracker needs it.
+  renderGithubScopes();
+}
+
+/** The run issues left open, what each waits for, and the button that checks now. */
+function waitingRuns(runs) {
+  return el("div", { class: "tracker-waiting small" },
+    el("p", { class: "tracker-waiting-h", text: "Left open until their sub-issues close" }),
+    el("ul", { class: "tracker-waiting-list" }, ...runs.map((run) => {
+      const open = run.sub_issues.filter((s) => s.open);
+      return el("li", {},
+        externalLink(run.url, `#${run.number} ${run.title}`),
+        `: ${run.sub_issues.length - open.length} of ${nOf(run.sub_issues.length, "sub-issue")} closed`,
+        open.length ? el("ul", {}, ...open.map((s) => el("li", {},
+          externalLink(s.url, `#${s.number} ${s.title}`),
+          s.pull_requests.length ? `: pull request ${s.pull_requests.map((n) => `#${n}`).join(", ")}` : ": no pull request yet"))) : null);
+    })),
+    el("p", { class: "muted small", text: "Proofkin closes each one when all its sub-issues are closed. It looks every 10 minutes; Check now looks at once." }),
+    el("button", { type: "button", class: "btn small", onclick: (e) => syncTracker(e.currentTarget) }, "Check now"));
 }
 
 /** Puts every issue and pull request of the tracker's repository on its board. */
@@ -2286,8 +2381,35 @@ async function addAllToBoard(t, button) {
   }
 }
 
-/** Why the board isn't updated, with the command that fixes it to copy. */
-function boardProblem(problem) {
+/** Why the board isn't updated. A missing scope comes with Grant access (and the gh
+ * commands to run in a terminal instead); anything else with the command it names. */
+function boardProblem(t) {
+  if (t.board_scope) {
+    const commands = el("pre", { class: "mono" });
+    // Filled in when opened: by then the GitHub card knows gh's active account.
+    const terminal = el("details", {
+      ontoggle: (e) => {
+        if (!e.currentTarget.open) return;
+        const active = github?.accounts?.find((a) => a.active && a.host === t.host)?.login;
+        const away = !active || active.toLowerCase() !== t.login.toLowerCase();
+        const lines = [
+          ...(away ? [`gh auth switch --hostname ${t.host} --user ${t.login}`] : []),
+          `gh auth refresh --hostname ${t.host} --scopes ${t.board_scope}`,
+          ...(away ? [`gh auth switch --hostname ${t.host} --user ${active ?? "<the account you use>"}`] : []),
+        ];
+        commands.textContent = lines.join("\n");
+      },
+    }, el("summary", { text: "Or in a terminal" }), commands,
+    el("button", { type: "button", class: "btn small", onclick: () => copy(commands.textContent, "Commands") }, icon(ICONS.copy), "Copy"));
+    return el("div", { class: "tracker-problem small", role: "status" },
+      el("p", {}, "The board isn't updated: ", el("strong", { text: t.login }), "'s GitHub token lacks the ",
+        el("span", { class: "mono", text: t.board_scope }), " scope."),
+      el("p", { class: "command" },
+        el("button", { type: "button", class: "btn small primary", onclick: () => grantScope(t.board_scope) }, "Grant access"),
+        el("span", { class: "muted", text: "You approve it on GitHub with a code." })),
+      terminal);
+  }
+  const problem = t.board_problem;
   const command = problem.match(/`([^`]+)`/)?.[1];
   return el("div", { class: "tracker-problem small", role: "status" },
     el("p", { text: `The board isn't updated: ${command ? problem.replace(/`[^`]+`/, "the command below") : problem}` }),
@@ -2344,7 +2466,10 @@ async function syncTracker(button) {
   button.disabled = true;
   try {
     const res = await api("/api/tracker/sync", { method: "POST" });
-    toast(res.closed.length ? `Closed ${res.closed.map((n) => `#${n}`).join(", ")}: their pull requests are merged` : "Still waiting for their pull requests");
+    const stillOpen = res.waiting.reduce((n, run) => n + run.sub_issues.filter((s) => s.open).length, 0);
+    toast(res.closed.length
+      ? `Closed ${res.closed.map((n) => `#${n}`).join(", ")}: all their sub-issues are closed`
+      : `Nothing could be closed yet: ${nOf(stillOpen, "sub-issue")} still open`);
     await loadTracker();
   } catch (err) {
     toast(err.message, "error");
@@ -2820,6 +2945,10 @@ function init() {
   $("#repo-cancel").addEventListener("click", () => $("#repo-dialog").close());
   $("#github-form").addEventListener("submit", submitGithubLogin);
   $("#github-cancel").addEventListener("click", () => $("#github-dialog").close());
+  $("#github-new-btn").addEventListener("click", signInAnother);
+  $("#gh-flow-copy").addEventListener("click", () => ghFlow && copy(ghFlow.code, "Code"));
+  $("#gh-flow-cancel").addEventListener("click", () => $("#gh-flow-dialog").close());
+  $("#gh-flow-dialog").addEventListener("close", ghFlowClosed);
   $("#pr-form").addEventListener("submit", submitPr);
   $("#pr-cancel").addEventListener("click", () => $("#pr-dialog").close());
   // Monitors run in the background: refresh the health panel now and then.
@@ -2881,7 +3010,7 @@ function init() {
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
-    "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog"]) guardDialog($(id));
+    "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });

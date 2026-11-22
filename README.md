@@ -868,6 +868,19 @@ backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
 `skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout` and `issue` are given once.
 
+A step's task text can go on over the lines after it: lines indented more than the step line continue
+it, with their common indentation removed (deeper indentation is kept, so nested lists work), and a
+blank line between them is a paragraph break. A line that isn't indented more ends the step. Options
+still go only on the step line, and lines after a `claim:`, `track:` or `//` line are not continuations.
+
+```
+review @alice:app verify=test Check the change:
+  - the tests cover the new code
+  - the docs are updated
+
+  Report anything missing.
+```
+
 **3. Agents do the work, and each result comes back with signed evidence.**
 
 - Every delegated result carries an evidence record: the checks and their results, the
@@ -1058,7 +1071,7 @@ It reaches git only as an HTTP header in the environment: never on a command lin
 the clone's config.
 
 ```powershell
-gh auth login                                           # once, if you haven't
+gh auth login                                           # once, if you haven't (or github login --new, below)
 proofkin github login --gh-user alice --profile alice  # github status / logout
 proofkin repo link acme/shop --access full --check test="npm test" --check lint="npm run lint" --profile alice
 proofkin peers allow <boss-ticket> --profile alice --delegate --access full --share data,shop
@@ -1072,6 +1085,28 @@ the repository's default branch with the profile's account. In the web UI the **
 card does the same: **Sign in to GitHub** (pick a GitHub CLI account), **Link repo**
 (with checks, and which peers to share it with), **Sync**, and **Open PR** on each task
 branch. Digital workers use their owner's GitHub account.
+
+**Another account, or a scope its token lacks, without a terminal.** The GitHub CLI can
+hold several accounts per host but refreshes only the active one, so Proofkin runs its
+device flow for you and puts the active account back afterwards:
+
+```powershell
+proofkin github login --new --profile alice   # sign another account in, in the browser, and use it
+proofkin github grant project --profile alice # give the profile's account a scope, e.g. for the tracker's board
+```
+
+Each shows a one-time code to enter on GitHub (`https://github.com/login/device`), in a
+browser where you're signed in as that account. `login --new` gives the new account's
+token the `project` and `workflow` scopes too (`--scope` says which; `--scope ""` only the
+GitHub CLI's own), and the profile then uses it. `grant` makes the profile's account the
+GitHub CLI's active one for the refresh only if it isn't already, and checks the token
+afterwards. Either way the account that was active before is active again when it ends,
+also if you cancel (Ctrl-C), it fails, it times out (after 15 minutes) or the agent stops.
+In the web UI: **Change account** → **Sign in another account** (with its host, for GitHub
+Enterprise), and **Grant access** on the
+Tracker card when its board lacks the `project` scope (or on the GitHub card, which lists
+what each scope of the account's token is for). The code shows in a dialog with **Copy
+code** and **Open GitHub**; closing the dialog cancels.
 
 **Pull requests carry their proof.** When an agent's runtime commits a task's work, it
 keeps the evidence record it signed for the commit with the commit itself, as a git note
@@ -1114,12 +1149,15 @@ is tracked on GitHub, where your team already tracks work:
   GitHub links the pull request to the issues and closes them when it merges. The run's
   issue waits *In review* until then (or, if it has other open sub-issues, where it was)
   and is closed once all its sub-issues are (checked every 10 minutes by a running
-  agent, or now with `tracker sync`).
+  agent, or now with `tracker sync`). The **Tracker** card lists those run issues under
+  *Left open until their sub-issues close*: each run with how many of its sub-issues are
+  closed, and the open ones with the pull request that will close them, or *no pull request yet*.
+  **Check now** (`tracker sync`) closes what can be closed at once and says what is still
+  open; `tracker status` prints the same list.
 
 ```powershell
 proofkin github login --gh-user alice --profile boss
-# once, with alice as the GitHub CLI's active account: the board needs the project scope
-gh auth refresh --hostname github.com --scopes project
+proofkin github grant project --profile boss   # once: the board needs the project scope (or Grant access on the Tracker card)
 proofkin tracker link acme/shop --project https://github.com/users/alice/projects/4 --profile boss
 proofkin tracker status --profile boss   # the board's statuses, or why it isn't updated
 proofkin tracker items --profile boss    # what is on the board, by status, with agents and pull requests
@@ -1466,7 +1504,7 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
-`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|status|logout`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
@@ -1499,10 +1537,15 @@ proofkin --name me --providers copilot --serve --ui
   [team plan](#team-steps-handing-work-down-a-level).
 - **GitHub**: **Sign in to GitHub** with a GitHub CLI account; once signed in, **Change
   account** next to "Signed in as …" switches to another one (the account in use is
-  preselected). Task branches show the issues their pull request closes, and **Open PR**
-  fills in `Closes #N` for them.
+  preselected), or **Sign in another account** with a code entered on GitHub. The card
+  says what each scope of the account's token is for, with **Grant access** when the
+  tracker's board needs the `project` scope, and names the GitHub CLI's active account
+  when it is another one. Task branches show the issues their pull request closes, and
+  **Open PR** fills in `Closes #N` for them.
 - **Tracker**: link the repository (and project board) your plan runs are tracked on, see
-  the board's statuses or why it isn't updated (with the command that fixes it, to copy),
+  the board's statuses or why it isn't updated (a missing scope with **Grant access**, and
+  the commands to run in a terminal instead; anything else with the command that fixes
+  it, to copy),
   **Board items** (what is open, by status, with **Plan it**) and **Add existing issues**
   (the repository's issues and pull requests onto the board). A tracked plan's card
   links its issue, and each step its sub-issue (see
@@ -1579,6 +1622,9 @@ proofkin --name me --providers copilot --serve --ui
   place of the empty conversation: share your ticket, add a teammate's, or create a
   digital worker.
 - Times show their day when it isn't today ("Yesterday, 9:25 PM", "Nov 18, 9:25 PM").
+- A task's prompt and a team step's text show as Markdown (code spans, bold, lists,
+  paragraphs; markup in the text stays text). A long prompt is cut at about four lines
+  with a fade until **Show all**.
 - **Light, dark or System** theme (follows the OS live; the choice is remembered). Keyboard
   accessible, screen-reader labelled, WCAG AA contrast in both themes, works on phone-sized
   windows, honours reduced motion. From 1180 px wide down the page scrolls instead of
@@ -1993,7 +2039,8 @@ Workflow for a change:
 | `Not logged in · Please run /login` (claude) | Sign the agent's profile in: `proofkin auth login claude --profile <profile>`. |
 | `401 Unauthorized` (codex) | Sign the agent's profile in: `proofkin auth login codex --profile <profile>`. |
 | `<provider> is not signed in for profile '<p>'` | The agent's profile has no account for that provider; run the printed `auth login` command. Agents never borrow the machine's global sign-in. |
-| `no GitHub CLI token for <user> on <host>` | Sign that account in to gh: `gh auth login --hostname <host>`, then check `gh auth status`. |
+| `no GitHub CLI token for <user> on <host>` | Sign that account in to gh: `gh auth login --hostname <host>` (or `proofkin github login --new --host <host> --profile <p>`), then check `gh auth status`. |
+| `the GitHub account <user> can't use projects yet` | Its token lacks the `project` scope the tracker's board needs: **Grant access** on the Tracker card, or `proofkin github grant project --profile <p>`. |
 | `Copilot rejected this profile's token` | The token is invalid, expired, or the account has no Copilot access. Sign in again with `auth login copilot`. |
 | Windows Firewall prompt on first run | Allow it for direct (faster) connections; if blocked, agents still connect through the relays. |
 | `! refused connection from <id>` | That key is not on this profile's allowlist. If it should be: `proofkin peers allow <id> --profile <p> --name <n>`. |

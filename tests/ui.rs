@@ -1396,6 +1396,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     // GitHub: not signed in yet, so repositories can't be linked.
     let github = get("/api/github").await.json();
     assert!(github["account"].is_null() && github["repos"].as_array().unwrap().is_empty());
+    assert!(github["flow"].is_null(), "no GitHub CLI sign-in waits");
     let link = post("/api/repos", r#"{"repo":"acme/app"}"#).await;
     assert_eq!(link.status, 400);
     assert!(
@@ -1403,6 +1404,23 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         "{}",
         link.body
     );
+    // Granting a scope needs a sign-in too, and a new sign-in's host and scopes are
+    // checked before the GitHub CLI starts.
+    let grant = post("/api/github/grant", r#"{"scopes":["project"]}"#).await;
+    assert_eq!(grant.status, 400);
+    assert!(
+        grant.body.contains("sign in to GitHub first"),
+        "{}",
+        grant.body
+    );
+    for body in [
+        r#"{"host":"github.com --web"}"#,
+        r#"{"scopes":["project --admin"]}"#,
+    ] {
+        let new = post("/api/github/login/new", body).await;
+        assert_eq!(new.status, 400, "{body}: {}", new.body);
+    }
+    assert!(get("/api/github/flow").await.json()["flow"].is_null());
     agent.shutdown().await;
 }
 
@@ -2120,6 +2138,7 @@ async fn the_page_follows_the_ux_guidelines() {
     let page = request(port, "GET", "/", &host, None, None).await.body;
     assert!(page.contains(r#"<meta name="theme-color""#));
     assert!(page.contains(r#"<script src="/tools.js" defer>"#));
+    assert!(page.contains(r#"<script src="/markdown.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     assert!(page.contains(r#"<script src="/workers.js" defer>"#));
@@ -2178,6 +2197,7 @@ async fn the_page_follows_the_ux_guidelines() {
     let mut declarations = std::collections::HashMap::new();
     for script in [
         "/app.js",
+        "/markdown.js",
         "/tools.js",
         "/plan-text.js",
         "/plan-builder.js",
@@ -2252,6 +2272,24 @@ fn the_plan_editor_keeps_plans_valid() {
         .arg(&cases)
         .output()
         .expect("node must be installed to run the plan editor's tests");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("ok: "), "{stdout}");
+}
+
+/// Task and step text shows as Markdown: backticks become code, lists and blank-line
+/// paragraphs become list items and paragraphs, and markup in the text stays text. The
+/// cases (tests/markdown.test.cjs) run in node, which loads ui/markdown.js as the page does.
+#[test]
+fn task_text_shows_as_markdown_and_markup_stays_text() {
+    let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/markdown.test.cjs");
+    let out = std::process::Command::new("node")
+        .arg(&cases)
+        .output()
+        .expect("node must be installed to run the Markdown tests");
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
