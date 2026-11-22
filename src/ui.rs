@@ -2026,6 +2026,10 @@ fn start_plan(
                 .as_ref()
                 .map(|t| t.refs.clone())
                 .unwrap_or_default(),
+            issue_texts: tracking
+                .as_ref()
+                .map(|t| t.texts.clone())
+                .unwrap_or_default(),
             recipients,
             work_context: work,
             work_log: crate::plan::WorkLog::default(),

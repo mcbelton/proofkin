@@ -195,6 +195,8 @@ impl TeamRunner {
                 .map(|s| (s.id.clone(), task.issues.clone()))
                 .filter(|(_, issues)| !issues.is_empty())
                 .collect(),
+            // The team step's own task already has its issue's text in it.
+            issue_texts: Default::default(),
             recipients,
             work_context: crate::plan::work_context(&self.profile, &plan)?,
             work_log: crate::plan::WorkLog::default(),
