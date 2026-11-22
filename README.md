@@ -868,6 +868,19 @@ backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
 `skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout` and `issue` are given once.
 
+A step's task text can go on over the lines after it: lines indented more than the step line continue
+it, with their common indentation removed (deeper indentation is kept, so nested lists work), and a
+blank line between them is a paragraph break. A line that isn't indented more ends the step. Options
+still go only on the step line, and lines after a `claim:`, `track:` or `//` line are not continuations.
+
+```
+review @alice:app verify=test Check the change:
+  - the tests cover the new code
+  - the docs are updated
+
+  Report anything missing.
+```
+
 **3. Agents do the work, and each result comes back with signed evidence.**
 
 - Every delegated result carries an evidence record: the checks and their results, the
@@ -1608,6 +1621,9 @@ proofkin --name me --providers copilot --serve --ui
   place of the empty conversation: share your ticket, add a teammate's, or create a
   digital worker.
 - Times show their day when it isn't today ("Yesterday, 9:25 PM", "Nov 18, 9:25 PM").
+- A task's prompt and a team step's text show as Markdown (code spans, bold, lists,
+  paragraphs; markup in the text stays text). A long prompt is cut at about four lines
+  with a fade until **Show all**.
 - **Light, dark or System** theme (follows the OS live; the choice is remembered). Keyboard
   accessible, screen-reader labelled, WCAG AA contrast in both themes, works on phone-sized
   windows, honours reduced motion. From 1180 px wide down the page scrolls instead of

@@ -449,6 +449,24 @@
       "tests": ["ui::tasks_outlive_a_restart_and_finished_ones_can_be_cleared"]
     },
     {
+      "id": "UI-4",
+      "area": "ui",
+      "claim": "The web UI shows a task's prompt and a team step's text as Markdown (code spans, bold, lists and paragraphs, built as DOM nodes so markup in the text stays text), compactly; a long prompt is cut at about four lines with a fade until Show all.",
+      "tests": ["ui::task_text_shows_as_markdown_and_markup_stays_text"]
+    },
+    {
+      "id": "PLAN-1",
+      "area": "plans",
+      "claim": "A plan step's task text continues on the lines indented under it, keeping lists, paragraphs and deeper indentation, with options only on the step line and errors naming the step's first line; the plan editor and builder read and write those lines with their step.",
+      "tests": [
+        "lib::plan::indented_lines_after_a_step_continue_its_task_text",
+        "lib::plan::plans_indented_uniformly_parse_as_before",
+        "lib::plan::option_looking_words_in_continuation_lines_are_text",
+        "lib::plan::a_step_error_names_its_first_line",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
       "id": "LRN-1",
       "area": "knowledge",
       "claim": "The system keeps learning: the ops summary (health, incidents, usage) is written into the knowledge base (kb learn, and hourly by agents with monitors) for context=all and the learn playbook, and learned TSGs fix repeats without the model.",

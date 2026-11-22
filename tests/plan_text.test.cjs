@@ -192,6 +192,27 @@ cases.push(
   ["tracking a plan", line("a @x Do| it", "track"), "track: #[1]\na @x Do it"],
   ["a plan tracked already", line("track: #4\na @x Do| it", "track"), "track: [#4]\na @x Do it"],
   ["a step's one issue", part("a @x issue=#3 Do| it", "issue=#5"), "a @x issue=#5 Do it[]"],
+  // A step's task text goes on in the lines indented under it (src/plan.rs).
+  ["task text over several lines comes back as it was",
+    text(planText.parsePlan("a @x Do these:\n  - one\n    - nested\n\n  second\nb @x Next")),
+    "a @x Do these:\n  - one\n    - nested\n\n  second\nb @x Next"],
+  ["a step whose text starts on the next line", text(planText.parsePlan("a @x\n  Alpha\n  - b")), "a @x\n  Alpha\n  - b"],
+  ["the task text of a step is all of it",
+    planText.taskOf(planText.parsePlan("a @x One\n    - two\n      - three").steps[0]), "One\n- two\n  - three"],
+  ["an option-looking word in a continuation line is text",
+    JSON.stringify(planText.parsePlan("a @x Do\n  verify=test more").steps[0].options), "[]"],
+  ["which lines are a step's text",
+    planText.lineKinds("a @x One\n  more\n\n  x\n// c\nb @x Y").map((l) => l.kind).join(","),
+    "step,text,text,text,comment,step"],
+  ["a part clicked in a continuation line goes on the step's line",
+    part("a @x Do these:\n  - o|ne", "verify=test"), "a @x verify=test Do these:[]\n  - one"],
+  ["a line added after a step goes after its text",
+    fixed("a @x One\n  more\nb @x Y", [{ do: "add_line", step: "a", line: "// hi" }]), "a @x One\n  more\n// hi\nb @x Y"],
+  ["extra lines of a step are written indented", (() => {
+    const plan = planText.parsePlan("a @x");
+    planText.setTask(plan.steps[0], "One\n- two\n\n  - three");
+    return text(plan);
+  })(), "a @x One\n  - two\n\n    - three"],
 );
 
 const failed = cases.filter(([, got, want]) => got !== want);

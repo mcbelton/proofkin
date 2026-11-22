@@ -40,26 +40,44 @@ const planText = (() => {
   };
   const isTarget = (word) => /^[@#]./.test(word);
 
-  /// The line around `pos`: where it starts and ends, and its text.
+  /// The line around `pos` and where its step's text ends: a line of a step's task
+  /// text is read as the step's own line.
   function lineAt(text, pos) {
-    const start = pos > 0 ? text.lastIndexOf("\n", pos - 1) + 1 : 0;
-    const newline = text.indexOf("\n", pos);
-    const end = newline < 0 ? text.length : newline;
-    return { start, end, line: text.slice(start, end) };
+    const lines = linesOf(text);
+    const found = lines.find((l) => l.start <= pos && pos <= l.end) ?? lines.at(-1);
+    return lines[found.head];
   }
 
-  /// Each line of `text` with where it starts and ends.
+  /// Each line of `text` with where it starts and ends, how the parser reads it (see
+  /// kindOf; "text" for a line that continues the task text of a step), the index of
+  /// the step line it belongs to (its own for any other line) and, on a step line,
+  /// where its last continuation line ends.
   function linesOf(text) {
     let start = 0;
-    return text.split("\n").map((line) => {
-      const at = { start, end: start + line.length, line };
+    const lines = text.split("\n").map((line, index) => {
+      const at = { start, end: start + line.length, line, kind: kindOf(line), head: index, blockEnd: start + line.length };
       start = at.end + 1;
       return at;
     });
+    const indent = (l) => l.match(/^\s*/)[0].length;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].kind !== "step") continue;
+      const base = indent(lines[i].line);
+      let last = i;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (!lines[j].line.trim()) continue;
+        if (indent(lines[j].line) <= base) break;
+        last = j;
+      }
+      for (let k = i + 1; k <= last; k++) Object.assign(lines[k], { kind: "text", head: i });
+      lines[i].blockEnd = lines[last].end;
+      i = last;
+    }
+    return lines;
   }
 
-  /// How the parser reads a line: "empty", "comment", "claim", "track" (how the run is
-  /// tracked on GitHub) or "step".
+  /// How the parser reads a line on its own: "empty", "comment", "claim", "track" (how
+  /// the run is tracked on GitHub) or "step".
   function kindOf(line) {
     const t = line.trim();
     return !t ? "empty" : t.startsWith("//") ? "comment" : t.startsWith("claim:") ? "claim"
@@ -136,10 +154,11 @@ const planText = (() => {
     s.target, s.using ? `using ${s.using}` : "", ...s.options, s.todo].filter(Boolean).join(" ");
 
   /// The names of the plan's steps.
-  const stepIds = (text) => text.split("\n").filter((l) => kindOf(l) === "step")
-    .map((l) => parseStep(l).id).filter(Boolean);
+  const stepIds = (text) => linesOf(text).filter((l) => l.kind === "step")
+    .map((l) => parseStep(l.line).id).filter(Boolean);
   /// The ids of the plan's claims.
-  const claimIds = (text) => text.split("\n").map((l) => l.trim().match(/^claim:\s*(\S+)/)?.[1]).filter(Boolean);
+  const claimIds = (text) => linesOf(text).filter((l) => l.kind === "claim")
+    .map((l) => l.line.trim().match(/^claim:\s*(\S+)/)?.[1]).filter(Boolean);
   /// The first of make(from), make(from + 1), ... that isn't taken.
   function freeId(taken, make, from) {
     let n = from;
@@ -160,7 +179,7 @@ const planText = (() => {
   /// after the plan's last line if the cursor is on a claim (claims come first).
   function placeLine(text, at, kind, line, select) {
     if (kind === "empty") return change(at.start, at.end, line, at.start, select);
-    const pos = kind === "claim" ? text.length : at.end;
+    const pos = kind === "claim" ? text.length : at.blockEnd;
     const lead = pos === text.length && text.endsWith("\n") ? "" : "\n";
     return change(pos, pos, lead + line, pos + lead.length, select);
   }
@@ -191,7 +210,7 @@ const planText = (() => {
     }
     step.id ??= nextStepId(text);
     step.target ??= target;
-    step.todo ||= TODO;
+    step.todo ||= at.blockEnd > at.end ? "" : TODO;
     const line = (kind === "step" ? at.line.match(/^\s*/)[0] : "") + formatStep(step);
     // Select a placeholder to type over: a new topic's name, or what to do.
     const topic = part === "save=topic" ? line.indexOf(" save=topic ") : -1;
@@ -217,7 +236,7 @@ const planText = (() => {
     if (what === "track") {
       // One per plan, at the top: select its issue number to type over.
       const lines = linesOf(text);
-      const have = lines.find((l) => kindOf(l.line) === "track");
+      const have = lines.find((l) => l.kind === "track");
       if (have) {
         const start = have.line.indexOf("track:") + "track:".length;
         return change(have.start, have.start, "", have.start, [start + (have.line[start] === " " ? 1 : 0), have.line.length]);
@@ -228,9 +247,9 @@ const planText = (() => {
       const [line, select] = make(["claim:", freeId(claims, (n) => `C-${n}`, claims.length + 1)],
         "What must be true at the end");
       const lines = linesOf(text);
-      const lastClaim = lines.filter((l) => kindOf(l.line) === "claim").at(-1);
+      const lastClaim = lines.filter((l) => l.kind === "claim").at(-1);
       if (lastClaim) return change(lastClaim.end, lastClaim.end, `\n${line}`, lastClaim.end + 1, select);
-      const firstStep = lines.find((l) => kindOf(l.line) === "step");
+      const firstStep = lines.find((l) => l.kind === "step");
       if (firstStep) return change(firstStep.start, firstStep.start, `${line}\n`, firstStep.start, select);
       const lead = !text || text.endsWith("\n") ? "" : "\n";
       return change(text.length, text.length, lead + line, text.length + lead.length, select);
@@ -254,21 +273,22 @@ const planText = (() => {
     for (const edit of edits) {
       const lines = linesOf(text);
       if (edit.do === "remove_claim") {
-        const at = lines.find((l) => kindOf(l.line) === "claim" && claimIds(l.line)[0] === edit.claim);
+        const at = lines.find((l) => l.kind === "claim" && claimIds(l.line)[0] === edit.claim);
         if (at) {
           text = at.end < text.length ? text.slice(0, at.start) + text.slice(at.end + 1)
             : text.slice(0, Math.max(at.start - 1, 0));
         }
         continue;
       }
-      const at = lines.find((l) => kindOf(l.line) === "step" && parseStep(l.line).id === (edit.step ?? edit.after));
+      const at = lines.find((l) => l.kind === "step" && parseStep(l.line).id === (edit.step ?? edit.after));
       if (!at) continue;
-      let line = `${at.line}\n${edit.line}`;
-      if (edit.do !== "add_line") {
-        const step = parseStep(at.line);
-        (edit.do === "add" ? setOption : removeOption)(step, edit.option);
-        line = at.line.match(/^\s*/)[0] + formatStep(step);
+      if (edit.do === "add_line") {
+        text = `${text.slice(0, at.blockEnd)}\n${edit.line}${text.slice(at.blockEnd)}`;
+        continue;
       }
+      const step = parseStep(at.line);
+      (edit.do === "add" ? setOption : removeOption)(step, edit.option);
+      const line = at.line.match(/^\s*/)[0] + formatStep(step);
       text = text.slice(0, at.start) + line + text.slice(at.end);
     }
     return text;
@@ -299,6 +319,27 @@ const planText = (() => {
     else step.options.push(word);
   }
 
+  /// The lines after the step line `all[index]` that continue its task text, without
+  /// their common indentation, as the parser reads them (src/plan.rs).
+  function moreOf(all, index) {
+    const body = [];
+    for (let i = index + 1; all[i]?.head === index && all[i].kind === "text"; i++) body.push(all[i].line.trimEnd());
+    const indent = (l) => l.match(/^\s*/)[0].length;
+    const common = Math.min(...body.filter(Boolean).map(indent));
+    const lines = body.map((l) => l.slice(common));
+    return (parseStep(all[index].line).todo ? lines.join("\n") : lines.join("\n").replace(/^\n+/, ""));
+  }
+
+  /// A step's whole task text: what is on its line and the lines that continue it.
+  const taskOf = (s) => (s.more ? (s.todo ? `${s.todo}\n${s.more}` : s.more) : s.todo);
+
+  /// Sets a step's task text; its first line goes on the step's line, the rest continues it.
+  function setTask(s, text) {
+    const [first, ...rest] = text.split("\n");
+    s.todo = first.split(/\s+/).filter(Boolean).join(" ");
+    s.more = rest.join("\n").trimEnd();
+  }
+
   /// The plan as the builder edits it: notes (comments before the first claim or step,
   /// and after the last), how its run is tracked (`track:`, kept as written), claims
   /// and steps, each with the comments just above it. Lenient, like the palette: a
@@ -306,7 +347,9 @@ const planText = (() => {
   function parsePlan(text) {
     const plan = { notes: [], track: null, claims: [], steps: [] };
     let comments = [];
-    for (const line of text.split("\n")) {
+    const all = linesOf(text);
+    for (const [index, { line, kind: lineKind }] of all.entries()) {
+      if (lineKind === "text") continue;
       const t = line.trim();
       const kind = kindOf(t);
       if (kind === "empty") continue;
@@ -329,7 +372,7 @@ const planText = (() => {
         const named = NAME.test(id);
         plan.claims.push({ id: named ? id : null, text: named ? rest : `${id} ${rest}`.trim(), notes: comments });
       } else {
-        plan.steps.push({ ...parseStep(t), notes: comments });
+        plan.steps.push({ ...parseStep(t), more: moreOf(all, index), notes: comments });
       }
       comments = [];
     }
@@ -361,6 +404,7 @@ const planText = (() => {
     for (const s of plan.steps) {
       s.notes?.forEach((n) => note(n, { step: s.id }));
       add(formatStep(s), { step: s.id });
+      for (const l of s.more ? s.more.split("\n") : []) add(l ? `  ${l}` : "", { step: s.id });
     }
     return { text: lines.join("\n"), items };
   }
@@ -429,7 +473,7 @@ const planText = (() => {
         if (s.approve || s.team) need("step", i, "target", ERRORS.workiqKind);
         else if (s.options.some((o) => NOT_IN_WORKIQ.has(optionOf(o)))) need("step", i, "target", ERRORS.workiqOption);
       }
-      if (blank(s.todo, TODO)) {
+      if (blank(taskOf(s), TODO)) {
         need("step", i, "todo", s.approve ? "Say what to check before signing off" : "Say what this step should do");
       }
       if (!s.approve && !s.team && s.target !== WORKIQ && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {
@@ -443,5 +487,6 @@ const planText = (() => {
     addPart, addLine, applyFix, stepIds, claimIds, parseStep, formatStep, ERRORS,
     parsePlan, formatPlan, valuesOf, setValues, renameStep, removeStep, renameClaim, removeClaim,
     dependents, needs, isTodo: (text) => blank(text, TODO), isTodoClaim: (text) => blank(text, TODO_CLAIM),
+    taskOf, setTask, lineKinds: (text) => linesOf(text).map((l) => ({ kind: l.kind, head: l.head })),
   };
 })();
