@@ -1050,6 +1050,46 @@
       ]
     },
     {
+      "id": "WIQ-5",
+      "area": "work-iq",
+      "claim": "proofkin auth login workiq --cli [--tenant T] --profile P connects a profile to Microsoft's Work IQ CLI, which signs in by itself with its own app: the account (connection kind cli with the optional tenant) is saved with no token in the secret store, the user shown is the one the CLI reports in its initialize reply (serverInfo.user, else serverInfo.upn) else Work IQ CLI, and the sign-in is checked right away with tools/list through the CLI and signed out again if that fails. A StdioTransport (the client's Transport over a child process) starts workiq mcp, or npx -y @microsoft/workiq mcp when workiq is not on the PATH, adding --tenant-id when the account has a tenant; it writes newline-delimited JSON-RPC to the child's stdin and reads replies line by line from its stdout, skipping notifications and lines that are not JSON and matching responses by id. The MCP client runs initialize, tools/list and tools/call over it. A child that exited is started again once, and gets the initialize handshake again before the message; a change tool that may already have reached a child that crashed is not sent again (reported as uncertain), and a second crash is an error. The child is killed when the transport is dropped. The child gets the agent's environment minus the inherited credential variables the providers' processes lose (GH_TOKEN, GITHUB_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY and the rest of INHERITED_CREDENTIAL_VARS). A CLI account has no bearer: its token source gives nothing. workiq::connect(profile) builds the client for the profile's account, hosted or CLI, and client_for_profile uses it. When the CLI says its EULA is not accepted (its error mentions the EULA or accept-eula), the error says to run workiq accept-eula yourself and that Proofkin never accepts it for you.",
+      "tests": [
+        "workiq_cli::initialize_list_tools_and_call_tool_run_over_stdio_with_the_tenant",
+        "workiq_cli::notifications_and_lines_that_are_not_json_before_a_response_are_skipped",
+        "workiq_cli::a_cli_that_crashed_is_started_again_once_and_gets_the_handshake_again",
+        "workiq_cli::a_cli_that_crashes_again_is_not_started_a_third_time",
+        "workiq_cli::a_change_that_may_have_reached_a_crashed_cli_is_not_sent_again",
+        "workiq_cli::a_cli_that_wants_its_eula_accepted_says_to_run_accept_eula_yourself",
+        "workiq_cli::the_cli_does_not_inherit_the_credentials_the_providers_lose",
+        "workiq_cli::a_cli_account_has_no_token_and_connect_builds_its_client",
+        "workiq_cli::the_cli_sign_in_saves_a_cli_account_without_a_token",
+        "workiq_cli::a_cli_sign_in_that_fails_is_signed_out_again"
+      ]
+    },
+    {
+      "id": "WIQ-6",
+      "area": "work-iq",
+      "claim": "proofkin workiq doctor [--json] --profile P (docs/work-iq.md section 10) runs five checks in order against the account the profile uses, through workiq::connect_at, and stops at the first that fails; its address for the discovery document, the MCP endpoint and Entra are configurable (workiq::Endpoints) so tests use fakes. (1) Discovery, hosted accounts only (skipped otherwise): a GET of the protected-resource metadata answers with resource and authorization_servers. (2) Sign-in: the profile has a Work IQ account and, when hosted, its refresh token. (3) Token, hosted only: a fresh access token whose claims, decoded only for this diagnosis, have an aud of api://workiq.svc.cloud.microsoft or fdcc1f02-fc51-4226-8753-f668596af7f7, the account's tid, and WorkIQAgent.Ask in scp. (4) tools/list works and offers retrieve. (5) One small retrieve (query Proofkin connection check), audited with the purpose doctor and counted against the budgets. Each failure says what is wrong, the fix and who makes it, from the client's error classes where they apply: the Work IQ service principal (az ad sp create --id fdcc1f02-fc51-4226-8753-f668596af7f7, a tenant admin), admin consent (the adminconsent URL of the account's client id and tenant), user assignment (an admin, Enterprise applications, Users and groups), billing and the spending policy (a billing admin, Microsoft 365 admin center), the Work IQ MCP policy (an admin, Microsoft 365 admin center, Agents, Tools, Work IQ MCP), or signing in again (the user). --json prints the profile, whether all passed, and each check's name, result (ok, failed or skipped), detail and fix (who and action). The command exits 1 when a check fails. proofkin doctor shows one Work IQ line per profile (signed in or not, and the connection) without network calls.",
+      "tests": [
+        "workiq_doctor::all_five_checks_pass_and_the_retrieve_is_audited_as_a_doctor_call",
+        "workiq_doctor::an_unreachable_discovery_document_fails_first_and_nothing_else_runs",
+        "workiq_doctor::a_discovery_document_without_the_resource_and_its_servers_fails",
+        "workiq_doctor::a_profile_that_is_not_signed_in_is_told_to_sign_in",
+        "workiq_doctor::a_hosted_account_without_its_refresh_token_is_told_to_sign_in_again",
+        "workiq_doctor::a_token_for_another_audience_points_at_the_service_principal",
+        "workiq_doctor::the_resource_app_id_is_also_an_accepted_audience",
+        "workiq_doctor::a_token_for_another_tenant_is_told_to_sign_in_with_the_right_account",
+        "workiq_doctor::a_token_without_the_ask_scope_needs_an_admin_to_grant_consent",
+        "workiq_doctor::entra_refusals_get_the_fix_that_matches_them",
+        "workiq_doctor::a_work_iq_that_refuses_the_token_is_told_to_sign_in_again",
+        "workiq_doctor::a_tool_list_without_retrieve_needs_the_mcp_policy_changed",
+        "workiq_doctor::a_retrieve_that_billing_stops_needs_a_billing_admin",
+        "workiq_doctor::a_retrieve_the_mcp_policy_denies_needs_an_admin_to_change_the_policy",
+        "workiq_doctor::a_user_who_is_not_assigned_to_the_app_is_sent_to_the_admin",
+        "workiq_doctor::the_json_report_has_each_checks_name_result_and_fix"
+      ]
+    },
+    {
       "id": "WIQ-7",
       "area": "work-iq",
       "claim": "The Work IQ content policy (src/workiq/content.rs, docs/work-iq.md section 3) reads retrieve results from structuredContent under application/vnd.ms-workiq.retrieval, never from the MCP content array, and fails on isError, stoppedReason error or a missing structuredContent. Only results whose contentProtection is exactly allowed (after trimming) are kept; the rest, a missing value included, are withheld and counted as missing, blocked or other. A Local audience gets every label; a Peer gets only the labels in its allowlist (compared without case), and unlabeled allows results without a label; results withheld by label are counted too. Markdown, titles and links are redacted, results are kept by relevance up to a character cap (16000 by default), and each result is wrapped in the external-content envelope, followed by a Sources list (also wrapped) and a line with the withheld counts, under the heading saying the context is cited and unverified. An ask answer and its citations are read the same way; an answer whose citations have no label metadata is local only, and a Peer gets nothing from it.",

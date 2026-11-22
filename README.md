@@ -297,6 +297,7 @@ shows which store is used. The allowlist is `<profile>\peers.json`.
 | `codex` | `proofkin auth login codex --profile P --api-key` | Prompts for an OpenAI API key (saved by `codex login --with-api-key`) |
 | `workiq` | `proofkin auth login workiq --profile P --tenant <id-or-domain> --client-id <app-id>` | Microsoft 365 work context: signs in to Entra ID in your browser (authorization code with PKCE, redirected to a loopback port on localhost; the address is printed too) and keeps the refresh token in the OS credential store |
 | `workiq` | `proofkin auth login workiq --profile P --tenant <id-or-domain> --client-id <app-id> --device-code` | Same, for machines without a browser: prints a web address and a code to enter on another device |
+| `workiq` | `proofkin auth login workiq --profile P --cli [--tenant <id>]` | Same Work IQ, through Microsoft's Work IQ CLI instead: Proofkin starts `workiq mcp` (else `npx -y @microsoft/workiq mcp`; install Node.js or `npm install -g @microsoft/workiq`) and talks to it over stdio. The CLI signs in by itself with its own app, which your tenant's admin must have approved, so Proofkin keeps no token. The CLI doesn't get the agent's provider credentials (`GH_TOKEN`, `ANTHROPIC_API_KEY` and so on). If the CLI says its EULA isn't accepted, run `workiq accept-eula` yourself; Proofkin never accepts it for you |
 Secrets are read from a hidden prompt, or from stdin when piped. Every login is verified
 right away; if verification fails, that provider is signed out again.
 
@@ -555,6 +556,36 @@ sent: it fails saying which budget is used up and how to raise it, and is record
 `budget` keeps a limit you leave out, and saves them in `profile.json` (`workiq_budget`).
 `proofkin workiq agents --profile alice` lists the declarative agents Work IQ offers (name
 and id), for `agent=` on [`@workiq` steps](#asking-microsoft-365-in-a-step-workiq).
+
+#### Checking the Work IQ connection
+
+```text
+> proofkin workiq doctor --profile alice [--json]
+```
+
+Checks the connection in order and stops at the first check that fails:
+
+1. **discovery** (hosted accounts): Work IQ's `/.well-known/oauth-protected-resource/mcp`
+   answers with `resource` and `authorization_servers`.
+2. **sign-in**: the profile has a Work IQ account and, when hosted, its refresh token.
+3. **token** (hosted accounts): a fresh access token for Work IQ (`aud`
+   `api://workiq.svc.cloud.microsoft` or `fdcc1f02-fc51-4226-8753-f668596af7f7`) for the
+   account's tenant (`tid`) with the `WorkIQAgent.Ask` scope. The token's claims are read
+   only for this diagnosis, not trusted for anything else.
+4. **tools**: `tools/list` works and offers `retrieve`.
+5. **retrieve**: one small `retrieve` ("Proofkin connection check"). It is a real call, so it
+   is in the audit file with the purpose `doctor` and counts against the budgets.
+
+A failure says what is wrong, the fix and who makes it: the Work IQ service principal (a
+tenant admin runs `az ad sp create --id fdcc1f02-fc51-4226-8753-f668596af7f7`), admin consent
+(with the consent URL for the account's app and tenant), user assignment (an admin, under
+Enterprise applications, Users and groups), billing and the spending policy (a billing admin,
+in the Microsoft 365 admin center), the Work IQ MCP policy (an admin, Microsoft 365 admin
+center, Agents, Tools, Work IQ MCP), or signing in again (you). The command exits with 1 when
+a check fails. `--json` prints `{"profile", "ok", "checks": [{"name", "result", "detail",
+"fix": {"who", "action"} | null}]}`, with `result` one of `ok`, `failed` and `skipped`, for
+the web UI. `proofkin doctor` also shows one Work IQ line per profile (signed in or not, and
+the connection) without calling Work IQ.
 
 ### Cancelling tasks
 

@@ -210,6 +210,10 @@ pub async fn doctor(bridge: &Path) -> Result<bool> {
             "  profile {name:<14} providers: [{}], allowlisted peers: {peers}",
             signed.join(", ")
         );
+        println!(
+            "  workiq  {name:<14} {}",
+            crate::workiq::account::describe(&profile)
+        );
     }
     println!(
         "{}",

@@ -1,8 +1,9 @@
-//! MCP client for Work IQ's streamable HTTP endpoint.
+//! MCP client for Work IQ.
 //!
 //! The [`Client`] owns the MCP session (`initialize`, `Mcp-Session-Id`, renewal when the server
 //! forgets it) and caches `tools/list`. A [`Transport`] carries one JSON-RPC message at a time:
-//! [`HttpTransport`] here, and a stdio transport for Microsoft's CLI later.
+//! [`HttpTransport`] here for the hosted endpoint, and [`super::stdio::StdioTransport`] for
+//! Microsoft's CLI.
 
 use std::fmt;
 use std::sync::Arc;
@@ -213,6 +214,11 @@ impl WorkIqError {
         ids: RequestIds,
     ) -> Self {
         let message = one_line(message.as_ref());
+        let (class, message) = if mentions_eula(&message) {
+            (Class::Tool, EULA_MESSAGE.to_string())
+        } else {
+            (class, message)
+        };
         let fix = fix_for(&class, &message);
         WorkIqError {
             kind,
@@ -224,12 +230,12 @@ impl WorkIqError {
     }
 
     /// A failure to send the request or read the reply.
-    fn transport(message: impl AsRef<str>, ids: RequestIds) -> Self {
+    pub(crate) fn transport(message: impl AsRef<str>, ids: RequestIds) -> Self {
         Self::new(WorkIqErrorKind::Transport, Class::Transient, message, ids)
     }
 
     /// A reply that is not the MCP message that was expected.
-    fn protocol(message: impl AsRef<str>, ids: RequestIds) -> Self {
+    pub(crate) fn protocol(message: impl AsRef<str>, ids: RequestIds) -> Self {
         Self::new(WorkIqErrorKind::Protocol, Class::Tool, message, ids)
     }
 
@@ -387,7 +393,24 @@ fn classify(text: &str, payload: &Payload) -> Class {
     }
 }
 
+const EULA_MESSAGE: &str = "the Work IQ CLI says its EULA is not accepted";
+
+/// Whether the Work IQ CLI is complaining about its EULA (it mentions the EULA or
+/// `accept-eula`).
+fn mentions_eula(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word == "eula" || word == "accepteula")
+}
+
 fn fix_for(class: &Class, text: &str) -> Fix {
+    if text == EULA_MESSAGE {
+        return Fix {
+            who: Who::User,
+            action: "run `workiq accept-eula` yourself; Proofkin never accepts it for you"
+                .to_string(),
+        };
+    }
     let text = normalized(text);
     let (who, action) = match class {
         Class::SignInAgain => (

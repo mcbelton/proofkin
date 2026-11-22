@@ -2,6 +2,7 @@
 //! authorization code flow (PKCE, loopback redirect) or the device code flow (see
 //! docs/work-iq.md, section 1).
 
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,11 @@ use tokio::sync::mpsc;
 
 use super::account::{DEFAULT_AUTHORITY, HostedTokens, SCOPE, encode, logout};
 use super::client::{Client, DEFAULT_URL, http_client};
+use super::stdio::{NoToken, StdioTransport};
 use crate::profile::{Profile, WorkIqAccount, WorkIqConnection};
+
+/// Shown as the user of a CLI account when the CLI doesn't say who it is.
+const CLI_USER: &str = "Work IQ CLI";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the browser has to come back to the loopback address.
@@ -79,6 +84,77 @@ fn browser_command(url: &str) -> std::process::Command {
     let mut command = std::process::Command::new(opener);
     command.arg(url);
     command
+}
+
+/// A Work IQ sign-in through Microsoft's Work IQ CLI: no token is kept, because the CLI signs
+/// in by itself with its own app, which the tenant's admin has approved.
+pub struct CliLogin {
+    tenant: Option<String>,
+    command: Option<(OsString, Vec<String>)>,
+}
+
+impl CliLogin {
+    pub fn new(tenant: Option<&str>) -> Self {
+        CliLogin {
+            tenant: tenant.map(str::to_string),
+            command: None,
+        }
+    }
+
+    /// Starts `program` with `args` instead of the CLI, for tests.
+    pub fn with_command(mut self, program: impl Into<OsString>, args: &[&str]) -> Self {
+        let args = args.iter().map(|arg| arg.to_string()).collect();
+        self.command = Some((program.into(), args));
+        self
+    }
+
+    /// Saves the account, and checks it with `tools/list` through the CLI; if that fails, the
+    /// profile is signed out again. Returns who signed in: the user the CLI reports, else
+    /// `Work IQ CLI`.
+    pub async fn run(&self, profile: &mut Profile) -> Result<String> {
+        let transport = Arc::new(match &self.command {
+            Some((program, args)) => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                StdioTransport::with_command(program, &args, self.tenant.as_deref())
+            }
+            None => StdioTransport::new(self.tenant.as_deref()),
+        });
+        let mut account = WorkIqAccount {
+            connection: WorkIqConnection::Cli {
+                tenant: self.tenant.clone(),
+            },
+            display_name: CLI_USER.to_string(),
+            upn: CLI_USER.to_string(),
+            tenant_id: self.tenant.clone().unwrap_or_else(|| "unknown".into()),
+            added: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        profile.config.workiq = Some(account.clone());
+        profile.delete_workiq_token()?;
+        profile.save()?;
+
+        let client = Client::with_transport(transport.clone(), Arc::new(NoToken));
+        if let Err(error) = client.list_tools().await {
+            logout(profile)?;
+            bail!(
+                "Work IQ refused the sign-in through the Work IQ CLI, so it was signed out \
+                 again: {error:#}"
+            );
+        }
+        let who = transport
+            .reported_user()
+            .await
+            .unwrap_or_else(|| CLI_USER.to_string());
+        if who != CLI_USER {
+            account.display_name = who.clone();
+            account.upn = who.clone();
+            profile.config.workiq = Some(account);
+            profile.save()?;
+        }
+        Ok(who)
+    }
 }
 
 /// A Work IQ sign-in for one tenant and client app.
@@ -501,8 +577,9 @@ fn random_token(bytes: usize) -> String {
     data_encoding::BASE64URL_NOPAD.encode(&random[..bytes])
 }
 
-/// The claims of a JWT, read without checking its signature: only for display.
-fn id_token_claims(token: &str) -> Option<Value> {
+/// The claims of a JWT, read without checking its signature: only for display and for
+/// diagnosing a connection.
+pub(crate) fn id_token_claims(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let bytes = data_encoding::BASE64URL_NOPAD
         .decode(payload.trim_end_matches('=').as_bytes())
