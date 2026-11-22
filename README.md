@@ -902,7 +902,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `team @lead:folder`, `levels=N` | Instead of a model, the lead's team does it, with the folder's team plan ([team steps](#team-steps-handing-work-down-a-level)). `levels=` (1 to 3, default 1) is how many levels down it may go. |
 | `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
 | `workiq=all` / `workiq=email,files` | Searches your Microsoft 365 (Work IQ) for the step's own words when the step is sent, and puts what it finds in the prompt before `Your task:`. `all` searches everything; a list names sources: `email`, `meetings`, `files`, `teams`, `people`, `connectors`. Not on sign-offs. See [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq). |
-| `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue. |
+| `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue, and its task gets the issue's title and body in front of it (as external content, secrets redacted, cut at 4,000 characters), so the plan needn't repeat them. |
 
 A step line is `name [after steps] [team] @peer[:folder] or #squad [options] what to do`: options
 go before the task text (the plan check warns about one typed after it, but not text in

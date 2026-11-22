@@ -1388,6 +1388,16 @@
       "tests": [
         "lib::profile::a_digital_worker_runs_on_its_owners_models_unless_it_sets_its_own"
       ]
+    },
+    {
+      "id": "TRK-7",
+      "area": "tracking",
+      "claim": "A step that names an issue (issue=#N) on a tracked run gets the issue's title and body, as its tracker has them, in front of its task as external content (Proofkin's own markers left out, secrets redacted, cut at 4,000 characters; after the earlier steps' results), so the plan needn't repeat them and the model needn't look them up; a sign-off shows them to the person. Steps that name no issue get none.",
+      "tests": [
+        "lib::tracker::a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do",
+        "lib::plan::a_step_working_on_an_issue_gets_its_text_as_external_content",
+        "agents::a_step_gets_the_text_of_the_issue_it_works_on"
+      ]
     }
   ]
 }

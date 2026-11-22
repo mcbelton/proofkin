@@ -629,6 +629,42 @@ async fn owners_set_the_default_model_and_which_ones_tasks_may_ask_for() {
     );
 }
 
+/// A step that works on an issue (issue=#N) gets the issue's text, as its tracker
+/// has it, in front of its task as external content, so the model needn't look it up.
+#[tokio::test]
+async fn a_step_gets_the_text_of_the_issue_it_works_on() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let plan = Plan::parse("docs @worker issue=#12 Document it\nplain @worker Say hi").unwrap();
+    let ctx = RunContext {
+        issue_texts: [(
+            "docs".to_owned(),
+            "acme/app#12 Document the API\n\nEvery endpoint.".to_owned(),
+        )]
+        .into(),
+        ..RunContext::default()
+    };
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    let output = |id: &str| match &states[id] {
+        StepState::Done { output, .. } => output.clone(),
+        other => panic!("{id}: {other:?}"),
+    };
+    let docs = output("docs");
+    assert!(
+        docs.contains(
+            "<external_content source=\"issue:12\">\nacme/app#12 Document the API\n\nEvery endpoint.\n</external_content>"
+        ),
+        "{docs}"
+    );
+    assert!(docs.ends_with("Your task:\nDocument it"), "{docs}");
+    assert_eq!(output("plain"), "copilot did: Say hi");
+}
+
 /// An owner sets the reasoning effort its tasks work at; a task may ask for another.
 /// The result names it with the model (in characters every version shows as they are),
 /// its signed output says it, and a name that isn't an effort is refused.

@@ -2145,8 +2145,22 @@ pub fn step_prompt(step: &Step, deps: &[Earlier]) -> String {
     step_prompt_with(step, deps, "")
 }
 
-/// [`step_prompt`] with the Microsoft 365 `work` section (what the step's `workiq=`
-/// search found; empty if none) in front of the task.
+/// The issue a step works on, for its prompt (see [`step_prompt_with`]): its tracker's
+/// text of it, as external content (people wrote it).
+pub fn issue_section(step: &Step, text: &str) -> String {
+    let source = match step.issue {
+        Some(n) => format!("issue:{n}"),
+        None => "issue".to_owned(),
+    };
+    format!(
+        "The issue this task works on:\n{}\n",
+        crate::boundary::wrap(&source, text)
+    )
+}
+
+/// [`step_prompt`] with `work` in front of the task: the issue the step works on (see
+/// [`issue_section`]) and the Microsoft 365 section of what its `workiq=` search found,
+/// either or both (empty if none).
 pub fn step_prompt_with(step: &Step, deps: &[Earlier], work: &str) -> String {
     if deps.is_empty() && work.is_empty() {
         return crate::boundary::guard(&step.prompt);
@@ -2285,6 +2299,10 @@ impl ReadyRun {
                 .as_ref()
                 .map(|t| t.refs.clone())
                 .unwrap_or_default(),
+            issue_texts: tracking
+                .as_ref()
+                .map(|t| t.texts.clone())
+                .unwrap_or_default(),
             recipients: self.recipients.clone(),
             work_context: self.work.clone(),
             work_log: WorkLog::default(),
@@ -2350,6 +2368,10 @@ pub struct RunContext {
     /// The issues each step's task carries, by step (`owner/repo#N`, see
     /// [`crate::tracker`]): its commit references them, a pull request closes them.
     pub issues: HashMap<String, Vec<String>>,
+    /// The text of the issue each step that names one (`issue=#N`) works on, by step
+    /// (see [`crate::tracker::Tracking::texts`]): put in front of its task as external
+    /// content, so the plan needn't repeat it and the model needn't look it up.
+    pub issue_texts: HashMap<String, String>,
     /// Who may receive Microsoft 365 content: each marked step is checked against it
     /// (with the allowlist as it is then) before its task is sent.
     pub recipients: Recipients,
@@ -2726,7 +2748,13 @@ pub async fn run_plan_with(
                         _ => None,
                     })
                     .collect();
-                let prompt = step_prompt(step, &deps);
+                // The issue it works on, as its tracker has it (people wrote it).
+                let issue = ctx
+                    .issue_texts
+                    .get(&step.id)
+                    .map(|text| issue_section(step, text))
+                    .unwrap_or_default();
+                let prompt = step_prompt_with(step, &deps, &issue);
                 let fail = |error: String| StepState::failed(None, error);
                 let (peer_name, work): (
                     String,
@@ -2808,7 +2836,7 @@ pub async fn run_plan_with(
                         prompt
                     } else {
                         match search_work(agent, ctx, step, &peer).await {
-                            Ok(work) => step_prompt_with(step, &deps, &work),
+                            Ok(work) => step_prompt_with(step, &deps, &format!("{issue}{work}")),
                             Err(e) => {
                                 let state = StepState::failed(Some(peer.name), format!("{e:#}"));
                                 on_update(&step.id, &state);
@@ -3164,6 +3192,35 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("Your task:\nApprove the facts"), "{text}");
+    }
+
+    /// A step that works on an issue gets its tracker's text of it in front of its task,
+    /// as external content; with earlier steps' results, after them.
+    #[test]
+    fn a_step_working_on_an_issue_gets_its_text_as_external_content() {
+        let plan = Plan::parse("docs @x issue=#12 Document it").unwrap();
+        let step = &plan.steps[0];
+        let issue = issue_section(step, "acme/app#12 Document the API\n\nEvery endpoint.");
+        let prompt = step_prompt_with(step, &[], &issue);
+        assert!(prompt.starts_with(crate::boundary::DIRECTIVE), "{prompt}");
+        assert!(
+            prompt.contains(
+                "The issue this task works on:\n<external_content source=\"issue:12\">\nacme/app#12 Document the API\n\nEvery endpoint.\n</external_content>"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("---\nYour task:\nDocument it"), "{prompt}");
+        let earlier = Earlier {
+            id: "api",
+            peer: "w",
+            task: "Add the API",
+            output: "done",
+        };
+        let both = step_prompt_with(step, &[earlier], &issue);
+        assert!(
+            both.find("### Step api").unwrap() < both.find("The issue this task works on").unwrap(),
+            "{both}"
+        );
     }
 
     /// A step gets what each step it waits for was asked (its own words, cut), with

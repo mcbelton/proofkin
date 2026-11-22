@@ -406,6 +406,7 @@ pub struct Board {
 struct Issue {
     id: String,
     number: u64,
+    title: String,
     url: String,
     open: bool,
     body: String,
@@ -652,8 +653,8 @@ impl Tracker {
 
     fn issue_fields(&self) -> String {
         let mut fields =
-            "id number url state body parent { number } subIssuesSummary { total completed } \
-                          subIssues(first: 100) { nodes { id number url state body } }"
+            "id number title url state body parent { number } subIssuesSummary { total completed } \
+                          subIssues(first: 100) { nodes { id number title url state body } }"
                 .to_owned();
         if let Some(board) = &self.board {
             let status = board
@@ -687,6 +688,7 @@ impl Tracker {
         Some(Issue {
             id: text(v, "id"),
             number,
+            title: text(v, "title"),
             url: text(v, "url"),
             open: text(v, "state") == "OPEN",
             body: text(v, "body"),
@@ -821,7 +823,7 @@ impl Tracker {
         results
             .into_iter()
             .zip(new)
-            .map(|(r, (_, body, _))| {
+            .map(|(r, (title, body, _))| {
                 let v = r?;
                 let issue = v.get("issue").context("GitHub didn't return the issue")?;
                 Ok(Issue {
@@ -831,6 +833,7 @@ impl Tracker {
                         .unwrap_or_default()
                         .to_owned(),
                     number: issue.get("number").and_then(Value::as_u64).unwrap_or(0),
+                    title: title.clone(),
                     url: issue
                         .get("url")
                         .and_then(Value::as_str)
@@ -1679,6 +1682,33 @@ struct Run {
     config_path: Option<PathBuf>,
     /// The step issues it works on, so a run at the same time doesn't share them.
     _claim: Claim,
+    /// The text of the issue each step that names one (`issue=#N`) works on, by step.
+    texts: HashMap<String, String>,
+}
+
+/// The most of an issue's text a step's task gets.
+const MAX_ISSUE_TEXT: usize = 4_000;
+
+/// What a step working on `issue` (of `repo`) gets to read of it: its title and body,
+/// without Proofkin's own markers, secrets redacted, cut at [`MAX_ISSUE_TEXT`]
+/// characters. People wrote it: the task gets it as external content.
+fn issue_text(repo: &str, issue: &Issue) -> String {
+    let body: Vec<&str> = issue
+        .body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("<!-- proofkin:"))
+        .collect();
+    let text = format!(
+        "{repo}#{} {}\n\n{}",
+        issue.number,
+        issue.title.trim(),
+        body.join("\n").trim()
+    );
+    let text = crate::redact::redact(text.trim_end()).0;
+    match text.char_indices().nth(MAX_ISSUE_TEXT) {
+        Some((at, _)) => format!("{}\n[... cut]", &text[..at]),
+        None => text,
+    }
 }
 
 /// The marker in a step issue's body, so a later run on the same issue finds it.
@@ -1920,6 +1950,15 @@ impl Run {
         let mut run = Run {
             issue: StepIssue::from(&run_issue),
             previous: run_issue.status.clone(),
+            texts: plan
+                .steps
+                .iter()
+                .filter(|s| s.issue.is_some())
+                .filter_map(|s| {
+                    let issue = steps.get(&s.id)?;
+                    Some((s.id.clone(), issue_text(&tracker.config.repo, issue)))
+                })
+                .collect(),
             steps: steps
                 .iter()
                 .map(|(id, i)| (id.clone(), StepIssue::from(i)))
@@ -2580,6 +2619,10 @@ pub struct Tracking {
     task: tokio::task::JoinHandle<TrackedRun>,
     /// The issue references each step's task carries (see [`crate::plan::RunContext`]).
     pub refs: HashMap<String, Vec<String>>,
+    /// The text of the issue each step that names one (`issue=#N`) works on, by step:
+    /// its title and body, redacted and cut, for its task (see
+    /// [`crate::plan::RunContext::issue_texts`]).
+    pub texts: HashMap<String, String>,
     /// The issues, as set up when the run started.
     pub tracked: TrackedRun,
 }
@@ -2672,6 +2715,7 @@ pub async fn start_with(
             .insert(0, format!("the board isn't updated: {p}"));
     }
     let refs = issue_refs(plan, &run);
+    let texts = run.texts.clone();
     let tracked = run.tracked();
     let steps: HashMap<String, Step> = plan
         .steps
@@ -2696,6 +2740,7 @@ pub async fn start_with(
         tx,
         task,
         refs,
+        texts,
         tracked,
     })
 }
@@ -2708,6 +2753,7 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct FakeIssue {
         number: u64,
+        title: String,
         open: bool,
         body: String,
         parent: Option<u64>,
@@ -2753,7 +2799,7 @@ mod tests {
             };
             let subs: Vec<&FakeIssue> = issues.values().filter(|s| s.parent == Some(n)).collect();
             let node = |i: &FakeIssue| {
-                json!({ "id": format!("I{}", i.number), "number": i.number, "url": format!("https://github.com/acme/app/issues/{}", i.number),
+                json!({ "id": format!("I{}", i.number), "number": i.number, "title": i.title, "url": format!("https://github.com/acme/app/issues/{}", i.number),
                         "state": if i.open { "OPEN" } else { "CLOSED" }, "body": i.body })
             };
             let mut v = node(i);
@@ -2828,6 +2874,7 @@ mod tests {
                         number,
                         FakeIssue {
                             number,
+                            title: s("title"),
                             open: true,
                             body: s("body"),
                             parent,
@@ -3352,8 +3399,13 @@ mod tests {
             },
             FakeIssue {
                 number: 12,
+                title: "Document the API".into(),
                 open: false,
-                body: "Docs".into(),
+                body: format!(
+                    "Every endpoint, with an example.\nThe deploy token is ghp_{}\n{}",
+                    "Zx9".repeat(12),
+                    step_marker("docs")
+                ),
                 ..FakeIssue::default()
             },
             FakeIssue {
@@ -3377,6 +3429,19 @@ mod tests {
         assert_eq!(fake.calls("addSubIssue")[0]["subIssueId"], "I12");
         assert_eq!(fake.calls("addAssigneesToAssignable").len(), 2);
         assert_eq!(tracking.refs["docs"], ["acme/app#12"]);
+        // The step that names #12 gets its title and body, its secrets redacted and
+        // Proofkin's own marker left out; the others get no issue text.
+        let text = &tracking.texts["docs"];
+        assert!(
+            text.starts_with("acme/app#12 Document the API\n\nEvery endpoint, with an example."),
+            "{text}"
+        );
+        assert!(
+            text.contains("[REDACTED:github-token]") && !text.contains("Zx9Zx9"),
+            "{text}"
+        );
+        assert!(!text.contains("proofkin:step"), "{text}");
+        assert!(!tracking.texts.contains_key("api"));
         assert_eq!(fake.status(10).as_deref(), Some("🏗 In progress"));
 
         tracking.update(
