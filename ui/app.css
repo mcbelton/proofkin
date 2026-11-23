@@ -166,7 +166,8 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .who { min-width: 0; flex: 1; display: flex; flex-direction: column; }
 .who .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .who .sub { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-.badge { display: inline-flex; align-items: center; padding: 0 7px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--accent-soft); color: var(--accent); line-height: 18px; }
+/* Half the line height: a pill on one line, a rounded box (not a blob) if it wraps. */
+.badge { display: inline-flex; align-items: center; padding: 0 7px; border-radius: 9px; font-size: 11.5px; font-weight: 600; background: var(--accent-soft); color: var(--accent); line-height: 18px; }
 .badge.neutral { background: var(--surface-3); color: var(--muted); }
 .trust-shares { overflow-wrap: anywhere; }
 .badge.ok { background: var(--success-soft); color: var(--success); }
