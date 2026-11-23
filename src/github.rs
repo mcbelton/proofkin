@@ -410,9 +410,22 @@ pub struct BranchState {
     /// Deleting it loses nothing: its work is on the repository's branch, or a pull
     /// request merged it as it is.
     pub safe_to_delete: bool,
+    /// Pull requests from other branches that closed its issues: they may have its work,
+    /// done again (by a step that applied it, say), to compare before deleting it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub closed_by: Vec<ClosingPr>,
     /// Its head commit.
     #[serde(skip)]
     pub head: String,
+}
+
+/// A pull request from another branch that closed one of a task branch's issues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClosingPr {
+    pub number: u64,
+    pub url: String,
+    /// The branch it was from.
+    pub branch: String,
 }
 
 /// The most issues one [`branch_states`] query asks about.
@@ -421,8 +434,9 @@ const MAX_BRANCH_ISSUES: usize = 50;
 /// Where the work of each of `branches` (of `repo`) is: the newest of the repository's
 /// last 100 pull requests from it (and whether it has the branch as it is), whether its
 /// commit or its changes are on the repository's branch, what a pull request from it
-/// would change, whether the issues it is for are closed, and so whether deleting it
-/// loses anything. One GraphQL query for all of them.
+/// would change, whether the issues it is for are closed (and by which pull requests
+/// from other branches), and so whether deleting it loses anything. One GraphQL query
+/// for all of them.
 pub async fn branch_states(
     api: &dyn crate::tracker::Api,
     repo: &Repo,
@@ -449,7 +463,7 @@ pub async fn branch_states(
     );
     for n in &numbers {
         fields += &format!(
-            " i{n}: issueOrPullRequest(number: {n}) {{ ... on Issue {{ state }} ... on PullRequest {{ state }} }}"
+            " i{n}: issueOrPullRequest(number: {n}) {{ ... on Issue {{ state timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {{ nodes {{ ... on ClosedEvent {{ closer {{ ... on PullRequest {{ number url headRefName }} }} }} }} }} }} ... on PullRequest {{ state }} }}"
         );
     }
     let query = format!(
@@ -477,6 +491,17 @@ pub async fn branch_states(
         data[format!("i{n}")]["state"]
             .as_str()
             .is_some_and(|s| s != "OPEN")
+    };
+    // The pull request that closed issue `n`, if one did.
+    let closer = |n: u64| {
+        let pr = data[format!("i{n}")]
+            .pointer("/timelineItems/nodes/0/closer")
+            .filter(|c| c.get("number").is_some())?;
+        Some(ClosingPr {
+            number: pr["number"].as_u64()?,
+            url: pr["url"].as_str()?.to_owned(),
+            branch: pr["headRefName"].as_str().unwrap_or_default().to_owned(),
+        })
     };
     let mut states = std::collections::BTreeMap::new();
     // What git says about each branch, a few at a time.
@@ -526,12 +551,19 @@ pub async fn branch_states(
         let merged = pull_request
             .as_ref()
             .is_some_and(|p| p.state == "MERGED" && p.current);
+        let mut closed_by: Vec<ClosingPr> = Vec::new();
+        for c in refs.iter().flatten().filter_map(|n| closer(*n)) {
+            if c.branch != branch.name && !closed_by.iter().any(|b| b.number == c.number) {
+                closed_by.push(c);
+            }
+        }
         states.insert(
             branch.name.clone(),
             BranchState {
                 pull_request,
                 issues_closed,
                 safe_to_delete: local.in_base || local.same_as_base || merged,
+                closed_by,
                 ..local
             },
         );

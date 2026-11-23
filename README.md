@@ -1177,6 +1177,13 @@ from where it can open the pull request or delete the branch. The pull request f
 what it would change, with a link back to the review. A branch with a pull request open
 offers neither: GitHub would close the pull request with it.
 
+When a pull request from another branch closed its issues, the card names it ("its issues
+were closed by #74"): often a later step took over its work (`apply=`) and that step's
+branch was merged, with the work changed on the way, so git can't tell it is there.
+**Review changes** says so, and the confirmation that deleting it loses its work "unless
+#74 (from p2p/boss/19-…), which closed its issues, has it": compare the two, then delete it
+from the review.
+
 **Another account, or a scope its token lacks, without a terminal.** The GitHub CLI can
 hold several accounts per host but refreshes only the active one, so Proofkin runs its
 device flow for you and puts the active account back afterwards:
@@ -1276,6 +1283,13 @@ item, with a step per open sub-issue. **Add existing issues** (`tracker add`) pu
 repository's issues and pull requests on the board, with a status from their state (open
 issues to do, open pull requests in review, closed and merged ones done; statuses already
 set stay). Tracked steps link their issue, and a plan its run's.
+
+GitHub sometimes answers a batch of board adds with an error after carrying out some or
+all of them (an HTTP 502), and a board whose **Auto-add sub-issues** workflow is on puts
+a run's sub-issues on it by itself, so adding them again says "Content already exists in
+this project". So an add that fails is looked up on the board before it counts as a
+problem, and what is still missing is added again, five to a request. Queries (never
+changes) that GitHub answers with a 502, 503 or 504 are asked again, twice at most.
 
 Without the `project` scope tracking keeps to the issues (the `repo` scope is enough) and
 says how to grant it. Tracking never fails or holds up a plan: it runs beside it, and what

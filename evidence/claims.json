@@ -1344,7 +1344,7 @@
     {
       "id": "GH-4",
       "area": "github",
-      "claim": "The GitHub card says where each task branch's work is, from one GraphQL query for all of a repository's branches, checked against the repository's branch as GitHub has it (fetched when the clone's last fetch is over 5 minutes old; when it can't be, the card says the states are as of the last fetch): its newest pull request (open, merged or closed, and whether it has the branch as it is), its commit or its changes (the same content in every file it changes) on the repository's branch already, the issues it is for all closed, and its commits, files and lines that aren't there. A branch is safe to delete only when its work is on the repository's branch or a pull request merged it as it is: closed issues, a closed pull request, or one that merged an earlier version of it don't make it safe. The card offers Delete branch only then (on GitHub first, then in the clone, only p2p/ branches), its confirmation saying what is lost, and Open PR only when there is work to merge and no pull request is open; it says how many older branches it doesn't show.",
+      "claim": "The GitHub card says where each task branch's work is, from one GraphQL query for all of a repository's branches, checked against the repository's branch as GitHub has it (fetched when the clone's last fetch is over 5 minutes old; when it can't be, the card says the states are as of the last fetch): its newest pull request (open, merged or closed, and whether it has the branch as it is), its commit or its changes (the same content in every file it changes) on the repository's branch already, the issues it is for all closed (and the pull requests from other branches that closed them, named on the card, in Review changes and in the delete confirmation as possibly having its work), and its commits, files and lines that aren't there. A branch is safe to delete only when its work is on the repository's branch or a pull request merged it as it is: closed issues, a closed pull request, or one that merged an earlier version of it don't make it safe. The card offers Delete branch only then (on GitHub first, then in the clone, only p2p/ branches), its confirmation saying what is lost, and Open PR only when there is work to merge and no pull request is open; it says how many older branches it doesn't show.",
       "tests": [
         "github::linked_repositories_clone_share_sync_push_and_open_pull_requests",
         "lib::github::renamed_files_are_compared_at_their_new_path",
@@ -1422,6 +1422,16 @@
         "lib::tracker::a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do",
         "lib::plan::a_step_working_on_an_issue_gets_its_text_as_external_content",
         "agents::a_step_gets_the_text_of_the_issue_it_works_on"
+      ]
+    },
+    {
+      "id": "TRK-8",
+      "area": "tracking",
+      "claim": "Putting issues on the board (Add existing issues, tracker add, and a tracked run's issues) holds when GitHub answers a batch of adds with an error: each add that fails is looked up on the board first, as GitHub may have carried it out (an HTTP 502 for a batch it did) or put it there itself (a board's Auto-add sub-issues workflow adds a run's sub-issues when the run's issue goes on it, and adding them then says \"Content already exists in this project\"); those still missing are added again, five to a request, and only what still fails is a problem, once. Every item it added gets its status (and a run's items their agent). Queries GitHub answers with a 502, 503 or 504 are asked again, twice at most; mutations never are.",
+      "tests": [
+        "lib::tracker::adds_github_answers_with_an_error_are_found_on_the_board_or_made_again",
+        "lib::tracker::a_board_that_puts_sub_issues_on_itself_still_gets_the_steps_fields",
+        "lib::tracker::queries_are_asked_again_after_a_server_error_but_mutations_never"
       ]
     },
     {

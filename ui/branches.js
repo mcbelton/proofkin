@@ -17,6 +17,17 @@ function branchChangeText(st) {
   return st.ahead ? `${branchCount(st.ahead, "commit")}, ${files}` : files;
 }
 
+/** The pull requests from other branches that closed a branch's issues (when all of them
+ * are closed): they may have its work, done again. */
+function branchClosers(st) {
+  return st.issues_closed ? st.closed_by ?? [] : [];
+}
+
+/** Words as "a", "a and b" or "a, b and c". */
+function joinWithAnd(words) {
+  return words.length < 3 ? words.join(" and ") : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
 /** Where the work of a task branch in state `st` is, for its line on the GitHub card.
  * `lead`: text, its pull request as { number, url }; `note`: what a pull request would
  * change while one is open, else whether deleting the branch loses anything (`safe`:
@@ -35,13 +46,31 @@ function branchStatus(st, base) {
       : [`its changes are on ${base}`];
     return { lead, note: "safe to delete", tone: "safe", safe: true, open: false };
   }
+  const closers = branchClosers(st);
+  const closedBy = closers.flatMap((c, i) => [
+    ...(i === 0 ? [] : [i === closers.length - 1 ? " and " : ", "]), { number: c.number, url: c.url }]);
   const lead = pr?.state === "MERGED" ? ["merged in ", ref, ", but it changed since"]
+    : closers.length ? ["its issues were closed by ", ...closedBy]
     : pr?.state === "CLOSED" ? ["pull request ", ref, " was closed"]
     : st.issues_closed ? ["its issues are closed"]
     : ["no pull request yet"];
   return {
     lead, note: changes ? `not on ${base}: ${changes}` : `not on ${base}`, tone: "warn", safe: false, open: false,
   };
+}
+
+/** For a branch whose issues pull requests from other branches closed: that those may
+ * have its work, so deleting it may lose nothing; null otherwise. */
+function branchClosedByNote(st) {
+  const closers = branchClosers(st);
+  if (!closers.length || st.safe_to_delete || st.pull_request?.state === "OPEN") return null;
+  return `Its issues were closed by ${closerWords(closers)}: if ${closers.length === 1 ? "that has" : "those have"} `
+    + "this branch's work, deleting it loses nothing.";
+}
+
+/** Closing pull requests as "#74 (from p2p/boss/19-1)" or "#74 (from …) and #97 (from …)". */
+function closerWords(closers) {
+  return joinWithAnd(closers.map((c) => (c.branch ? `#${c.number} (from ${c.branch})` : `#${c.number}`)));
 }
 
 /** A status's words, its pull request as #N. */
@@ -67,7 +96,11 @@ function branchDeleteNote(st, base, slug) {
   const work = pr?.state === "MERGED"
     ? `Pull request #${pr.number} merged an earlier version of it; what it has now isn't on ${base}`
     : `Its work isn't on ${base}`;
-  return `${work}${changes ? `: ${changes}` : ""}. Deleting the branch loses it${st.issues_closed ? ", even though its issues are closed" : ""}. ${where}`;
+  const closers = branchClosers(st);
+  const unless = closers.length
+    ? `, unless ${closerWords(closers)}, which closed its issues, ${closers.length === 1 ? "has" : "have"} it`
+    : st.issues_closed ? ", even though its issues are closed" : "";
+  return `${work}${changes ? `: ${changes}` : ""}. Deleting the branch loses it${unless}. ${where}`;
 }
 
 /** A path in a diff's ---/+++ line ("b/src/a.rs", "/dev/null", quoted when odd). */
@@ -177,6 +210,11 @@ async function openBranchReview(r, b, opener) {
   const shown = branchStatusNodes(r, b);
   $("#branch-status").replaceChildren(...(shown?.nodes ?? []));
   $("#branch-status").hidden = !shown;
+  // Its issues closed by another branch's pull request: that may have its work.
+  const st = taskBranchStates.get(branchKey(r, b.name));
+  const hint = st ? branchClosedByNote(st) : null;
+  $("#branch-hint").textContent = hint ?? "";
+  $("#branch-hint").hidden = !hint;
   // An open pull request is reviewed on GitHub; one with nothing to add needs none.
   $("#branch-delete").hidden = Boolean(shown?.status.open);
   $("#branch-pr").hidden = Boolean(shown && (shown.status.open || shown.status.safe));

@@ -7,8 +7,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const code = fs.readFileSync(path.join(__dirname, "..", "ui", "branches.js"), "utf8");
-const { branchChangeText, branchStatus, branchStatusText, branchDeleteNote, diffSections, diffHeaderPath } =
-  vm.runInThisContext(`${code}\n;({ branchChangeText, branchStatus, branchStatusText, branchDeleteNote, diffSections, diffHeaderPath })`);
+const { branchChangeText, branchStatus, branchStatusText, branchDeleteNote, branchClosedByNote, diffSections, diffHeaderPath } =
+  vm.runInThisContext(`${code}\n;({ branchChangeText, branchStatus, branchStatusText, branchDeleteNote, branchClosedByNote, diffSections, diffHeaderPath })`);
 
 const url = (n) => `https://github.com/acme/app/pull/${n}`;
 const pr = (number, state, current = true) => ({ number, state, url: url(number), current });
@@ -59,6 +59,23 @@ assert.strictEqual(note({ ...work, pull_request: pr(7, "MERGED", false) }),
 assert.strictEqual(note({ ...work, pull_request: pr(12, "OPEN") }),
   `Pull request #12 from it is open: GitHub closes it when the branch goes. ${where}`);
 assert.strictEqual(note(null), `Its commits are lost unless they are on main or a pull request merged them. ${where}`);
+
+// Its issues closed by another branch's pull request (a later step that took its work,
+// say): named, as it may have the work, but the branch isn't called safe.
+const by74 = { number: 74, url: url(74), branch: "p2p/boss/19-1" };
+const superseded = { ...work, issues_closed: true, closed_by: [by74] };
+assert.strictEqual(say(superseded), "its issues were closed by #74 · not on main: 1 commit, 9 files (+213 −100)");
+assert.deepStrictEqual(branchStatus(superseded, "main").lead[1], { number: 74, url: url(74) });
+assert.strictEqual(say({ ...superseded, closed_by: [by74, { number: 97, url: url(97), branch: "github-inline" }] }),
+  "its issues were closed by #74 and #97 · not on main: 1 commit, 9 files (+213 −100)");
+assert.strictEqual(say({ ...superseded, issues_closed: false }), "no pull request yet · not on main: 1 commit, 9 files (+213 −100)",
+  "only when all its issues are closed");
+assert.strictEqual(note(superseded),
+  `Its work isn't on main: 1 commit, 9 files (+213 −100). Deleting the branch loses it, unless #74 (from p2p/boss/19-1), which closed its issues, has it. ${where}`);
+assert.strictEqual(branchClosedByNote(superseded),
+  "Its issues were closed by #74 (from p2p/boss/19-1): if that has this branch's work, deleting it loses nothing.");
+assert.strictEqual(branchClosedByNote({ ...superseded, safe_to_delete: true }), null);
+assert.strictEqual(branchClosedByNote(work), null);
 
 // A diff read into files: a hunk's lines by its counts (a removed "-- x" line is no
 // header), new, renamed and deleted files, and "\ No newline" notes.
