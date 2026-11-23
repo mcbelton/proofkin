@@ -53,6 +53,8 @@ fn worker_json(
         "id": id.map(|id| id.to_string()),
         "role": worker.config.role,
         "providers": worker.config.providers,
+        // Its own model settings (for the providers it sets nothing for: its owner's).
+        "models": worker.config.models,
         "folders": workers::folders(worker),
         "start_with_owner": worker.config.start_with_owner,
         "process": sup.process(worker),

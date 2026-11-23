@@ -58,6 +58,31 @@ impl Executor for FakeExecutor {
         });
         Ok(Ran::new(self.answer(task, ctx).await?, model).with_effort(task.effort.clone()))
     }
+
+    /// Copilot lists three models: one with reasoning efforts, one without, and one
+    /// its account can't use.
+    async fn list_models(
+        &self,
+        provider: Provider,
+    ) -> anyhow::Result<Vec<proofkin::models::Offered>> {
+        let model = |id: &str, efforts: &[&str], policy: Option<&str>| proofkin::models::Offered {
+            id: id.into(),
+            name: id.to_uppercase(),
+            vendor: Some("Fake Labs".into()),
+            multiplier: Some("0.33".into()),
+            policy: policy.map(Into::into),
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+            default_effort: efforts.first().map(|e| e.to_string()),
+        };
+        Ok(match provider {
+            Provider::Copilot => vec![
+                model("fake-big", &["low", "medium", "high", "max"], None),
+                model("fake-small", &[], None),
+                model("fake-off", &[], Some("disabled")),
+            ],
+            Provider::Claude | Provider::Codex => Vec::new(),
+        })
+    }
 }
 
 impl FakeExecutor {
@@ -710,6 +735,178 @@ async fn tasks_work_at_the_owners_reasoning_effort_unless_they_ask_for_another()
             .starts_with("worker refused the task: \"turbo\" isn't a reasoning effort"),
         "{}",
         refused.output
+    );
+}
+
+/// A worker lets tasks ask only for some reasoning efforts (it refuses others, and one
+/// that asks for none works at the least of them), and tells peers the models its
+/// account offers and can use, with the efforts each supports.
+#[tokio::test]
+async fn workers_allow_only_some_efforts_and_tell_peers_the_models_they_offer() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    proofkin::models::set_default(&mut worker.models, Provider::Copilot, Some("fake-big")).unwrap();
+    proofkin::models::set_efforts(
+        &mut worker.models,
+        Provider::Copilot,
+        &["medium".into(), "low".into()],
+    )
+    .unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let executor = worker.executor.clone().unwrap();
+    let (worker, _we) = worker.start().await;
+    // It lists them when it starts (here before its peer connects).
+    assert!(worker.learn_offers(executor.as_ref()).await.is_empty());
+    assert_eq!(
+        worker.listed()[&Provider::Copilot].len(),
+        3,
+        "all, as listed"
+    );
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let peer = boss.peers().into_iter().next().unwrap();
+    assert_eq!(peer.models[&Provider::Copilot].efforts, ["low", "medium"]);
+    let offers = &peer.offers[&Provider::Copilot];
+    let ids: Vec<&str> = offers.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["fake-big", "fake-small"],
+        "the ones its account can use"
+    );
+    assert_eq!(offers[0].efforts, ["low", "medium", "high", "max"]);
+    assert_eq!(
+        (offers[0].name.as_str(), offers[0].multiplier.as_deref()),
+        ("FAKE-BIG", Some("0.33"))
+    );
+    assert!(offers[1].efforts.is_empty(), "it takes no reasoning effort");
+    // Asking for none: the least allowed effort; an allowed one: it; another: refused.
+    let plain = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(plain.model.as_deref(), Some("fake-big (low reasoning)"));
+    let mut medium = LlmTask::new(Provider::Copilot, "hello");
+    medium.effort = Some("medium".into());
+    let done = boss.delegate_verified(worker.id(), medium).await.unwrap();
+    assert_eq!(done.model.as_deref(), Some("fake-big (medium reasoning)"));
+    let mut max = LlmTask::new(Provider::Copilot, "hello");
+    max.effort = Some("max".into());
+    let refused = boss.delegate_verified(worker.id(), max).await.unwrap();
+    assert!(refused.refused && !refused.ok, "{refused:?}");
+    assert_eq!(
+        refused.output,
+        "worker refused the task: max isn't a reasoning effort allowed here: low, medium"
+    );
+}
+
+/// A worker's models changed while it runs (its owner limited them), and the models it
+/// lists, reach connected peers at once (the models it offers cut to the allowed ones),
+/// and its next task runs with them.
+#[tokio::test]
+async fn model_changes_reach_connected_peers_at_once() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let executor = worker.executor.clone().unwrap();
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, mut boss_events) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    assert!(boss.peers()[0].offers.is_empty(), "not listed yet");
+
+    worker.learn_offers(executor.as_ref()).await;
+    next_matching(&mut worker_events, |e| matches!(e, Event::ModelsChanged)).await;
+    next_matching(&mut boss_events, |e| matches!(e, Event::PeerModels { .. })).await;
+    assert_eq!(boss.peers()[0].offers[&Provider::Copilot].len(), 2);
+
+    // Its owner allows only fake-small, at high or max reasoning (max unless asked).
+    let mut models = proofkin::models::Models::new();
+    let only = proofkin::models::ModelChoice {
+        allowed: vec!["fake-small".into()],
+        effort: Some("max".into()),
+        efforts: vec!["high".into(), "max".into()],
+        ..Default::default()
+    };
+    proofkin::models::set_choice(&mut models, Provider::Copilot, &only).unwrap();
+    worker.set_models(models.clone());
+    assert_eq!(worker.models(), models);
+    next_matching(&mut boss_events, |e| matches!(e, Event::PeerModels { .. })).await;
+    let peer = boss.peers().into_iter().next().unwrap();
+    assert_eq!(peer.models, models);
+    let ids: Vec<&str> = peer.offers[&Provider::Copilot]
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(ids, ["fake-small"], "only the allowed ones");
+    let plain = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(plain.model.as_deref(), Some("fake-small (max reasoning)"));
+    let mut big = LlmTask::new(Provider::Copilot, "hello");
+    big.model = Some("fake-big".into());
+    let refused = boss.delegate_verified(worker.id(), big).await.unwrap();
+    assert!(refused.refused && !refused.ok, "{refused:?}");
+}
+
+/// A running agent applies its profile's models when its profile.json changes, and a
+/// digital worker its owner's for providers it sets nothing for: no restart.
+#[tokio::test]
+async fn running_agents_apply_profile_model_changes_and_workers_their_owners() {
+    let root = tempfile::tempdir().unwrap();
+    let mut owner = proofkin::profile::Profile::open_in(root.path(), "owner").unwrap();
+    proofkin::models::set_default(
+        &mut owner.config.models,
+        Provider::Copilot,
+        Some("fake-big"),
+    )
+    .unwrap();
+    owner.save().unwrap();
+    let mut profile = proofkin::profile::Profile::open_in(root.path(), "helper").unwrap();
+    profile.config.owner = Some("owner".into());
+    profile.save().unwrap();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    worker.models = profile.models();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    worker.watch_models(profile.clone(), None, Duration::from_millis(50));
+    let (boss, mut boss_events) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let said = |boss: &Agent| boss.peers()[0].models[&Provider::Copilot].clone();
+    assert_eq!(
+        said(&boss).default.as_deref(),
+        Some("fake-big"),
+        "its owner's"
+    );
+
+    // The owner sets max reasoning: the worker uses it, and its peers learn it.
+    proofkin::models::set_effort(&mut owner.config.models, Provider::Copilot, Some("max")).unwrap();
+    owner.save().unwrap();
+    next_matching(&mut boss_events, |e| matches!(e, Event::PeerModels { .. })).await;
+    assert_eq!(said(&boss).effort.as_deref(), Some("max"));
+    let done = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(done.model.as_deref(), Some("fake-big (max reasoning)"));
+    // Its own settings for a provider replace its owner's.
+    let mut helper = profile.reload().unwrap();
+    proofkin::models::set_default(
+        &mut helper.config.models,
+        Provider::Copilot,
+        Some("fake-small"),
+    )
+    .unwrap();
+    helper.save().unwrap();
+    next_matching(&mut boss_events, |e| matches!(e, Event::PeerModels { .. })).await;
+    let now = said(&boss);
+    assert_eq!(
+        (now.default.as_deref(), now.effort.as_deref()),
+        (Some("fake-small"), None)
     );
 }
 

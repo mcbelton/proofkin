@@ -184,6 +184,7 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.facts-models { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 
 /* Connect other agents: addresses, the token and client setups to copy. */
 .connect-row { display: grid; grid-template-columns: 3.2em minmax(0, 1fr) auto; gap: 6px; align-items: center; margin: 6px 0; }
@@ -276,6 +277,21 @@ textarea { resize: vertical; }
 .mcp-chip:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
 .mcp-chip input { margin: 0; accent-color: var(--accent); width: 16px; height: 16px; }
 .mcp-chip .about { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* The Models dialog: the models an account offers, by vendor, and the reasoning levels. */
+#models-dialog { width: min(600px, calc(100vw - 32px)); }
+#models-body { display: flex; flex-direction: column; gap: 12px; }
+#models-body .check, #models-body .mcp-chip { font-weight: 400; }
+#models-body .model-checks {
+  display: flex; flex-direction: column; gap: 10px; margin-top: 4px; max-height: min(320px, 40vh);
+  overflow: auto; overscroll-behavior: contain; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2);
+}
+.model-vendor { display: flex; flex-direction: column; gap: 4px; }
+.model-vendor h3 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.model-check { min-height: 24px; align-items: center; }
+.model-check > span { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; }
+.model-check .mono { font-size: 12.5px; overflow-wrap: anywhere; }
+.effort-checks { margin-top: 4px; }
 .input-row { display: flex; gap: 10px; align-items: flex-end; }
 .input-row textarea { flex: 1; min-height: 44px; max-height: 220px; }
 /* A plan needs the width: the text box spans the composer, its check results and

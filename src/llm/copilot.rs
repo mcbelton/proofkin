@@ -185,6 +185,18 @@ impl CopilotBackend {
         let _ = self.client.stop().await;
     }
 
+    /// The models `creds`' account may use, from a Copilot CLI started for the purpose
+    /// (for an agent that runs none: e.g. one that only delegates, for its digital
+    /// workers' settings).
+    pub async fn list_models_with(
+        creds: CopilotCredentials,
+    ) -> Result<Vec<crate::models::Offered>> {
+        let backend = Self::start(creds).await?;
+        let offered = backend.list_models().await;
+        backend.stop().await;
+        offered
+    }
+
     /// The models this account may use, as the Copilot CLI lists them.
     pub async fn list_models(&self) -> Result<Vec<crate::models::Offered>> {
         let models = self

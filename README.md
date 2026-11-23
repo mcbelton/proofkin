@@ -328,28 +328,39 @@ proofkin auth logout workiq --profile me   # removes the Work IQ account and its
 ### Models
 
 Unless a task names a model, each provider runs on its own default (Copilot's is whatever
-the CLI picks for the account). A profile's owner can set each provider's **default model**,
-**which models tasks may ask for** and the **reasoning effort** tasks work at:
+the CLI picks for the account). A profile's owner chooses, per provider, the **default
+model**, **which models tasks may ask for** (one or more, or any the account offers), the
+**reasoning effort** tasks work at and **which efforts they may ask for**. Peers then pick
+only from those. In the web UI, **Models…** on the This agent card does it: the models the
+account offers, by vendor, with their cost multiplier and the reasoning levels each
+supports, to tick (Claude and Codex don't list theirs: name them), and the levels to tick.
+Each digital worker has its own **Models…** in the Digital workers list. Or from the CLI:
 
 ```powershell
 proofkin models list --profile worker1                     # Copilot lists the models the account may use, with their efforts
 proofkin models allow copilot claude-sonnet-5.5,gpt-6-sol --profile worker1
+proofkin models allow copilot --efforts low,medium,high --profile worker1   # only these reasoning levels
 proofkin models default copilot claude-sonnet-5.5 --profile worker1
 proofkin models default copilot claude-opus-5.5 --effort max --profile worker1
 proofkin models effort copilot high --profile worker1      # minimal, low, medium, high, xhigh or max
 proofkin models default copilot none --profile worker1     # back to the provider's own
 proofkin models effort copilot none --profile worker1      # back to the model's own effort
-proofkin models allow copilot any --profile worker1        # any model again
+proofkin models allow copilot any --efforts any --profile worker1   # any model and level again
 ```
 
-A default must be one of the allowed models. With a list and no default, tasks that name
-none run on the first in the list (a provider's own default may not be allowed). A task
-asking for another model is refused, with the ones allowed, so a squad step can go to
-another member (squad steps that name a model go first to members that allow it); Copilot
-sessions are also limited to the list. Peers learn the defaults and the lists from the
-agent's hello when they connect. The settings are kept in `profile.json`; a running agent
-uses them once it restarts. A [digital worker](#digital-workers) runs on its owner's
-settings for each provider it sets nothing for, as it runs on the owner's accounts.
+A default must be one of the allowed models, and the default effort one of the allowed
+efforts. With a list and no default, tasks that name none run on the first model in the
+list (a provider's own default may not be allowed) and at the least effort in the list. A
+task asking for another model or effort is refused, naming the ones allowed, so a squad
+step can go to another member (squad steps, and *Any peer* tasks, that name a model or an
+effort go first to members that allow them); Copilot sessions are also limited to the list.
+
+Peers learn the settings, and the models the agent's account offers that they may ask
+for (with the reasoning levels each supports), from its hello, and again whenever they
+change: the settings are kept in `profile.json`, and a running agent applies a change
+(from the web UI or the CLI) within seconds and tells its connected peers. A
+[digital worker](#digital-workers) runs on its owner's settings for each provider it sets
+nothing for, as it runs on the owner's accounts, and follows them when they change.
 
 **Reasoning effort** is how hard the model thinks: `minimal`, `low`, `medium`, `high`,
 `xhigh` or `max`. Copilot gets it per session, as each model supports it (`models list`
@@ -359,10 +370,15 @@ one asked for, and one that supports none runs at its own. Claude takes `low` to
 
 A task picks its model and effort with `model=` and `effort=` in a plan step (or its agent's
 `model:`), `/ask` and `/delegate --model <name> --effort <level>`, the **Model** and
-**Reasoning** fields of the web UI's Run task form (the chosen peer's defaults selected and
-named, the models it allows, or another by name when it allows any) or the `model` and
-`effort` arguments of the MCP and A2A `delegate`. The result names the model that did the
-work and its effort, e.g. `claude-opus-5.5 (max reasoning)`, and so does the signed output.
+**Reasoning** fields of the web UI's Run task form and plan builder, or the `model` and
+`effort` arguments of the MCP and A2A `delegate`. The web UI lists exactly what the chosen
+peer lets you pick: the models it allows, or all its account offers when it allows any (by
+vendor, with their cost multiplier; a name typed by hand only for a peer that lists none,
+such as Claude, Codex or an older version), and the levels it allows that the chosen model
+supports, its defaults selected (the default level as the model takes it). For *Any peer*
+or a squad it lists what their peers allow together. The result names the model that did
+the work and its effort, e.g. `claude-opus-5.5 (max reasoning)`, and so does the signed
+output.
 
 ### Example: two workers on two accounts
 
@@ -535,7 +551,7 @@ In terminal 2, once `+ worker` appears:
 | --- | --- |
 | `<text>` | Broadcast a chat message |
 | `/ask <provider> [--model <name>] [--effort <level>] <prompt>` | Run a task locally (needs `--providers`), on that model and [reasoning effort](#models) if given |
-| `/delegate <provider>[@peer[:folder]] [--model <name>] [--effort <level>] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder); `--model` picks one of the [models](#models) the peer allows (default: its default) and `--effort` its reasoning effort. `@#squad` gives it to the squad's least busy member that can run it, as a plan step on `#squad` would, and moves it to another member if that one turns it down |
+| `/delegate <provider>[@peer[:folder]] [--model <name>] [--effort <level>] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder); `--model` picks one of the [models](#models) the peer allows (default: its default) and `--effort` a reasoning effort it allows. `@#squad` gives it to the squad's least busy member that can run it, as a plan step on `#squad` would, and moves it to another member if that one turns it down |
 | `/plan <file>` | Run a [plan](#squads-and-plans): steps on peers (`@name`) or squads (`#squad`), in dependency order |
 | `/squads` | List your squads and which members are online |
 | `/runs` | List saved evidence runs ([EDD with agents](#evidence-driven-development-with-agents)) |
@@ -895,7 +911,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
 | `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step names one). Not on sign-offs. |
 | `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (default: the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
-| `effort=level` | The reasoning effort its model works at: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (default: the peer's default; a model that supports fewer takes the nearest below, see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
+| `effort=level` | The reasoning effort its model works at: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (default: the peer's default; a model that supports fewer takes the nearest below, see [Models](#models)). The peer refuses an effort its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it. Not on sign-offs, team steps or `@workiq` steps. |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
@@ -1578,9 +1594,11 @@ proofkin --name me --providers copilot --serve --ui
   `peers.json` and take effect at once (removed peers are disconnected).
 - **Digital workers**: create [digital workers](#digital-workers) that run on your
   sign-ins (sign in to Copilot right there with a GitHub CLI account), in the folders you
-  pick; start and stop them, choose whether they start with this agent, read why one
+  pick; start and stop them, choose whether they start with this agent, set their
+  **Models…** (your settings, or their own), read why one
   stopped on its own, and delete them (they leave your allowlist and squads).
 - **Your ticket** with a copy button, plus this agent's profile, network, providers, accounts,
+  its [models](#models) with **Models…** to choose the ones peers may pick,
   access level and workspace, and its shared folders, each with a **Team plan…** button (for
   folders with edit or full access) to set or remove the folder's
   [team plan](#team-steps-handing-work-down-a-level).
@@ -1606,7 +1624,8 @@ proofkin --name me --providers copilot --serve --ui
   filled in; only add people you know), tasks peers delegate to you.
 - **Run task**: pick a provider and where to run it (*This agent*, a named peer, *Any peer*
   when several serve it, or a squad: its least busy member that can run it, moving to another
-  member if that one turns it down), and the peer's folder. If that folder offers MCP servers, tick
+  member if that one turns it down), and the peer's folder. **Model** and **Reasoning** list
+  what that peer lets you pick (its defaults selected; see [Models](#models)). If that folder offers MCP servers, tick
   the ones the task may use (each shows what its owner says it is for). Where you have
   full access to the folder, tick the checks its runtime runs after the model
   (**Verify with**, and how many attempts it gets while they fail): the task is proven
@@ -2106,7 +2125,7 @@ Workflow for a change:
 
 ## Layout
 
-- [src/protocol.rs](src/protocol.rs): wire messages (`hello` with addresses and capabilities, `peers`, `chat`, `task_request`, `task_result`, `task_cancel`, `task_progress`, `load`; unknown types are ignored) and the `p2pagents/1` ALPN
+- [src/protocol.rs](src/protocol.rs): wire messages (`hello` with addresses, capabilities, models and the models its accounts offer, `peers`, `chat`, `task_request`, `task_result`, `task_cancel`, `task_progress`, `load`, `shares`, `models`; unknown types are ignored) and the `p2pagents/1` ALPN
 - [src/agent.rs](src/agent.rs): `Agent` node on an iroh endpoint: allowlist enforcement, dialing, gossip, auto-reconnect, broadcast, task delegation with permissions and hourly limits, task slots and queue, live progress and load reports, the task grace for dropped peers, shutdown (telling peers)
 - [src/trust.rs](src/trust.rs): allowlist (`peers.json`) and `p2pa1...` tickets
 - [src/llm/mod.rs](src/llm/mod.rs): `Provider`, `Access`, `LlmTask`, the `Executor` trait and `SdkExecutor`
@@ -2146,8 +2165,8 @@ Workflow for a change:
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
 - [src/main.rs](src/main.rs): interactive CLI
-- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events; [src/ui/tools.rs](src/ui/tools.rs): its plugins, MCP servers and skills API; [src/ui/workers.rs](src/ui/workers.rs): its digital workers API; [src/ui/connect.rs](src/ui/connect.rs): the MCP server and A2A agent other agents connect to
-- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card, [ui/connect.js](ui/connect.js) the Connect other agents card
+- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events; [src/ui/tools.rs](src/ui/tools.rs): its plugins, MCP servers and skills API; [src/ui/workers.rs](src/ui/workers.rs): its digital workers API; [src/ui/models.rs](src/ui/models.rs): its Models dialog API; [src/ui/connect.rs](src/ui/connect.rs): the MCP server and A2A agent other agents connect to
+- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card, [ui/models.js](ui/models.js) the model lists and the Models dialog, [ui/connect.js](ui/connect.js) the Connect other agents card
 - [docs/ux-guidelines.md](docs/ux-guidelines.md): the UI's design guidelines and definition of done
 - [docs/work-iq.md](docs/work-iq.md): the design for Microsoft 365 work context through Work IQ (being built, tracked in [#36](https://github.com/mcbelton/proofkin/issues/36))
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper

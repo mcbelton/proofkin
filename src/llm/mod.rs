@@ -280,6 +280,12 @@ impl From<String> for Ran {
 pub trait Executor: Send + Sync {
     fn providers(&self) -> Vec<Provider>;
     async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<Ran>;
+    /// Runs tasks with these models from now on (see [`crate::models`]).
+    fn set_models(&self, _models: crate::models::Models) {}
+    /// The models `provider` offers this agent's account, if it lists them.
+    async fn list_models(&self, _provider: Provider) -> Result<Vec<crate::models::Offered>> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct ExecutorConfig {
@@ -297,8 +303,9 @@ pub struct SdkExecutor {
     providers: Vec<Provider>,
     /// The profile's role, given to the model with every task.
     role: Option<String>,
-    /// The profile's models per provider: the default and the ones tasks may ask for.
-    models: crate::models::Models,
+    /// The profile's models per provider: the default and the ones tasks may ask for
+    /// (changed while it runs: see [`Executor::set_models`]).
+    models: std::sync::RwLock<crate::models::Models>,
     copilot: Option<CopilotBackend>,
     bridge: Option<Bridge>,
     accounts: Vec<(Provider, String)>,
@@ -344,7 +351,7 @@ impl SdkExecutor {
         Ok(Arc::new(Self {
             providers,
             role: profile.config.role.clone(),
-            models: profile.models(),
+            models: std::sync::RwLock::new(profile.models()),
             copilot,
             bridge,
             accounts,
@@ -371,6 +378,18 @@ impl Executor for SdkExecutor {
         self.providers.clone()
     }
 
+    fn set_models(&self, models: crate::models::Models) {
+        *self.models.write().unwrap() = models;
+    }
+
+    async fn list_models(&self, provider: Provider) -> Result<Vec<crate::models::Offered>> {
+        match provider {
+            Provider::Copilot => self.copilot_models().await,
+            // Their SDKs take any model name they know: there is no list.
+            Provider::Claude | Provider::Codex => Ok(Vec::new()),
+        }
+    }
+
     async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<Ran> {
         if !self.providers.contains(&task.provider) {
             bail!("provider {} is not enabled on this agent", task.provider);
@@ -384,7 +403,7 @@ impl Executor for SdkExecutor {
         let mut task = with_role(self.role.as_deref(), task);
         // The model it asked for, if this agent's owner allows it; else the default. The
         // same for the reasoning effort.
-        let choice = crate::models::choice(&self.models, task.provider);
+        let choice = crate::models::choice(&self.models.read().unwrap(), task.provider);
         task.model = choice.pick(task.model.as_deref())?;
         task.effort = choice.pick_effort(task.effort.as_deref())?;
         if !ctx.mcp.is_empty() {

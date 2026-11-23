@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/app.css">
   <script src="/plan-text.js" defer></script>
   <script src="/markdown.js" defer></script>
+  <script src="/models.js" defer></script>
 <script src="/app.js" defer></script>
   <script src="/tools.js" defer></script>
 <script src="/plan-builder.js" defer></script>
@@ -155,7 +156,7 @@
               <select id="target"></select>
             </label>
             <label class="field-inline" id="model-field" hidden
-                   title="The model it runs on: its default (selected), one its agent allows, or another by name (its agent refuses models it doesn't allow)">
+                   title="The model it runs on: its default (selected), or one its agent lets you pick (the models its account offers, or the ones it allows)">
               <span>Model</span>
               <select id="model"></select>
             </label>
@@ -165,7 +166,7 @@
               <input id="model-name" type="text" class="mono model-name" placeholder="e.g. claude-sonnet-5.5" spellcheck="false" autocomplete="off">
             </label>
             <label class="field-inline" id="effort-field" hidden
-                   title="How hard the model reasons: its default (selected) or another level; a model that supports fewer takes the nearest it supports below">
+                   title="How hard the model reasons: its default (selected), or a level its agent allows that the model supports">
               <span>Reasoning</span>
               <select id="effort"></select>
             </label>
@@ -534,6 +535,25 @@
         <button type="button" class="btn danger" id="team-remove">Remove team plan</button>
         <button type="button" class="btn" id="team-cancel">Cancel</button>
         <button type="submit" class="btn primary" id="team-save">Save team plan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="models-dialog" aria-labelledby="models-h">
+    <form method="dialog" id="models-form" novalidate>
+      <h2 id="models-h">Models</h2>
+      <p class="muted small" id="models-intro"></p>
+      <label class="field" id="models-provider-field" hidden>
+        <span>Provider</span>
+        <select id="models-provider"></select>
+      </label>
+      <div id="models-body"></div>
+      <div class="dialog-footer">
+        <p class="form-error" id="models-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn" id="models-cancel">Cancel</button>
+          <button type="submit" class="btn primary" id="models-save">Save models</button>
+        </div>
       </div>
     </form>
   </dialog>
