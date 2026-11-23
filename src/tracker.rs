@@ -2865,6 +2865,105 @@ pub async fn start_with(
         run.problems
             .insert(0, format!("the board isn't updated: {p}"));
     }
+    Ok(follow(run, plan))
+}
+
+/// Takes the tracking of `plan`'s run `run_id` up again after its agent restarted (see
+/// [`crate::plan::Resume`]), on the issues it had (`tracked`): nothing is made, linked or
+/// put on the board again, and the issues of the steps that finished stay as they are.
+/// None if the run wasn't tracked, or the profile has no tracker now.
+pub async fn resume(
+    profile: &Profile,
+    plan: &Plan,
+    run_id: &str,
+    agent: &str,
+    tracked: &TrackedRun,
+) -> Result<Option<Tracking>> {
+    if tracked.issue.is_none() {
+        return Ok(None);
+    }
+    let path = profile.tracker_path();
+    let Some(config) = TrackerConfig::load(&path)? else {
+        return Ok(None);
+    };
+    let creds = profile.github()?;
+    if creds.host != config.host {
+        bail!(
+            "the tracker is on {}, but profile '{}' is signed in to {}",
+            config.host,
+            profile.name,
+            creds.host
+        );
+    }
+    resume_with(
+        Arc::new(GhApi::new(creds)),
+        config,
+        plan,
+        run_id,
+        agent,
+        Some(path),
+        tracked,
+    )
+    .await
+    .map(Some)
+}
+
+/// [`resume`] with `api` and `config` (saved at `config_path`, if any).
+pub async fn resume_with(
+    api: Arc<dyn Api>,
+    config: TrackerConfig,
+    plan: &Plan,
+    run_id: &str,
+    agent: &str,
+    config_path: Option<PathBuf>,
+    tracked: &TrackedRun,
+) -> Result<Tracking> {
+    let issue = tracked.issue.as_ref().context("the run wasn't tracked")?;
+    let tracker = Tracker::connect(api, config).await?;
+    let mut wanted = vec![issue.number];
+    wanted.extend(tracked.steps.values().map(|s| s.number));
+    let existing = tracker.issues(&wanted).await?;
+    let run_issue = existing
+        .get(&issue.number)
+        .with_context(|| format!("the run's issue #{} is gone", issue.number))?
+        .clone();
+    let mut claim = Claim::new(&tracker.config);
+    let mut steps = BTreeMap::new();
+    for (step, issue) in &tracked.steps {
+        if let Some(issue) = existing.get(&issue.number) {
+            claim.take(issue.number);
+            steps.insert(step.clone(), issue.clone());
+        }
+    }
+    let run = Run {
+        issue: StepIssue::from(&run_issue),
+        previous: run_issue.status.clone(),
+        texts: plan
+            .steps
+            .iter()
+            .filter(|s| s.issue.is_some())
+            .filter_map(|s| {
+                let issue = steps.get(&s.id)?;
+                Some((s.id.clone(), issue_text(&tracker.config.repo, issue)))
+            })
+            .collect(),
+        steps: steps
+            .iter()
+            .map(|(id, i)| (id.clone(), StepIssue::from(i)))
+            .collect(),
+        tracker,
+        run_id: run_id.to_owned(),
+        agent: agent.to_owned(),
+        problems: tracked.problems.clone(),
+        last: HashMap::new(),
+        config_path,
+        _claim: claim,
+    };
+    Ok(follow(run, plan))
+}
+
+/// The [`Tracking`] that follows `run` of `plan`: its steps' states and its end.
+fn follow(mut run: Run, plan: &Plan) -> Tracking {
     let refs = issue_refs(plan, &run);
     let texts = run.texts.clone();
     let tracked = run.tracked();
@@ -2887,13 +2986,13 @@ pub async fn start_with(
         }
         run.tracked()
     });
-    Ok(Tracking {
+    Tracking {
         tx,
         task,
         refs,
         texts,
         tracked,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -3881,6 +3980,80 @@ mod tests {
                 "number": 8, "title": "Run", "url": "https://github.com/acme/app/issues/8",
                 "sub_issues": [{ "number": 9, "title": "Part", "url": "https://github.com/acme/app/issues/9",
                                 "open": true, "pull_requests": [12] }] }] })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_goes_on_after_a_restart_keeps_its_issues_as_they_are() {
+        let fake = Fake::with(&[]);
+        let plan = Plan::parse(PLAN).unwrap();
+        let tracking = start_with(fake.clone(), config(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        // `ui` ends before the agent restarts: its issue is closed, and done.
+        tracking.update("ui", &done("worker", Some(evidence(None))));
+        let tracked = tracking.tracked.clone();
+        for _ in 0..200 {
+            if !fake.open(3) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!fake.open(3) && fake.status(3).as_deref() == Some("Done"));
+        drop(tracking);
+        let calls = |fields: &[&str]| fields.iter().map(|f| fake.calls(f).len()).sum::<usize>();
+        let before = calls(&[
+            "createIssue",
+            "addSubIssue",
+            "addProjectV2ItemById",
+            "reopenIssue",
+        ]);
+
+        let resumed = resume_with(fake.clone(), config(), &plan, "r1", "boss", None, &tracked)
+            .await
+            .unwrap();
+        // The same issues: nothing is made, linked, reopened or put on the board again,
+        // and the step that ended stays as it ended.
+        assert_eq!(
+            calls(&[
+                "createIssue",
+                "addSubIssue",
+                "addProjectV2ItemById",
+                "reopenIssue"
+            ]),
+            before
+        );
+        assert_eq!(resumed.tracked.issue, tracked.issue);
+        assert_eq!(resumed.tracked.steps, tracked.steps);
+        assert_eq!(resumed.refs["ui"], ["acme/app#3", "acme/app#2"]);
+        assert!(!fake.open(3) && fake.status(3).as_deref() == Some("Done"));
+        // The run goes on on them.
+        let api = done("worker", Some(evidence(Some("0123456789abcdef"))));
+        resumed.update("api", &api);
+        let mut states = BTreeMap::new();
+        states.insert("api".to_owned(), api);
+        states.insert("ui".to_owned(), done("worker", Some(evidence(None))));
+        states.insert("signoff".to_owned(), done("you", None));
+        let mut record = RunRecord::new("boss", "id", PLAN, &plan, &states, 0);
+        record.id = "r1".into();
+        let ended = resumed.finish(&record).await;
+        assert!(ended.problems.is_empty(), "{:?}", ended.problems);
+        assert!(fake.open(2) && fake.status(2).as_deref() == Some("👀 In review"));
+        let comments: Vec<String> = fake
+            .calls("addComment")
+            .iter()
+            .map(|c| c["body"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            comments.iter().filter(|c| c.contains("step `ui`")).count(),
+            1,
+            "a step that ended before is told once: {comments:?}"
+        );
+        assert!(
+            comments
+                .last()
+                .unwrap()
+                .contains("- `api`: done by worker (#2)")
         );
     }
 

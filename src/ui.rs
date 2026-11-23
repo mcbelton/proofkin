@@ -354,6 +354,9 @@ struct Shared {
     work: Option<Arc<dyn crate::workiq::context::WorkContext>>,
     /// GitHub CLI sign-ins run for the user: granting a scope, signing in an account.
     gh: Arc<crate::gh_auth::Flows>,
+    /// The plan runs in progress, by the plan's task id, kept in the profile as they go
+    /// (see [`PlanProgress`]).
+    plan_runs: Mutex<HashMap<u64, Arc<Mutex<PlanProgress>>>>,
 }
 
 type AppState = Arc<Shared>;
@@ -791,7 +794,10 @@ pub async fn start_with_work(
         fixed_port: bind.port() != 0,
         work,
         gh: crate::gh_auth::Flows::new(Arc::new(crate::gh_auth::GhCli::new())),
+        plan_runs: Mutex::new(HashMap::new()),
     });
+    // Plan runs the agent stopped in the middle of go on: their tasks aren't cancelled.
+    let stopped = stopped.saturating_sub(resume_plans(&shared));
     if stopped > 0 {
         let (were, they, them) = if stopped == 1 {
             ("task was", "it", "it")
@@ -1811,14 +1817,17 @@ fn cancel_running(s: &Shared, id: u64, why: &str) -> Result<(), ApiError> {
         .find(|t| t.id == id)
         .and_then(|t| t.plan);
     let ids: Vec<u64> = match plan {
-        Some(plan) => s
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|t| t.plan == Some(plan) && !t.finished())
-            .map(|t| t.id)
-            .collect(),
+        Some(plan) => {
+            // A cancelled run doesn't go on after a restart.
+            end_progress(s, plan);
+            s.tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.plan == Some(plan) && !t.finished())
+                .map(|t| t.id)
+                .collect()
+        }
         None => vec![id],
     };
     for id in ids {
@@ -2038,114 +2047,25 @@ fn start_plan(
         s.add_task(view.clone());
         s.send(json!({ "type": "task", "task": view }));
     }
-    let squads = s.squads.lock().unwrap().clone();
-    let shared = s.clone();
-    let step_ids = ids.clone();
-    let handle = tokio::spawn(async move {
-        let started = crate::runs::unix_now();
+    let progress = PlanProgress {
         // The run's id is known from the start: each step's peer is told it.
-        let run_id = crate::runs::new_run_id();
-        // Tracked runs get their issues before their steps start.
-        let tracking =
-            match crate::tracker::start(&shared.info.profile, &plan, &run_id, shared.agent.name())
-                .await
-            {
-                Ok(tracking) => tracking,
-                Err(e) => {
-                    shared.system("warn", format!("The run isn't tracked on GitHub: {e:#}"));
-                    None
-                }
-            };
-        if let Some(t) = &tracking {
-            show_tracked(&shared, &step_ids, &t.tracked, 0);
-        }
-        let ctx = crate::plan::RunContext {
-            run_id: Some(run_id.clone()),
-            chain: Vec::new(),
-            issues: tracking
-                .as_ref()
-                .map(|t| t.refs.clone())
-                .unwrap_or_default(),
-            issue_texts: tracking
-                .as_ref()
-                .map(|t| t.texts.clone())
-                .unwrap_or_default(),
-            recipients,
-            work_context: work,
-            work_log: crate::plan::WorkLog::default(),
-        };
-        let agent = shared.agent.clone();
-        let states = crate::plan::run_plan_with(&agent, &squads, &ready, &ctx, |step, state| {
-            let id = step_ids[step];
-            if !matches!(state, StepState::Waiting | StepState::Running { .. }) {
-                shared.running.lock().unwrap().remove(&id);
-            }
-            shared.update_task(id, |t| apply_state(&shared, t, state));
-            if let Some(t) = &tracking {
-                t.update(step, state);
-            }
-        })
-        .await;
-        let mut run = RunRecord::new(
-            shared.agent.name(),
-            &shared.agent.id().to_string(),
-            &text,
-            &plan,
-            &states,
-            started,
-        );
-        run.id = run_id;
-        run.peer_ids = crate::runs::peer_ids(&shared.agent);
-        run.workiq = ctx.work_log.records();
-        if let Some(t) = tracking {
-            let known = t.tracked.problems.len();
-            let tracked = t.finish(&run).await;
-            show_tracked(&shared, &step_ids, &tracked, known);
-            run.tracked = Some(tracked);
-        }
-        let saved_run = match run.save(&shared.info.profile.runs_dir()) {
-            Ok(_) => {
-                shared.system(
-                    if run.passed() { "info" } else { "warn" },
-                    format!("Evidence run {}: {}", run.id, run.verdict_line()),
-                );
-                Some(run.id.clone())
-            }
-            Err(e) => {
-                shared.system("warn", format!("Could not save the run: {e:#}"));
-                None
-            }
-        };
-        if let Some(run_id) = &saved_run {
-            for id in step_ids.values() {
-                shared.update_task(*id, |t| t.run = Some(run_id.clone()));
-            }
-        }
-        let saved = crate::plan::save_knowledge(
-            &kb,
-            &crate::plan::with_actual_labels(&plan, &ctx.work_log),
-            &states,
-            &run.id,
-        );
-        if !saved.is_empty() {
-            shared.system("info", format!("Knowledge saved: {}", saved.join(", ")));
-        }
-        shared.send(json!({ "type": "runs" }));
-        shared.send(json!({ "type": "ops" }));
-        crate::schedule::Outcome {
-            verdict: run.verdict_line(),
-            run_id: saved_run,
-        }
-    });
-    {
-        let mut running = s.running.lock().unwrap();
-        let tasks = s.tasks.lock().unwrap();
-        for id in ids.values() {
-            if tasks.iter().any(|t| t.id == *id && !t.finished()) {
-                running.insert(*id, handle.abort_handle());
-            }
-        }
-    }
+        run_id: crate::runs::new_run_id(),
+        text,
+        started: crate::runs::unix_now(),
+        plan: plan_id,
+        steps: ids.clone(),
+        ..PlanProgress::default()
+    };
+    let handle = tokio::spawn(run_plan_here(
+        s.clone(),
+        plan,
+        ready,
+        recipients,
+        work,
+        progress,
+        false,
+    ));
+    keep_running(s, &ids, &handle);
     s.system(
         "task",
         format!(
@@ -2159,6 +2079,420 @@ fn start_plan(
         steps: ids,
         done: handle,
     })
+}
+
+/// Lets the Cancel of each of a plan's unfinished steps' tasks (`ids`) stop its run.
+fn keep_running(
+    s: &Shared,
+    ids: &HashMap<String, u64>,
+    handle: &tokio::task::JoinHandle<crate::schedule::Outcome>,
+) {
+    let mut running = s.running.lock().unwrap();
+    let tasks = s.tasks.lock().unwrap();
+    for id in ids.values() {
+        if tasks.iter().any(|t| t.id == *id && !t.finished()) {
+            running.insert(*id, handle.abort_handle());
+        }
+    }
+}
+
+/// A plan run in progress, kept in the profile as its steps are sent and end (see
+/// [`crate::profile::Profile::runs_in_progress_dir`]), so the run goes on after the
+/// agent restarts (see [`resume_plans`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PlanProgress {
+    run_id: String,
+    /// The plan, as started.
+    text: String,
+    started: u64,
+    /// Its task ids here: the plan's, and each step's.
+    plan: u64,
+    steps: HashMap<String, u64>,
+    /// The issues it is tracked on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tracked: Option<crate::tracker::TrackedRun>,
+    /// Its steps that ended, as they ended; a done step's patch is kept apart.
+    #[serde(default)]
+    finished: std::collections::BTreeMap<String, StepState>,
+    #[serde(default)]
+    patches: std::collections::BTreeMap<String, String>,
+    /// The work it waits for (see [`crate::plan::SentStep`]).
+    #[serde(default)]
+    sent: std::collections::BTreeMap<String, crate::plan::SentStep>,
+    /// It ended (or was cancelled): nothing is kept any more.
+    #[serde(skip)]
+    ended: bool,
+}
+
+impl PlanProgress {
+    fn path(dir: &std::path::Path, plan: u64) -> PathBuf {
+        dir.join(format!("{plan}.json"))
+    }
+
+    /// Keeps it in `dir`, unless the run has ended.
+    fn save(&self, dir: &std::path::Path) {
+        if self.ended {
+            return;
+        }
+        let saved = std::fs::create_dir_all(dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| serde_json::to_vec(self).map_err(anyhow::Error::from))
+            .and_then(|bytes| crate::store::write_atomic(&Self::path(dir, self.plan), &bytes));
+        if let Err(e) = saved {
+            eprintln!("  plan run {} isn't kept for a restart: {e:#}", self.run_id);
+        }
+    }
+
+    /// Step `step` is in `state` now.
+    fn step(&mut self, step: &str, state: &StepState) {
+        if !state.finished() {
+            return;
+        }
+        self.sent.remove(step);
+        if let StepState::Done {
+            patch: Some(patch), ..
+        } = state
+        {
+            self.patches.insert(step.to_owned(), patch.clone());
+        }
+        self.finished.insert(step.to_owned(), state.clone());
+    }
+
+    /// Where the run goes on from after a restart.
+    fn resume(&self) -> crate::plan::Resume {
+        let finished = self
+            .finished
+            .iter()
+            .map(|(step, state)| {
+                let mut state = state.clone();
+                if let StepState::Done { patch, .. } = &mut state {
+                    *patch = self.patches.get(step).cloned();
+                }
+                (step.clone(), state)
+            })
+            .collect();
+        crate::plan::Resume {
+            finished,
+            sent: self.sent.clone(),
+        }
+    }
+}
+
+/// Stops keeping plan `plan`'s run for a restart: it ended, or was cancelled.
+fn end_progress(s: &Shared, plan: u64) {
+    if let Some(progress) = s.plan_runs.lock().unwrap().remove(&plan) {
+        progress.lock().unwrap().ended = true;
+    }
+    let _ = std::fs::remove_file(PlanProgress::path(
+        &s.info.profile.runs_in_progress_dir(),
+        plan,
+    ));
+}
+
+/// How long a run that goes on after a restart waits for its peers to connect again
+/// before its steps that didn't start yet are sent.
+const RESUME_WAIT: Duration = Duration::from_secs(30);
+
+/// Runs a plan here: started now (`plan` as written, `ready` prepared to run), or going
+/// on after a restart (`resumed`, from `progress`). Its steps show as tasks, it is kept
+/// for a restart as it goes, and when it ends its run is saved.
+async fn run_plan_here(
+    shared: AppState,
+    plan: Plan,
+    ready: Plan,
+    recipients: crate::plan::Recipients,
+    work: Option<Arc<dyn crate::workiq::context::WorkContext>>,
+    progress: PlanProgress,
+    resumed: bool,
+) -> crate::schedule::Outcome {
+    let dir = shared.info.profile.runs_in_progress_dir();
+    let (run_id, text, started, plan_id) = (
+        progress.run_id.clone(),
+        progress.text.clone(),
+        progress.started,
+        progress.plan,
+    );
+    let step_ids = progress.steps.clone();
+    let squads = shared.squads.lock().unwrap().clone();
+    // Tracked runs get their issues before their steps start; one that goes on after a
+    // restart takes up the issues it had.
+    let tracking = if resumed {
+        match &progress.tracked {
+            Some(tracked) => match crate::tracker::resume(
+                &shared.info.profile,
+                &plan,
+                &run_id,
+                shared.agent.name(),
+                tracked,
+            )
+            .await
+            {
+                Ok(tracking) => tracking,
+                Err(e) => {
+                    shared.system(
+                        "warn",
+                        format!("The run's issues on GitHub aren't followed any more: {e:#}"),
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        match crate::tracker::start(&shared.info.profile, &plan, &run_id, shared.agent.name()).await
+        {
+            Ok(tracking) => tracking,
+            Err(e) => {
+                shared.system("warn", format!("The run isn't tracked on GitHub: {e:#}"));
+                None
+            }
+        }
+    };
+    if let Some(t) = &tracking
+        && !resumed
+    {
+        show_tracked(&shared, &step_ids, &t.tracked, 0);
+    }
+    // Steps that ended before a restart were shown and tracked then.
+    let ended_before: std::collections::HashSet<String> =
+        progress.finished.keys().cloned().collect();
+    let resume = if resumed {
+        wait_for_peers(&shared, &ready, &ended_before).await;
+        progress.resume()
+    } else {
+        crate::plan::Resume::default()
+    };
+    let progress = Arc::new(Mutex::new(PlanProgress {
+        tracked: tracking
+            .as_ref()
+            .map(|t| t.tracked.clone())
+            .or(progress.tracked.clone()),
+        ..progress
+    }));
+    shared
+        .plan_runs
+        .lock()
+        .unwrap()
+        .insert(plan_id, progress.clone());
+    progress.lock().unwrap().save(&dir);
+    let journal = {
+        let (progress, dir) = (progress.clone(), dir.clone());
+        crate::plan::Journal(Arc::new(move |step: &str, sent: &crate::plan::SentStep| {
+            let mut kept = progress.lock().unwrap();
+            kept.sent.insert(step.to_owned(), sent.clone());
+            kept.save(&dir);
+        }))
+    };
+    let ctx = crate::plan::RunContext {
+        run_id: Some(run_id.clone()),
+        chain: Vec::new(),
+        issues: tracking
+            .as_ref()
+            .map(|t| t.refs.clone())
+            .unwrap_or_default(),
+        issue_texts: tracking
+            .as_ref()
+            .map(|t| t.texts.clone())
+            .unwrap_or_default(),
+        recipients,
+        work_context: work,
+        work_log: crate::plan::WorkLog::default(),
+        resume,
+        journal: Some(journal),
+    };
+    let agent = shared.agent.clone();
+    let states = crate::plan::run_plan_with(&agent, &squads, &ready, &ctx, |step, state| {
+        let id = step_ids[step];
+        if !matches!(state, StepState::Waiting | StepState::Running { .. }) {
+            shared.running.lock().unwrap().remove(&id);
+        }
+        if ended_before.contains(step) {
+            return;
+        }
+        shared.update_task(id, |t| apply_state(&shared, t, state));
+        if let Some(t) = &tracking {
+            t.update(step, state);
+        }
+        if state.finished() {
+            let mut kept = progress.lock().unwrap();
+            kept.step(step, state);
+            kept.save(&dir);
+        }
+    })
+    .await;
+    let mut run = RunRecord::new(
+        shared.agent.name(),
+        &shared.agent.id().to_string(),
+        &text,
+        &plan,
+        &states,
+        started,
+    );
+    run.id = run_id;
+    run.peer_ids = crate::runs::peer_ids(&shared.agent);
+    run.workiq = ctx.work_log.records();
+    if let Some(t) = tracking {
+        let known = t.tracked.problems.len();
+        let tracked = t.finish(&run).await;
+        show_tracked(&shared, &step_ids, &tracked, known);
+        run.tracked = Some(tracked);
+    }
+    let saved_run = match run.save(&shared.info.profile.runs_dir()) {
+        Ok(_) => {
+            shared.system(
+                if run.passed() { "info" } else { "warn" },
+                format!("Evidence run {}: {}", run.id, run.verdict_line()),
+            );
+            Some(run.id.clone())
+        }
+        Err(e) => {
+            shared.system("warn", format!("Could not save the run: {e:#}"));
+            None
+        }
+    };
+    // It ended: nothing goes on after a restart.
+    end_progress(&shared, plan_id);
+    if let Some(run_id) = &saved_run {
+        for id in step_ids.values() {
+            shared.update_task(*id, |t| t.run = Some(run_id.clone()));
+        }
+    }
+    let saved = crate::plan::save_knowledge(
+        &shared.info.profile.knowledge(),
+        &crate::plan::with_actual_labels(&plan, &ctx.work_log),
+        &states,
+        &run.id,
+    );
+    if !saved.is_empty() {
+        shared.system("info", format!("Knowledge saved: {}", saved.join(", ")));
+    }
+    shared.send(json!({ "type": "runs" }));
+    shared.send(json!({ "type": "ops" }));
+    crate::schedule::Outcome {
+        verdict: run.verdict_line(),
+        run_id: saved_run,
+    }
+}
+
+/// Waits (up to [`RESUME_WAIT`]) until the peers and squads the open steps of `plan`
+/// (those not in `ended`) go to are connected again: a step started before they are
+/// would fail for want of its peer.
+async fn wait_for_peers(shared: &Shared, plan: &Plan, ended: &std::collections::HashSet<String>) {
+    let open: Vec<&crate::plan::Step> = plan
+        .steps
+        .iter()
+        .filter(|s| !ended.contains(&s.id))
+        .collect();
+    let deadline = std::time::Instant::now() + RESUME_WAIT;
+    loop {
+        let peers = shared.agent.peers();
+        let online = |name: &str| peers.iter().any(|p| p.name == name);
+        let squads = shared.squads.lock().unwrap().clone();
+        let ready = open.iter().all(|s| match &s.target {
+            crate::plan::Target::Peer(name) => name == "me" || online(name),
+            crate::plan::Target::Squad(name) => squads
+                .get(name)
+                .is_none_or(|squad| squad.members.iter().any(|m| online(m))),
+            crate::plan::Target::Workiq => true,
+        });
+        if ready || std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Goes on with the plan runs this agent stopped in the middle of (see
+/// [`PlanProgress`]): their steps' tasks are taken up again. How many tasks it took up.
+fn resume_plans(shared: &AppState) -> usize {
+    let dir = shared.info.profile.runs_in_progress_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut taken = 0;
+    for path in entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+    {
+        let Some(progress) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PlanProgress>(&bytes).ok())
+        else {
+            shared.system(
+                "warn",
+                format!(
+                    "A plan run kept to go on after a restart can't be read: {}",
+                    path.display()
+                ),
+            );
+            continue;
+        };
+        let run_id = progress.run_id.clone();
+        match resume_plan(shared, progress) {
+            Ok(n) => taken += n,
+            Err(e) => {
+                shared.system(
+                    "warn",
+                    format!("Plan run {run_id} doesn't go on after the restart: {e}"),
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    taken
+}
+
+/// Goes on with one plan run (see [`resume_plans`]); how many tasks it took up.
+fn resume_plan(shared: &AppState, progress: PlanProgress) -> Result<usize, String> {
+    let profile = &shared.info.profile;
+    let plan = Plan::parse(&progress.text).map_err(|e| format!("{e:#}"))?;
+    let ready = plan
+        .prepare(&profile.knowledge(), &profile.skills())
+        .map_err(|e| format!("{e:#}"))?;
+    let work = crate::plan::work_context(profile, &plan).map_err(|e| format!("{e:#}"))?;
+    let recipients = crate::plan::Recipients::of(&shared.agent, profile);
+    let mut open = 0;
+    for (step, id) in &progress.steps {
+        match progress.finished.get(step) {
+            // It ended after the tasks were last kept: shown as it ended.
+            Some(state) => shared.update_task(*id, |t| {
+                if t.output.as_deref() == Some(STOPPED) {
+                    apply_state(shared, t, state);
+                }
+            }),
+            None => {
+                open += 1;
+                shared.update_task(*id, |t| {
+                    t.status = "waiting";
+                    t.output = None;
+                    t.finished_ms = None;
+                    t.progress = None;
+                });
+            }
+        }
+    }
+    let (run_id, ended, all) = (
+        progress.run_id.clone(),
+        progress.finished.len(),
+        progress.steps.len(),
+    );
+    let ids = progress.steps.clone();
+    let handle = tokio::spawn(run_plan_here(
+        shared.clone(),
+        plan,
+        ready,
+        recipients,
+        work,
+        progress,
+        true,
+    ));
+    keep_running(shared, &ids, &handle);
+    shared.system(
+        "task",
+        format!("Plan run {run_id} goes on after the restart: {ended} of {all} steps had ended"),
+    );
+    Ok(open)
 }
 
 /// Runs the profile's scheduled plans like plans started here, so their steps show

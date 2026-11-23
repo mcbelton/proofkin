@@ -447,7 +447,7 @@
     {
       "id": "UI-3",
       "area": "web ui",
-      "claim": "The web UI's task list outlives a restart: the latest 200 tasks are kept in the profile with long outputs cut, a task the agent stopped in the middle comes back cancelled saying why (reported once), task ids go on from the kept ones, and Clear finished lets the finished tasks go while running ones stay.",
+      "claim": "The web UI's task list outlives a restart: the latest 200 tasks are kept in the profile with long outputs cut, a task the agent stopped in the middle comes back cancelled saying why (reported once), unless it is a step of a plan run that goes on (PLAN-2), task ids go on from the kept ones, and Clear finished lets the finished tasks go while running ones stay.",
       "tests": ["ui::tasks_outlive_a_restart_and_finished_ones_can_be_cleared"]
     },
     {
@@ -466,6 +466,15 @@
         "lib::plan::option_looking_words_in_continuation_lines_are_text",
         "lib::plan::a_step_error_names_its_first_line",
         "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
+      "id": "PLAN-2",
+      "area": "plans",
+      "claim": "A web UI plan run goes on after its agent restarts, as the same run: it is kept in the profile (runs-in-progress) as its steps are sent and end, and when the agent starts again (once its peers are connected, or after 30 seconds) its steps that ended keep their results and patches and aren't run or reported again, a step that was running is waited for again under the same request (its peer goes on with it, or sends the result it kept if it finished meanwhile, so it doesn't run twice), a sign-off is asked again under the same request, and the steps after them run; its issues on GitHub are the ones it had (nothing is made, linked or put on the board again), and it is saved once, when it ends. Its steps aren't cancelled when the agent stops (their peers keep them for the task grace), its tasks come back running rather than cancelled, and a cancelled or ended run isn't kept. Task ids go on after a restart (next-task-id), so a peer never takes a new task for one it is still running.",
+      "tests": [
+        "ui::a_plan_goes_on_after_its_agent_restarts",
+        "lib::tracker::a_run_that_goes_on_after_a_restart_keeps_its_issues_as_they_are"
       ]
     },
     {

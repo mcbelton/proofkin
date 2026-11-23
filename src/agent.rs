@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -72,6 +72,10 @@ pub struct AgentConfig {
     pub team: Option<Arc<crate::team::TeamRunner>>,
     /// How long tasks wait for a dropped peer to come back (see [`TASK_GRACE`]).
     pub task_grace: Duration,
+    /// Where the next id for the tasks it gives peers is kept, so ids go on after a
+    /// restart (none: they start at 1). A peer still running a task from before must
+    /// never take a new task for it, nor a plan resumed after a restart a new one's.
+    pub task_ids: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -91,6 +95,7 @@ impl AgentConfig {
             worktrees_dir: std::env::temp_dir().join("proofkin-worktrees"),
             team: None,
             task_grace: TASK_GRACE,
+            task_ids: None,
         }
     }
 }
@@ -195,6 +200,15 @@ pub struct Delivered {
     pub refused: bool,
     /// The model that did the work, as the peer says (older peers don't).
     pub model: Option<String>,
+}
+
+/// The first id for the tasks an agent gives peers: the one kept at `path` (see
+/// [`AgentConfig::task_ids`]), else 1.
+fn first_task_id(path: Option<&Path>) -> u64 {
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// A delegated task failed because its peer dropped and didn't come back in time.
@@ -350,6 +364,12 @@ impl Drop for CancelOnDrop {
         if !self.armed {
             return;
         }
+        // A run's step this agent leaves running while it stops (see
+        // [`Agent::keep_on_exit`]): the run waits for it again after the restart.
+        let kept = self.inner.kept.lock().unwrap().remove(&self.task_id);
+        if kept && *self.inner.shutdown.borrow() {
+            return;
+        }
         self.inner.pending.lock().unwrap().remove(&self.task_id);
         if self.peer == self.inner.endpoint.id() {
             self.inner.withdraw_approval(&self.peer, self.task_id);
@@ -442,6 +462,13 @@ struct Inner {
     /// raised; sent when the peer connects (see [`Agent::alert`]).
     held: Mutex<HashMap<EndpointId, VecDeque<(Instant, String)>>>,
     next_task_id: AtomicU64,
+    /// Where `next_task_id` is kept (see [`AgentConfig::task_ids`]), and a lock so the
+    /// file always ends up with the latest value.
+    task_ids: Option<PathBuf>,
+    task_ids_write: Mutex<()>,
+    /// Tasks (and approval requests) left running when this agent stops (see
+    /// [`Agent::keep_on_exit`]).
+    kept: Mutex<HashSet<u64>>,
     worktrees_dir: PathBuf,
     /// Approval requests waiting for this agent's user, by local id.
     approvals: Mutex<BTreeMap<u64, IncomingApproval>>,
@@ -504,7 +531,10 @@ impl Agent {
             recent: Mutex::new(HashMap::new()),
             announced: Mutex::new(HashSet::new()),
             held: Mutex::new(HashMap::new()),
-            next_task_id: AtomicU64::new(1),
+            next_task_id: AtomicU64::new(first_task_id(config.task_ids.as_deref())),
+            task_ids: config.task_ids,
+            task_ids_write: Mutex::new(()),
+            kept: Mutex::new(HashSet::new()),
             worktrees_dir: config.worktrees_dir,
             approvals: Mutex::new(BTreeMap::new()),
             slots: Mutex::new(Slots::default()),
@@ -942,7 +972,7 @@ impl Agent {
         task: LlmTask,
         origin: Option<Origin>,
     ) -> Result<Delegation> {
-        let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let task_id = self.inner.new_task_id();
         let (reply, rx) = oneshot::channel();
         let (progress_tx, progress) = mpsc::unbounded_channel();
         let peers = self.inner.peers.lock().unwrap();
@@ -1023,7 +1053,51 @@ impl Agent {
         text: &str,
         preview: BTreeMap<String, String>,
     ) -> Result<Delivered> {
-        let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let task_id = self.inner.new_task_id();
+        self.request_approval_as(peer, task_id, title, text, preview)
+            .await
+    }
+
+    /// [`Agent::request_approval_with`] as request `task_id` (see [`Agent::new_task_id`]):
+    /// a plan run keeps it, to wait for the same request again after a restart (the
+    /// approver keeps one request per id, so it isn't asked twice).
+    pub async fn request_approval_as(
+        &self,
+        peer: Option<EndpointId>,
+        task_id: u64,
+        title: &str,
+        text: &str,
+        preview: BTreeMap<String, String>,
+    ) -> Result<Delivered> {
+        self.ask_approval(peer, task_id, title, text, preview, false)
+            .await
+    }
+
+    /// Waits again for approval request `task_id`, which a plan run of this agent sent
+    /// before it restarted (see [`crate::plan::Resume`]): it is asked again, of an
+    /// approver not connected yet when it connects; it fails if the approver isn't back
+    /// within the task grace.
+    pub async fn rejoin_approval(
+        &self,
+        peer: Option<EndpointId>,
+        task_id: u64,
+        title: &str,
+        text: &str,
+    ) -> Result<Delivered> {
+        self.ask_approval(peer, task_id, title, text, BTreeMap::new(), true)
+            .await
+    }
+
+    async fn ask_approval(
+        &self,
+        peer: Option<EndpointId>,
+        task_id: u64,
+        title: &str,
+        text: &str,
+        preview: BTreeMap<String, String>,
+        rejoin: bool,
+    ) -> Result<Delivered> {
+        self.inner.reserve_task_id(task_id);
         let (reply, rx) = oneshot::channel();
         let me = self.id();
         let target = peer.unwrap_or(me);
@@ -1054,12 +1128,73 @@ impl Agent {
                 .unwrap()
                 .get(&target)
                 .map(|h| request.clone().is_some_and(|r| h.tx.send(r).is_ok()));
-            if sent != Some(true) {
+            if rejoin {
+                // Not connected yet: it goes out when the approver connects.
+                self.inner.give_up_unless_back(target, task_id);
+            } else if sent != Some(true) {
                 self.inner.pending.lock().unwrap().remove(&task_id);
                 bail!("not connected to {}", target.fmt_short());
             }
         }
         self.await_reply(target, task_id, rx).await
+    }
+
+    /// Waits again for task `task_id`, which this agent gave `peer` before it restarted
+    /// (see [`crate::plan::Resume`]): the same request goes to `peer` again, now or when
+    /// it connects, and `peer` answers it as a re-sent request: it goes on with the task
+    /// if it is still running it, sends the result it kept if it is done, or runs it if
+    /// it has neither. Fails if `peer` isn't back within the task grace.
+    pub fn rejoin_task(
+        &self,
+        peer: EndpointId,
+        task_id: u64,
+        task: LlmTask,
+        origin: Option<Origin>,
+    ) -> Delegation {
+        self.inner.reserve_task_id(task_id);
+        let (reply, rx) = oneshot::channel();
+        let (progress_tx, progress) = mpsc::unbounded_channel();
+        let request = Message::TaskRequest {
+            task_id,
+            task,
+            origin,
+        };
+        self.inner.pending.lock().unwrap().insert(
+            task_id,
+            PendingTask {
+                peer,
+                reply,
+                request: Some(request.clone()),
+                progress: Some(progress_tx),
+            },
+        );
+        if let Some(handle) = self.inner.peers.lock().unwrap().get(&peer) {
+            let _ = handle.tx.send(request);
+        }
+        self.inner.give_up_unless_back(peer, task_id);
+        Delegation {
+            guard: CancelOnDrop {
+                inner: self.inner.clone(),
+                peer,
+                task_id,
+                armed: true,
+            },
+            reply: rx,
+            progress,
+        }
+    }
+
+    /// A new id for a task or approval request (see [`Agent::request_approval_as`]).
+    pub fn new_task_id(&self) -> u64 {
+        self.inner.new_task_id()
+    }
+
+    /// Leaves task (or approval request) `task_id` running when this agent stops,
+    /// instead of cancelling it: a plan run waits for it again after a restart (see
+    /// [`Agent::rejoin_task`]). Its peer stops it if this agent isn't back within the
+    /// task grace.
+    pub fn keep_on_exit(&self, task_id: u64) {
+        self.inner.kept.lock().unwrap().insert(task_id);
     }
 
     /// Approval requests waiting for this agent's user.
@@ -1382,12 +1517,63 @@ impl Inner {
         }
     }
 
+    /// A new id for a task (or approval request) this agent gives a peer; ids go on
+    /// after a restart where they are kept (see [`AgentConfig::task_ids`]).
+    fn new_task_id(&self) -> u64 {
+        let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        self.keep_task_ids();
+        id
+    }
+
+    /// Makes sure no new id is `id` or below it (a task from before a restart has it).
+    fn reserve_task_id(&self, id: u64) {
+        self.next_task_id
+            .fetch_max(id.saturating_add(1), Ordering::Relaxed);
+        self.keep_task_ids();
+    }
+
+    /// Fails `task_id`, which `peer` was given before this agent restarted, unless
+    /// `peer` is connected once the task grace has passed: it would never answer.
+    fn give_up_unless_back(self: &Arc<Self>, peer: EndpointId, task_id: u64) {
+        let inner = Arc::downgrade(self);
+        let grace = self.task_grace;
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            if inner.peers.lock().unwrap().contains_key(&peer) {
+                return;
+            }
+            inner.complete_pending(
+                &peer,
+                task_id,
+                Err("it didn't come back after this agent restarted".into()),
+            );
+        });
+    }
+
+    fn keep_task_ids(&self) {
+        if let Some(path) = &self.task_ids {
+            // The latest value, whichever write lands last.
+            let _write = self.task_ids_write.lock().unwrap();
+            let next = self.next_task_id.load(Ordering::Relaxed);
+            if let Err(e) = crate::store::write_atomic(path, next.to_string().as_bytes()) {
+                eprintln!(
+                    "  could not keep the next task id in {}: {e:#}",
+                    path.display()
+                );
+            }
+        }
+    }
+
     fn complete_pending(&self, peer: &EndpointId, task_id: u64, result: Result<Delivered, String>) {
         let mut pending = self.pending.lock().unwrap();
         // Only the peer the task was sent to may answer it.
         if pending.get(&task_id).is_some_and(|p| &p.peer == peer)
             && let Some(task) = pending.remove(&task_id)
         {
+            self.kept.lock().unwrap().remove(&task_id);
             let _ = task.reply.send(result);
         }
     }
@@ -1397,17 +1583,20 @@ impl Inner {
         self.serving.lock().unwrap().retain(|(p, _), _| p != peer);
     }
 
-    /// Tells peers this agent is stopping: the tasks it gave them are cancelled, and
-    /// those it runs for them end as not done (so another worker may take them).
+    /// Tells peers this agent is stopping: the tasks it gave them are cancelled (but
+    /// those a plan run waits for again after a restart, see [`Agent::keep_on_exit`]),
+    /// and those it runs for them end as not done (so another worker may take them).
     /// Whether there was anything to say.
     fn say_goodbye(&self) -> bool {
         let peers = self.peers.lock().unwrap();
         let mut said = false;
+        let kept = self.kept.lock().unwrap().clone();
         let pending: Vec<(EndpointId, u64)> = self
             .pending
             .lock()
             .unwrap()
             .iter()
+            .filter(|(id, _)| !kept.contains(id))
             .map(|(id, p)| (p.peer, *id))
             .collect();
         for (peer, task_id) in pending {
