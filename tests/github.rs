@@ -10,7 +10,7 @@ use std::process::Command;
 use proofkin::audit::{AuditEntry, AuditLog, Outcome};
 use proofkin::evidence::{Evidence, EvidenceKind};
 use proofkin::github::{
-    FileChange, GithubCredentials, RepoStore, branch_changes, branch_states, link_url,
+    ClosingPr, FileChange, GithubCredentials, RepoStore, branch_changes, branch_states, link_url,
     task_branches, unlink,
 };
 use proofkin::worktree::Worktree;
@@ -245,7 +245,8 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
                 { "number": 7, "state": "MERGED", "url": "https://github.com/acme/app/pull/7", "headRefName": "p2p/boss/1-1", "headRefOid": one_head },
                 { "number": 3, "state": "CLOSED", "url": "https://github.com/acme/app/pull/3", "headRefName": "p2p/boss/1-1" },
             ] },
-            "i5": { "state": "CLOSED" },
+            "i5": { "state": "CLOSED", "timelineItems": { "nodes": [{ "closer": {
+                "number": 11, "url": "https://github.com/acme/app/pull/11", "headRefName": "p2p/boss/9-1" } }] } },
         } } }),
         asked: Default::default(),
     };
@@ -276,6 +277,15 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
     assert!(
         !two.safe_to_delete,
         "its issue is closed, but its change isn't on main"
+    );
+    // What closed its issue: a pull request from another branch, which may have its work.
+    assert_eq!(
+        two.closed_by,
+        [ClosingPr {
+            number: 11,
+            url: "https://github.com/acme/app/pull/11".into(),
+            branch: "p2p/boss/9-1".into(),
+        }]
     );
     let three = &states["p2p/boss/3-1"];
     assert!(three.ahead == 0 && three.same_as_base && three.safe_to_delete);
@@ -376,7 +386,8 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
                 { "number": 9, "state": "MERGED", "url": "https://github.com/acme/app/pull/9", "headRefName": "p2p/boss/5-1", "headRefOid": after },
                 { "number": 11, "state": "MERGED", "url": "https://github.com/acme/app/pull/11", "headRefName": "p2p/boss/2-1", "headRefOid": main_head },
             ] },
-            "i5": { "state": "CLOSED" },
+            "i5": { "state": "CLOSED", "timelineItems": { "nodes": [{ "closer": {
+                "number": 11, "url": "https://github.com/acme/app/pull/11", "headRefName": "p2p/boss/2-1" } }] } },
         } } }),
         asked: Default::default(),
     };
@@ -389,9 +400,13 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
         !two.pull_request.as_ref().unwrap().current && !two.safe_to_delete,
         "{two:?}"
     );
+    assert!(
+        two.closed_by.is_empty(),
+        "its own pull request closed its issue"
+    );
     let asked = fake.asked.lock().unwrap().clone();
     assert!(
-        asked.contains("i5: issueOrPullRequest(number: 5)"),
+        asked.contains("i5: issueOrPullRequest(number: 5)") && asked.contains("CLOSED_EVENT"),
         "{asked}"
     );
     // A finished one is deleted in the clone and on GitHub; only task branches are.

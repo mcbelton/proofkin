@@ -2694,8 +2694,12 @@ async fn the_page_follows_the_ux_guidelines() {
         );
     }
     // One name, one meaning: the page's scripts share one scope, where a second
-    // declaration of a function silently replaces the first.
-    let declared = regex::Regex::new(r"(?m)^(?:async )?function (\w+)\(").unwrap();
+    // declaration of a function silently replaces the first, and a const, let or class
+    // of a name declared before stops the later script (a SyntaxError).
+    let declared = regex::Regex::new(
+        r"(?m)^(?:(?:async )?function\*? (\w+)\(|(?:const|let|var|class) (\w+)\b)",
+    )
+    .unwrap();
     let mut declarations = std::collections::HashMap::new();
     for script in [
         "/app.js",
@@ -2722,7 +2726,10 @@ async fn the_page_follows_the_ux_guidelines() {
             !html.is_match(&js.body),
             "{script} builds HTML from strings"
         );
-        for name in declared.captures_iter(&js.body).map(|c| c[1].to_owned()) {
+        for name in declared
+            .captures_iter(&js.body)
+            .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_owned()))
+        {
             if let Some(first) = declarations.insert(name.clone(), script) {
                 panic!("{name} is declared in {first} and again in {script}");
             }

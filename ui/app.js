@@ -391,7 +391,9 @@ function renderPeers() {
         el("span", { class: "sub" },
           el("span", { text: t.connected ? "Connected" : "Offline" }),
           t.can_delegate
-            ? el("span", { class: "badge ok", title: `May run tasks in: ${(t.shares ?? []).join(", ")}`, text: `Tasks: ${ACCESS_SHORT[t.access] ?? "Read only"} · ${t.tasks_per_hour}/h · ${(t.shares ?? []).join(", ")}` })
+            ? [el("span", { class: "badge ok", title: "The access its tasks get here, and how many it may run an hour", text: `Tasks: ${ACCESS_SHORT[t.access] ?? "Read only"} · ${t.tasks_per_hour}/h` }),
+              // The folders as text: in the pill they wrap into a blob in a narrow column.
+              el("span", { class: "trust-shares", text: `in ${(t.shares ?? []).join(", ") || "no folder"}` })]
             : el("span", { class: "badge neutral", title: "It can connect and chat, but can't run tasks on this agent's accounts", text: "Chat only" }))),
       el("div", { class: "row-actions" },
         el("button", {

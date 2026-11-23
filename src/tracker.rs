@@ -53,6 +53,12 @@ const MAX_TEXT: usize = 6_000;
 const MAX_RESULT: usize = 2_000;
 /// Mutations sent in one request.
 const BATCH: usize = 20;
+/// Board adds sent in one request when they are tried again: GitHub answers big batches
+/// of them with a 502 at times (having carried out some, or all, of them).
+const RETRY_BATCH: usize = 5;
+/// How long GitHub is given to show adds it answered with an error before they are
+/// looked up on the board.
+const LOOKUP_PAUSE: Duration = Duration::from_millis(if cfg!(test) { 0 } else { 1500 });
 /// The longest one GitHub call may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest the end of a run waits for its tracking to catch up.
@@ -264,6 +270,36 @@ impl GhApi {
 #[async_trait]
 impl Api for GhApi {
     async fn graphql(&self, query: &str, variables: Value) -> Result<Reply> {
+        let mut attempt = 0;
+        loop {
+            match self.call(query, &variables).await {
+                Err(e) => match retry_pause(query, &format!("{e:#}"), attempt) {
+                    Some(pause) => {
+                        attempt += 1;
+                        tokio::time::sleep(pause).await;
+                    }
+                    None => return Err(e),
+                },
+                reply => return reply,
+            }
+        }
+    }
+}
+
+/// How long to wait before asking GitHub `query` again after attempt `attempt` (0 for
+/// the first) failed with `error`, or none to give up: a query is asked up to twice
+/// more when GitHub answers with a server error (502, 503 or 504). A mutation never is,
+/// as GitHub may have carried it out.
+fn retry_pause(query: &str, error: &str, attempt: u32) -> Option<Duration> {
+    let transient = ["HTTP 502", "HTTP 503", "HTTP 504"]
+        .iter()
+        .any(|code| error.contains(code));
+    (transient && attempt < 2 && !query.trim_start().starts_with("mutation"))
+        .then(|| Duration::from_secs(u64::from(attempt) + 1))
+}
+
+impl GhApi {
+    async fn call(&self, query: &str, variables: &Value) -> Result<Reply> {
         let body = serde_json::to_vec(&json!({ "query": query, "variables": variables }))?;
         let mut cmd = Command::new(crate::github::gh_program());
         cmd.args([
@@ -788,8 +824,13 @@ impl Tracker {
 
     /// Runs `ops` (in order, `BATCH` to a request); each one's result by position.
     async fn run_ops(&self, name: &str, ops: Vec<Op>) -> Vec<Result<Value>> {
+        self.run_ops_in(name, ops, BATCH).await
+    }
+
+    /// Runs `ops` (in order, `size` to a request); each one's result by position.
+    async fn run_ops_in(&self, name: &str, ops: Vec<Op>, size: usize) -> Vec<Result<Value>> {
         let mut results = Vec::with_capacity(ops.len());
-        for chunk in ops.chunks(BATCH) {
+        for chunk in ops.chunks(size.max(1)) {
             let mut vars = serde_json::Map::new();
             let (mut decl, mut body) = (Vec::new(), Vec::new());
             for (i, op) in chunk.iter().enumerate() {
@@ -908,33 +949,96 @@ impl Tracker {
         ))
     }
 
-    /// Puts issues (by node id) on the board; their item ids, in order.
-    async fn board_add(&self, issues: &[String]) -> Vec<Result<String>> {
+    /// Puts issues and pull requests (by node id) on the board; their item ids, in order.
+    /// An add GitHub answers with an error is looked up on the board before it counts as
+    /// failed: GitHub may have carried it out anyway (a 502 for a batch it did), or put it
+    /// there itself (a board's Auto-add sub-issues workflow adds a run's sub-issues when
+    /// the run's issue goes on it, and adding them then says "Content already exists in
+    /// this project"). Those still missing are added again, a few to a request.
+    async fn board_add(&self, contents: &[String]) -> Vec<Result<String>> {
         let Some(board) = &self.board else {
-            return issues
+            return contents
                 .iter()
                 .map(|_| Err(anyhow!("there is no board")))
                 .collect();
         };
-        let ops = issues
-            .iter()
-            .map(|id| Op {
-                field: "addProjectV2ItemById",
-                input_type: "AddProjectV2ItemByIdInput",
-                input: json!({ "projectId": board.id, "contentId": id }),
-                select: "item { id }",
-            })
-            .collect();
-        self.run_ops("BoardAdd", ops)
+        let adds = |ids: &[&String]| -> Vec<Op> {
+            ids.iter()
+                .map(|id| Op {
+                    field: "addProjectV2ItemById",
+                    input_type: "AddProjectV2ItemByIdInput",
+                    input: json!({ "projectId": board.id, "contentId": id }),
+                    select: "item { id }",
+                })
+                .collect()
+        };
+        let item_id = |r: Result<Value>| -> Result<String> {
+            r?.pointer("/item/id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("GitHub didn't return the board item")
+        };
+        let all: Vec<&String> = contents.iter().collect();
+        let mut results: Vec<Result<String>> = self
+            .run_ops("BoardAdd", adds(&all))
             .await
             .into_iter()
-            .map(|r| {
-                r?.pointer("/item/id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .context("GitHub didn't return the board item")
-            })
-            .collect()
+            .map(item_id)
+            .collect();
+        for add_again in [true, false] {
+            let failed: Vec<usize> = (0..results.len())
+                .filter(|i| results[*i].is_err())
+                .collect();
+            if failed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(LOOKUP_PAUSE).await;
+            let ids: Vec<&String> = failed.iter().map(|i| &contents[*i]).collect();
+            let on_board = self.board_items(board, &ids).await;
+            let mut missing = Vec::new();
+            for i in failed {
+                match on_board.get(&contents[i]) {
+                    Some(item) => results[i] = Ok(item.clone()),
+                    None => missing.push(i),
+                }
+            }
+            if !add_again || missing.is_empty() {
+                break;
+            }
+            let ids: Vec<&String> = missing.iter().map(|i| &contents[*i]).collect();
+            let again = self.run_ops_in("BoardAdd", adds(&ids), RETRY_BATCH).await;
+            for (i, r) in missing.into_iter().zip(again) {
+                results[i] = item_id(r);
+            }
+        }
+        results
+    }
+
+    /// The board items of those of `contents` (issues and pull requests, by node id)
+    /// that are on the board, by content id. None when GitHub can't say.
+    async fn board_items(&self, board: &Board, contents: &[&String]) -> HashMap<String, String> {
+        const QUERY: &str = "query BoardItems($ids: [ID!]!) { nodes(ids: $ids) { \
+            ... on Issue { id projectItems(first: 50) { nodes { id project { id } } } } \
+            ... on PullRequest { id projectItems(first: 50) { nodes { id project { id } } } } } }";
+        let mut found = HashMap::new();
+        for chunk in contents.chunks(100) {
+            let Ok(reply) = self.api.graphql(QUERY, json!({ "ids": chunk })).await else {
+                continue;
+            };
+            for node in reply.data["nodes"].as_array().into_iter().flatten() {
+                let item = node
+                    .pointer("/projectItems/nodes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|i| i.pointer("/project/id").and_then(Value::as_str) == Some(&board.id))
+                    .and_then(|i| i.get("id").and_then(Value::as_str));
+                if let (Some(id), Some(item)) = (node.get("id").and_then(Value::as_str), item) {
+                    found.insert(id.to_owned(), item.to_owned());
+                }
+            }
+        }
+        found
     }
 
     /// Closes the run issues left open whose sub-issues are all closed now (see
@@ -2821,6 +2925,14 @@ mod tests {
         calls: Mutex<Vec<(String, Value)>>,
         no_project_scope: bool,
         review_column: bool,
+        /// The next requests that add to the board fail with a 502, having carried out
+        /// their adds (true) or not (false).
+        add_failures: Mutex<std::collections::VecDeque<bool>>,
+        /// How many adds each request to add to the board had.
+        add_requests: Mutex<Vec<usize>>,
+        /// The board puts an issue's sub-issues on it when the issue goes on it, and
+        /// adding one that is on it then fails (GitHub's Auto-add sub-issues workflow).
+        auto_add_sub_issues: bool,
     }
 
     const STATUSES: &[(&str, &str)] = &[
@@ -2937,8 +3049,19 @@ mod tests {
                 }
                 "addProjectV2ItemById" => {
                     let n = Fake::number(&s("contentId"));
+                    if self.auto_add_sub_issues && issues[&n].item.is_some() {
+                        return json!({ "__error": "Content already exists in this project" });
+                    }
                     let item = format!("PVTI{n}");
                     issues.get_mut(&n).unwrap().item = Some(item.clone());
+                    if self.auto_add_sub_issues {
+                        for sub in issues
+                            .values_mut()
+                            .filter(|i| i.parent == Some(n) && i.item.is_none())
+                        {
+                            sub.item = Some(format!("PVTI{}", sub.number));
+                        }
+                    }
                     json!({ "item": { "id": item } })
                 }
                 "updateProjectV2ItemFieldValue" => {
@@ -3071,9 +3194,36 @@ mod tests {
                         numbers.into_iter().map(|n| self.item_json(n)).collect();
                     json!({ "repository": { "list": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": nodes } } })
                 }
+                "BoardItems" => {
+                    let issues = self.issues.lock().unwrap();
+                    let nodes: Vec<Value> = variables["ids"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| {
+                            let n = Fake::number(id.as_str().unwrap());
+                            issues.get(&n).map_or(Value::Null, |i| {
+                                json!({ "id": format!("I{n}"), "projectItems": { "nodes": i.item.iter()
+                                    .map(|item| json!({ "id": item, "project": { "id": "P1" } })).collect::<Vec<_>>() } })
+                            })
+                        })
+                        .collect();
+                    json!({ "nodes": nodes })
+                }
                 _ if query.starts_with("mutation") => {
+                    let adds = query.matches("addProjectV2ItemById(").count();
+                    let failure = if adds > 0 {
+                        self.add_requests.lock().unwrap().push(adds);
+                        self.add_failures.lock().unwrap().pop_front()
+                    } else {
+                        None
+                    };
                     let mut data = serde_json::Map::new();
+                    let mut errors = Vec::new();
                     for part in query.split(" m").skip(1) {
+                        if failure == Some(false) {
+                            break;
+                        }
                         let Some((i, rest)) = part.split_once(": ") else {
                             continue;
                         };
@@ -3082,9 +3232,26 @@ mod tests {
                         };
                         let field = rest.split('(').next().unwrap();
                         let input = variables[format!("m{i}")].clone();
-                        data.insert(format!("m{i}"), self.mutate(field, &input));
+                        let alias = format!("m{i}");
+                        let result = self.mutate(field, &input);
+                        if let Some(message) = result.get("__error").and_then(Value::as_str) {
+                            errors.push(GqlError {
+                                message: message.to_owned(),
+                                path: vec![json!(alias)],
+                                ..GqlError::default()
+                            });
+                            data.insert(alias, Value::Null);
+                        } else {
+                            data.insert(alias, result);
+                        }
                     }
-                    Value::Object(data)
+                    if failure.is_some() {
+                        return Err(anyhow!("the GitHub CLI failed: gh: HTTP 502"));
+                    }
+                    return Ok(Reply {
+                        data: Value::Object(data),
+                        errors,
+                    });
                 }
                 other => panic!("unexpected query {other}: {query}"),
             };
@@ -3822,6 +3989,129 @@ mod tests {
             err.contains("the board isn't used") && err.contains("--scopes project"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn adds_github_answers_with_an_error_are_found_on_the_board_or_made_again() {
+        let issue = |number, open, parent| FakeIssue {
+            number,
+            open,
+            parent,
+            body: format!("Item {number}"),
+            ..FakeIssue::default()
+        };
+        let every = AddItems {
+            open: true,
+            closed: true,
+            ..AddItems::default()
+        };
+        let statuses = |fake: &Fake, numbers: std::ops::RangeInclusive<u64>| {
+            numbers
+                .map(|n| fake.status(n).unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        // GitHub carries out the adds but answers with a 502, and the board puts a run's
+        // sub-issues on it by itself (so adding them says they're there already): all
+        // are on the board, with the statuses their state gives them.
+        let fake = Arc::new(Fake {
+            issues: Mutex::new(
+                [
+                    issue(1, true, None),
+                    issue(2, true, Some(1)),
+                    issue(3, true, Some(1)),
+                    issue(4, false, None),
+                ]
+                .into_iter()
+                .map(|i| (i.number, i))
+                .collect(),
+            ),
+            review_column: true,
+            auto_add_sub_issues: true,
+            add_failures: Mutex::new([true].into()),
+            ..Fake::default()
+        });
+        let tracker = Tracker::connect(fake.clone(), config()).await.unwrap();
+        let added = tracker.add_to_board(&every).await.unwrap();
+        assert!(added.problems.is_empty(), "{:?}", added.problems);
+        assert!(added.added.iter().all(|a| !a.already));
+        assert_eq!(statuses(&fake, 1..=4), ["Todo", "Todo", "Todo", "Done"]);
+        assert_eq!(
+            *fake.add_requests.lock().unwrap(),
+            [4],
+            "found, not made again"
+        );
+
+        // A 502 for adds GitHub didn't carry out: made again, a few to a request.
+        let fake = Fake::with(&(1..=7).map(|n| issue(n, true, None)).collect::<Vec<_>>());
+        fake.add_failures.lock().unwrap().push_back(false);
+        let tracker = Tracker::connect(fake.clone(), config()).await.unwrap();
+        let added = tracker.add_to_board(&every).await.unwrap();
+        assert!(added.problems.is_empty(), "{:?}", added.problems);
+        assert_eq!(statuses(&fake, 1..=7), ["Todo"; 7]);
+        assert_eq!(*fake.add_requests.lock().unwrap(), [7, 5, 2]);
+
+        // Adds that keep failing are each a problem, once.
+        let fake = Fake::with(&[issue(1, true, None), issue(2, false, None)]);
+        fake.add_failures
+            .lock()
+            .unwrap()
+            .extend([false, false, false]);
+        let tracker = Tracker::connect(fake.clone(), config()).await.unwrap();
+        let added = tracker.add_to_board(&every).await.unwrap();
+        assert_eq!(added.problems.len(), 2, "{:?}", added.problems);
+        assert!(added.problems[0].starts_with("#1: ") && added.problems[0].contains("HTTP 502"));
+        assert!(added.added.is_empty());
+        assert_eq!(*fake.add_requests.lock().unwrap(), [2, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_board_that_puts_sub_issues_on_itself_still_gets_the_steps_fields() {
+        let fake = Arc::new(Fake {
+            review_column: true,
+            auto_add_sub_issues: true,
+            ..Fake::default()
+        });
+        let plan = Plan::parse(PLAN).unwrap();
+        let tracking = start_with(fake.clone(), config(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        assert!(
+            tracking.tracked.problems.is_empty(),
+            "{:?}",
+            tracking.tracked.problems
+        );
+        assert_eq!(fake.status(1).as_deref(), Some("🏗 In progress"));
+        for step in 2..=4 {
+            assert_eq!(
+                fake.status(step).as_deref(),
+                Some("Todo"),
+                "step issue #{step}"
+            );
+        }
+        let agents = fake
+            .calls("updateProjectV2ItemFieldValue")
+            .iter()
+            .filter(|c| c.pointer("/value/text").is_some())
+            .count();
+        assert_eq!(agents, 4, "the run's agent and each step's");
+    }
+
+    #[test]
+    fn queries_are_asked_again_after_a_server_error_but_mutations_never() {
+        let error = "the GitHub CLI failed: gh: HTTP 502";
+        let query = "query BoardItems($ids: [ID!]!) { nodes(ids: $ids) { id } }";
+        assert_eq!(retry_pause(query, error, 0), Some(Duration::from_secs(1)));
+        assert_eq!(
+            retry_pause(query, "gh: HTTP 504", 1),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(retry_pause(query, error, 2), None, "twice more at most");
+        assert_eq!(
+            retry_pause("mutation BoardAdd($m0: X!) { m0: x }", error, 0),
+            None,
+            "GitHub may have carried it out"
+        );
+        assert_eq!(retry_pause(query, "gh: HTTP 401", 0), None);
     }
 
     #[test]
