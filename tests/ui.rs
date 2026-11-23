@@ -598,6 +598,318 @@ async fn tasks_outlive_a_restart_and_finished_ones_can_be_cleared() {
     agent.shutdown().await;
 }
 
+/// Runs the tasks it is given like [`Echo`], holding those whose prompt has a gate until
+/// it opens; it notes each task as it starts and ends.
+struct Gated {
+    gates: std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>,
+    started: std::sync::Mutex<Vec<String>>,
+    ended: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Executor for Gated {
+    fn providers(&self) -> Vec<Provider> {
+        vec![Provider::Copilot]
+    }
+
+    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<Ran> {
+        self.started.lock().unwrap().push(task.prompt.clone());
+        if let Some(gate) = self.gates.get(&task.prompt) {
+            gate.acquire().await.unwrap().forget();
+        }
+        self.ended.lock().unwrap().push(task.prompt.clone());
+        Ok(Ran::new(format!("echo: {}", task.prompt), None))
+    }
+}
+
+/// A plan run goes on after its agent restarts: a step that ended before keeps its
+/// result, one its peer finished while the agent was away gets the result the peer kept,
+/// one still running is waited for again (neither runs twice), a sign-off is asked
+/// again, and the steps after them run. The run is saved once, as the same run; task ids
+/// go on; nothing is kept for a restart once it has ended.
+#[tokio::test]
+async fn a_plan_goes_on_after_its_agent_restarts() {
+    let home = tempfile::tempdir().unwrap();
+    let (boss_key, worker_key) = (SecretKey::generate(), SecretKey::generate());
+    let trust = |name: &str, key: &SecretKey, delegate: bool| TrustedPeer {
+        name: name.into(),
+        id: key.public(),
+        addrs: Default::default(),
+        can_delegate: delegate,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec!["data".into()],
+        m365: None,
+    };
+    let gate = || Arc::new(tokio::sync::Semaphore::new(0));
+    let (early, mid, late) = (gate(), gate(), gate());
+    let worked = Arc::new(Gated {
+        gates: [
+            ("early".to_owned(), early.clone()),
+            ("mid".to_owned(), mid.clone()),
+            ("late".to_owned(), late.clone()),
+        ]
+        .into(),
+        started: Default::default(),
+        ended: Default::default(),
+    });
+    let mut worker = AgentConfig::new("worker", worker_key.clone());
+    worker.network = Network::Local;
+    worker.bind = Some("127.0.0.1:0".parse().unwrap());
+    worker.trust.allow(trust("boss", &boss_key, true));
+    worker.executor = Some(worked.clone());
+    worker.shares = ShareStore::with_data(home.path().join("data"));
+    let (worker, _we) = Agent::bind(worker).await.unwrap();
+
+    let profile = Profile::open_in(home.path(), "boss").unwrap();
+    let in_progress = profile.runs_in_progress_dir();
+    // The boss, and the same boss again after a restart (its key and profile).
+    let start_boss = || {
+        let (key, home, worker_key, worker) = (
+            boss_key.clone(),
+            home.path().to_owned(),
+            worker_key.clone(),
+            worker.clone(),
+        );
+        async move {
+            let profile = Profile::open_in(&home, "boss").unwrap();
+            let mut config = AgentConfig::new("boss", key);
+            config.network = Network::Local;
+            config.bind = Some("127.0.0.1:0".parse().unwrap());
+            config.trust.allow(trust("worker", &worker_key, false));
+            config.task_ids = Some(profile.task_ids_path());
+            // Its runs' steps never give up on the worker in this test: a boss that
+            // stopped has no run going on.
+            config.task_grace = Duration::from_secs(3600);
+            let (boss, events) = Agent::bind(config).await.unwrap();
+            let info = UiInfo {
+                profile,
+                network: Network::Local,
+                serving: false,
+                access: Access::ReadOnly,
+                workspace: home.clone(),
+                providers: Vec::new(),
+                accounts: Vec::new(),
+                workers: None,
+            };
+            let server = ui::start(
+                boss.clone(),
+                events,
+                info,
+                None,
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+            // After a restart the peers connect again; the run waits for them.
+            boss.connect(worker.addr()).await.unwrap();
+            let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+            let (port, token) = rest.split_once("/#t=").unwrap();
+            (boss, port.parse::<u16>().unwrap(), token.to_owned())
+        }
+    };
+    let state = |port: u16, token: String| async move {
+        let host = format!("127.0.0.1:{port}");
+        request(port, "GET", "/api/state", &host, Some(&token), None)
+            .await
+            .json()
+    };
+    let until = |what: &'static str, mut done: Box<dyn FnMut() -> bool + Send>| async move {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    };
+    let kept = || {
+        std::fs::read_dir(&in_progress)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read(e.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .collect::<Vec<_>>()
+    };
+
+    let (boss, port, token) = start_boss().await;
+    let host = format!("127.0.0.1:{port}");
+    while boss.peers().is_empty() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let text = serde_json::json!({ "text": "early @worker early\nmid @worker mid\nlate @worker late\nok after early approve @me Sign it\nlast after ok,mid,late @worker last" });
+    let started = request(
+        port,
+        "POST",
+        "/api/plans",
+        &host,
+        Some(&token),
+        Some(&text.to_string()),
+    )
+    .await;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let ran = worked.clone();
+    let (p, t) = (port, token.clone());
+    // Two run at once on the worker: `late` waits for a slot.
+    if tokio::time::timeout(Duration::from_secs(20), async {
+        while ran.started.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let tasks = state(p, t).await["tasks"].clone();
+        panic!(
+            "the first steps didn't start: {:?}\n{tasks}",
+            worked.started.lock().unwrap(),
+        );
+    }
+    // `early` ends: `late` gets its slot, and the sign-off after it is asked for.
+    early.add_permits(1);
+    let (p, t, ran) = (port, token.clone(), worked.clone());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while state(p, t.clone()).await["approvals"]
+            .as_array()
+            .is_none_or(|a| a.is_empty())
+            || !ran.started.lock().unwrap().contains(&"late".to_owned())
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("late started and the sign-off asked for");
+    // Kept for a restart: the step that ended, and the work it waits for.
+    let file = kept().pop().expect("the run is kept while it goes");
+    assert_eq!(file["finished"]["early"]["status"], "done");
+    for step in ["mid", "late", "ok"] {
+        assert!(file["sent"][step]["task_id"].as_u64().is_some(), "{file}");
+    }
+    assert_eq!(file["sent"]["ok"]["kind"], "approval");
+    assert_eq!(file["sent"]["mid"]["task"]["prompt"], "mid");
+    let run_id = file["run_id"].as_str().unwrap().to_owned();
+    let late_id = file["sent"]["late"]["task_id"].as_u64().unwrap();
+
+    // The boss stops; `mid` ends while it is away.
+    boss.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    mid.add_permits(1);
+    let ran = worked.clone();
+    until(
+        "mid ended while the boss was away",
+        Box::new(move || ran.ended.lock().unwrap().contains(&"mid".to_owned())),
+    )
+    .await;
+
+    let (boss, port, token) = start_boss().await;
+    let host = format!("127.0.0.1:{port}");
+    let now = state(port, token.clone()).await;
+    let feed = now["feed"].to_string();
+    assert!(
+        feed.contains(&format!(
+            "Plan run {run_id} goes on after the restart: 1 of 5 steps had ended"
+        )),
+        "{feed}"
+    );
+    assert!(
+        !feed.contains("cancelled because the agent stopped"),
+        "{feed}"
+    );
+    let status = |state: &Value, step: &str| {
+        state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["step"] == step)
+            .map(|t| t["status"].as_str().unwrap().to_owned())
+            .unwrap()
+    };
+    assert_eq!(status(&now, "early"), "done");
+    assert_ne!(status(&now, "late"), "cancelled", "{now}");
+    // The sign-off is asked for again.
+    let (p, t) = (port, token.clone());
+    let approval = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(a) = state(p, t.clone()).await["approvals"]
+                .as_array()
+                .and_then(|a| a.first().cloned())
+            {
+                return a;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("sign-off asked for again");
+    let answer = request(
+        port,
+        "POST",
+        &format!("/api/approvals/{}", approval["id"]),
+        &host,
+        Some(&token),
+        Some(r#"{"approved":true,"note":"ok"}"#),
+    )
+    .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    late.add_permits(1);
+    let (p, t) = (port, token.clone());
+    let done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let now = state(p, t.clone()).await;
+            let tasks = now["tasks"].as_array().unwrap().clone();
+            if tasks.iter().all(|t| t["status"] == "done")
+                && tasks.iter().all(|t| t["run"].is_string())
+            {
+                return now;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the run ended");
+    let tasks = done["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 5);
+    assert!(
+        tasks.iter().all(|t| t["run"] == run_id.as_str()),
+        "the same run"
+    );
+    let find = |step: &str| tasks.iter().find(|t| t["step"] == step).unwrap().clone();
+    assert_eq!(
+        find("mid")["output"].as_str().unwrap().lines().next(),
+        Some("echo: mid")
+    );
+    assert_eq!(
+        find("late")["output"].as_str().unwrap().lines().next(),
+        Some("echo: late")
+    );
+    // Each ran once: the worker gave the kept result, or went on with the task.
+    let mut started = worked.started.lock().unwrap().clone();
+    started.sort();
+    assert_eq!(started.len(), 4, "{started:?}");
+    for prompt in ["early", "mid", "late"] {
+        assert_eq!(
+            started.iter().filter(|p| *p == prompt).count(),
+            1,
+            "{prompt}"
+        );
+    }
+    let runs = request(port, "GET", "/api/runs", &host, Some(&token), None)
+        .await
+        .json();
+    assert_eq!(runs["runs"].as_array().unwrap().len(), 1, "saved once");
+    assert_eq!(runs["runs"][0]["id"], run_id.as_str());
+    assert!(kept().is_empty(), "nothing kept once it ended");
+    // Ids went on from where they were: the step sent after the restart has a newer one.
+    let next: u64 = std::fs::read_to_string(profile.task_ids_path())
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(next > late_id + 1, "{next} after {late_id}");
+    boss.shutdown().await;
+}
+
 /// A task on its own can go to a squad (`#name`): its least busy member that can run
 /// it, as a plan step would; it moves on to another member when that one refuses it,
 /// and its card names the squad and the member that ran it.

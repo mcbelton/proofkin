@@ -4290,6 +4290,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.role = profile.config.role.clone();
         config.models = profile.models();
         config.worktrees_dir = profile.worktrees_dir();
+        // Task ids go on after a restart (a plan run resumed waits for its old ones).
+        config.task_ids = Some(profile.task_ids_path());
         if let Some(secs) =
             proofkin::profile::env_setting("TASK_GRACE_SECS").and_then(|v| v.parse::<u64>().ok())
         {

@@ -2326,6 +2326,7 @@ impl ReadyRun {
             recipients: self.recipients.clone(),
             work_context: self.work.clone(),
             work_log: WorkLog::default(),
+            ..RunContext::default()
         };
         let states = run_plan_with(agent, &self.squads, &self.ready, &ctx, |step, state| {
             if let Some(t) = &tracking {
@@ -2400,6 +2401,63 @@ pub struct RunContext {
     pub work_context: Option<Arc<dyn WorkContext>>,
     /// What those searches found, by step: for the run record, kept on this machine.
     pub work_log: WorkLog,
+    /// The run as it was before its agent restarted (see [`Resume`]); empty for a new run.
+    pub resume: Resume,
+    /// Told each step's work as it is sent, so the run can go on after a restart (see
+    /// [`SentStep`]); with one, that work is also left running when the agent stops.
+    pub journal: Option<Journal>,
+}
+
+/// A step's work as it was sent: a run keeps it to go on after its agent restarts,
+/// waiting for the same work instead of asking for it again (see [`Resume`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentStep {
+    /// Who it went to: a peer's name (or "you", this agent's own user).
+    pub peer: String,
+    /// Its endpoint id (none: this agent's own user).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
+    /// The request's id on the wire.
+    pub task_id: u64,
+    #[serde(flatten)]
+    pub work: SentWork,
+}
+
+/// What [`SentStep`] asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SentWork {
+    /// A task, exactly as sent: a peer that still has it (running, or done) knows it again.
+    Task {
+        task: Box<LlmTask>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
+    },
+    /// An approval request.
+    Approval { title: String, text: String },
+}
+
+/// A run going on after its agent restarted: its steps that had finished, as they ended
+/// (a done step with its patch), and the work it was waiting for. Finished steps aren't
+/// run again; the work is waited for again ([`Agent::rejoin_task`]); the other steps
+/// start when their turn comes.
+#[derive(Debug, Clone, Default)]
+pub struct Resume {
+    pub finished: BTreeMap<String, StepState>,
+    pub sent: BTreeMap<String, SentStep>,
+}
+
+/// Told a step's id and its work as it is sent (see [`Journal`]).
+pub type JournalFn = dyn Fn(&str, &SentStep) + Send + Sync;
+
+/// Where a run tells each step's work as it is sent (see [`RunContext::journal`]).
+#[derive(Clone)]
+pub struct Journal(pub Arc<JournalFn>);
+
+impl std::fmt::Debug for Journal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Journal")
+    }
 }
 
 /// What a step's Work IQ search found, for the run record: the sources it got, how many
@@ -2484,6 +2542,46 @@ pub fn movable(result: &Result<Delivered>) -> Option<String> {
         Err(e) if e.downcast_ref::<crate::agent::PeerGone>().is_some() => Some(format!("{e:#}")),
         _ => None,
     }
+}
+
+/// A step's work: its result, to come.
+type Work = std::pin::Pin<Box<dyn Future<Output = Result<Delivered>> + Send>>;
+
+/// The work of `step`, sent before this agent restarted, waited for again (see
+/// [`Resume`]): who it went to, and its result to come. It is left running if this
+/// agent stops again.
+fn rejoin(
+    agent: &Agent,
+    sent: SentStep,
+    progress: &tokio::sync::mpsc::UnboundedSender<(String, Progress)>,
+    step: &str,
+) -> (String, Work) {
+    let peer = sent
+        .peer_id
+        .as_deref()
+        .and_then(|id| id.parse::<EndpointId>().ok());
+    agent.keep_on_exit(sent.task_id);
+    let work: Work = match (sent.work, peer) {
+        (SentWork::Task { task, origin }, Some(peer)) => {
+            let delegation = agent.rejoin_task(peer, sent.task_id, *task, origin);
+            let (tx, id) = (progress.clone(), step.to_owned());
+            Box::pin(delegation.finish(move |p| {
+                let _ = tx.send((id.clone(), p));
+            }))
+        }
+        (SentWork::Task { .. }, None) => {
+            Box::pin(async { Err(anyhow!("it isn't known which peer has its task")) })
+        }
+        (SentWork::Approval { title, text }, approver) => {
+            let (agent, task_id) = (agent.clone(), sent.task_id);
+            Box::pin(async move {
+                agent
+                    .rejoin_approval(approver, task_id, &title, &text)
+                    .await
+            })
+        }
+    };
+    (sent.peer, work)
 }
 
 /// `work`, cancelled (by dropping it) once `secs` have passed.
@@ -2704,14 +2802,20 @@ pub async fn run_plan_with(
     ctx: &RunContext,
     mut on_update: impl FnMut(&str, &StepState),
 ) -> BTreeMap<String, StepState> {
+    // A resumed run's finished steps stay as they ended.
     let mut states: BTreeMap<String, StepState> = plan
         .steps
         .iter()
-        .map(|s| (s.id.clone(), StepState::Waiting))
+        .map(|s| {
+            let before = ctx.resume.finished.get(&s.id).filter(|st| st.finished());
+            (s.id.clone(), before.cloned().unwrap_or(StepState::Waiting))
+        })
         .collect();
     for step in &plan.steps {
-        on_update(&step.id, &StepState::Waiting);
+        on_update(&step.id, &states[&step.id]);
     }
+    // The work it was waiting for before the restart, waited for again (once).
+    let mut sent_before = ctx.resume.sent.clone();
     let mut running: JoinSet<(String, String, Result<Delivered>)> = JoinSet::new();
     let (progress_tx, mut progress_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Progress)>();
@@ -2748,6 +2852,21 @@ pub async fn run_plan_with(
                     .iter()
                     .all(|d| matches!(states[d], StepState::Done { .. }))
                 {
+                    continue;
+                }
+                if let Some(sent) = sent_before.remove(&step.id) {
+                    let (peer_name, work) = rejoin(agent, sent, &progress_tx, &step.id);
+                    let state = StepState::Running {
+                        peer: peer_name.clone(),
+                        progress: Some(Progress::new(
+                            Phase::Running,
+                            "taken up again after this agent restarted",
+                        )),
+                    };
+                    on_update(&step.id, &state);
+                    states.insert(step.id.clone(), state);
+                    let (id, timeout) = (step.id.clone(), step.timeout);
+                    running.spawn(async move { (id, peer_name, within(timeout, work).await) });
                     continue;
                 }
                 let deps: Vec<Earlier> = step
@@ -2811,11 +2930,29 @@ pub async fn run_plan_with(
                             let (agent, title) = (agent.clone(), format!("Plan step {}", step.id));
                             // A person reads it: the rule for models is left out.
                             let text = approval_text(&prompt);
+                            let task_id = agent.new_task_id();
+                            if let Some(journal) = &ctx.journal {
+                                agent.keep_on_exit(task_id);
+                                (journal.0)(
+                                    &step.id,
+                                    &SentStep {
+                                        peer: name.clone(),
+                                        peer_id: approver.map(|id| id.to_string()),
+                                        task_id,
+                                        work: SentWork::Approval {
+                                            title: title.clone(),
+                                            text: text.clone(),
+                                        },
+                                    },
+                                );
+                            }
                             (
                                 name,
                                 Box::pin(async move {
                                     agent
-                                        .request_approval_with(approver, &title, &text, preview)
+                                        .request_approval_as(
+                                            approver, task_id, &title, &text, preview,
+                                        )
                                         .await
                                 }),
                             )
@@ -2902,6 +3039,7 @@ pub async fn run_plan_with(
                         step: Some(step.id.clone()),
                         task: None,
                     };
+                    let journaled = ctx.journal.as_ref().map(|_| (task.clone(), origin.clone()));
                     let delegation = match agent.send_task(peer.id, task, Some(origin)) {
                         Ok(delegation) => delegation,
                         Err(e) => {
@@ -2912,6 +3050,21 @@ pub async fn run_plan_with(
                             continue;
                         }
                     };
+                    if let (Some(journal), Some((task, origin))) = (&ctx.journal, journaled) {
+                        agent.keep_on_exit(delegation.task_id());
+                        (journal.0)(
+                            &step.id,
+                            &SentStep {
+                                peer: peer.name.clone(),
+                                peer_id: Some(peer.id.to_string()),
+                                task_id: delegation.task_id(),
+                                work: SentWork::Task {
+                                    task: Box::new(task),
+                                    origin: Some(origin),
+                                },
+                            },
+                        );
+                    }
                     let (tx, id) = (progress_tx.clone(), step.id.clone());
                     (
                         peer.name,

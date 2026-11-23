@@ -268,6 +268,8 @@ profile is a private identity:
   claude\        CLAUDE_CONFIG_DIR for this agent's own Claude instance (+ its login)
   codex\         CODEX_HOME for this agent's own Codex instance (+ auth.json)
   tasks.json     the web UI's latest 200 tasks, kept across restarts
+  runs-in-progress\  the web UI's plan runs in progress, so they go on after a restart
+  next-task-id   the next id for the tasks this agent gives peers (ids go on after a restart)
 ```
 
 Tokens and API keys are stored in the OS credential store (Windows Credential Manager,
@@ -718,6 +720,27 @@ Run it with `/plan plan.txt`, or in the web UI's **Plan** mode. The web UI shows
 one card: a bar of its steps (done, running, failed), the steps in the order they can run
 (each column waits for the one before), and each step as a task that waits, runs, finishes
 or is skipped. Cancelling the plan, or any of its steps, cancels the whole plan.
+
+**A plan run goes on after its agent restarts.** The web UI keeps each plan run in the
+profile (`runs-in-progress\`) as its steps are sent and end: the steps that ended, with
+their results and patches, and each step's task exactly as it was sent, with its id. When
+the agent starts again, the run goes on as the same run, once its peers have connected
+again (it waits up to 30 seconds for them):
+
+- A step that ended before keeps its result; it isn't run or reported again.
+- A step that was running is waited for again: the same request goes to its peer, which
+  goes on with the task if it is still running it, or sends the result it kept if it
+  finished while the agent was away. Neither runs twice. If the agent was away longer than
+  the task grace (a minute), its peers stopped those tasks and the steps run again; a peer
+  that doesn't come back within the task grace fails its step (a squad step moves to
+  another member).
+- A sign-off is asked again under the same request, so the approver isn't asked twice.
+- The steps after them run as usual, the run's issues on GitHub are the ones it had
+  (nothing is made again), and the run is saved once, when it ends.
+
+So a plan's steps aren't cancelled when the agent stops: its peers keep working for a
+minute, waiting for it to come back. Task ids go on after a restart (`next-task-id`), so
+a peer never takes a new task for one it is still running. A cancelled run doesn't go on.
 
 #### Live status
 
@@ -1692,7 +1715,9 @@ proofkin --name me --providers copilot --serve --ui
   [team step](#team-steps-handing-work-down-a-level) shows its lead's team steps under it,
   live. The latest 200 tasks are kept
   in the profile (`tasks.json`, long results cut at 32,000 characters) and come back
-  after a restart; one the agent stopped in the middle comes back cancelled, saying so.
+  after a restart; one the agent stopped in the middle comes back cancelled, saying so,
+  but a plan's steps come back running: the plan goes on (see
+  [squads and plans](#squads-and-plans)).
   **Clear finished** lets the finished ones go (running ones stay).
 - **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
   Ctrl+Enter runs it), or press **Open editor** for a full-size editor with two views of

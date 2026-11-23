@@ -200,6 +200,7 @@ impl TeamRunner {
             recipients,
             work_context: crate::plan::work_context(&self.profile, &plan)?,
             work_log: crate::plan::WorkLog::default(),
+            ..RunContext::default()
         };
         let finals = crate::plan::run_plan_with(agent, &squads, &ready, &ctx, |id, state| {
             states.insert(id.to_owned(), state.clone());

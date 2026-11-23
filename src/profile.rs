@@ -645,6 +645,17 @@ impl Profile {
         self.dir.join("tasks.json")
     }
 
+    /// The web UI's plan runs in progress, one file each, so they go on after a restart.
+    pub fn runs_in_progress_dir(&self) -> PathBuf {
+        self.dir.join("runs-in-progress")
+    }
+
+    /// Where the next id for the tasks this agent gives peers is kept (see
+    /// [`crate::agent::AgentConfig::task_ids`]).
+    pub fn task_ids_path(&self) -> PathBuf {
+        self.dir.join("next-task-id")
+    }
+
     /// The knowledge base (private to this profile).
     pub fn knowledge(&self) -> crate::knowledge::KnowledgeBase {
         crate::knowledge::KnowledgeBase::new(self.dir.join("knowledge"))
