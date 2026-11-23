@@ -3143,12 +3143,13 @@ fn task_forms_offer_the_models_and_levels_the_worker_allows() {
     assert!(stdout.starts_with("ok: "), "{stdout}");
 }
 
-/// The GitHub card says where each task branch's work is and offers Delete branch only
-/// when deleting it loses nothing (its work on the repository's branch, or a pull request
-/// merged it as it is): closed issues alone don't make it safe, and the confirmation says
-/// what would be lost. Review changes reads the diff into its files' lines by the hunks'
-/// counts. The cases (tests/branches.test.cjs) run in node, which loads ui/branches.js
-/// as the page does.
+/// The GitHub card says where each task branch's work is and offers what fits it: only
+/// Delete branch when deleting it loses nothing (its work on the repository's branch, or a
+/// pull request merged it as it is), so nothing is left to review; Review changes and
+/// Delete branch once its pull request or its issues are closed, which don't make it safe:
+/// the confirmation says what would be lost; and Open PR while there is work to merge.
+/// Review changes reads the diff into its files' lines by the hunks' counts. The cases
+/// (tests/branches.test.cjs) run in node, which loads ui/branches.js as the page does.
 #[test]
 fn task_branches_say_whether_deleting_them_loses_work() {
     let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/branches.test.cjs");

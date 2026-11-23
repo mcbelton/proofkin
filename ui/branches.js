@@ -32,19 +32,20 @@ function joinWithAnd(words) {
  * `lead`: text, its pull request as { number, url }; `note`: what a pull request would
  * change while one is open, else whether deleting the branch loses anything (`safe`:
  * nothing, as its work is on the repository's branch `base` or a pull request merged it
- * as it is); `tone`: how the note reads (safe, warn, or plain). */
+ * as it is); `tone`: how the note reads (safe, warn, or plain); `decided`: not safe, but
+ * done with: its pull request was closed as it is, or its issues are closed. */
 function branchStatus(st, base) {
   const pr = st.pull_request ?? null;
   const ref = pr ? { number: pr.number, url: pr.url } : null;
   const changes = branchChangeText(st);
   if (pr?.state === "OPEN") {
-    return { lead: ["pull request ", ref, " is open"], note: changes, tone: null, safe: false, open: true };
+    return { lead: ["pull request ", ref, " is open"], note: changes, tone: null, safe: false, open: true, decided: false };
   }
   if (st.safe_to_delete) {
     const lead = pr?.state === "MERGED" && pr.current ? ["merged in ", ref]
       : st.in_base ? [`its commit is on ${base}`]
       : [`its changes are on ${base}`];
-    return { lead, note: "safe to delete", tone: "safe", safe: true, open: false };
+    return { lead, note: "safe to delete", tone: "safe", safe: true, open: false, decided: false };
   }
   const closers = branchClosers(st);
   const closedBy = closers.flatMap((c, i) => [
@@ -54,9 +55,24 @@ function branchStatus(st, base) {
     : pr?.state === "CLOSED" ? ["pull request ", ref, " was closed"]
     : st.issues_closed ? ["its issues are closed"]
     : ["no pull request yet"];
+  // Commits after a merged pull request are work still to merge, whatever its issues say.
+  const decided = Boolean((pr?.state === "CLOSED" && pr.current) || (st.issues_closed && pr?.state !== "MERGED"));
   return {
-    lead, note: changes ? `not on ${base}: ${changes}` : `not on ${base}`, tone: "warn", safe: false, open: false,
+    lead, note: changes ? `not on ${base}: ${changes}` : `not on ${base}`, tone: "warn", safe: false, open: false, decided,
   };
+}
+
+/** Which buttons a task branch's line offers for `status` (branchStatus; null: not known
+ * yet), in order: "review" (Review changes), "pr" (Open PR) and "delete" (Delete branch,
+ * whose confirmation says what it loses). One whose work is on the repository's branch
+ * has nothing left to review, so it is only deleted; one whose pull request was closed or
+ * whose issues are closed isn't proposed again, it is reviewed and deleted; an open pull
+ * request is reviewed (and merged) on GitHub. */
+function branchButtons(status) {
+  if (!status) return ["review", "pr"];
+  if (status.open) return ["review"];
+  if (status.safe) return ["delete"];
+  return status.decided ? ["review", "delete"] : ["review", "pr"];
 }
 
 /** For a branch whose issues pull requests from other branches closed: that those may
@@ -95,6 +111,7 @@ function branchDeleteNote(st, base, slug) {
   const changes = branchChangeText(st);
   const work = pr?.state === "MERGED"
     ? `Pull request #${pr.number} merged an earlier version of it; what it has now isn't on ${base}`
+    : pr?.state === "CLOSED" ? `Pull request #${pr.number} was closed without merging it, and its work isn't on ${base}`
     : `Its work isn't on ${base}`;
   const closers = branchClosers(st);
   const unless = closers.length
@@ -215,9 +232,10 @@ async function openBranchReview(r, b, opener) {
   const hint = st ? branchClosedByNote(st) : null;
   $("#branch-hint").textContent = hint ?? "";
   $("#branch-hint").hidden = !hint;
-  // An open pull request is reviewed on GitHub; one with nothing to add needs none.
+  // An open pull request is reviewed on GitHub; one with nothing to add, or done with
+  // (closed, or its issues are), isn't proposed again.
   $("#branch-delete").hidden = Boolean(shown?.status.open);
-  $("#branch-pr").hidden = Boolean(shown && (shown.status.open || shown.status.safe));
+  $("#branch-pr").hidden = !branchButtons(shown?.status ?? null).includes("pr");
   $("#branch-error").textContent = "";
   $("#branch-proof").textContent = "";
   $("#branch-changes").replaceChildren(el("p", { class: "muted small", role: "status" },

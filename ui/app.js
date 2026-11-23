@@ -2266,8 +2266,9 @@ async function loadGithub() {
 
 /// Says where each listed task branch's work is (a pull request open or merged, its
 /// commit or its changes on the repository's branch already, or what isn't there yet),
-/// and whether deleting it loses anything: Delete branch shows only when nothing would
-/// be lost, Open PR only when there is work to merge and no pull request is open.
+/// and offers what fits it (see branchButtons): only Delete branch once its work is
+/// there, Review changes and Delete branch once its pull request or its issues are
+/// closed, and Open PR while there is work to merge and no pull request is open.
 async function loadBranchStates(r, list) {
   let res;
   try {
@@ -2290,22 +2291,23 @@ async function loadBranchStates(r, list) {
   }
 }
 
-/** A task branch's buttons: Review changes always; Open PR while there is work to merge
- * and no pull request is open; Delete branch when deleting it loses nothing (`status`
- * null: not known yet, so not offered). */
+/** A task branch's buttons for `status` (null: not known yet), as branchButtons says:
+ * Review changes while there is something to review, Open PR while there is work to merge
+ * and no pull request is open, Delete branch once it is done with (its confirmation says
+ * what that loses). */
 function branchActions(r, b, status) {
-  const review = el("button", {
-    type: "button", class: "btn small", "aria-label": `Review changes on ${b.name}`,
-    onclick: (e) => openBranchReview(r, b, e.currentTarget),
-  }, "Review changes");
-  const pr = !status || (!status.open && !status.safe)
-    ? el("button", { type: "button", class: "btn small", "aria-label": `Open a pull request from ${b.name}`, onclick: () => openPr(r, b) }, "Open PR")
-    : null;
-  const remove = status?.safe ? el("button", {
-    type: "button", class: "btn small danger", "aria-label": `Delete branch ${b.name}`,
-    onclick: () => deleteBranch(r, b),
-  }, "Delete branch") : null;
-  return [review, pr, remove].filter(Boolean);
+  const make = {
+    review: () => el("button", {
+      type: "button", class: "btn small", "aria-label": `Review changes on ${b.name}`,
+      onclick: (e) => openBranchReview(r, b, e.currentTarget),
+    }, "Review changes"),
+    pr: () => el("button", { type: "button", class: "btn small", "aria-label": `Open a pull request from ${b.name}`, onclick: () => openPr(r, b) }, "Open PR"),
+    delete: () => el("button", {
+      type: "button", class: "btn small danger", "aria-label": `Delete branch ${b.name}`,
+      onclick: () => deleteBranch(r, b),
+    }, "Delete branch"),
+  };
+  return branchButtons(status).map((name) => make[name]());
 }
 
 /** Deletes task branch `b` of `r` once confirmed, saying what that loses; whether it did. */
