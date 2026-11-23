@@ -293,6 +293,20 @@ try:
     w1.send("/delegate copilot@worker2 hi")
     check("delegation without permission refused", w1.wait_for(r"not allowed to delegate", 60))
 
+    print("== models: worker1's owner limits its reasoning levels while it runs; it applies them at once")
+    boss.cursor = len(boss.lines)
+    _, out = cli("models", "allow", "copilot", "--efforts", "medium,low", "--profile", "worker1")
+    check("models allow --efforts saved", "only low, medium reasoning may be asked for" in out, out.strip())
+    time.sleep(5)  # a running agent applies its profile.json within seconds
+    boss.send("/delegate copilot@worker1 --effort max Reply with exactly: EFFORT-MAX")
+    check("a level worker1 no longer allows is refused",
+          boss.wait_for(r"max isn't a reasoning effort allowed here: low, medium", 60))
+    boss.send("/delegate copilot@worker1 --effort medium Reply with exactly: EFFORT-OK")
+    check("an allowed level runs at it", boss.wait_for(r"=== copilot on worker1 · [^=\n]*\(medium reasoning\) ===", 300))
+    _, out = cli("models", "allow", "copilot", "--efforts", "any", "--profile", "worker1")
+    check("any level again", "any effort may be asked for" in out, out.strip())
+    time.sleep(5)
+
     print("== two real Copilot delegations in parallel over the internet, in the folders shared with boss")
     boss.send("/delegate copilot@worker1:repo Read src/protocol.rs and list the message types it defines, in one line.")
     boss.send("/delegate copilot@worker2:code Create a file p2p_live.txt containing exactly: written via p2p delegation. Reply DONE.")

@@ -1409,7 +1409,8 @@
         "lib::protocol::hello_with_addresses_round_trips",
         "lib::plan::steps_name_their_model_or_take_their_agents_and_the_check_warns_when_peers_refuse_it",
         "lib::plan::squad_steps_pick_the_least_busy_capable_member",
-        "agents::workers_allow_only_some_efforts_and_tell_peers_the_models_they_offer"
+        "agents::workers_allow_only_some_efforts_and_tell_peers_the_models_they_offer",
+        "bin::models_allow_takes_the_models_the_efforts_or_both"
       ]
     },
     {
