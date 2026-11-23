@@ -1386,6 +1386,15 @@
       ]
     },
     {
+      "id": "GH-6",
+      "area": "github",
+      "claim": "A pull request a plan's pull request step opens lists the plan's sign-offs before it: each approval step it comes after, with who approved it, their agent's key, when, and their note as code (so it mentions no one and links nothing), from the record the approver's agent signed. The folder's agent lists only approvals that verify for exactly their words and were asked for by the peer that asks for the pull request, says how many it left out, and names the evidence run that has them (proofkin runs verify).",
+      "tests": [
+        "agents::a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merged",
+        "lib::pulls::the_sign_offs_that_check_out_go_on_the_pull_request"
+      ]
+    },
+    {
       "id": "TRK-6",
       "area": "tracking",
       "claim": "With a tracker linked, Plan mode and the plan editor offer Track on GitHub beside Run plan: a new issue (with a sub-issue per step), an existing issue it works on (by number) or don't track, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's). The line under it says what running the plan does there before it runs: the repository and the board (links that open a new tab), the account the issues are assigned to, the new issue's title when the plan names one, and that anyone can read them when the repository is public (the tracker reads its visibility; tracker status says it too), or that nothing goes to GitHub. An existing issue is looked up as its number is typed (GET /api/tracker/issues/N): its title, with a warning when it is closed (running reopens it), doesn't exist (the plan would run untracked) or can't be looked up; Run plan and Schedule… ask for the number when it is missing instead of opening a new issue.",

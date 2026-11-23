@@ -2437,10 +2437,35 @@ fn pr_ask(
     } else {
         step.own_text()
     };
+    // The sign-offs before it, as their approvers signed them: the pull request lists them.
+    let before = ancestors(plan, &step.id);
+    let signoffs = plan
+        .steps
+        .iter()
+        .filter(|s| s.approve && before.contains(&s.id))
+        .filter_map(|s| match &states[&s.id] {
+            StepState::Done {
+                output,
+                evidence: Some(evidence),
+                verified: true,
+                ..
+            } if evidence.kind == crate::evidence::EvidenceKind::Approval
+                && evidence.approved == Some(true) =>
+            {
+                Some(crate::pulls::SignOff {
+                    step: s.id.clone(),
+                    output: output.clone(),
+                    evidence: evidence.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
     Ok(crate::pulls::PullRequestAsk {
         branch: git.branch.clone(),
         commit: git.commit.clone().unwrap_or_default(),
         title: crate::llm::title_of(words),
+        signoffs,
     })
 }
 

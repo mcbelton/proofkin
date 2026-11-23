@@ -1,10 +1,10 @@
 //! Pull request steps: `pr @peer:folder` in a plan (see [`crate::plan`]). The agent that
 //! holds a linked repository's clone opens the pull request from the branch the steps
-//! before it committed to, with the commit's signed proof and the issues the work is for,
-//! and follows it until it is merged or closed. Its owner allows this per folder
-//! (`proofkin share pull-requests`): the branch is pushed and the pull request opened with
-//! the owner's GitHub account, and only from a task branch whose signed record this agent
-//! made for the peer that asks.
+//! before it committed to, with the commit's signed proof, the plan's sign-offs before it
+//! and the issues the work is for, and follows it until it is merged or closed. Its owner
+//! allows this per folder (`proofkin share pull-requests`): the branch is pushed and the
+//! pull request opened with the owner's GitHub account, and only from a task branch whose
+//! signed record this agent made for the peer that asks.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::process::Command;
 
-use crate::evidence::Evidence;
+use crate::evidence::{Evidence, EvidenceKind};
 use crate::github::{GithubCredentials, Repo};
 use crate::tracker::Api;
 
@@ -33,6 +33,32 @@ pub struct PullRequestAsk {
     pub commit: String,
     /// The pull request's title.
     pub title: String,
+    /// The plan's sign-offs before it, as their approvers signed them: the pull request
+    /// lists those that check out (see [`SignOff::checks_out`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signoffs: Vec<SignOff>,
+}
+
+/// A sign-off of the plan (an approval step it comes after), as its approver signed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignOff {
+    /// The plan step it is.
+    pub step: String,
+    /// What the approver answered (`Approved by carol: Ship it`): the words its record signs.
+    pub output: String,
+    pub evidence: Evidence,
+}
+
+impl SignOff {
+    /// Whether it is an approval, signed by its approver's agent for exactly its words and
+    /// asked for by `requester` (the peer that asks for the pull request).
+    pub fn checks_out(&self, requester: &str) -> bool {
+        crate::profile::name_ok(&self.step)
+            && self.evidence.kind == EvidenceKind::Approval
+            && self.evidence.approved == Some(true)
+            && self.evidence.requester_id == requester
+            && self.evidence.verify_self(&self.output).is_ok()
+    }
 }
 
 /// A pull request a step opened, or found opened from its branch.
@@ -53,14 +79,16 @@ pub struct Opened {
 #[async_trait]
 pub trait PullRequests: Send + Sync {
     /// Opens a pull request from `ask.branch` of folder `share`'s repository into its
-    /// branch, closing `issues` and the issues its commit is for, with the commit's proof
-    /// and who asked for it (`by`). If one was opened from the branch as it is, that one.
+    /// branch, closing `issues` and the issues its commit is for, with the commit's proof,
+    /// who asked for it (`by`, as part of evidence run `run`) and `ask`'s sign-offs (checked
+    /// already). If one was opened from the branch as it is, that one.
     async fn open(
         &self,
         share: &str,
         ask: &PullRequestAsk,
         issues: &[String],
         by: &str,
+        run: Option<&str>,
     ) -> Result<Opened>;
 
     /// Where pull request `number` of folder `share`'s repository is: `OPEN`, `MERGED` or
@@ -156,15 +184,52 @@ pub fn number_of(url: &str) -> Option<u64> {
 }
 
 /// The description of a pull request a step opens: the lines closing `issues` (those of
-/// `slug` by number) and who asked for it.
-pub fn description(issues: &[String], slug: &str, by: &str) -> String {
+/// `slug` by number), who asked for it (`by`), and the plan's sign-offs before it, with the
+/// evidence run (`run`) that has their records.
+pub fn description(
+    issues: &[String],
+    slug: &str,
+    by: &str,
+    run: Option<&str>,
+    signoffs: &[SignOff],
+) -> String {
+    let clean = |text: &str| text.replace(['`', '*', '_', '[', ']', '\r', '\n'], "");
     let mut body = crate::tracker::closing_lines(issues, slug);
     if !body.is_empty() {
         body.push('\n');
     }
+    let by = clean(by);
+    body += &format!("Opened by Proofkin for **{by}**, as a pull request step of their plan.\n");
+    if signoffs.is_empty() {
+        return body;
+    }
+    body += "\n### Sign-offs\n\n";
+    for s in signoffs {
+        let e = &s.evidence;
+        let key: String = e.signer_id.chars().take(10).collect();
+        // The approver's words, as code: they mention no one and link nothing.
+        let note = s
+            .output
+            .split_once(": ")
+            .map(|(_, note)| crate::redact::redact(note).0)
+            .map(|note| note.replace('`', "'").replace(['\r', '\n'], " "))
+            .map(|note| note.trim().chars().take(300).collect::<String>())
+            .filter(|note| !note.is_empty());
+        body += &format!(
+            "- `{}`: approved by **{}** (key `{key}`) on {} UTC{}\n",
+            clean(&s.step),
+            clean(&e.signer),
+            crate::runs::utc(e.finished_unix),
+            note.map(|n| format!(", noting `{n}`")).unwrap_or_default()
+        );
+    }
     body += &format!(
-        "Opened by Proofkin for **{}**, as a pull request step of their plan.\n",
-        by.replace(['`', '*', '_', '[', ']', '\r', '\n'], "")
+        "\n<sub>Each is a record its approver's agent signed (Ed25519), checked before it was added{}.</sub>\n",
+        run.map(|r| format!(
+            "; they are in {by}'s evidence run `{}`, which `proofkin runs verify` checks again",
+            clean(r)
+        ))
+        .unwrap_or_default()
     );
     body
 }
@@ -198,6 +263,7 @@ impl PullRequests for ProfilePulls {
         ask: &PullRequestAsk,
         issues: &[String],
         by: &str,
+        run: Option<&str>,
     ) -> Result<Opened> {
         let (repo, creds) = self.linked(share)?;
         let api = crate::tracker::GhApi::new(creds.clone());
@@ -215,7 +281,7 @@ impl PullRequests for ProfilePulls {
                 refs.push(issue.clone());
             }
         }
-        let mut body = description(&refs, &repo.slug, by);
+        let mut body = description(&refs, &repo.slug, by, run, &ask.signoffs);
         creds.push(&repo, &ask.branch).await?;
         let profile = self.profile.reload()?;
         let proof = match creds.pr_proof(&repo, &ask.branch, &profile).await {
@@ -334,17 +400,72 @@ mod tests {
             &["acme/app#3".into(), "other/lib#9".into(), "bad".into()],
             "acme/app",
             "bo*ss_`x`",
+            None,
+            &[],
         );
         assert_eq!(
             body,
             "Closes #3\nCloses other/lib#9\n\nOpened by Proofkin for **bossx**, as a pull request step of their plan.\n"
         );
         assert_eq!(
-            description(&[], "acme/app", "boss"),
+            description(&[], "acme/app", "boss", None, &[]),
             "Opened by Proofkin for **boss**, as a pull request step of their plan.\n"
         );
         assert_eq!(number_of("https://github.com/acme/app/pull/12"), Some(12));
         assert_eq!(number_of("https://github.com/acme/app/pull/12/"), Some(12));
         assert_eq!(number_of("https://github.com/acme/app/issues/12"), None);
+    }
+
+    #[test]
+    fn the_sign_offs_that_check_out_go_on_the_pull_request() {
+        let (carol, boss) = (iroh::SecretKey::generate(), iroh::SecretKey::generate());
+        let answer = |approved: bool, output: &str| {
+            let mut e = Evidence::new(
+                EvidenceKind::Approval,
+                "carol",
+                carol.public(),
+                boss.public(),
+                7,
+            );
+            e.approved = Some(approved);
+            e.finished_unix = 1_795_411_590;
+            SignOff {
+                step: "ok".into(),
+                output: output.into(),
+                evidence: e.sign(output, &carol),
+            }
+        };
+        let good = answer(true, "Approved by carol: Ship it, @team see #12 `now`");
+        let asker = boss.public().to_string();
+        assert!(good.checks_out(&asker));
+        // Asked for by another peer, rejected, or with other words than it signed: left out.
+        assert!(!good.checks_out(&carol.public().to_string()));
+        assert!(!answer(false, "Rejected by carol: not yet").checks_out(&asker));
+        let forged = SignOff {
+            output: "Approved by carol: anything".into(),
+            ..good.clone()
+        };
+        assert!(!forged.checks_out(&asker));
+
+        let body = description(
+            &[],
+            "acme/app",
+            "boss",
+            Some("20261123-064022-169d7"),
+            &[good],
+        );
+        assert!(
+            body.contains("\n### Sign-offs\n\n- `ok`: approved by **carol** (key `"),
+            "{body}"
+        );
+        // Its words are code: they mention no one and link nothing.
+        assert!(
+            body.contains(" on 2026-11-23 05:26:30 UTC, noting `Ship it, @team see #12 'now'`\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("they are in boss's evidence run `20261123-064022-169d7`, which `proofkin runs verify` checks again"),
+            "{body}"
+        );
     }
 }

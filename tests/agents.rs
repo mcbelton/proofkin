@@ -1842,15 +1842,18 @@ async fn worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch()
     assert!(!review_repo.path().join("feature.txt").exists());
 }
 
-/// A pull request [`FakePulls`] opened: the folder, the ask, the issues and who asked.
-type OpenedWith = (String, PullRequestAsk, Vec<String>, String);
+/// A call [`FakePulls`] answered: the folder, the ask as it came (with the sign-offs that
+/// checked out), the issues, who asked and the run it is part of.
+type OpenCall = (String, PullRequestAsk, Vec<String>, String, Option<String>);
 
 /// Pull requests kept in memory: each one opened is open until the test merges or closes
 /// it, and opening the same work again finds it.
 #[derive(Default)]
 struct FakePulls {
-    opened: Mutex<Vec<OpenedWith>>,
-    /// Each one's state, by number (from 1).
+    calls: Mutex<Vec<OpenCall>>,
+    /// The work of each one opened (its branch and commit), by number (from 1).
+    opened: Mutex<Vec<(String, String)>>,
+    /// Each one's state, by number.
     states: Mutex<std::collections::BTreeMap<u64, String>>,
 }
 
@@ -1862,13 +1865,22 @@ impl PullRequests for FakePulls {
         ask: &PullRequestAsk,
         issues: &[String],
         by: &str,
+        run: Option<&str>,
     ) -> anyhow::Result<Opened> {
+        self.calls.lock().unwrap().push((
+            share.into(),
+            ask.clone(),
+            issues.to_vec(),
+            by.into(),
+            run.map(Into::into),
+        ));
         let mut opened = self.opened.lock().unwrap();
         let mut states = self.states.lock().unwrap();
-        let (number, existed) = match opened.iter().position(|(_, a, _, _)| a == ask) {
+        let work = (ask.branch.clone(), ask.commit.clone());
+        let (number, existed) = match opened.iter().position(|w| *w == work) {
             Some(i) => (i as u64 + 1, true),
             None => {
-                opened.push((share.into(), ask.clone(), issues.to_vec(), by.into()));
+                opened.push(work);
                 states.insert(opened.len() as u64, "OPEN".into());
                 (opened.len() as u64, false)
             }
@@ -1938,10 +1950,23 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     let plan = Plan::parse(
         "impl @worker:app create feature.txt\n\
          check after impl @worker:app apply=impl Check the feature\n\
-         ship after check pr @worker:app",
+         ok after check approve @me Ship it?\n\
+         ship after ok pr @worker:app",
     )
     .unwrap();
     let squads = SquadStore::default();
+    // You sign off on each run's work as it comes.
+    let signer = {
+        let boss = boss.clone();
+        tokio::spawn(async move {
+            loop {
+                for a in boss.approvals() {
+                    let _ = boss.answer_approval(a.id, true, "Looks good").await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+    };
 
     // Its owner doesn't let peers open pull requests there yet: the step isn't sent.
     let states = timeout(
@@ -1959,7 +1984,7 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         "{:?}",
         states["ship"]
     );
-    assert!(pulls.opened.lock().unwrap().is_empty());
+    assert!(pulls.calls.lock().unwrap().is_empty());
 
     // Allowed: it opens the pull request from check's branch (it has impl's work too),
     // named after the work, and waits until it is merged.
@@ -1976,11 +2001,15 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         tokio::spawn(async move { pulls.when_opened(1, "MERGED").await })
     };
     let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let ctx = RunContext {
+        run_id: Some("run-2".into()),
+        ..Default::default()
+    };
     let states = {
         let said = said.clone();
         timeout(
             Duration::from_secs(60),
-            run_plan(&boss, &squads, &plan, move |id, state| {
+            run_plan_with(&boss, &squads, &plan, &ctx, move |id, state| {
                 if let (
                     "ship",
                     StepState::Running {
@@ -2004,14 +2033,29 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         panic!("{:?}", states["check"]);
     };
     let branch = checked.git.clone().unwrap();
-    let (share, ask, issues, by) = pulls.opened.lock().unwrap()[0].clone();
-    assert_eq!((share.as_str(), by.as_str()), ("app", "boss"));
+    let (share, ask, issues, by, run) = pulls.calls.lock().unwrap()[0].clone();
+    assert_eq!(
+        (share.as_str(), by.as_str(), run.as_deref()),
+        ("app", "boss", Some("run-2"))
+    );
     assert!(issues.is_empty(), "{issues:?}");
     assert_eq!(
         (Some(ask.branch.clone()), Some(ask.commit.clone())),
         (Some(branch.branch.clone()), branch.commit.clone())
     );
     assert_eq!(ask.title, "create feature.txt");
+    // Its sign-off goes with it, as you signed it.
+    assert_eq!(
+        ask.signoffs
+            .iter()
+            .map(|s| (
+                s.step.as_str(),
+                s.output.as_str(),
+                s.evidence.signer.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [("ok", "Approved by boss: Looks good", "boss")]
+    );
     let shown = std::process::Command::new("git")
         .arg("-C")
         .arg(repo.path())
@@ -2032,7 +2076,7 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
             assert!(
                 output.starts_with(
                     "Pull request #1 was merged: https://github.com/acme/app/pull/1\n"
-                ),
+                ) && output.contains("with its signed proof and 1 sign-off."),
                 "{output}"
             );
             assert!(
@@ -2082,7 +2126,7 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     );
     task.pull_request = Some(Box::new(PullRequestAsk {
         commit: "0".repeat(40),
-        ..ask
+        ..ask.clone()
     }));
     let refused = boss.delegate_verified(worker.id(), task).await.unwrap();
     assert!(
@@ -2090,7 +2134,31 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         "{}",
         refused.output
     );
+
+    // A sign-off whose record doesn't check out stays off it.
+    let signed = ask.signoffs[0].clone();
+    let forged = proofkin::pulls::SignOff {
+        output: "Approved by boss: anything".into(),
+        ..signed.clone()
+    };
+    let mut again = LlmTask::new(Provider::Copilot, "open it").in_share("app");
+    again.pull_request = Some(Box::new(PullRequestAsk {
+        signoffs: vec![signed.clone(), forged],
+        ..ask.clone()
+    }));
+    let reopened = boss.delegate_verified(worker.id(), again).await.unwrap();
+    assert!(
+        reopened.ok
+            && reopened
+                .output
+                .contains("1 sign-off left out: its record doesn't check out; an earlier try of this step opened it."),
+        "{}",
+        reopened.output
+    );
+    let call = pulls.calls.lock().unwrap().last().unwrap().1.clone();
+    assert_eq!(call.signoffs, [signed]);
     assert_eq!(pulls.opened.lock().unwrap().len(), 2);
+    signer.abort();
 }
 
 #[tokio::test]
