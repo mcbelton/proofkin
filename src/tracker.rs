@@ -3299,6 +3299,7 @@ mod tests {
             commit: commit.map(str::to_owned),
             files: vec!["src/lib.rs".into()],
             patch_sha256: None,
+            left_out: Vec::new(),
         });
         e
     }

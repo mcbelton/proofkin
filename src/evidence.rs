@@ -54,6 +54,10 @@ pub struct GitCommit {
     pub files: Vec<String>,
     /// SHA-256 of the patch (`git diff base commit --binary`), sent alongside.
     pub patch_sha256: Option<String>,
+    /// Build and tool caches the task made that the commit left out (folders end with
+    /// `/`), for the task's report. Not part of the record: older peers verify it as before.
+    #[serde(skip)]
+    pub left_out: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,18 +223,39 @@ impl Evidence {
             match &git.commit {
                 Some(commit) => {
                     text += &format!(
-                        "**Commit** `{}` on branch `{}` ({} file{})\n",
+                        "**Commit** `{}` on branch `{}` ({} file{}): {}\n",
                         commit.chars().take(12).collect::<String>(),
                         git.branch,
                         git.files.len(),
-                        if git.files.len() == 1 { "" } else { "s" }
+                        if git.files.len() == 1 { "" } else { "s" },
+                        code_list(&git.files)
                     )
                 }
                 None => text += &format!("**No changes** committed (branch `{}`)\n", git.branch),
             }
+            if !git.left_out.is_empty() {
+                text += &format!(
+                    "**Left out** of the commit (build and tool caches the task made): {}\n",
+                    code_list(&git.left_out)
+                );
+            }
         }
         text
     }
+}
+
+/// Paths as Markdown code, the first 20 of them, then how many more.
+fn code_list(paths: &[String]) -> String {
+    const LISTED: usize = 20;
+    let mut list: Vec<String> = paths
+        .iter()
+        .take(LISTED)
+        .map(|p| format!("`{}`", p.replace('`', "'")))
+        .collect();
+    if paths.len() > LISTED {
+        list.push(format!("and {} more", paths.len() - LISTED));
+    }
+    list.join(", ")
 }
 
 /// Runs built-in check `name` (see [`crate::spec`]): it only reads files in `dir`,

@@ -1271,6 +1271,7 @@ mod tests {
             commit: Some("0123456789abcdef".into()),
             files: vec!["a.txt".into()],
             patch_sha256: None,
+            left_out: Vec::new(),
         };
         (e, git)
     }
