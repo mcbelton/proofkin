@@ -46,6 +46,7 @@ const TOOLS_JS: &str = include_str!("../ui/tools.js");
 const PLAN_TEXT_JS: &str = include_str!("../ui/plan-text.js");
 const MARKDOWN_JS: &str = include_str!("../ui/markdown.js");
 const MODELS_JS: &str = include_str!("../ui/models.js");
+const BRANCHES_JS: &str = include_str!("../ui/branches.js");
 const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
 const WORKERS_JS: &str = include_str!("../ui/workers.js");
 const CONNECT_JS: &str = include_str!("../ui/connect.js");
@@ -981,6 +982,7 @@ pub async fn start_with_work(
         .route("/api/repos/{name}/sync", post(sync_repo))
         .route("/api/repos/{name}/pr", post(open_pr))
         .route("/api/repos/{name}/proof", get(branch_proof))
+        .route("/api/repos/{name}/changes", get(branch_changes))
         .route(
             "/api/repos/{name}/branches",
             get(repo_branches).delete(delete_task_branch),
@@ -1091,6 +1093,10 @@ pub async fn start_with_work(
         .route(
             "/models.js",
             get(|| async { asset("text/javascript; charset=utf-8", MODELS_JS) }),
+        )
+        .route(
+            "/branches.js",
+            get(|| async { asset("text/javascript; charset=utf-8", BRANCHES_JS) }),
         )
         .route(
             "/plan-builder.js",
@@ -3171,23 +3177,44 @@ struct ProofQuery {
 }
 
 /// Where the work of each of a linked repository's task branches is (see
-/// [`crate::github::branch_states`]), asked of GitHub with the profile's account; what
-/// went wrong instead, if GitHub can't say.
+/// [`crate::github::branch_states`]), asked of GitHub with the profile's account, against
+/// the repository's branch as GitHub has it now (fetched when the last fetch is a few
+/// minutes old); what went wrong instead, if GitHub can't say.
 async fn repo_branches(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let (repo, creds) = linked(&s, &name)?;
+    // Offline, the clone's own copy is used: the states are as of its last fetch.
+    let stale = creds
+        .refresh_base(&repo, Duration::from_secs(300))
+        .await
+        .err()
+        .map(|e| format!("{e:#}"));
     let branches = crate::github::task_branches(&repo)
         .await
         .unwrap_or_default();
     let api = crate::tracker::GhApi::new(creds);
     Ok(Json(
         match crate::github::branch_states(&api, &repo, &branches).await {
-            Ok(states) => json!({ "states": states }),
-            Err(e) => json!({ "states": {}, "error": format!("{e:#}") }),
+            Ok(states) => json!({ "states": states, "fetch_error": stale }),
+            Err(e) => json!({ "states": {}, "error": format!("{e:#}"), "fetch_error": stale }),
         },
     ))
+}
+
+/// What a pull request from a task branch would carry: its commits, files and diff
+/// (see [`crate::github::branch_changes`]), to review before opening it or deleting it.
+async fn branch_changes(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<ProofQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (repo, _) = linked(&s, &name)?;
+    crate::github::branch_changes(&repo, &q.branch)
+        .await
+        .map(|c| Json(json!(c)))
+        .map_err(|e| bad_request(format!("{e:#}")))
 }
 
 /// Deletes a task branch of a linked repository, on GitHub and in the clone.

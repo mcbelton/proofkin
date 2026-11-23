@@ -1,7 +1,8 @@
 // Proofkin web UI: models. Which models and reasoning efforts a task may ask an agent
 // for, from what it says (its settings, and the models its account offers it), for the
-// Run task form (app.js) and the plan builder's step cards (plan-builder.js); and the
-// Models dialog, where an owner picks them for this agent and its digital workers.
+// Run task form (app.js) and the plan builder's step cards (plan-builder.js); what a
+// squad member runs, for the squad dialog and card; and the Models dialog, where an
+// owner picks them for this agent and its digital workers.
 // The pure helpers at the top are tested in node (tests/models.test.cjs); the dialog
 // uses app.js helpers ($, el, api, toast, providerLabel, state) when it opens.
 "use strict";
@@ -331,6 +332,31 @@ function modelsSummary(set) {
     set.effort ?? set.efforts?.[0] ? `${set.effort ?? set.efforts[0]} reasoning` : null,
     allowed.length > 3 ? `only ${allowed.length} models` : allowed.length ? `only ${allowed.join(", ")}` : null,
     set.efforts?.length ? `levels ${set.efforts.join(", ")}` : null].filter(Boolean).join(" · ");
+}
+
+/** What a connected peer takes as a squad member, in a few words: whose digital worker
+ * it is and its role, the providers it runs with their default model and reasoning (named
+ * by `label`), and the folders it shares with this agent ("(team plan)": team steps go
+ * there). `takes`: some step can go to it, as it runs a provider in a folder it shares or
+ * leads a folder's team plan; else `why` none can (src/plan.rs unable), in `text` too. */
+function squadMember(peer, label = (p) => p) {
+  const providers = peer?.capabilities ?? [];
+  const shares = peer?.shares ?? [];
+  const who = [peer?.owner ? `digital worker of ${peer.owner}` : null, peer?.role || null].filter(Boolean);
+  const takes = (providers.length > 0 && shares.length > 0) || shares.some((s) => s.team);
+  if (!takes) {
+    const why = providers.length ? "it shares no folder with you" : "it runs no models (it only delegates)";
+    return { takes, why, text: [...who, `takes no squad steps: ${why}`].join(" · ") };
+  }
+  const runs = providers.map((p) => {
+    const set = peer.models?.[p] ?? {};
+    const model = set.default ?? set.allowed?.[0] ?? null;
+    const effort = set.effort ?? set.efforts?.[0] ?? null;
+    const what = [model, effort ? `${effort} reasoning` : null].filter(Boolean).join(", ");
+    return what ? `${label(p)} (${what})` : label(p);
+  });
+  const folders = shares.map((s) => (s.team ? `${s.name} (team plan)` : s.name));
+  return { takes, text: [...who, runs.join(", ") || "team steps only", `folders ${folders.join(", ")}`].join(" · ") };
 }
 
 /** Saves each provider whose settings changed; errors stay in the dialog, with the form. */

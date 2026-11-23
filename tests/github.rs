@@ -10,7 +10,8 @@ use std::process::Command;
 use proofkin::audit::{AuditEntry, AuditLog, Outcome};
 use proofkin::evidence::{Evidence, EvidenceKind};
 use proofkin::github::{
-    GithubCredentials, RepoStore, branch_states, link_url, task_branches, unlink,
+    FileChange, GithubCredentials, RepoStore, branch_changes, branch_states, link_url,
+    task_branches, unlink,
 };
 use proofkin::worktree::Worktree;
 use proofkin::{Access, Profile, Provider, TrustStore, TrustedPeer};
@@ -237,10 +238,11 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
     // Where each task branch's work is, in one GraphQL query: 1-1 has a merged pull
     // request (its newest), 2-1's issue is closed, and 3-1's commit is on main already.
     git(&repo.path, &["branch", "p2p/boss/3-1", "main"]);
+    let one_head = git(&repo.path, &["rev-parse", "p2p/boss/1-1"]);
     let fake = AnswerApi {
         answer: serde_json::json!({ "data": { "repository": {
             "pullRequests": { "nodes": [
-                { "number": 7, "state": "MERGED", "url": "https://github.com/acme/app/pull/7", "headRefName": "p2p/boss/1-1" },
+                { "number": 7, "state": "MERGED", "url": "https://github.com/acme/app/pull/7", "headRefName": "p2p/boss/1-1", "headRefOid": one_head },
                 { "number": 3, "state": "CLOSED", "url": "https://github.com/acme/app/pull/3", "headRefName": "p2p/boss/1-1" },
             ] },
             "i5": { "state": "CLOSED" },
@@ -254,6 +256,139 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
     assert!(!states["p2p/boss/1-1"].in_base && !states["p2p/boss/1-1"].issues_closed);
     assert!(states["p2p/boss/2-1"].issues_closed && states["p2p/boss/2-1"].pull_request.is_none());
     assert!(states["p2p/boss/3-1"].in_base);
+    // Each says what deleting it would lose: 1-1's pull request merged, so nothing; 2-1's
+    // issue is closed, but its change isn't on main; 3-1 is on main.
+    let one = &states["p2p/boss/1-1"];
+    assert_eq!(
+        (
+            one.ahead,
+            one.files,
+            one.added,
+            one.removed,
+            one.same_as_base
+        ),
+        (1, 1, 1, 0, false)
+    );
+    assert!(one.safe_to_delete, "its pull request merged it as it is");
+    assert!(one.pull_request.as_ref().unwrap().current);
+    let two = &states["p2p/boss/2-1"];
+    assert_eq!((two.ahead, two.files, two.same_as_base), (1, 1, false));
+    assert!(
+        !two.safe_to_delete,
+        "its issue is closed, but its change isn't on main"
+    );
+    let three = &states["p2p/boss/3-1"];
+    assert!(three.ahead == 0 && three.same_as_base && three.safe_to_delete);
+    let shown = serde_json::to_value(one).unwrap();
+    assert_eq!(shown["safe_to_delete"], true);
+    assert!(shown.get("head").is_none() && shown["pull_request"].get("head").is_none());
+    // The changes a pull request from 2-1 would carry, to review first.
+    let changes = branch_changes(&repo, "p2p/boss/2-1").await.unwrap();
+    assert_eq!(changes.commits.len(), 1);
+    assert!(
+        changes.commits[0]
+            .subject
+            .starts_with("proofkin: task 2 from boss")
+    );
+    assert_eq!(
+        changes.files,
+        [FileChange {
+            path: "other.txt".into(),
+            added: Some(1),
+            removed: Some(0),
+        }]
+    );
+    assert!(
+        changes.diff.contains("+++ b/other.txt\n") && changes.diff.contains("\n+other\n"),
+        "{}",
+        changes.diff
+    );
+    assert_eq!((changes.base.as_str(), changes.truncated), ("main", false));
+    assert!(
+        branch_changes(&repo, "main").await.is_err(),
+        "task branches only"
+    );
+    assert!(branch_changes(&repo, "p2p/boss/nope").await.is_err());
+    // A diff too big to show is cut at a line's end.
+    let big = Worktree::create(&repo.path, &root, "p2p/boss/5-1")
+        .await
+        .unwrap();
+    let text: String = (0..40_000).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(big.path.join("big.txt"), text).unwrap();
+    big.commit("proofkin: task 5 from boss\n\nA big file")
+        .await
+        .unwrap();
+    drop(big);
+    let changes = branch_changes(&repo, "p2p/boss/5-1").await.unwrap();
+    assert!(changes.truncated && changes.diff.len() <= proofkin::github::MAX_DIFF_BYTES);
+    assert!(changes.diff.ends_with('\n'));
+    assert_eq!(changes.files[0].added, Some(40_000));
+    // One whose change reached main another way (the same content, in another commit)
+    // loses nothing either. The states are checked against main as the repository has it
+    // now: the clone fetches it when its last fetch is a few minutes old.
+    let same = Worktree::create(&repo.path, &root, "p2p/boss/4-1")
+        .await
+        .unwrap();
+    std::fs::write(same.path.join("same.txt"), "same\n").unwrap();
+    same.commit("proofkin: task 4 from boss\n\nThe same change")
+        .await
+        .unwrap();
+    drop(same);
+    commit(&seed, "same.txt", "same\n", "the same change, made on main");
+    git(&seed, &["push", "-q", "origin", "main"]);
+    let fresh = std::time::Duration::from_secs(300);
+    assert!(
+        creds.refresh_base(&repo, fresh).await.unwrap(),
+        "never fetched since it was cloned"
+    );
+    assert!(
+        !creds.refresh_base(&repo, fresh).await.unwrap(),
+        "fetched just now"
+    );
+    let branches = task_branches(&repo).await.unwrap();
+    let states = branch_states(&fake, &repo, &branches).await.unwrap();
+    let four = &states["p2p/boss/4-1"];
+    assert!(
+        !four.in_base && four.ahead == 1 && four.same_as_base && four.safe_to_delete,
+        "{four:?}"
+    );
+    // A merged pull request loses nothing only if it had the branch as it is: 5-1's had
+    // it (and a commit pushed after it from elsewhere), but 2-1's merged without its commit.
+    let after = git(
+        &repo.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit-tree",
+            "p2p/boss/5-1^{tree}",
+            "-p",
+            "p2p/boss/5-1",
+            "-m",
+            "pushed from elsewhere",
+        ],
+    );
+    let main_head = git(&repo.path, &["rev-parse", "origin/main"]);
+    let later = AnswerApi {
+        answer: serde_json::json!({ "data": { "repository": {
+            "pullRequests": { "nodes": [
+                { "number": 9, "state": "MERGED", "url": "https://github.com/acme/app/pull/9", "headRefName": "p2p/boss/5-1", "headRefOid": after },
+                { "number": 11, "state": "MERGED", "url": "https://github.com/acme/app/pull/11", "headRefName": "p2p/boss/2-1", "headRefOid": main_head },
+            ] },
+            "i5": { "state": "CLOSED" },
+        } } }),
+        asked: Default::default(),
+    };
+    let states = branch_states(&later, &repo, &branches).await.unwrap();
+    let five = &states["p2p/boss/5-1"];
+    assert!(five.pull_request.as_ref().unwrap().current && five.safe_to_delete);
+    assert!(!five.same_as_base, "only the pull request has its work");
+    let two = &states["p2p/boss/2-1"];
+    assert!(
+        !two.pull_request.as_ref().unwrap().current && !two.safe_to_delete,
+        "{two:?}"
+    );
     let asked = fake.asked.lock().unwrap().clone();
     assert!(
         asked.contains("i5: issueOrPullRequest(number: 5)"),

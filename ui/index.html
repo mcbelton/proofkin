@@ -10,6 +10,7 @@
   <script src="/plan-text.js" defer></script>
   <script src="/markdown.js" defer></script>
   <script src="/models.js" defer></script>
+  <script src="/branches.js" defer></script>
 <script src="/app.js" defer></script>
   <script src="/tools.js" defer></script>
 <script src="/plan-builder.js" defer></script>
@@ -504,7 +505,7 @@
   <dialog id="squad-dialog" aria-labelledby="squad-h">
     <form method="dialog" id="squad-form" novalidate>
       <h2 id="squad-h">New squad</h2>
-      <p class="muted small">A squad is a group of peers. In a plan, <span class="mono">#name</span> runs a step on its least busy online member that can do it.</p>
+      <p class="muted small">A squad is a group of peers. In a plan, <span class="mono">#name</span> runs a step on its least busy online member that can do it: one that runs the step's provider in a folder it shares with you or, for a team step, one whose folder has a team plan. Sign-offs (<span class="mono">approve</span>) go to a person instead: <span class="mono">@name</span>.</p>
       <label class="field">
         <span>Squad name</span>
         <input id="squad-name" type="text" maxlength="64" spellcheck="false" placeholder="e.g. qa">
@@ -727,10 +728,29 @@
     </div>
   </dialog>
 
+  <dialog id="branch-dialog" class="wide" aria-labelledby="branch-h">
+    <div class="dialog-body">
+      <div class="card-head">
+        <h2 id="branch-h">Review changes</h2>
+        <span class="head-actions"><button type="button" class="btn small" id="branch-close">Close</button></span>
+      </div>
+      <p class="muted small mono" id="branch-desc"></p>
+      <p class="small" id="branch-status"></p>
+      <p class="muted small" id="branch-proof" role="status"></p>
+      <div class="review-body" id="branch-changes"></div>
+      <p class="form-error" id="branch-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn danger" id="branch-delete">Delete branch…</button>
+        <button type="button" class="btn primary" id="branch-pr">Open pull request…</button>
+      </div>
+    </div>
+  </dialog>
+
   <dialog id="pr-dialog" aria-labelledby="pr-h">
     <form method="dialog" id="pr-form" novalidate>
       <h2 id="pr-h">Open a pull request</h2>
       <p class="muted small" id="pr-desc"></p>
+      <p class="small" id="pr-changes" hidden></p>
       <label class="field"><span>Title</span><input id="pr-title" type="text" maxlength="200" required></label>
       <label class="field"><span>Description</span><textarea id="pr-body" rows="4"></textarea></label>
       <label class="check" id="pr-proof-field">

@@ -770,17 +770,28 @@ function renderSquads() {
   }
   for (const s of squads) {
     const online = s.members.filter((m) => m.online).length;
+    // What each online member takes (it says in its hello); offline ones say when they connect.
+    const takes = s.members.map((m) => {
+      const peer = m.online ? state.peers.find((p) => p.name === m.name) : null;
+      return peer ? { peer, about: squadMember(peer, providerLabel) } : null;
+    });
+    const none = online > 0 && takes.every((t) => !t?.about.takes);
     list.append(el("li", { class: "squad" },
       el("div", { class: "who" },
         el("span", { class: "name", text: `#${s.name}` }),
         el("span", { class: "sub", text: `${online}/${s.members.length} online` }),
-        el("ul", { class: "squad-members" }, ...s.members.map((m) => {
+        el("ul", { class: "squad-members" }, ...s.members.map((m, i) => {
           const busy = state.tasks.filter((t) => t.status === "running" && t.target === m.name).length;
+          const known = takes[i];
+          const runs = known?.about.takes
+            ? ` · ${known.peer.capabilities.map(providerLabel).join(", ") || "team steps"}` : "";
           return el("li", {},
             el("span", { class: `dot${m.online ? " on" : ""}`, "aria-hidden": "true" }),
             el("span", { text: m.name }),
-            el("span", { class: "muted small", text: m.online ? (busy ? ` · ${busy} running` : " · idle") : " · offline" }));
-        }))),
+            el("span", { class: "muted small", text: m.online ? `${busy ? ` · ${busy} running` : " · idle"}${runs}` : " · offline" }),
+            known && !known.about.takes ? el("span", { class: "warn-text small", text: ` · takes no steps: ${known.about.why}` }) : null);
+        })),
+        none ? el("span", { class: "warn-text small", text: "No online member can take its steps now." }) : null),
       el("div", { class: "row-actions" },
         el("button", {
           type: "button", class: "btn small", "aria-label": `Change squad ${s.name}`,
@@ -877,15 +888,25 @@ function openSquadDialog(squad = null, opener = $("#add-squad-btn")) {
   name.value = squad?.name ?? "";
   name.readOnly = !!squad;
   const members = new Set((squad?.members ?? []).map((m) => m.name));
-  const check = (value, label) => el("label", { class: "check" },
-    el("input", { type: "checkbox", value, ...(members.has(value) ? { checked: "" } : {}) }),
-    el("span", { text: label }));
+  // Each with what it takes: what it runs and where, or why no step can go to it.
+  const check = (value, label, about, warn, i) => el("label", { class: "check squad-check" },
+    el("input", {
+      type: "checkbox", value, "aria-labelledby": `squad-member-${i}`, "aria-describedby": `squad-member-about-${i}`,
+      ...(members.has(value) ? { checked: "" } : {}),
+    }),
+    el("span", {},
+      el("span", { id: `squad-member-${i}`, text: label }),
+      el("span", { id: `squad-member-about-${i}`, class: `small ${warn ? "warn-text" : "muted"}`, text: about })));
   // Members that left the allowlist stay listed, so they can be dropped.
   const gone = [...members].filter((m) => !state.trusted.some((t) => t.name === m));
   const box = $("#squad-members");
   box.replaceChildren(...(state.trusted.length || gone.length
-    ? [...state.trusted.map((t) => check(t.name, `${t.name}${t.connected ? "" : " (offline)"}`)),
-      ...gone.map((m) => check(m, `${m} (not on the allowlist)`))]
+    ? [...state.trusted.map((t, i) => {
+      const peer = state.peers.find((p) => p.id === t.id);
+      const about = peer ? squadMember(peer, providerLabel) : null;
+      return check(t.name, t.name, about?.text ?? "offline: what it runs shows when it connects", about && !about.takes, i);
+    }),
+    ...gone.map((m, i) => check(m, m, "not on the allowlist: it takes no steps", true, state.trusted.length + i))]
     : [el("span", { class: "muted small", text: "Add peers to the allowlist first." })]));
   $("#squad-dialog").showModal();
   (squad ? box.querySelector("input") ?? name : name).focus();
@@ -901,6 +922,14 @@ async function submitSquad(e) {
   }
   if (!squadEditing && (state.squads ?? []).some((s) => s.name === name)) {
     $("#squad-error").textContent = `There is already a squad #${name}: use Change… on it instead.`;
+    return;
+  }
+  // A squad no step can go to: every member is online and takes none (offline ones may).
+  const idle = members.map((m) => state.peers.find((p) => p.name === m))
+    .filter((p) => p && !squadMember(p).takes);
+  if (idle.length === members.length) {
+    $("#squad-error").textContent = `No step could go to it: ${idle.map((p) => p.name).join(", ")} `
+      + `${idle.length === 1 ? "runs" : "run"} no models in a folder shared with you. Pick a member that does, or leads a team plan.`;
     return;
   }
   try {
@@ -2157,9 +2186,8 @@ async function loadGithub() {
       el("span", { class: "mono small", text: b.name }),
       el("span", { class: "muted small", text: ` ${stamp(b.unix * 1000)} · ${b.subject}` }),
       b.issues?.length ? el("span", { class: "muted small", text: ` · closes ${shortRefs(b.issues, r.slug).join(", ")}` }) : null,
-      el("span", { class: "muted small branch-state" }),
-      el("span", { class: "branch-actions" },
-        el("button", { type: "button", class: "btn small", onclick: () => openPr(r, b) }, "Open PR"))));
+      el("span", { class: "small branch-state" }),
+      el("span", { class: "branch-actions" }, ...branchActions(r, b, null))));
     const more = r.branches.length - branches.length;
     if (more > 0) branches.push(el("li", { class: "muted small", text: `${more} older task branch${more === 1 ? "" : "es"} not shown` }));
     const list = branches.length ? el("ul", { class: "branch-list" }, ...branches) : null;
@@ -2175,9 +2203,10 @@ async function loadGithub() {
   }
 }
 
-/// Says where each listed task branch's work is (a pull request open or merged, on the
-/// repository's branch already, its issues closed, or no pull request yet), offering
-/// Open PR only when no pull request is open or merged, and Delete branch for finished work.
+/// Says where each listed task branch's work is (a pull request open or merged, its
+/// commit or its changes on the repository's branch already, or what isn't there yet),
+/// and whether deleting it loses anything: Delete branch shows only when nothing would
+/// be lost, Open PR only when there is work to merge and no pull request is open.
 async function loadBranchStates(r, list) {
   let res;
   try {
@@ -2189,42 +2218,53 @@ async function loadBranchStates(r, list) {
     const b = r.branches.find((x) => x.name === li.dataset.branch);
     const st = res.states?.[b?.name];
     if (!st) continue;
-    const pr = st.pull_request;
-    const link = pr ? externalLink(pr.url, `#${pr.number}`) : null;
-    const where = pr?.state === "OPEN" ? ["pull request ", link, " is open"]
-      : pr?.state === "MERGED" ? ["merged in ", link]
-      : st.in_base ? [`on ${r.branch} already`]
-      : st.issues_closed ? ["its issues are closed"]
-      : pr?.state === "CLOSED" ? ["pull request ", link, " was closed"]
-      : ["no pull request yet"];
-    li.querySelector(".branch-state").replaceChildren(" · ", ...where);
-    const finished = pr?.state === "MERGED" || pr?.state === "CLOSED" || st.in_base || st.issues_closed;
-    li.querySelector(".branch-actions").replaceChildren(...[
-      pr?.state === "OPEN" || pr?.state === "MERGED" ? null
-        : el("button", { type: "button", class: "btn small", onclick: () => openPr(r, b) }, "Open PR"),
-      finished ? el("button", {
-        type: "button", class: "btn small danger", "aria-label": `Delete branch ${b.name}`,
-        onclick: () => deleteBranch(r, b),
-      }, "Delete branch") : null,
-    ].filter(Boolean));
+    taskBranchStates.set(branchKey(r, b.name), st);
+    const shown = branchStatusNodes(r, b);
+    li.querySelector(".branch-state").replaceChildren(" · ", ...shown.nodes);
+    li.querySelector(".branch-actions").replaceChildren(...branchActions(r, b, shown.status));
   }
   if (res.error) list.append(el("li", { class: "muted small", text: `GitHub can't say where their work is now: ${res.error}` }));
+  if (res.fetch_error) {
+    list.append(el("li", { class: "muted small", text: `As of this clone's last fetch: ${r.branch} couldn't be fetched (${res.fetch_error}).` }));
+  }
 }
 
+/** A task branch's buttons: Review changes always; Open PR while there is work to merge
+ * and no pull request is open; Delete branch when deleting it loses nothing (`status`
+ * null: not known yet, so not offered). */
+function branchActions(r, b, status) {
+  const review = el("button", {
+    type: "button", class: "btn small", "aria-label": `Review changes on ${b.name}`,
+    onclick: (e) => openBranchReview(r, b, e.currentTarget),
+  }, "Review changes");
+  const pr = !status || (!status.open && !status.safe)
+    ? el("button", { type: "button", class: "btn small", "aria-label": `Open a pull request from ${b.name}`, onclick: () => openPr(r, b) }, "Open PR")
+    : null;
+  const remove = status?.safe ? el("button", {
+    type: "button", class: "btn small danger", "aria-label": `Delete branch ${b.name}`,
+    onclick: () => deleteBranch(r, b),
+  }, "Delete branch") : null;
+  return [review, pr, remove].filter(Boolean);
+}
+
+/** Deletes task branch `b` of `r` once confirmed, saying what that loses; whether it did. */
 async function deleteBranch(r, b) {
   const ok = await confirmDialog({
     title: `Delete ${b.name}?`,
-    body: `It goes from this agent's clone of ${r.slug} and from GitHub, if it was pushed. Its commits stay wherever they were merged.`,
+    body: branchDeleteNote(taskBranchStates.get(branchKey(r, b.name)) ?? null, r.branch, r.slug),
     confirm: "Delete branch",
     danger: true,
   });
-  if (!ok) return;
+  if (!ok) return false;
   try {
     await api(`/api/repos/${encodeURIComponent(r.name)}/branches?branch=${encodeURIComponent(b.name)}`, { method: "DELETE" });
+    taskBranchStates.delete(branchKey(r, b.name));
     toast(`Deleted ${b.name}`);
     await loadGithub();
+    return true;
   } catch (err) {
     toast(err.message, "error");
+    return false;
   }
 }
 
@@ -2483,6 +2523,12 @@ let prTarget = null;
 async function openPr(r, b) {
   prTarget = { repo: r, branch: b.name };
   $("#pr-desc").textContent = `${b.name} → ${r.branch} in ${r.slug}`;
+  // What it would change, and where to look at it first.
+  const st = taskBranchStates.get(branchKey(r, b.name));
+  const changes = st ? branchChangeText(st) : null;
+  $("#pr-changes").replaceChildren(...(changes ? [`It changes ${changes}. `,
+    el("button", { type: "button", class: "btn link", onclick: () => { $("#pr-dialog").close(); openBranchReview(r, b, null); } }, "Review changes")] : []));
+  $("#pr-changes").hidden = !changes;
   $("#pr-title").value = b.subject.replace(/^(proofkin|p2pagents): /, "");
   // The issues the commit is for: the pull request closes them when it merges.
   const closes = shortRefs(b.issues ?? [], r.slug).map((ref) => `Closes ${ref}`);
@@ -3413,8 +3459,10 @@ function init() {
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
-    "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog"]) guardDialog($(id));
+    "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog",
+    "#branch-dialog"]) guardDialog($(id));
   initModelsDialog();
+  initBranchReview();
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); renderModelOptions(); updateComposer(); });
   $("#model").addEventListener("change", () => {
