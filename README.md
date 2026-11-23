@@ -1258,15 +1258,25 @@ confirmation says what deleting it would lose. **Review changes** shows exactly 
 commits that aren't on main, the proof a pull request from it would carry, the files it
 changes with lines added and removed, and the diff a pull request would show (up to 400 KB),
 from where it can open the pull request or delete the branch. The pull request form says
-what it would change, with a link back to the review. A branch with a pull request open
-offers neither: GitHub would close the pull request with it.
+what it would change, with a link back to the review.
+
+Each branch offers what fits where its work is:
+
+- **Safe to delete**: only **Delete branch**. Its work is on main, so there is nothing left
+  to review.
+- **Its pull request was closed, or its issues are closed** (by another branch's pull
+  request, say): **Review changes** and **Delete branch**, whose confirmation says what it
+  loses. It isn't proposed again; reopen the pull request on GitHub if you change your mind.
+- **Work still to merge** (no pull request yet, or commits added since one was merged or
+  closed): **Review changes** and **Open PR**.
+- **A pull request open**: **Review changes** only. It is reviewed and merged on GitHub, and
+  deleting the branch would close it.
 
 When a pull request from another branch closed its issues, the card names it ("its issues
 were closed by #74"): often a later step took over its work (`apply=`) and that step's
 branch was merged, with the work changed on the way, so git can't tell it is there.
 **Review changes** says so, and the confirmation that deleting it loses its work "unless
-#74 (from p2p/boss/19-…), which closed its issues, has it": compare the two, then delete it
-from the review.
+#74 (from p2p/boss/19-…), which closed its issues, has it": compare the two, then delete it.
 
 **Another account, or a scope its token lacks, without a terminal.** The GitHub CLI can
 hold several accounts per host but refreshes only the active one, so Proofkin runs its
@@ -1740,8 +1750,9 @@ proofkin --name me --providers copilot --serve --ui
   otherwise it says what isn't on the repository's branch yet ("its issues are closed ·
   not on main: 1 commit, 9 files (+213 −100)"). **Review changes** shows its commits, the
   proof a pull request would carry, its files and its diff, with **Delete branch…** and
-  **Open pull request…**; the card offers **Delete branch** only when nothing would be lost
-  and **Open PR** only when there is work to merge (see
+  **Open pull request…**. The card offers only **Delete branch** once nothing would be
+  lost, **Review changes** and **Delete branch** once its pull request or its issues are
+  closed, and **Open PR** only while there is work to merge (see
   [task branches](#when-a-task-branch-is-done-with)).
 - **Tracker**: link the repository (and project board) your plan runs are tracked on, see
   the board's statuses or why it isn't updated (a missing scope with **Grant access**, and

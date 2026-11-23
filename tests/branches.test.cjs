@@ -7,8 +7,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const code = fs.readFileSync(path.join(__dirname, "..", "ui", "branches.js"), "utf8");
-const { branchChangeText, branchStatus, branchStatusText, branchDeleteNote, branchClosedByNote, diffSections, diffHeaderPath } =
-  vm.runInThisContext(`${code}\n;({ branchChangeText, branchStatus, branchStatusText, branchDeleteNote, branchClosedByNote, diffSections, diffHeaderPath })`);
+const { branchChangeText, branchStatus, branchStatusText, branchButtons, branchDeleteNote, branchClosedByNote, diffSections, diffHeaderPath } =
+  vm.runInThisContext(`${code}\n;({ branchChangeText, branchStatus, branchStatusText, branchButtons, branchDeleteNote, branchClosedByNote, diffSections, diffHeaderPath })`);
 
 const url = (n) => `https://github.com/acme/app/pull/${n}`;
 const pr = (number, state, current = true) => ({ number, state, url: url(number), current });
@@ -58,7 +58,28 @@ assert.strictEqual(note({ ...work, pull_request: pr(7, "MERGED", false) }),
   `Pull request #7 merged an earlier version of it; what it has now isn't on main: 1 commit, 9 files (+213 −100). Deleting the branch loses it. ${where}`);
 assert.strictEqual(note({ ...work, pull_request: pr(12, "OPEN") }),
   `Pull request #12 from it is open: GitHub closes it when the branch goes. ${where}`);
+assert.strictEqual(note({ ...work, pull_request: pr(3, "CLOSED") }),
+  `Pull request #3 was closed without merging it, and its work isn't on main: 1 commit, 9 files (+213 −100). Deleting the branch loses it. ${where}`);
 assert.strictEqual(note(null), `Its commits are lost unless they are on main or a pull request merged them. ${where}`);
+
+// What each branch's line offers: once its work is on main, nothing is left to review,
+// only to delete; once its pull request is closed (as it is) or its issues are, it is
+// reviewed and deleted, not proposed again; work still to merge is reviewed and proposed.
+const buttons = (st) => branchButtons(branchStatus(st, "main")).join(" ");
+assert.strictEqual(branchButtons(null).join(" "), "review pr", "not known yet");
+assert.strictEqual(buttons({ ahead: 0, files: 0, in_base: true, same_as_base: true, safe_to_delete: true }), "delete");
+assert.strictEqual(buttons({ ...work, pull_request: pr(7, "MERGED"), safe_to_delete: true }), "delete");
+assert.strictEqual(buttons({ ...work, same_as_base: true, safe_to_delete: true }), "delete");
+assert.strictEqual(buttons({ ...work, pull_request: pr(12, "OPEN") }), "review");
+assert.strictEqual(buttons({ ...work, pull_request: pr(3, "CLOSED") }), "review delete");
+assert.strictEqual(buttons({ ...work, issues_closed: true }), "review delete");
+assert.strictEqual(buttons({ ...work, issues_closed: true, closed_by: [{ number: 74, url: url(74), branch: "p2p/boss/19-1" }] }),
+  "review delete");
+assert.strictEqual(buttons({ ...work, ahead: 2, pull_request: pr(3, "CLOSED", false) }), "review pr",
+  "work added since its pull request was closed");
+assert.strictEqual(buttons({ ...work, ahead: 2, pull_request: pr(7, "MERGED", false), issues_closed: true }), "review pr",
+  "work added since its pull request was merged");
+assert.strictEqual(buttons(work), "review pr");
 
 // Its issues closed by another branch's pull request (a later step that took its work,
 // say): named, as it may have the work, but the branch isn't called safe.
