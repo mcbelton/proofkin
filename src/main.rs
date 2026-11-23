@@ -5169,4 +5169,40 @@ mod tests {
         assert_eq!(civil_date(11_016), "2000-02-29");
         assert_eq!(civil_date(20_772), "2026-11-15");
     }
+
+    #[test]
+    fn models_allow_takes_the_models_the_efforts_or_both() {
+        let allow = |args: &[&str]| {
+            let args = [
+                &["proofkin", "models", "allow", "copilot"],
+                args,
+                &["--profile", "w"],
+            ]
+            .concat();
+            match Cli::try_parse_from(args) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Models(ModelsCommand::Allow {
+                            models, efforts, ..
+                        })),
+                    ..
+                }) => Some((models, efforts)),
+                _ => None,
+            }
+        };
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            allow(&["gpt-5.5,claude-opus-5.5"]),
+            Some((list(&["gpt-5.5", "claude-opus-5.5"]), None))
+        );
+        assert_eq!(
+            allow(&["--efforts", "low,medium"]),
+            Some((Vec::new(), Some(list(&["low", "medium"]))))
+        );
+        assert_eq!(
+            allow(&["any", "--efforts", "any"]),
+            Some((list(&["any"]), Some(list(&["any"]))))
+        );
+        assert_eq!(allow(&[]), None, "models, efforts or both");
+    }
 }

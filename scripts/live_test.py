@@ -334,6 +334,20 @@ try:
     denied = w1.wait_for(r"copilot: denied read .*outside-secret\.txt", 1)
     print(f"  (stopped by {'the proofkin path policy' if denied else 'the model declining before any tool call'})")
 
+    print("== models: worker1's owner limits its reasoning levels while it runs; it applies them at once")
+    boss.cursor = len(boss.lines)
+    _, out = cli("models", "allow", "copilot", "--efforts", "medium,low", "--profile", "worker1")
+    check("models allow --efforts saved", "only low, medium reasoning may be asked for" in out, out.strip())
+    time.sleep(5)  # a running agent applies its profile.json within seconds
+    boss.send("/delegate copilot@worker1 --effort max Reply with exactly: EFFORT-MAX")
+    check("a level worker1 no longer allows is refused",
+          boss.wait_for(r"max isn't a reasoning effort allowed here: low, medium", 60))
+    boss.send("/delegate copilot@worker1 --effort low Reply with exactly: EFFORT-OK")
+    check("an allowed level runs at it", boss.wait_for(r"=== copilot on worker1 · [^=\n]*\(low reasoning\) ===", 300))
+    _, out = cli("models", "allow", "copilot", "--efforts", "any", "--profile", "worker1")
+    check("any level again", "any effort may be asked for" in out, out.strip())
+    time.sleep(5)
+
     print("== cancel: boss stops a long Copilot task running on worker1")
     boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
     boss.send("/delegate copilot@worker1:repo Read every file under src/ and write a detailed 2000-word review of the whole codebase.")

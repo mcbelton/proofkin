@@ -1409,8 +1409,10 @@
         "lib::protocol::hello_with_addresses_round_trips",
         "lib::plan::steps_name_their_model_or_take_their_agents_and_the_check_warns_when_peers_refuse_it",
         "lib::plan::squad_steps_pick_the_least_busy_capable_member",
-        "agents::workers_allow_only_some_efforts_and_tell_peers_the_models_they_offer"
-      ]
+        "agents::workers_allow_only_some_efforts_and_tell_peers_the_models_they_offer",
+        "bin::models_allow_takes_the_models_the_efforts_or_both"
+      ],
+      "live": ["models allow --efforts saved", "a level worker1 no longer allows is refused", "an allowed level runs at it", "any level again"]
     },
     {
       "id": "MDL-8",
@@ -1422,7 +1424,8 @@
         "agents::workers_allow_only_some_efforts_and_tell_peers_the_models_they_offer",
         "agents::model_changes_reach_connected_peers_at_once",
         "agents::running_agents_apply_profile_model_changes_and_workers_their_owners"
-      ]
+      ],
+      "live": ["a level worker1 no longer allows is refused"]
     },
     {
       "id": "MDL-9",
