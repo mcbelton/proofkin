@@ -1702,29 +1702,62 @@ function schedulePlanCheck() {
 }
 
 // ---------- how a plan's run is tracked ----------
+/// Issues looked up for the "Existing issue" choice, by number, with when: shared by the
+/// composer's and the plan editor's choice, and looked up again after a minute.
+const trackLookups = new Map();
+const TRACK_LOOKUP_KEPT_MS = 60_000;
+
 /// The choice beside Run plan (in the composer and the plan editor) of how a run is
 /// tracked on GitHub, when a tracker is linked: a new issue, an issue it works on, or
-/// not at all. It reads and writes the plan's track: line in `input`, then `changed()`;
-/// `shown()` says when it applies. Returns what brings it up to date with the text.
+/// not at all, with a line under it saying what running the plan does there (it looks
+/// the issue up as you type its number). It reads and writes the plan's track: line in
+/// `input`, then `changed()`; `shown()` says when it applies. Returns `sync`, which
+/// brings it up to date with the text, and `ready`, which says whether the plan can run
+/// as chosen (an existing issue needs its number) and, if not, goes to the number.
 function trackChoice(box, input, changed, shown) {
-  const kind = el("select", { "aria-label": "How this run is tracked" },
-    el("option", { value: "new", text: "a new issue, a sub-issue per step" }),
-    el("option", { value: "issue", text: "an issue it works on, a sub-issue per step" }),
-    el("option", { value: "off", text: "not tracked" }));
+  const noteId = `${box.id}-note`;
+  const kind = el("select", { id: `${box.id}-kind`, "aria-describedby": noteId },
+    el("option", { value: "new", text: "New issue" }),
+    el("option", { value: "issue", text: "Existing issue…" }),
+    el("option", { value: "off", text: "Don't track" }));
   const number = el("input", {
-    type: "text", inputmode: "numeric", placeholder: "#12", size: "6", spellcheck: "false",
-    "aria-label": "The issue's number",
+    type: "text", inputmode: "numeric", placeholder: "#12", size: "6", spellcheck: "false", autocomplete: "off",
+    "aria-label": "Issue number", "aria-describedby": noteId,
   });
-  const where = el("strong");
-  box.replaceChildren(el("span", { class: "small" }, "Tracked in ", where, ":"), kind, number);
-  // "An issue it works on" picked, its number not typed yet: the text has no line for it.
+  const note = el("p", { id: noteId, class: "plan-track-note", "aria-live": "polite" });
+  box.replaceChildren(el("label", { class: "small", for: kind.id }, "Track on GitHub"), kind, number, note);
+  // "Existing issue" picked, its number not typed yet: the text has no line for it.
   let picking = false;
+  // The plan was run (or scheduled) without the number: the note says it's needed.
+  let asked = false;
+  // The number being looked up, and the last lookup that failed: { n, error }.
+  let pending = null;
+  let failed = null;
+  let timer = null;
+  // What the note says now.
+  let said = "";
   const write = (value) => {
     input.value = planText.setTrack(input.value, value);
     changed();
   };
+  const lookUp = (n) => {
+    pending = n;
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      try {
+        const { issue } = await api(`/api/tracker/issues/${n}`);
+        trackLookups.set(n, { issue, at: Date.now() });
+        if (failed?.n === n) failed = null;
+      } catch (err) {
+        failed = { n, error: err.message, at: Date.now() };
+      }
+      pending = null;
+      sync();
+    }, 400);
+  };
   kind.addEventListener("change", () => {
     picking = kind.value === "issue";
+    asked = false;
     if (kind.value === "off") write("off");
     else if (kind.value === "new") write(null);
     else {
@@ -1732,29 +1765,55 @@ function trackChoice(box, input, changed, shown) {
       number.focus();
       const n = Number(number.value.trim().replace(/^#/, ""));
       if (Number.isInteger(n) && n > 0) write(`#${n}`);
+      else sync();
     }
   });
   number.addEventListener("input", () => {
     const n = Number(number.value.trim().replace(/^#/, ""));
-    if (number.value.trim() && Number.isInteger(n) && n > 0) {
-      picking = false;
-      write(`#${n}`);
-    }
+    const ok = Boolean(number.value.trim()) && Number.isInteger(n) && n > 0;
+    picking = !ok;
+    failed = null;
+    write(ok ? `#${n}` : null);
   });
   const sync = () => {
-    box.hidden = !tracker?.linked || !shown();
+    box.hidden = !tracker?.linked || !tracker.tracker || !shown();
     if (box.hidden) return;
-    where.textContent = tracker.tracker.repo;
     const now = planText.trackOf(input.value);
-    kind.value = picking && now.kind === "new" ? "issue" : now.kind;
-    number.hidden = kind.value !== "issue";
-    if (now.kind === "issue" && document.activeElement !== number) number.value = `#${now.number}`;
+    const track = picking && now.kind === "new" ? { kind: "issue", number: null } : now;
+    kind.value = track.kind;
+    number.hidden = track.kind !== "issue";
+    if (track.number && document.activeElement !== number) number.value = `#${track.number}`;
+    const n = track.kind === "issue" ? track.number : null;
+    const seen = n ? trackLookups.get(n) : null;
+    const found = !n ? null
+      // A failed lookup is tried again a little later.
+      : failed?.n === n && Date.now() - failed.at < 10_000 ? { error: failed.error }
+        : seen && Date.now() - seen.at < TRACK_LOOKUP_KEPT_MS ? (seen.issue ? { issue: seen.issue } : { missing: true })
+          : null;
+    if (n && !found && pending !== n) lookUp(n);
+    const { parts, warn } = planText.trackNote(track, tracker.tracker, found);
+    // Only a change is drawn (and so read out): typing in the plan redraws nothing.
+    const next = JSON.stringify(parts);
+    if (said !== next) {
+      said = next;
+      note.replaceChildren(...parts.map((p) => (typeof p === "string" ? p : externalLink(p.href, p.text, p.label))));
+    }
+    const needed = asked && track.kind === "issue" && !track.number;
+    note.classList.toggle("warn", warn || needed);
+    number.setAttribute("aria-invalid", String(Boolean(found?.missing) || needed));
   };
   input.addEventListener("input", sync);
-  return sync;
+  const ready = () => {
+    if (box.hidden || !picking || planText.trackOf(input.value).kind !== "new") return true;
+    asked = true;
+    sync();
+    number.focus();
+    return false;
+  };
+  return { sync, ready };
 }
-let syncPlanTrack = () => {};
-let syncEditorTrack = () => {};
+let planTrack = { sync() {}, ready: () => true };
+let editorTrack = { sync() {}, ready: () => true };
 
 // ---------- plan editor ----------
 /// Opens the plan in a large editor: as forms (the builder) or as text with what can go
@@ -1765,7 +1824,7 @@ function openPlanEditor() {
   planBuilder.reset();
   $("#plan-editor").showModal();
   planBuilder.setView(planBuilder.view());
-  syncEditorTrack();
+  editorTrack.sync();
 }
 
 /// Makes a palette change in the plan editor (see ui/plan-text.js) and selects what
@@ -2486,8 +2545,8 @@ function externalLink(href, text, label = text, attrs = {}) {
 let tracker = null;
 async function loadTracker() {
   tracker = await api("/api/tracker");
-  syncPlanTrack();
-  syncEditorTrack();
+  planTrack.sync();
+  editorTrack.sync();
   const box = $("#tracker");
   box.replaceChildren();
   const btn = $("#tracker-btn");
@@ -2963,7 +3022,7 @@ function updateComposer() {
   $("#composer-hint").textContent = plan
     ? "Ctrl+Enter to run · claims are proven only by checks peers run (verify=) or a sign-off (approve) · the run is saved under Evidence runs"
     : "Enter to send · Shift+Enter for a new line";
-  syncPlanTrack();
+  planTrack.sync();
 }
 
 async function submitComposer(e) {
@@ -2971,6 +3030,8 @@ async function submitComposer(e) {
   const input = $("#composer-input");
   const text = input.value.trim();
   if (!text || $("#send-btn").disabled) return;
+  // An existing issue chosen without its number: the choice asks for it.
+  if (state.mode === "plan" && !planTrack.ready()) return;
   $("#send-btn").disabled = true;
   try {
     if (state.mode === "chat") {
@@ -3260,10 +3321,10 @@ function init() {
     if (!$("#composer-input").value.trim()) state.playbook = null;
     if (!state.playbook) renderPlanExplain();
   });
-  syncPlanTrack = trackChoice($("#plan-track"), $("#composer-input"),
+  planTrack = trackChoice($("#plan-track"), $("#composer-input"),
     () => $("#composer-input").dispatchEvent(new Event("input", { bubbles: true })),
     () => state.mode === "plan");
-  syncEditorTrack = trackChoice($("#plan-editor-track"), $("#plan-editor-text"), () => {
+  editorTrack = trackChoice($("#plan-editor-track"), $("#plan-editor-text"), () => {
     const editor = $("#plan-editor-text");
     if (planBuilder.active()) planBuilder.load(editor.value);
     editor.dispatchEvent(new Event("input", { bubbles: true }));
@@ -3313,7 +3374,7 @@ function init() {
     e.target.dataset.typed = "1";
     e.target.removeAttribute("aria-invalid");
   });
-  $("#schedule-open").addEventListener("click", () => openScheduleDialog());
+  $("#schedule-open").addEventListener("click", () => planTrack.ready() && openScheduleDialog());
   $("#schedule-cancel").addEventListener("click", () => $("#schedule-dialog").close());
   $("#schedule-form").addEventListener("submit", submitSchedule);
   $("#when-repeat").addEventListener("change", syncWhenPicker);
@@ -3339,13 +3400,13 @@ function init() {
     schedulePlanCheck();
   });
   $("#plan-editor-run").addEventListener("click", () => {
-    if (!planBuilder.ready()) return;
+    if (!planBuilder.ready() || !editorTrack.ready()) return;
     editorToComposer();
     $("#plan-editor").close();
     submitComposer();
   });
   $("#plan-editor-schedule").addEventListener("click", () => {
-    if (!planBuilder.ready()) return;
+    if (!planBuilder.ready() || !editorTrack.ready()) return;
     editorToComposer();
     $("#plan-editor").close();
     openScheduleDialog();

@@ -1240,7 +1240,7 @@ ui after api @alice:shop apply=api verify=test claims=C-1 Add an Export button t
 signoff after ui approve @me claims=C-1 Try the export and approve it
 ```
 
-Here the run works on issue #12 (`track: <title>` makes a new issue with that title,
+Here the run works on issue #12 (reopened if it is closed; `track: <title>` makes a new issue with that title,
 `track: off` leaves the run untracked; without a `track:` line the run gets a new issue
 named after its first claim). Step `api` works on #15, made a sub-issue of #12 if it isn't
 one; `ui` and `signoff` get new sub-issues. A later run with `track: #12` takes up its
@@ -1665,9 +1665,14 @@ proofkin --name me --providers copilot --serve --ui
   makes it (in the builder, on the card they are about).
   Steps show which steps they wait for, and skipped steps are flagged. **Schedule…** runs
   the plan on its own at set times ([scheduled plans](#scheduled-plans)). With a
-  [tracker](#tracked-work) linked, **Tracked in owner/repo** beside it says the run gets an
-  issue with a sub-issue per step, and lets you pick an issue it works on instead, or leave
-  the run untracked (it writes the plan's `track:` line). "What is a
+  [tracker](#tracked-work) linked, **Track on GitHub** beside it chooses where the run is
+  tracked: a **New issue** (with a sub-issue per step), an **Existing issue…** it works on
+  (by number), or **Don't track** (it writes the plan's `track:` line). The line under it
+  says what running the plan will do there: the repository and board (links), the account
+  the issues are assigned to, and that anyone can read them when the repository is public.
+  An existing issue is looked up as you type its number: its title, and a warning when it
+  is closed (running reopens it) or doesn't exist (the plan would run untracked). Run plan
+  and Schedule… ask for the number when it's missing. "What is a
   plan?" stays folded until you open it.
 - **Schedules**: each schedule in plain words, its next run, its last run's result (with
   a link to the evidence run), and Run now, Pause/Resume, Edit and Delete.

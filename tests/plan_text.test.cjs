@@ -240,6 +240,40 @@ cases.push(
   ["setting it again replaces the line", planText.setTrack("// c\ntrack: off\na @x Do it", "#4"), "// c\ntrack: #4\na @x Do it"],
   ["no value takes it out", planText.setTrack("track: #4\na @x Do it", null), "a @x Do it"],
   ["no value takes out a last line too", planText.setTrack("a @x Do it\ntrack: off", null), "a @x Do it"],
+  // The line under the choice says what running the plan does on GitHub.
+  ...(() => {
+    const repo = { repo: "acme/shop", repo_url: "https://github.com/acme/shop", login: "alice", visibility: "public",
+      board: { title: "Shop", url: "https://github.com/users/alice/projects/4" } };
+    const say = (track, found, tracker = repo) => {
+      const { parts, warn } = planText.trackNote(track, tracker, found);
+      return `${warn ? "! " : ""}${parts.map((p) => (typeof p === "string" ? p : `[${p.text}](${p.href})`)).join("")}`;
+    };
+    const issue = (open) => ({ issue: { number: 12, title: "Customers export orders", url: "https://github.com/acme/shop/issues/12", open } });
+    const after = " They move on the [Shop board](https://github.com/users/alice/projects/4) as the steps run, and each result is commented on its issue."
+      + " The repository is public: anyone can read them.";
+    return [
+      ["a new issue: where, who, the board and who can read them", say(planText.trackOf("a @x Do it")),
+        `Running it opens an issue in [acme/shop](https://github.com/acme/shop/issues), with a sub-issue per step, assigned to alice.${after}`],
+      ["a new issue with a title names it", say(planText.trackOf("track: Ship it\na @x Do it")).split(" in ")[0],
+        "Running it opens the issue “Ship it”"],
+      ["an existing issue without its number asks for it", say({ kind: "issue", number: null }),
+        "Type the number of an issue in [acme/shop](https://github.com/acme/shop/issues): the run works on it, and its steps become sub-issues of it."],
+      ["its number is looked up", say({ kind: "issue", number: 12 }), "Looking up #12 in [acme/shop](https://github.com/acme/shop/issues)…"],
+      ["an open issue is named, with a link", say({ kind: "issue", number: 12 }, issue(true)),
+        "Running it works on [#12 Customers export orders](https://github.com/acme/shop/issues/12): its steps become sub-issues of it"
+        + ` (or take up the open ones an earlier run left), assigned to alice.${after}`],
+      ["a closed one is reopened: a warning", say({ kind: "issue", number: 12 }, issue(false)).split(", and")[0],
+        "! [#12 Customers export orders](https://github.com/acme/shop/issues/12) is closed: running it reopens it"],
+      ["no such issue: the run wouldn't be tracked", say({ kind: "issue", number: 99 }, { missing: true }),
+        "! [acme/shop](https://github.com/acme/shop/issues) has no issue #99: the plan would run without tracking. Check the number, or choose New issue."],
+      ["a lookup that failed says why", say({ kind: "issue", number: 12 }, { error: "GitHub is down" }), "! Couldn't look up #12: GitHub is down"],
+      ["not tracked: nothing goes to GitHub", say({ kind: "off" }), "Nothing goes to GitHub: the run is kept under Evidence runs only."],
+      ["a private repository without a board says neither", say({ kind: "new", title: "" }, null,
+        { repo: "acme/shop", host: "github.com", login: "alice", visibility: "private" }),
+        "Running it opens an issue in [acme/shop](https://github.com/acme/shop/issues), with a sub-issue per step, assigned to alice."
+        + " Each step's result is commented on its issue."],
+    ];
+  })(),
 );
 
 const failed = cases.filter(([, got, want]) => got !== want);

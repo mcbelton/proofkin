@@ -507,11 +507,52 @@ const planText = (() => {
       : text.slice(0, Math.max(0, have.start - 1));
   }
 
+  /// What running the plan does on GitHub, for the line under the tracking choice:
+  /// `track` as trackOf reads it (an issue without a number: its number isn't typed
+  /// yet), `tracker` the linked tracker (repo, repo_url, login, visibility, board) and,
+  /// for an issue it works on, what looking the issue up found: { issue }, { missing },
+  /// { error }, or nothing yet. Parts are text or links ({ text, href, label }); `warn`
+  /// marks a note to read before running.
+  function trackNote(track, tracker, found = null) {
+    // A tracker GitHub can't be reached for has only its settings.
+    const base = tracker.repo_url || `https://${tracker.host || "github.com"}/${tracker.repo}`;
+    const repo = { text: tracker.repo, href: `${base}/issues`, label: `${tracker.repo} issues on GitHub` };
+    const board = tracker.board
+      ? { text: `${tracker.board.title} board`, href: tracker.board.url, label: `The ${tracker.board.title} board on GitHub` }
+      : null;
+    const who = tracker.login ? `, assigned to ${tracker.login}` : "";
+    const after = [
+      ...(board ? [" They move on the ", board, " as the steps run, and each result is commented on its issue."]
+        : [" Each step's result is commented on its issue."]),
+      ...(tracker.visibility === "public" ? [" The repository is public: anyone can read them."]
+        : tracker.visibility === "internal" ? [" The repository is internal: everyone in its enterprise can read them."]
+          : []),
+    ];
+    const note = (parts, warn = false) => ({ parts, warn });
+    if (track.kind === "off") return note(["Nothing goes to GitHub: the run is kept under Evidence runs only."]);
+    if (track.kind === "new") {
+      const which = track.title ? `the issue “${track.title}”` : "an issue";
+      return note([`Running it opens ${which} in `, repo, `, with a sub-issue per step${who}.`, ...after]);
+    }
+    if (!track.number) return note(["Type the number of an issue in ", repo, ": the run works on it, and its steps become sub-issues of it."]);
+    const n = `#${track.number}`;
+    if (!found) return note([`Looking up ${n} in `, repo, "…"]);
+    if (found.error) return note([`Couldn't look up ${n}: ${found.error}`], true);
+    if (!found.issue) return note([repo, ` has no issue ${n}: the plan would run without tracking. Check the number, or choose New issue.`], true);
+    const issue = found.issue;
+    const title = issue.title.length > 60 ? `${issue.title.slice(0, 59)}…` : issue.title;
+    const link = { text: `${n} ${title}`, href: issue.url, label: `Issue ${n} ${issue.title} on GitHub` };
+    const steps = `its steps become sub-issues of it (or take up the open ones an earlier run left)${who}.`;
+    return issue.open
+      ? note(["Running it works on ", link, `: ${steps}`, ...after])
+      : note([link, ` is closed: running it reopens it, and ${steps}`, ...after], true);
+  }
+
   return {
     addPart, addLine, applyFix, stepIds, claimIds, parseStep, formatStep, ERRORS,
     parsePlan, formatPlan, valuesOf, setValues, renameStep, removeStep, renameClaim, removeClaim,
     dependents, needs, isTodo: (text) => blank(text, TODO), isTodoClaim: (text) => blank(text, TODO_CLAIM),
     taskOf, setTask, lineKinds: (text) => linesOf(text).map((l) => ({ kind: l.kind, head: l.head })),
-    trackOf, setTrack,
+    trackOf, setTrack, trackNote,
   };
 })();

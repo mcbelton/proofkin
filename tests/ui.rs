@@ -1901,6 +1901,15 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         assert_eq!(new.status, 400, "{body}: {}", new.body);
     }
     assert!(get("/api/github/flow").await.json()["flow"].is_null());
+    // No tracker linked: the plan's "Existing issue" choice can't look an issue up.
+    let lookup = get("/api/tracker/issues/12").await;
+    assert_eq!(lookup.status, 400);
+    assert!(
+        lookup.body.contains("no tracker is linked"),
+        "{}",
+        lookup.body
+    );
+    assert_eq!(get("/api/tracker/issues/twelve").await.status, 400);
     agent.shutdown().await;
 }
 
