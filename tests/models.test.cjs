@@ -8,8 +8,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const code = fs.readFileSync(path.join(__dirname, "..", "ui", "models.js"), "utf8");
-const { modelMenu, effortChoices, fitEffort, modelOptionText, effortRange, modelsByVendor, modelsSummary } =
-  vm.runInThisContext(`${code}\n;({ modelMenu, effortChoices, fitEffort, modelOptionText, effortRange, modelsByVendor, modelsSummary })`);
+const { modelMenu, effortChoices, fitEffort, modelOptionText, effortRange, modelsByVendor, modelsSummary, squadMember } =
+  vm.runInThisContext(`${code}\n;({ modelMenu, effortChoices, fitEffort, modelOptionText, effortRange, modelsByVendor, modelsSummary, squadMember })`);
 
 const opus = { id: "claude-opus-5.5", name: "Claude Opus 5.5", vendor: "Anthropic", multiplier: "3", efforts: ["low", "medium", "high", "max"] };
 const gpt = { id: "gpt-5.5", name: "GPT-5.5", vendor: "OpenAI", multiplier: "1", efforts: ["low", "medium", "high", "xhigh"] };
@@ -71,5 +71,29 @@ assert.strictEqual(
 );
 assert.strictEqual(modelsSummary({ allowed: ["a", "b", "c", "d"] }), "a · only 4 models");
 assert.strictEqual(modelsSummary(undefined), "its default model");
+
+// A squad member as the squad dialog and card describe it: what it runs, where, and
+// whether any step can go to it.
+const label = (p) => ({ copilot: "Copilot", claude: "Claude", codex: "Codex" })[p];
+assert.deepStrictEqual(squadMember({
+  capabilities: ["copilot"], owner: "worker", role: "tester",
+  models: { copilot: { default: "claude-opus-5.5", effort: "max" } }, shares: [{ name: "data" }],
+}, label), { takes: true, text: "digital worker of worker · tester · Copilot (claude-opus-5.5, max reasoning) · folders data" });
+assert.deepStrictEqual(squadMember({
+  capabilities: ["copilot", "claude"], models: { copilot: { allowed: ["gpt-5.5"] } },
+  shares: [{ name: "data" }, { name: "demo", team: true }],
+}, label), { takes: true, text: "Copilot (gpt-5.5), Claude · folders data, demo (team plan)" });
+// A delegate-only agent (no providers, no team plan) takes none: plans hand it nothing.
+assert.deepStrictEqual(squadMember({ capabilities: [], shares: [] }, label), {
+  takes: false, why: "it runs no models (it only delegates)",
+  text: "takes no squad steps: it runs no models (it only delegates)",
+});
+assert.deepStrictEqual(squadMember({ capabilities: ["codex"], shares: [], owner: "ana" }, label), {
+  takes: false, why: "it shares no folder with you",
+  text: "digital worker of ana · takes no squad steps: it shares no folder with you",
+});
+// A lead with no providers of its own takes team steps: its team plan runs them.
+assert.deepStrictEqual(squadMember({ capabilities: [], shares: [{ name: "demo", team: true }] }, label),
+  { takes: true, text: "team steps only · folders demo (team plan)" });
 
 console.log("ok: model lists");

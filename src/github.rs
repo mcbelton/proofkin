@@ -194,6 +194,26 @@ impl GithubCredentials {
             .await
     }
 
+    /// Fetches the repository's branch into the clone (`origin/<branch>`) unless the
+    /// clone fetched within `max_age`, so the task branches' states are checked against
+    /// what the repository has now. Returns whether it fetched.
+    pub async fn refresh_base(&self, repo: &Repo, max_age: std::time::Duration) -> Result<bool> {
+        let dir = Some(repo.path.as_path());
+        let fetched = self
+            .git(dir, &["rev-parse", "--git-path", "FETCH_HEAD"])
+            .await
+            .map(|p| repo.path.join(p))
+            .ok()
+            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+            .and_then(|t| t.elapsed().ok());
+        if fetched.is_some_and(|age| age < max_age) {
+            return Ok(false);
+        }
+        self.git(dir, &["fetch", "-q", "origin", &repo.branch])
+            .await?;
+        Ok(true)
+    }
+
     /// Pushes local branch `branch` to the repository.
     pub async fn push(&self, repo: &Repo, branch: &str) -> Result<()> {
         if !branch.starts_with("p2p/") {
@@ -361,6 +381,11 @@ pub struct BranchPr {
     /// `OPEN`, `MERGED` or `CLOSED`.
     pub state: String,
     pub url: String,
+    /// Its head commit.
+    #[serde(skip)]
+    pub head: String,
+    /// It has the branch as it is: the branch has no commits since.
+    pub current: bool,
 }
 
 /// Where a task branch's work is (see [`branch_states`]).
@@ -373,14 +398,31 @@ pub struct BranchState {
     pub in_base: bool,
     /// It is for issues of the repository (its `Refs:`), and all of them are closed.
     pub issues_closed: bool,
+    /// Its commits that aren't on the repository's branch.
+    pub ahead: u32,
+    /// What a pull request from it would change: files, and lines added and removed.
+    pub files: u32,
+    pub added: u64,
+    pub removed: u64,
+    /// The repository's branch has the same content in every file it changes: its work
+    /// is there, merged some other way (squashed or cherry-picked).
+    pub same_as_base: bool,
+    /// Deleting it loses nothing: its work is on the repository's branch, or a pull
+    /// request merged it as it is.
+    pub safe_to_delete: bool,
+    /// Its head commit.
+    #[serde(skip)]
+    pub head: String,
 }
 
 /// The most issues one [`branch_states`] query asks about.
 const MAX_BRANCH_ISSUES: usize = 50;
 
 /// Where the work of each of `branches` (of `repo`) is: the newest of the repository's
-/// last 100 pull requests from it, whether its commit is on the repository's branch,
-/// and whether the issues it is for are closed. One GraphQL query for all of them.
+/// last 100 pull requests from it (and whether it has the branch as it is), whether its
+/// commit or its changes are on the repository's branch, what a pull request from it
+/// would change, whether the issues it is for are closed, and so whether deleting it
+/// loses anything. One GraphQL query for all of them.
 pub async fn branch_states(
     api: &dyn crate::tracker::Api,
     repo: &Repo,
@@ -403,7 +445,7 @@ pub async fn branch_states(
         .take(MAX_BRANCH_ISSUES)
         .collect();
     let mut fields = String::from(
-        "pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { number state url headRefName } }",
+        "pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { number state url headRefName headRefOid } }",
     );
     for n in &numbers {
         fields += &format!(
@@ -437,8 +479,22 @@ pub async fn branch_states(
             .is_some_and(|s| s != "OPEN")
     };
     let mut states = std::collections::BTreeMap::new();
-    for branch in branches {
-        let pull_request = prs
+    // What git says about each branch, a few at a time.
+    let base = base_ref(repo).await;
+    let names: Vec<String> = branches.iter().map(|b| b.name.clone()).collect();
+    let local: Vec<BranchState> = {
+        use futures_util::StreamExt;
+        futures_util::stream::iter(names)
+            .map(|name| {
+                let base = base.clone();
+                async move { local_state(repo, base.as_deref(), &name).await }
+            })
+            .buffered(8)
+            .collect()
+            .await
+    };
+    for (branch, local) in branches.iter().zip(local) {
+        let mut pull_request = prs
             .iter()
             .find(|p| p["headRefName"].as_str() == Some(branch.name.as_str()))
             .and_then(|p| {
@@ -446,23 +502,259 @@ pub async fn branch_states(
                     number: p["number"].as_u64()?,
                     state: p["state"].as_str()?.to_owned(),
                     url: p["url"].as_str()?.to_owned(),
+                    head: p["headRefOid"].as_str().unwrap_or_default().to_owned(),
+                    current: false,
                 })
             });
+        if let Some(pr) = pull_request.as_mut() {
+            // Its head is the branch's, or comes after it (pushed from elsewhere).
+            pr.current = !local.head.is_empty()
+                && !pr.head.is_empty()
+                && (pr.head == local.head
+                    || local_git(
+                        &repo.path,
+                        &["merge-base", "--is-ancestor", &local.head, &pr.head],
+                    )
+                    .await
+                    .is_ok_and(|(ok, _)| ok));
+        }
         let refs: Vec<Option<u64>> = branch.issues.iter().map(|r| own(r)).collect();
         let issues_closed = !refs.is_empty()
             && refs
                 .iter()
                 .all(|n| n.is_some_and(|n| numbers.contains(&n) && closed(n)));
+        let merged = pull_request
+            .as_ref()
+            .is_some_and(|p| p.state == "MERGED" && p.current);
         states.insert(
             branch.name.clone(),
             BranchState {
                 pull_request,
-                in_base: in_base(repo, &branch.name).await,
                 issues_closed,
+                safe_to_delete: local.in_base || local.same_as_base || merged,
+                ..local
             },
         );
     }
     Ok(states)
+}
+
+/// The ref of the repository's branch in the clone: as last fetched, else its own.
+async fn base_ref(repo: &Repo) -> Option<String> {
+    for base in [
+        format!("refs/remotes/origin/{}", repo.branch),
+        format!("refs/heads/{}", repo.branch),
+    ] {
+        if local_git(&repo.path, &["rev-parse", "--verify", "--quiet", &base])
+            .await
+            .is_ok_and(|(ok, _)| ok)
+        {
+            return Some(base);
+        }
+    }
+    None
+}
+
+/// Runs git in `dir` (local operations only: no credentials); its success and output.
+async fn local_git(dir: &Path, args: &[&str]) -> Result<(bool, String)> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "core.quotepath=off"])
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("running git")?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+/// The files a pull request from `head` onto `base` would change: path, lines added
+/// and removed (none for a binary file).
+async fn changed_files(dir: &Path, base: &str, head: &str) -> Vec<(String, Option<(u64, u64)>)> {
+    let range = format!("{base}...{head}");
+    let (_, out) = local_git(dir, &["diff", "--numstat", "-M", &range])
+        .await
+        .unwrap_or_default();
+    out.lines()
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, '\t');
+            let (a, r, path) = (parts.next()?, parts.next()?, parts.next()?);
+            Some((path.to_owned(), a.parse().ok().zip(r.parse().ok())))
+        })
+        .collect()
+}
+
+/// Most files compared with the repository's branch to tell whether it has a task
+/// branch's changes already.
+const MAX_COMPARED_FILES: usize = 200;
+
+/// What git says about task branch `branch`: whether its commit is on the repository's
+/// branch (`base`, see [`base_ref`]), its commits that aren't, what a pull request from
+/// it would change, and whether the repository's branch has that content already.
+async fn local_state(repo: &Repo, base: Option<&str>, branch: &str) -> BranchState {
+    let head = format!("refs/heads/{branch}");
+    let mut state = BranchState {
+        in_base: in_base(repo, branch).await,
+        head: local_git(&repo.path, &["rev-parse", "--verify", "--quiet", &head])
+            .await
+            .map(|(_, sha)| sha.trim().to_owned())
+            .unwrap_or_default(),
+        ..BranchState::default()
+    };
+    let Some(base) = base else {
+        return state;
+    };
+    let range = format!("{base}..{head}");
+    state.ahead = local_git(&repo.path, &["rev-list", "--count", &range])
+        .await
+        .ok()
+        .and_then(|(_, n)| n.trim().parse().ok())
+        .unwrap_or(0);
+    let files = changed_files(&repo.path, base, &head).await;
+    state.files = files.len() as u32;
+    for (_, lines) in &files {
+        let (a, r) = lines.unwrap_or_default();
+        state.added += a;
+        state.removed += r;
+    }
+    state.same_as_base = state.in_base
+        // Nothing to lose: it changes no files.
+        || files.is_empty()
+        || (files.len() <= MAX_COMPARED_FILES && {
+            // Renamed files are named `old => new`: their new path is compared.
+            let paths: Vec<String> = files.iter().map(|(p, _)| new_path(p)).collect();
+            let mut args = vec!["diff", "--quiet", head.as_str(), base, "--"];
+            args.extend(paths.iter().map(String::as_str));
+            local_git(&repo.path, &args).await.is_ok_and(|(same, _)| same)
+        });
+    state
+}
+
+/// A `--numstat` path as it is after the change: `a/{b => c}/d` is `a/c/d`, `a => b` is `b`.
+fn new_path(path: &str) -> String {
+    match (path.find('{'), path.find(" => "), path.find('}')) {
+        (Some(open), Some(arrow), Some(close)) if open < arrow && arrow < close => {
+            let joined = format!(
+                "{}{}{}",
+                &path[..open],
+                &path[arrow + 4..close],
+                &path[close + 1..]
+            );
+            joined.replace("//", "/")
+        }
+        (_, Some(arrow), _) => path[arrow + 4..].to_owned(),
+        _ => path.to_owned(),
+    }
+}
+
+/// A commit on a task branch that isn't on the repository's branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BranchCommit {
+    pub commit: String,
+    pub unix: u64,
+    pub subject: String,
+}
+
+/// A file a pull request from a task branch would change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileChange {
+    pub path: String,
+    /// Lines added and removed (none for a binary file).
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+/// What a pull request from a task branch would carry, to review before opening it
+/// (or deleting the branch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BranchChanges {
+    pub branch: String,
+    /// The repository's branch it is compared with.
+    pub base: String,
+    /// Its commits that aren't on the repository's branch, newest first.
+    pub commits: Vec<BranchCommit>,
+    pub files: Vec<FileChange>,
+    /// The unified diff, as a pull request shows it (from where the branches split).
+    pub diff: String,
+    /// The diff was cut at [`MAX_DIFF_BYTES`].
+    pub truncated: bool,
+}
+
+/// The most diff a review shows.
+pub const MAX_DIFF_BYTES: usize = 400_000;
+
+/// The changes on task branch `branch` of `repo`: its commits, files and diff against
+/// the repository's branch (as last fetched).
+pub async fn branch_changes(repo: &Repo, branch: &str) -> Result<BranchChanges> {
+    if !branch.starts_with("p2p/") {
+        bail!("only branches agents' tasks made (p2p/...) are shown here");
+    }
+    let head = format!("refs/heads/{branch}");
+    if !local_git(&repo.path, &["rev-parse", "--verify", "--quiet", &head])
+        .await?
+        .0
+    {
+        bail!("{} has no task branch {branch}", repo.slug);
+    }
+    let base = base_ref(repo)
+        .await
+        .with_context(|| format!("the clone of {} has no branch {}", repo.slug, repo.branch))?;
+    let range = format!("{base}..{head}");
+    let (_, log) = local_git(
+        &repo.path,
+        &["log", "-n", "50", "--format=%h%x09%ct%x09%s", &range],
+    )
+    .await?;
+    let commits = log
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, '\t');
+            Some(BranchCommit {
+                commit: parts.next()?.to_owned(),
+                unix: parts.next()?.parse().ok()?,
+                subject: parts.next().unwrap_or_default().to_owned(),
+            })
+        })
+        .collect();
+    let files = changed_files(&repo.path, &base, &head)
+        .await
+        .into_iter()
+        .map(|(path, lines)| FileChange {
+            path,
+            added: lines.map(|(a, _)| a),
+            removed: lines.map(|(_, r)| r),
+        })
+        .collect();
+    let split = format!("{base}...{head}");
+    let (_, mut diff) = local_git(
+        &repo.path,
+        &["diff", "-M", "--no-color", "--no-ext-diff", &split],
+    )
+    .await?;
+    let truncated = diff.len() > MAX_DIFF_BYTES;
+    if truncated {
+        let mut cut = MAX_DIFF_BYTES;
+        while !diff.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        // At a line's end, so the last line shown is whole.
+        cut = diff[..cut].rfind('\n').map_or(cut, |n| n + 1);
+        diff.truncate(cut);
+    }
+    Ok(BranchChanges {
+        branch: branch.to_owned(),
+        base: repo.branch.clone(),
+        commits,
+        files,
+        diff,
+        truncated,
+    })
 }
 
 /// Whether `branch`'s commit is on the repository's branch (as last fetched, or the
@@ -887,6 +1179,15 @@ fn proof_markdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_files_are_compared_at_their_new_path() {
+        assert_eq!(new_path("src/a.rs"), "src/a.rs");
+        assert_eq!(new_path("old.txt => new.txt"), "new.txt");
+        assert_eq!(new_path("src/{old => new}/a.rs"), "src/new/a.rs");
+        assert_eq!(new_path("src/{ => sub}/a.rs"), "src/sub/a.rs");
+        assert_eq!(new_path("src/{sub => }/a.rs"), "src/a.rs");
+    }
 
     #[test]
     fn repository_names_are_parsed_strictly() {

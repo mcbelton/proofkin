@@ -1333,11 +1333,33 @@
       ]
     },
     {
+      "id": "SQD-8",
+      "area": "squads",
+      "claim": "The squad dialog says what each peer would take as a member: whose digital worker it is and its role, the providers it runs with their default model and reasoning, and the folders it shares (marked when they have a team plan); an offline one says that shows when it connects. A peer that runs no providers and leads no team plan (an agent that only delegates), or shares no folder, takes no squad steps, as the plan check says (sign-offs need a person): the dialog and the squads card say so and why, the card warns when no online member can take its steps, and a squad whose members all take none isn't saved.",
+      "tests": [
+        "ui::task_forms_offer_the_models_and_levels_the_worker_allows",
+        "lib::plan::squad_steps_pick_the_least_busy_capable_member"
+      ]
+    },
+    {
       "id": "GH-4",
       "area": "github",
-      "claim": "The GitHub card says where each task branch's work is, from one GraphQL query for all of a repository's branches: its newest pull request (open, merged or closed), its commit on the repository's branch already, or the issues it is for all closed; it offers Open PR only when no pull request is open or merged, Delete branch for finished work (on GitHub first, then in the clone, only p2p/ branches), and says how many older branches it doesn't show.",
+      "claim": "The GitHub card says where each task branch's work is, from one GraphQL query for all of a repository's branches, checked against the repository's branch as GitHub has it (fetched when the clone's last fetch is over 5 minutes old; when it can't be, the card says the states are as of the last fetch): its newest pull request (open, merged or closed, and whether it has the branch as it is), its commit or its changes (the same content in every file it changes) on the repository's branch already, the issues it is for all closed, and its commits, files and lines that aren't there. A branch is safe to delete only when its work is on the repository's branch or a pull request merged it as it is: closed issues, a closed pull request, or one that merged an earlier version of it don't make it safe. The card offers Delete branch only then (on GitHub first, then in the clone, only p2p/ branches), its confirmation saying what is lost, and Open PR only when there is work to merge and no pull request is open; it says how many older branches it doesn't show.",
       "tests": [
-        "github::linked_repositories_clone_share_sync_push_and_open_pull_requests"
+        "github::linked_repositories_clone_share_sync_push_and_open_pull_requests",
+        "lib::github::renamed_files_are_compared_at_their_new_path",
+        "ui::task_branches_say_whether_deleting_them_loses_work"
+      ]
+    },
+    {
+      "id": "GH-5",
+      "area": "github",
+      "claim": "Review changes on a task branch (GET /api/repos/NAME/changes?branch=, only p2p/ branches of a linked repository) shows what a pull request from it would carry before it is opened or the branch deleted: its commits that aren't on the repository's branch (up to 50), the proof the pull request would carry, the files it changes with lines added and removed (binary files say so), and the diff from where the branches split, cut at 400 KB on a line's end and saying so; each file's lines read by its hunks' counts, shown as text (never markup). The pull request form says what it would change, with a link back to the review.",
+      "tests": [
+        "github::linked_repositories_clone_share_sync_push_and_open_pull_requests",
+        "ui::task_branches_say_whether_deleting_them_loses_work",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks",
+        "ui::the_page_follows_the_ux_guidelines"
       ]
     },
     {

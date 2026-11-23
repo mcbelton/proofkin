@@ -344,7 +344,7 @@ textarea { resize: vertical; }
 .worker-signin-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .worker-signin-row select { min-width: 0; max-width: 100%; }
 .squad-members { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
-.squad-members li { display: flex; align-items: center; gap: 6px; }
+.squad-members li { display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; }
 .squad-members .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
 .squad-members .dot.on { background: var(--success); }
 .audit-panel { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px; }
@@ -358,6 +358,8 @@ textarea { resize: vertical; }
 fieldset.field { border: 0; padding: 0; margin: 0; min-width: 0; }
 fieldset.field legend { padding: 0; margin-bottom: 6px; font-weight: 600; font-size: 13px; }
 .share-checks { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.squad-check > span { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.squad-check .small { overflow-wrap: anywhere; }
 .spinner { width: 10px; height: 10px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .task details { margin-top: 6px; }
@@ -519,6 +521,28 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .branch-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .branch { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
 .branch .btn { margin-left: auto; }
+.branch-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.branch .branch-actions .btn { margin-left: 0; }
+.safe-text { color: var(--success); }
+/* Review changes: commits, files and the diff scroll under the dialog's head. */
+#branch-dialog .dialog-body > p { margin: 0; }
+.review-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 12px; }
+.review-part h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.review-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
+.review-list .mono { overflow-wrap: anywhere; }
+.diff-counts { font-variant-numeric: tabular-nums; }
+.diff-added { color: var(--success); }
+.diff-removed { color: var(--danger); }
+.diff-file { margin-top: 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.diff-file > summary { cursor: pointer; padding: 4px 8px; font-size: 12.5px; background: var(--surface-2); border-radius: var(--radius-sm); overflow-wrap: anywhere; }
+.diff-file[open] > summary { border-bottom: 1px solid var(--border); border-radius: var(--radius-sm) var(--radius-sm) 0 0; }
+pre.diff { margin: 0; padding: 4px 0; overflow-x: auto; font-family: var(--mono); font-size: 12px; line-height: 1.45; }
+pre.diff > span { display: block; width: max-content; min-width: 100%; padding: 0 8px; }
+pre.diff:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.diff-add { background: var(--success-soft); }
+.diff-del { background: var(--danger-soft); }
+.diff-hunk { color: var(--muted); background: var(--accent-soft); }
+.diff-meta, .diff-note { color: var(--muted); font-style: italic; }
 .issue-link { flex: none; min-width: 24px; padding: 0 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; line-height: 24px; text-align: center; text-decoration: none; white-space: nowrap; }
 .issue-link:hover { text-decoration: underline; }
 .tracker-waiting { margin: 6px 0; }

@@ -1884,6 +1884,14 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         "{}",
         link.body
     );
+    // Only a linked repository's task branches are reviewed.
+    let changes = get("/api/repos/app/changes?branch=p2p%2Fboss%2F1-1").await;
+    assert_eq!(changes.status, 400);
+    assert!(
+        changes.body.contains("no linked repository 'app'"),
+        "{}",
+        changes.body
+    );
     // Granting a scope needs a sign-in too, and a new sign-in's host and scopes are
     // checked before the GitHub CLI starts.
     let grant = post("/api/github/grant", r#"{"scopes":["project"]}"#).await;
@@ -2629,6 +2637,7 @@ async fn the_page_follows_the_ux_guidelines() {
     assert!(page.contains(r#"<script src="/tools.js" defer>"#));
     assert!(page.contains(r#"<script src="/markdown.js" defer>"#));
     assert!(page.contains(r#"<script src="/models.js" defer>"#));
+    assert!(page.contains(r#"<script src="/branches.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     assert!(page.contains(r#"<script src="/workers.js" defer>"#));
@@ -2656,6 +2665,8 @@ async fn the_page_follows_the_ux_guidelines() {
         "monitor-dialog",
         "team-dialog",
         "models-dialog",
+        "branch-dialog",
+        "pr-changes",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }
@@ -2690,6 +2701,7 @@ async fn the_page_follows_the_ux_guidelines() {
         "/app.js",
         "/markdown.js",
         "/models.js",
+        "/branches.js",
         "/tools.js",
         "/plan-text.js",
         "/plan-builder.js",
@@ -2793,8 +2805,10 @@ fn task_text_shows_as_markdown_and_markup_stays_text() {
 /// The Run task form and the plan builder offer what a worker lets peers pick: the
 /// models it allows, else all its account offers (by name only when it lists none), what
 /// several allow together, and the reasoning levels it allows that the model supports,
-/// with its defaults as the model takes them. The cases (tests/models.test.cjs) run in
-/// node, which loads ui/models.js as the page does.
+/// with its defaults as the model takes them. The squad dialog and card say what a peer
+/// takes as a squad member, or why it takes no steps (it only delegates, or shares no
+/// folder). The cases (tests/models.test.cjs) run in node, which loads ui/models.js as
+/// the page does.
 #[test]
 fn task_forms_offer_the_models_and_levels_the_worker_allows() {
     let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/models.test.cjs");
@@ -2802,6 +2816,27 @@ fn task_forms_offer_the_models_and_levels_the_worker_allows() {
         .arg(&cases)
         .output()
         .expect("node must be installed to run the model list tests");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("ok: "), "{stdout}");
+}
+
+/// The GitHub card says where each task branch's work is and offers Delete branch only
+/// when deleting it loses nothing (its work on the repository's branch, or a pull request
+/// merged it as it is): closed issues alone don't make it safe, and the confirmation says
+/// what would be lost. Review changes reads the diff into its files' lines by the hunks'
+/// counts. The cases (tests/branches.test.cjs) run in node, which loads ui/branches.js
+/// as the page does.
+#[test]
+fn task_branches_say_whether_deleting_them_loses_work() {
+    let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/branches.test.cjs");
+    let out = std::process::Command::new("node")
+        .arg(&cases)
+        .output()
+        .expect("node must be installed to run the task branch tests");
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),

@@ -692,6 +692,9 @@ report after api,tests @helper Write a one-paragraph status report
   provider (and shares the folder, if one is named): the one with the fewest tasks, counting
   what each member says it runs and queues for all its peers, plus your own tasks waiting
   on it. `:folder` defaults to the peer's `data` folder and `using` to `copilot`.
+  A member that runs no providers (an agent that only delegates) never gets a squad's
+  steps, except team steps when a folder it shares has a team plan; sign-offs
+  (`approve`) need a person (`@name` or `@me`), not a squad.
 - If a squad member turns a step down (it is over your hourly limit, or stopping) or goes
   away for good, the step moves to another member that can take it, and its task says
   **moved here** and why. A step on a named `@peer` fails instead.
@@ -1151,6 +1154,29 @@ card does the same: **Sign in to GitHub** (pick a GitHub CLI account), **Link re
 (with checks, and which peers to share it with), **Sync**, and **Open PR** on each task
 branch. Digital workers use their owner's GitHub account.
 
+#### When a task branch is done with
+
+Before listing where each task branch's work is, the card fetches the repository's branch
+(`git fetch origin main`) unless the clone fetched it in the last 5 minutes, so "on main"
+means on GitHub's main, not on the clone's old copy (when GitHub can't be reached it says
+the states are as of the last fetch). A branch is **safe to delete** when deleting it
+loses nothing:
+
+- **its commit is on main** (merged as it is, or fast-forwarded);
+- **its changes are on main**: main has the same content in every file it changes, merged
+  another way (squashed, cherry-picked, or the same change made there);
+- or **a pull request merged it** as it is now. A pull request that merged an earlier
+  version of the branch doesn't count: the commits after it are only on the branch.
+
+Closed issues, or a closed pull request, don't make it safe: the card then says what isn't
+on main yet ("its issues are closed · not on main: 1 commit, 9 files (+213 −100)"), and the
+confirmation says what deleting it would lose. **Review changes** shows exactly that: its
+commits that aren't on main, the proof a pull request from it would carry, the files it
+changes with lines added and removed, and the diff a pull request would show (up to 400 KB),
+from where it can open the pull request or delete the branch. The pull request form says
+what it would change, with a link back to the review. A branch with a pull request open
+offers neither: GitHub would close the pull request with it.
+
 **Another account, or a scope its token lacks, without a terminal.** The GitHub CLI can
 hold several accounts per host but refreshes only the active one, so Proofkin runs its
 device flow for you and puts the active account back afterwards:
@@ -1608,7 +1634,15 @@ proofkin --name me --providers copilot --serve --ui
   says what each scope of the account's token is for, with **Grant access** when the
   tracker's board needs the `project` scope, and names the GitHub CLI's active account
   when it is another one. Task branches show the issues their pull request closes, and
-  **Open PR** fills in `Closes #N` for them.
+  **Open PR** fills in `Closes #N` for them. Each branch says where its work is and
+  whether deleting it loses anything: "merged in #7", "its commit is on main" or "its
+  changes are on main" (merged another way, e.g. squashed) read **safe to delete**;
+  otherwise it says what isn't on the repository's branch yet ("its issues are closed ·
+  not on main: 1 commit, 9 files (+213 −100)"). **Review changes** shows its commits, the
+  proof a pull request would carry, its files and its diff, with **Delete branch…** and
+  **Open pull request…**; the card offers **Delete branch** only when nothing would be lost
+  and **Open PR** only when there is work to merge (see
+  [task branches](#when-a-task-branch-is-done-with)).
 - **Tracker**: link the repository (and project board) your plan runs are tracked on, see
   the board's statuses or why it isn't updated (a missing scope with **Grant access**, and
   the commands to run in a terminal instead; anything else with the command that fixes
@@ -1685,8 +1719,12 @@ proofkin --name me --providers copilot --serve --ui
   A2A client) hand work to your peers: turn it on or off, copy the addresses and ready-made
   client setups, show or replace the token ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
   Their tasks show up under **Tasks**, marked *asked by another agent*.
-- **Squads**: create, view (members, who is online, running tasks), change (**Change…**: who
-  is in it) and remove squads.
+- **Squads**: create, view (members, who is online, running tasks, what each runs), change
+  (**Change…**: who is in it) and remove squads. The squad dialog says what each peer would
+  take as a member (its providers with their default model and reasoning, and the folders
+  it shares with you, marked when they have a team plan), or why no step can go to it: an
+  agent that only delegates (no providers, no team plan) takes none, and the card marks it
+  **takes no steps**. A squad whose members all take none isn't saved.
   Digital workers show their owner and role in the peer list.
 - **Waiting for your approval**: approval requests from plans (yours or teammates'), with
   what you're approving and Approve / Reject (a rejection needs a reason).
