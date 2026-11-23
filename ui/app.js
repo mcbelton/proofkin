@@ -286,14 +286,17 @@ function renderMe() {
   if (me.providers.length) {
     fact("Providers", me.providers.map(providerLabel).join(", "));
     for (const a of me.accounts) fact(providerLabel(a.provider), a.account);
-    // The model and reasoning effort each provider's tasks run at unless they ask for others.
-    const models = me.providers.map((p) => {
-      const m = me.models?.[p] ?? {};
-      const model = m.default ?? m.allowed?.[0] ?? "its default model";
-      const only = m.allowed?.length ? ` · only ${m.allowed.join(", ")}` : "";
-      return `${providerLabel(p)}: ${model}${m.effort ? ` · ${m.effort} reasoning` : ""}${only}`;
-    });
-    fact("Models", el("ul", { class: "share-list" }, ...models.map((t) => el("li", { text: t }))));
+    // The model and reasoning effort each provider's tasks run at unless they ask for
+    // others, and what peers may ask for.
+    fact("Models", el("div", { class: "facts-models" },
+      el("ul", { class: "share-list" }, ...me.providers.map((p) =>
+        el("li", { text: `${providerLabel(p)}: ${modelsSummary(me.models?.[p])}` }))),
+      el("button", {
+        type: "button", class: "btn small", "aria-label": "Models of this agent",
+        title: me.serving ? "Choose the models and reasoning levels peers may ask this agent for, and its defaults"
+          : "Choose the models and reasoning levels your tasks here run with",
+        onclick: (e) => openModelsDialog(null, e.currentTarget),
+      }, "Models…")));
     fact("Serves peers", me.serving ? "Yes" : "No");
     fact("Your own tasks", el("span", {}, `${ACCESS_SHORT[me.access] ?? me.access} in `,
       el("span", { class: "mono", text: me.workspace })));
@@ -326,9 +329,15 @@ function renderMe() {
   } else {
     fact("Providers", "None (delegates only)");
     // Its settings are its digital workers' (they run on its accounts) unless they set their own.
-    const set = Object.entries(me.models ?? {}).map(([p, m]) =>
-      `${providerLabel(p)}: ${m.default ?? m.allowed?.[0] ?? "its default model"}${m.effort ? ` · ${m.effort} reasoning` : ""}`);
-    if (set.length) fact("Digital workers run", el("ul", { class: "share-list" }, ...set.map((t) => el("li", { text: t }))));
+    const set = Object.entries(me.models ?? {}).map(([p, m]) => `${providerLabel(p)}: ${modelsSummary(m)}`);
+    fact("Digital workers run", el("div", { class: "facts-models" },
+      set.length ? el("ul", { class: "share-list" }, ...set.map((t) => el("li", { text: t })))
+        : el("span", { class: "muted", text: "Each provider's defaults" }),
+      el("button", {
+        type: "button", class: "btn small", "aria-label": "Models of this agent",
+        title: "Choose the models and reasoning levels your digital workers use, unless they have their own",
+        onclick: (e) => openModelsDialog(null, e.currentTarget),
+      }, "Models…")));
   }
 }
 
@@ -2790,41 +2799,60 @@ function targetSquad() {
   return target.startsWith("#") ? (state.squads ?? []).find((s) => `#${s.name}` === target) : null;
 }
 
-// Reasoning efforts, least to most (src/models.rs EFFORTS), and the Model list's
-// choice that takes a model by name.
-const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+// The Model list's choice that takes a model by name (EFFORTS and the model helpers are
+// in ui/models.js).
 const OTHER_MODEL = "*other*";
+/** What the task form's Model and Reasoning lists offer, as last drawn (see modelMenu). */
+let taskModels = null;
 
-/** The model and reasoning effort a task runs at: its agent's defaults, selected and
- * named when it says them (a peer in its hello, this agent in its settings), a model it
- * allows, or one by name when it allows any. With "Any peer" or a squad it isn't known
- * which peer takes it: each peer's defaults, or a model by name. */
+/** The agents a task to `target` may go to, as they say what they offer: this agent, a
+ * peer, the connected peers that serve the provider (Any peer), or a squad's online
+ * members that do. */
+function targetAgents(target, provider) {
+  if (target === "local") return state.me ? [state.me] : [];
+  if (target === "auto") return state.peers.filter((p) => p.capabilities.includes(provider));
+  const squad = targetSquad();
+  if (squad) return squadServing(squad, provider);
+  return state.peers.filter((p) => p.id === target);
+}
+
+/** The model and reasoning effort a task runs at: its agent's defaults (selected, named
+ * when it says them), or a model it lets you pick (those it allows, else all its account
+ * offers; one by name when it allows any and lists none). With Any peer or a squad,
+ * what their peers allow together (the task goes to one that allows your pick). */
 function renderModelOptions() {
   const provider = $("#provider").value;
   const target = $("#target").value;
-  const one = target === "local" || Boolean(target && target !== "auto" && !target.startsWith("#"));
-  const said = target === "local" ? state.me?.models?.[provider]
-    : state.peers.find((p) => p.id === target)?.models?.[provider];
-  const list = said?.allowed ?? [];
-  const deflt = said?.default ?? list[0] ?? null;
-  const theirs = one ? "Its default" : "Each peer's default";
+  const agents = target ? targetAgents(target, provider) : [];
+  const menu = modelMenu(agents, provider);
+  taskModels = { menu, theirs: agents.length > 1 ? "Each peer's default" : "Its default" };
+  const deflt = menu.defaultModel?.toLowerCase();
   const sel = $("#model");
   const prev = sel.value;
   sel.replaceChildren(
-    el("option", { value: "", text: deflt ? `${deflt} (default)` : theirs }),
-    ...list.filter((m) => m !== deflt).map((m) => el("option", { value: m, text: m })),
-    ...(list.length ? [] : [el("option", { value: OTHER_MODEL, text: "Another model…" })]));
+    el("option", { value: "", text: menu.defaultModel ? `${menu.defaultModel} (default)` : taskModels.theirs }),
+    ...modelOptionNodes(menu.models.filter((m) => m.id.toLowerCase() !== deflt)),
+    ...(menu.other ? [el("option", { value: OTHER_MODEL, text: "Another model…" })] : []));
   if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
   $("#model-field").hidden = !target;
   $("#model-name-field").hidden = !target || sel.value !== OTHER_MODEL;
-  const effort = $("#effort");
-  const prevEffort = effort.value;
-  const deffort = said?.effort ?? null;
-  effort.replaceChildren(
-    el("option", { value: "", text: deffort ? `${deffort} (default)` : theirs }),
-    ...EFFORTS.filter((e) => e !== deffort).map((e) => el("option", { value: e, text: e })));
-  if ([...effort.options].some((o) => o.value === prevEffort)) effort.value = prevEffort;
   $("#effort-field").hidden = !target;
+  renderEffortOptions();
+}
+
+/** The Reasoning list for the model picked: the levels its agent allows that the model
+ * supports, with the default selected as the model takes it. */
+function renderEffortOptions() {
+  if (!taskModels) return;
+  const chosen = $("#model").value;
+  const pick = effortChoices(taskModels.menu, chosen === OTHER_MODEL ? $("#model-name").value.trim() : chosen);
+  const effort = $("#effort");
+  const prev = effort.value;
+  effort.replaceChildren(
+    el("option", { value: "", text: pick.fixed ? "None for this model" : pick.fitted ? `${pick.fitted} (default)` : taskModels.theirs }),
+    ...pick.levels.filter((e) => e !== pick.fitted).map((e) => el("option", { value: e, text: e })));
+  if ([...effort.options].some((o) => o.value === prev)) effort.value = prev;
+  effort.disabled = pick.fixed;
 }
 
 function selectedModel() {
@@ -2834,7 +2862,7 @@ function selectedModel() {
 }
 
 function selectedEffort() {
-  return $("#effort-field").hidden ? null : $("#effort").value || null;
+  return $("#effort-field").hidden || $("#effort").disabled ? null : $("#effort").value || null;
 }
 
 /** Folder picker for a peer target: the folders that peer shares with this agent; for
@@ -3163,6 +3191,11 @@ function connectEvents() {
       renderApprovals();
       if (msg.approvals.length > before) toast("A teammate asks for your approval");
     }
+    else if (msg.type === "me") {
+      state.me = msg.me;
+      renderMe();
+      renderTaskOptions();
+    }
     else if (msg.type === "peers") {
       state.peers = msg.peers;
       state.trusted = msg.trusted;
@@ -3319,12 +3352,14 @@ function init() {
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
-    "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog"]) guardDialog($(id));
+    "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog"]) guardDialog($(id));
+  initModelsDialog();
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); renderModelOptions(); updateComposer(); });
   $("#model").addEventListener("change", () => {
     const other = $("#model").value === OTHER_MODEL;
     $("#model-name-field").hidden = !other;
+    renderEffortOptions();
     if (other) $("#model-name").focus();
   });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });

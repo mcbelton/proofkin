@@ -91,6 +91,13 @@ function workerNode(w) {
           type: "button", class: "btn small", "aria-label": `${here ? "Stop" : "Start"} ${w.name}`,
           onclick: (e) => (here ? stopWorker(w, e.currentTarget) : startWorker(w, e.currentTarget)),
         }, here ? "Stop" : "Start"),
+        w.providers.length ? el("button", {
+          type: "button", class: "btn small", "aria-label": `Models for ${w.name}`,
+          title: Object.keys(w.models ?? {}).length
+            ? `Its own: ${Object.entries(w.models).map(([p, m]) => `${providerLabel(p)} ${modelsSummary(m)}`).join("; ")}`
+            : "It uses your models settings",
+          onclick: (e) => openModelsDialog(w.name, e.currentTarget),
+        }, "Models…") : null,
         el("label", { class: "check small", title: "Start it whenever this agent starts, and stop it when this agent stops" },
           el("input", { type: "checkbox", checked: w.start_with_owner || undefined, onchange: (e) => setStartWithOwner(w, e.currentTarget) }),
           el("span", { text: "Starts with this agent" })))),

@@ -459,18 +459,26 @@ examples:
         #[command(flatten)]
         profile: ProfileArg,
     },
-    /// Set the models tasks may ask for: a comma-separated list, or `any`. A task asking
-    /// for another is refused, and with a list tasks that name none run on the default,
-    /// else the first in the list.
+    /// Set the models tasks may ask for (a comma-separated list, or `any`), and with
+    /// `--efforts` the reasoning efforts they may ask for. A task asking for another is
+    /// refused. With a list, tasks that name none run on the default, else the first in
+    /// the list; with efforts, at the default effort, else the least in the list.
     #[command(after_help = "\
 examples:
   proofkin models allow copilot claude-sonnet-5.5,gpt-5.5 --profile worker
-  proofkin models allow copilot any --profile worker")]
+  proofkin models allow copilot any --profile worker
+  proofkin models allow copilot --efforts low,medium,high --profile worker
+  proofkin models allow copilot any --efforts any --profile worker")]
     Allow {
         #[arg(value_enum)]
         provider: Provider,
-        #[arg(value_delimiter = ',', required = true)]
+        /// Model names, comma-separated, or `any` (left out with --efforts: unchanged).
+        #[arg(value_delimiter = ',', required_unless_present = "efforts")]
         models: Vec<String>,
+        /// The reasoning efforts tasks may ask for, comma-separated (minimal, low,
+        /// medium, high, xhigh, max), or `any`.
+        #[arg(long, value_delimiter = ',')]
+        efforts: Option<Vec<String>>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -2099,38 +2107,19 @@ async fn device_flow(
     Ok(ended)
 }
 
-/// What `provider`'s models are set to, in words.
-fn describe_models(choice: &proofkin::models::ModelChoice) -> String {
-    let default = match (&choice.default, choice.allowed.first()) {
-        (Some(model), _) => format!("tasks that name no model run on {model}"),
-        (None, Some(first)) => {
-            format!("tasks that name no model run on {first} (the first allowed)")
-        }
-        (None, None) => "tasks that name no model run on the provider's own default".to_owned(),
-    };
-    let allowed = if choice.allowed.is_empty() {
-        "any model may be asked for".to_owned()
-    } else {
-        format!("only {} may be asked for", choice.allowed.join(", "))
-    };
-    let effort = match &choice.effort {
-        Some(effort) => format!("tasks that ask for no effort work at {effort} reasoning"),
-        None => "tasks that ask for no effort work at the model's own".to_owned(),
-    };
-    format!("{default}; {allowed}; {effort}")
-}
-
 /// `none` (any case) as no value.
 fn unless_none(value: &str) -> Option<&str> {
     Some(value.trim()).filter(|v| !v.eq_ignore_ascii_case("none"))
 }
 
 async fn run_models(command: ModelsCommand) -> Result<()> {
-    use proofkin::models::{choice, set_allowed, set_default, set_effort};
+    use proofkin::models::{
+        choice, describe as describe_models, set_allowed, set_default, set_effort, set_efforts,
+    };
     let apply_note = |profile: &Profile| {
         if profile.is_running() {
             println!(
-                "(its agent is running: restart it to apply; peers learn them when they connect)"
+                "(its agent is running: it applies them within seconds, and tells connected peers)"
             );
         }
     };
@@ -2167,11 +2156,9 @@ async fn run_models(command: ModelsCommand) -> Result<()> {
                     );
                     continue;
                 }
-                let backend =
-                    proofkin::llm::CopilotBackend::start(profile.copilot_credentials()?).await?;
-                let offered = backend.list_models().await;
-                backend.stop().await;
-                let offered = offered?;
+                let offered =
+                    proofkin::llm::CopilotBackend::list_models_with(profile.copilot_credentials()?)
+                        .await?;
                 let width = offered.iter().map(|m| m.id.len()).max().unwrap_or(0);
                 for m in &offered {
                     let mut marks = Vec::new();
@@ -2191,7 +2178,7 @@ async fn run_models(command: ModelsCommand) -> Result<()> {
                     }
                     let mut about = vec![m.name.clone()];
                     about.extend(m.vendor.clone());
-                    about.extend(m.multiplier.map(|x| format!("{x}x")));
+                    about.extend(m.multiplier.as_ref().map(|x| format!("{x}x")));
                     about.extend(m.policy.as_ref().map(|p| format!("policy: {p}")));
                     if !m.efforts.is_empty() {
                         about.push(format!(
@@ -2267,12 +2254,20 @@ async fn run_models(command: ModelsCommand) -> Result<()> {
         ModelsCommand::Allow {
             provider,
             models,
+            efforts,
             profile,
         } => {
             let mut profile = Profile::open(&profile.name)?;
-            let any = models.len() == 1 && models[0].trim().eq_ignore_ascii_case("any");
-            let list = if any { Vec::new() } else { models };
-            set_allowed(&mut profile.config.models, provider, &list)?;
+            let any =
+                |list: &[String]| list.len() == 1 && list[0].trim().eq_ignore_ascii_case("any");
+            if !models.is_empty() {
+                let list = if any(&models) { Vec::new() } else { models };
+                set_allowed(&mut profile.config.models, provider, &list)?;
+            }
+            if let Some(efforts) = efforts {
+                let list = if any(&efforts) { Vec::new() } else { efforts };
+                set_efforts(&mut profile.config.models, provider, &list)?;
+            }
             profile.save()?;
             println!(
                 "profile '{}': {provider}: {}",
@@ -4310,6 +4305,23 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         profile.data_folder(),
         Duration::from_secs(2),
     );
+    // Model settings changed while it runs (the CLI, the owner's) apply right away.
+    agent.watch_models(
+        profile.clone(),
+        executor.clone().map(|e| e as Arc<dyn Executor>),
+        Duration::from_secs(2),
+    );
+    // Peers pick from the models its accounts offer: listed once it runs.
+    if let Some(executor) = executor.clone() {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            for (provider, error) in agent.learn_offers(&*executor).await {
+                eprintln!(
+                    "could not list the models {provider} offers (peers can still name one): {error}"
+                );
+            }
+        });
+    }
     println!(
         "{} [profile '{}'] endpoint id {}",
         agent.name(),
@@ -4449,7 +4461,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     println!("! refused connection from {id} (not on the allowlist)")
                 }
                 Event::Chat { from, text } => println!("<{from}> {text}"),
-                Event::PeerBusy { .. } => {}
+                Event::PeerBusy { .. } | Event::PeerModels { .. } | Event::ModelsChanged => {}
                 Event::TaskReceived {
                     from,
                     task_id,

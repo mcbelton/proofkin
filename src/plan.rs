@@ -1964,8 +1964,8 @@ pub fn preflight(
             };
             report(Some(step), true, message);
         }
-        // A model none of its peers allows: each would refuse the step (they say which
-        // models they allow in their hello; peers that don't say allow any).
+        // A model or reasoning effort none of its peers allows: each would refuse the
+        // step (they say which they allow in their hello; peers that don't say allow any).
         if let Some(model) = &step.model {
             let refusing: Vec<String> = candidates
                 .iter()
@@ -1981,6 +1981,27 @@ pub fn preflight(
                     false,
                     format!(
                         "model={model} would be refused for {}: {}",
+                        step.provider,
+                        refusing.join("; ")
+                    ),
+                );
+            }
+        }
+        if let Some(effort) = &step.effort {
+            let refusing: Vec<String> = candidates
+                .iter()
+                .filter_map(|p| {
+                    let choice = p.models.get(&step.provider)?;
+                    (!choice.allows_effort(effort))
+                        .then(|| format!("{} allows only {}", p.name, choice.efforts.join(", ")))
+                })
+                .collect();
+            if !refusing.is_empty() && refusing.len() == candidates.len() {
+                report(
+                    Some(step),
+                    false,
+                    format!(
+                        "effort={effort} would be refused for {}: {}",
                         step.provider,
                         refusing.join("; ")
                     ),
@@ -2086,13 +2107,12 @@ pub fn choose_peer(
                 .filter(|p| squad.members.contains(&p.name))
                 .collect();
             let able: Vec<&PeerInfo> = online.iter().copied().filter(capable).collect();
-            // Members that allow the step's model come first (their hello says which;
-            // one that doesn't say allows any): the others would turn it down.
+            // Members that allow the step's model and reasoning effort come first (their
+            // hello says which; one that doesn't say allows any): the others would turn
+            // it down.
             let allows = |p: &&PeerInfo| {
-                step.model.as_deref().is_none_or(|model| {
-                    p.models
-                        .get(&step.provider)
-                        .is_none_or(|choice| choice.allows(model))
+                p.models.get(&step.provider).is_none_or(|choice| {
+                    choice.admits(step.model.as_deref(), step.effort.as_deref())
                 })
             };
             let pool: Vec<&PeerInfo> = if able.iter().any(allows) {
@@ -3456,10 +3476,11 @@ mod tests {
             role: None,
             load: None,
             models,
+            offers: Default::default(),
         };
         let problems = preflight(
             &plan,
-            &[peer],
+            std::slice::from_ref(&peer),
             &SquadStore::default(),
             &kb,
             &skills,
@@ -3476,6 +3497,39 @@ mod tests {
                 Some("b"),
                 false,
                 "model=claude-opus-5.5 would be refused for copilot: x allows only gpt-5.5"
+            )]
+        );
+        // And when it doesn't allow the reasoning effort.
+        let mut efforts = crate::models::Models::new();
+        crate::models::set_efforts(
+            &mut efforts,
+            Provider::Copilot,
+            &["low".into(), "medium".into()],
+        )
+        .unwrap();
+        let deep = Plan::parse("e @x effort=max Think hard\nf @x effort=low Quick").unwrap();
+        let problems = preflight(
+            &deep,
+            &[PeerInfo {
+                models: efforts,
+                ..peer
+            }],
+            &SquadStore::default(),
+            &kb,
+            &skills,
+            &Recipients::default(),
+        );
+        let about_efforts: Vec<(Option<&str>, bool, &str)> = problems
+            .iter()
+            .filter(|p| p.message.contains("effort="))
+            .map(|p| (p.step.as_deref(), p.error, p.message.as_str()))
+            .collect();
+        assert_eq!(
+            about_efforts,
+            [(
+                Some("e"),
+                false,
+                "effort=max would be refused for copilot: x allows only low, medium"
             )]
         );
     }
@@ -3658,6 +3712,7 @@ mod tests {
             role: None,
             load: None,
             models: Default::default(),
+            offers: Default::default(),
         };
         let peers = vec![
             peer("alice", vec![share("app", Access::Full, &["test"], true)]),
@@ -3954,6 +4009,7 @@ mod tests {
             role: None,
             load: None,
             models: Default::default(),
+            offers: Default::default(),
         };
         let dir = tempfile::tempdir().unwrap();
         let kb = KnowledgeBase::new(dir.path().join("kb"));
@@ -3999,6 +4055,7 @@ mod tests {
             role: None,
             load: None,
             models: Default::default(),
+            offers: Default::default(),
         };
         let peers = vec![
             peer("alice", vec![Provider::Copilot], &["data", "code"]),
@@ -4107,6 +4164,24 @@ mod tests {
             choose_peer(&opus, &picky, &squads, &busy).unwrap().name,
             "alice",
             "none allows it: the least busy, which will say why it refuses"
+        );
+        // The same for its reasoning effort.
+        picky[0].models.insert(
+            Provider::Copilot,
+            crate::models::ModelChoice {
+                efforts: vec!["low".into()],
+                ..Default::default()
+            },
+        );
+        picky[1].models.clear();
+        let deep = Plan::parse("t #qa:code effort=max test it")
+            .unwrap()
+            .steps
+            .remove(0);
+        assert_eq!(
+            choose_peer(&deep, &picky, &squads, &busy).unwrap().name,
+            "bob",
+            "alice is less busy but allows only low reasoning"
         );
     }
 
@@ -4323,6 +4398,7 @@ mod tests {
             role: None,
             load: None,
             models: Default::default(),
+            offers: Default::default(),
         };
         let mut trust = TrustStore::default();
         trust.allow(crate::trust::TrustedPeer {
@@ -4478,6 +4554,7 @@ mod tests {
             role: None,
             load: None,
             models: Default::default(),
+            offers: Default::default(),
         };
         let peers = vec![peer("open"), peer("plain"), peer("wide"), peer("helper")];
         let grants = [
@@ -4600,6 +4677,7 @@ mod tests {
             role: None,
             load: None,
             models: Default::default(),
+            offers: Default::default(),
         };
         let granted = |labels: &[&str]| {
             Some(M365Grant {

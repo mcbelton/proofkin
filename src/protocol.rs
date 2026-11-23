@@ -36,6 +36,11 @@ pub enum Message {
         /// tasks may ask for (left out when unset; older peers don't send it).
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         models: crate::models::Models,
+        /// Per provider it serves: the models its account offers that tasks may ask for,
+        /// with the reasoning efforts each supports (left out when it lists none, as
+        /// older peers and providers without a list don't).
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        offers: crate::models::Offers,
     },
     Peers {
         addrs: Vec<EndpointAddr>,
@@ -107,6 +112,14 @@ pub enum Message {
     /// The sender's folders the receiver may now use (sent when its grant changes).
     Shares {
         shares: Vec<ShareInfo>,
+    },
+    /// The sender's models and the ones its account offers, as its hello says them
+    /// (sent when they change).
+    Models {
+        #[serde(default)]
+        models: crate::models::Models,
+        #[serde(default)]
+        offers: crate::models::Offers,
     },
     /// A message type from a newer version; ignored so mixed versions keep working.
     #[serde(other)]
@@ -356,8 +369,18 @@ mod tests {
                 default: Some("claude-sonnet-5.5".into()),
                 allowed: vec!["claude-sonnet-5.5".into(), "claude-opus-5.5".into()],
                 effort: Some("max".into()),
+                efforts: vec!["high".into(), "max".into()],
             },
         );
+        let offers = crate::models::Offers::from([(
+            Provider::Claude,
+            vec![crate::models::Offered {
+                id: "claude-opus-5.5".into(),
+                name: "Claude Opus 5.5".into(),
+                efforts: vec!["high".into(), "max".into()],
+                ..Default::default()
+            }],
+        )]);
         let msg = Message::Hello {
             name: "a".into(),
             addr,
@@ -365,26 +388,53 @@ mod tests {
             shares: Vec::new(),
             owner: Some("alice".into()),
             role: None,
-            models,
+            models: models.clone(),
+            offers: offers.clone(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
-        // An older peer's hello has no models: it reads as saying nothing about them.
-        let older = json.replace(
-            r#","models":{"claude":{"default":"claude-sonnet-5.5","allowed":["claude-sonnet-5.5","claude-opus-5.5"],"effort":"max"}}"#,
+        let said = r#","offers":{"claude":[{"id":"claude-opus-5.5","name":"Claude Opus 5.5","efforts":["high","max"]}]}"#;
+        assert!(json.contains(said), "{json}");
+        // An older peer's hello has no models or offers: it reads as saying nothing.
+        let older = json.replace(said, "").replace(
+            r#","models":{"claude":{"default":"claude-sonnet-5.5","allowed":["claude-sonnet-5.5","claude-opus-5.5"],"effort":"max","efforts":["high","max"]}}"#,
             "",
         );
-        assert_ne!(older, json);
-        let Message::Hello { models, .. } = serde_json::from_str(&older).unwrap() else {
+        assert!(
+            !older.contains("models") && !older.contains("offers"),
+            "{older}"
+        );
+        let Message::Hello {
+            models: none,
+            offers: nothing,
+            ..
+        } = serde_json::from_str(&older).unwrap()
+        else {
             panic!("a hello");
         };
-        assert!(models.is_empty());
-        // One that has models but no effort (older than efforts) reads as no default effort.
-        let no_effort = json.replace(r#","effort":"max""#, "");
+        assert!(none.is_empty() && nothing.is_empty());
+        // One older than efforts reads as no default effort, and any allowed.
+        let no_effort = json.replace(r#","effort":"max","efforts":["high","max"]"#, "");
         assert_ne!(no_effort, json);
-        let Message::Hello { models, .. } = serde_json::from_str(&no_effort).unwrap() else {
+        let Message::Hello { models: old, .. } = serde_json::from_str(&no_effort).unwrap() else {
             panic!("a hello");
         };
-        assert_eq!(models[&Provider::Claude].effort, None);
+        assert_eq!(old[&Provider::Claude].effort, None);
+        assert!(old[&Provider::Claude].efforts.is_empty());
+        // Changes come in a `models` message (older peers skip it as an unknown type).
+        let changed = Message::Models { models, offers };
+        let json = serde_json::to_string(&changed).unwrap();
+        assert!(
+            json.starts_with(r#"{"type":"models","models":{"claude":"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), changed);
+        assert_eq!(
+            serde_json::from_str::<Message>(r#"{"type":"models"}"#).unwrap(),
+            Message::Models {
+                models: Default::default(),
+                offers: Default::default()
+            }
+        );
     }
 }

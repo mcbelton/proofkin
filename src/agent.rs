@@ -114,6 +114,14 @@ pub enum Event {
     PeerBusy {
         id: EndpointId,
     },
+    /// A peer's models, or the ones its account offers, changed (see
+    /// [`PeerInfo::models`] and [`PeerInfo::offers`]).
+    PeerModels {
+        id: EndpointId,
+    },
+    /// This agent's models, or the ones its accounts offer, changed (see
+    /// [`Agent::set_models`] and [`Agent::set_offers`]).
+    ModelsChanged,
     Chat {
         from: String,
         text: String,
@@ -251,6 +259,9 @@ pub struct PeerInfo {
     /// Its providers' default models and the ones tasks may ask for (empty: it didn't
     /// say, as older peers don't, or any model).
     pub models: crate::models::Models,
+    /// The models its accounts offer that tasks may ask for, with the reasoning efforts
+    /// each supports (empty: it lists none, as older peers and Claude and Codex don't).
+    pub offers: crate::models::Offers,
 }
 
 struct PeerHandle {
@@ -263,6 +274,7 @@ struct PeerHandle {
     role: Option<String>,
     load: Option<PeerLoad>,
     models: crate::models::Models,
+    offers: crate::models::Offers,
     tx: mpsc::UnboundedSender<Message>,
     close: Arc<Notify>,
 }
@@ -411,7 +423,10 @@ struct Inner {
     shares: Mutex<ShareStore>,
     owner: Option<String>,
     role: Option<String>,
-    models: crate::models::Models,
+    /// Its providers' models, as now set (see [`Agent::set_models`]).
+    models: Mutex<crate::models::Models>,
+    /// The models its accounts offer, as last listed (see [`Agent::set_offers`]).
+    offers: Mutex<crate::models::Offers>,
     task_slots: Semaphore,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
@@ -480,7 +495,8 @@ impl Agent {
             shares: Mutex::new(config.shares),
             owner: config.owner,
             role: config.role,
-            models: config.models,
+            models: Mutex::new(config.models),
+            offers: Mutex::new(crate::models::Offers::new()),
             task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -590,6 +606,7 @@ impl Agent {
                 role: p.role.clone(),
                 load: p.load,
                 models: p.models.clone(),
+                offers: p.offers.clone(),
             })
             .collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -674,6 +691,129 @@ impl Agent {
                     Err(e) if reported != now => {
                         reported = now;
                         eprintln!("could not reload the shared folders: {e:#}");
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
+    /// This agent's providers' models, as now set.
+    pub fn models(&self) -> crate::models::Models {
+        self.inner.models.lock().unwrap().clone()
+    }
+
+    /// The models each provider offers this agent's accounts, as last listed (all of
+    /// them, the ones it doesn't allow and those its account can't use too).
+    pub fn listed(&self) -> crate::models::Offers {
+        self.inner.offers.lock().unwrap().clone()
+    }
+
+    /// The models its accounts offer that its tasks may ask for, per provider listed:
+    /// what peers learn for the providers it serves (see [`crate::models::for_peers`]).
+    pub fn offers(&self) -> crate::models::Offers {
+        self.inner.offers_for(None)
+    }
+
+    /// Changes this agent's models (e.g. from the web UI, or `profile.json` changed):
+    /// its tasks run with them from now on, and connected peers learn them right
+    /// away. Persisting them is up to the caller.
+    pub fn set_models(&self, models: crate::models::Models) {
+        {
+            let mut now = self.inner.models.lock().unwrap();
+            if *now == models {
+                return;
+            }
+            *now = models.clone();
+        }
+        if let Some(executor) = &self.inner.executor {
+            executor.set_models(models);
+        }
+        self.inner.models_changed();
+    }
+
+    /// Replaces the models `provider` offers this agent's account (as it lists them);
+    /// connected peers learn the ones they may ask for right away.
+    pub fn set_offers(&self, provider: Provider, offered: Vec<crate::models::Offered>) {
+        {
+            let mut offers = self.inner.offers.lock().unwrap();
+            if offers.get(&provider) == Some(&offered) {
+                return;
+            }
+            if offered.is_empty() {
+                offers.remove(&provider);
+            } else {
+                offers.insert(provider, offered);
+            }
+        }
+        self.inner.models_changed();
+    }
+
+    /// Lists the models each of `executor`'s providers offers this agent's accounts
+    /// (see [`Agent::set_offers`]); returns why a list failed, per provider.
+    pub async fn learn_offers(&self, executor: &dyn Executor) -> BTreeMap<Provider, String> {
+        let mut failed = BTreeMap::new();
+        for provider in executor.providers() {
+            match executor.list_models(provider).await {
+                Ok(offered) => self.set_offers(provider, offered),
+                Err(e) => {
+                    failed.insert(provider, format!("{e:#}"));
+                }
+            }
+        }
+        failed
+    }
+
+    /// Applies `profile`'s models (with its owner's, for a digital worker) whenever its
+    /// `profile.json`, or its owner's, changes, checking every `every`: e.g. `proofkin
+    /// models allow` run while the agent runs, or the owner's Models dialog, take effect
+    /// for peers right away. `executor` runs this agent's own tasks, if it isn't the
+    /// agent's.
+    pub fn watch_models(
+        &self,
+        profile: crate::profile::Profile,
+        executor: Option<Arc<dyn Executor>>,
+        every: Duration,
+    ) {
+        let agent = self.clone();
+        let mut files = vec![profile.dir.join("profile.json")];
+        if let Some(owner) = &profile.config.owner
+            && let Some(root) = profile.dir.parent()
+        {
+            files.push(root.join(owner).join("profile.json"));
+        }
+        let modified = |files: &[PathBuf]| -> Vec<Option<std::time::SystemTime>> {
+            files
+                .iter()
+                .map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok())
+                .collect()
+        };
+        // As they are now: a change from here on applies.
+        let (mut seen, mut reported) = (modified(&files), None);
+        tokio::spawn(async move {
+            let mut shutdown = agent.inner.shutdown.subscribe();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(every) => {}
+                    _ = shutdown.wait_for(|stopped| *stopped) => return,
+                }
+                let now = modified(&files);
+                if now == seen {
+                    continue;
+                }
+                match profile.reload() {
+                    Ok(fresh) => {
+                        seen = now;
+                        let models = fresh.models();
+                        if let Some(executor) = &executor {
+                            executor.set_models(models.clone());
+                        }
+                        agent.set_models(models);
+                    }
+                    // Tried again next time (a writer may hold the file for a moment).
+                    Err(e) if reported.as_ref() != Some(&now) => {
+                        reported = Some(now);
+                        eprintln!("could not reload the model settings: {e:#}");
                     }
                     Err(_) => {}
                 }
@@ -1119,10 +1259,45 @@ impl Inner {
     fn models_offered(&self) -> crate::models::Models {
         let serves = self.capabilities();
         self.models
+            .lock()
+            .unwrap()
             .iter()
             .filter(|(p, _)| serves.contains(p))
             .map(|(p, c)| (*p, c.clone()))
             .collect()
+    }
+
+    /// The models its accounts offer that its tasks may ask for, per provider listed
+    /// among `serves` (none: every provider listed).
+    fn offers_for(&self, serves: Option<&[Provider]>) -> crate::models::Offers {
+        let models = self.models.lock().unwrap().clone();
+        self.offers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| serves.is_none_or(|s| s.contains(p)))
+            .map(|(p, list)| {
+                let choice = crate::models::choice(&models, *p);
+                (*p, crate::models::for_peers(list, &choice))
+            })
+            .filter(|(_, list)| !list.is_empty())
+            .collect()
+    }
+
+    /// Tells connected peers (if it serves them) and the application that this agent's
+    /// models, or the ones its accounts offer, changed.
+    fn models_changed(&self) {
+        let serves = self.capabilities();
+        if !serves.is_empty() {
+            let message = Message::Models {
+                models: self.models_offered(),
+                offers: self.offers_for(Some(&serves)),
+            };
+            for handle in self.peers.lock().unwrap().values() {
+                let _ = handle.tx.send(message.clone());
+            }
+        }
+        let _ = self.events.send(Event::ModelsChanged);
     }
 
     fn is_trusted(&self, id: &EndpointId) -> bool {
@@ -1526,9 +1701,9 @@ impl Inner {
             bail!("Codex tasks can't use MCP servers; ask for copilot or claude");
         }
         // The model it asks for must be one this agent's owner allows, and its effort a
-        // reasoning effort (a team step runs no model).
+        // reasoning effort it allows (a team step runs no model).
         if task.team.is_none() {
-            let choice = crate::models::choice(&self.models, task.provider);
+            let choice = crate::models::choice(&self.models.lock().unwrap(), task.provider);
             if let Err(e) = choice
                 .pick(task.model.as_deref())
                 .and_then(|_| choice.pick_effort(task.effort.as_deref()))
@@ -1886,8 +2061,9 @@ impl Inner {
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();
         // The model it asked for (allowed: checked when it was admitted), else the
-        // default; the same for its reasoning effort.
-        let choice = crate::models::choice(&self.models, task.provider);
+        // default; the same for its reasoning effort. Settings changed since it was
+        // admitted apply: it fails if they no longer allow what it asks for.
+        let choice = crate::models::choice(&self.models.lock().unwrap(), task.provider);
         prompt.model = choice.pick(task.model.as_deref())?;
         prompt.effort = choice.pick_effort(task.effort.as_deref())?;
         let mut results = Vec::<crate::evidence::CheckResult>::new();
@@ -2076,10 +2252,11 @@ impl Inner {
 }
 
 /// A peer's models as its hello says, kept only as far as they make sense: well-formed
-/// names, at most 50 per provider, a default only if it is one of the allowed, and a
-/// reasoning effort only if it is one.
+/// names, at most 50 per provider, a default only if it is one of the allowed, and
+/// reasoning efforts only if they are ones (the default only if allowed).
 fn clean_models(models: crate::models::Models) -> crate::models::Models {
     let ok = |m: &String| crate::models::check_name(m).is_ok();
+    let effort_ok = |e: &String| crate::models::check_effort(e).is_ok();
     models
         .into_iter()
         .map(|(provider, choice)| {
@@ -2087,16 +2264,26 @@ fn clean_models(models: crate::models::Models) -> crate::models::Models {
             let default = choice.default.filter(ok).filter(|d| {
                 allowed.is_empty() || allowed.iter().any(|m| m.eq_ignore_ascii_case(d))
             });
+            let mut efforts: Vec<String> = Vec::new();
+            for effort in choice.efforts.iter().filter(|e| effort_ok(e)) {
+                let effort = effort.to_ascii_lowercase();
+                if !efforts.contains(&effort) {
+                    efforts.push(effort);
+                }
+            }
+            efforts.sort_by_key(|e| crate::models::EFFORTS.iter().position(|x| x == e));
             let effort = choice
                 .effort
-                .filter(|e| crate::models::check_effort(e).is_ok())
-                .map(|e| e.to_ascii_lowercase());
+                .filter(effort_ok)
+                .map(|e| e.to_ascii_lowercase())
+                .filter(|e| efforts.is_empty() || efforts.contains(e));
             (
                 provider,
                 crate::models::ModelChoice {
                     default,
                     allowed,
                     effort,
+                    efforts,
                 },
             )
         })
@@ -2122,6 +2309,7 @@ async fn run_connection(
         owner: inner.owner.clone(),
         role: inner.role.clone(),
         models: inner.models_offered(),
+        offers: inner.offers_for(Some(&inner.capabilities())),
     };
     write_message(&mut send, &hello).await?;
     let first = lines
@@ -2136,6 +2324,7 @@ async fn run_connection(
         owner,
         role,
         models,
+        offers,
     } = serde_json::from_str(&first)?
     else {
         bail!("expected hello, got {first}");
@@ -2157,6 +2346,7 @@ async fn run_connection(
         conn_id,
         name: name.clone(),
         addr,
+        offers: crate::models::clean_offers(offers, &capabilities),
         capabilities,
         shares,
         owner,
@@ -2419,6 +2609,19 @@ async fn run_connection(
                         && handle.conn_id == conn_id
                     {
                         handle.shares = shares;
+                    }
+                }
+                Message::Models { models, offers } => {
+                    if let Some(handle) = inner.peers.lock().unwrap().get_mut(&peer_id)
+                        && handle.conn_id == conn_id
+                    {
+                        let models = clean_models(models);
+                        let offers = crate::models::clean_offers(offers, &handle.capabilities);
+                        if handle.models != models || handle.offers != offers {
+                            handle.models = models;
+                            handle.offers = offers;
+                            let _ = inner.events.send(Event::PeerModels { id: peer_id });
+                        }
                     }
                 }
                 Message::Hello { .. } => bail!("unexpected second hello"),

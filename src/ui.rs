@@ -35,6 +35,7 @@ use crate::runs::RunRecord;
 use crate::trust::{Ticket, TrustedPeer};
 
 mod connect;
+mod models;
 mod tools;
 mod workers;
 
@@ -44,6 +45,7 @@ const APP_JS: &str = include_str!("../ui/app.js");
 const TOOLS_JS: &str = include_str!("../ui/tools.js");
 const PLAN_TEXT_JS: &str = include_str!("../ui/plan-text.js");
 const MARKDOWN_JS: &str = include_str!("../ui/markdown.js");
+const MODELS_JS: &str = include_str!("../ui/models.js");
 const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
 const WORKERS_JS: &str = include_str!("../ui/workers.js");
 const CONNECT_JS: &str = include_str!("../ui/connect.js");
@@ -411,8 +413,10 @@ impl Shared {
                     // How busy it says it is, with this agent's tasks there right now.
                     "load": p.load,
                     "mine": self.agent.pending_to(p.id),
-                    // Its providers' default models and the ones tasks may ask for.
+                    // Its providers' default models and the ones tasks may ask for, and
+                    // the models its accounts offer that they may (with their efforts).
                     "models": p.models,
+                    "offers": p.offers,
                 })
             })
             .collect();
@@ -459,6 +463,11 @@ impl Shared {
         self.send(msg);
     }
 
+    /// This agent changed (e.g. its models): pages show it again.
+    fn broadcast_me(&self) {
+        self.send(json!({ "type": "me", "me": self.me_json() }));
+    }
+
     fn me_json(&self) -> Value {
         let addr = self.agent.addr();
         let ticket = Ticket {
@@ -484,9 +493,11 @@ impl Shared {
             "workspace": self.info.workspace.display().to_string(),
             "providers": self.info.providers,
             "accounts": accounts,
-            // Its providers' default models and efforts and the models tasks may ask for
-            // (as it started; a digital worker's include its owner's).
-            "models": self.info.profile.models(),
+            // Its providers' default models and efforts and the models tasks may ask for,
+            // as now set (a digital worker's include its owner's), and the models its
+            // accounts offer that they may.
+            "models": self.agent.models(),
+            "offers": self.agent.offers(),
             "shares": if self.info.serving { self.shares_json() } else { json!([]) },
             "ticket": ticket,
         })
@@ -838,7 +849,8 @@ pub async fn start_with_work(
                 Event::Chat { from, text } => pump.push_feed(
                     json!({ "kind": "chat", "from": from, "text": text, "self": false }),
                 ),
-                Event::PeerBusy { .. } => pump.broadcast_peers(),
+                Event::PeerBusy { .. } | Event::PeerModels { .. } => pump.broadcast_peers(),
+                Event::ModelsChanged => pump.broadcast_me(),
                 Event::TaskReceived {
                     from,
                     task_id,
@@ -1019,6 +1031,11 @@ pub async fn start_with_work(
         )
         .route("/api/workers/{name}/start", post(workers::start))
         .route("/api/workers/{name}/stop", post(workers::stop))
+        .route(
+            "/api/workers/{name}/models",
+            get(models::get_worker).put(models::put_worker),
+        )
+        .route("/api/models", get(models::get_own).put(models::put_own))
         .route("/api/sign-in/copilot", post(workers::sign_in_copilot))
         .route(
             "/api/connect",
@@ -1069,6 +1086,10 @@ pub async fn start_with_work(
         .route(
             "/markdown.js",
             get(|| async { asset("text/javascript; charset=utf-8", MARKDOWN_JS) }),
+        )
+        .route(
+            "/models.js",
+            get(|| async { asset("text/javascript; charset=utf-8", MODELS_JS) }),
         )
         .route(
             "/plan-builder.js",
@@ -1457,9 +1478,21 @@ fn start_task(
             }
         },
         "auto" => {
-            let peer = s.agent.find_peer(body.provider).ok_or_else(|| {
-                bad_request(format!("no connected peer serves {}", body.provider))
-            })?;
+            // A peer that allows the model and reasoning effort it asks for, if one does
+            // (their hello says); else the first, which says why it refuses.
+            let admits = |p: &PeerInfo| {
+                crate::models::choice(&p.models, body.provider)
+                    .admits(task.model.as_deref(), task.effort.as_deref())
+            };
+            let peer = s
+                .agent
+                .peers()
+                .into_iter()
+                .find(|p| p.capabilities.contains(&body.provider) && admits(p))
+                .or_else(|| s.agent.find_peer(body.provider))
+                .ok_or_else(|| {
+                    bad_request(format!("no connected peer serves {}", body.provider))
+                })?;
             Route::Peer(peer.id, peer.name)
         }
         squad if squad.starts_with('#') => {

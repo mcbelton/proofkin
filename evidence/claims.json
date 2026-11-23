@@ -1289,7 +1289,7 @@
     {
       "id": "MDL-3",
       "area": "models",
-      "claim": "A task chooses its model: a plan step's model= option (given once, a model's name, not on sign-offs, team steps or @workiq steps; a step with agent= and no model= takes the agent's model), /ask and /delegate --model right after the target, the web UI's Run task form (a Model list of the default and the models the chosen peer or this agent allows, or a name when any is allowed) and the model argument of the MCP and A2A delegate; the plan editor and builder read and write model=. The step's task carries it, the plan check warns when every peer a step may go to says it doesn't allow the model, the worker refuses a task asking for a model its owner doesn't allow (a refusal naming the allowed ones) and runs an allowed one, and the result, get_task and the A2A metadata name the model that did the work.",
+      "claim": "A task chooses its model: a plan step's model= option (given once, a model's name, not on sign-offs, team steps or @workiq steps; a step with agent= and no model= takes the agent's model), /ask and /delegate --model right after the target, the web UI's Run task form (a Model list of what the chosen peer or this agent lets you pick, see MDL-10) and the model argument of the MCP and A2A delegate; the plan editor and builder read and write model=. The step's task carries it, the plan check warns when every peer a step may go to says it doesn't allow the model, the worker refuses a task asking for a model its owner doesn't allow (a refusal naming the allowed ones) and runs an allowed one, and the result, get_task and the A2A metadata name the model that did the work.",
       "tests": [
         "lib::plan::steps_name_their_model_or_take_their_agents_and_the_check_warns_when_peers_refuse_it",
         "lib::models::a_task_runs_on_the_model_it_asks_for_if_allowed_else_the_default",
@@ -1359,7 +1359,7 @@
     {
       "id": "MDL-4",
       "area": "models",
-      "claim": "A task works at a reasoning effort (minimal, low, medium, high, xhigh or max): the one it asks for (a plan step's effort=, given once and not on sign-offs, team steps or @workiq steps; /ask and /delegate --effort with --model in either order; the web UI's Reasoning field; the MCP and A2A delegate's effort), else the profile's default for the provider (proofkin models effort, or models default --effort), which peers learn from the hello (a hello without one reads as none). The worker refuses a name that isn't an effort. Copilot gets it fitted to what the task's model supports (the nearest it supports below the one asked for, none if it supports none, and the task runs at the model's own if the CLI refuses it); Claude gets low to max (minimal is low) and Codex all of them, through the bridge. The result names the model with its effort, e.g. claude-opus-5.5 (max reasoning), in characters every version of Proofkin shows as they are, and so do the signed output, the audit log and the CLI; models list shows the efforts each Copilot model supports.",
+      "claim": "A task works at a reasoning effort (minimal, low, medium, high, xhigh or max): the one it asks for (a plan step's effort=, given once and not on sign-offs, team steps or @workiq steps; /ask and /delegate --effort with --model in either order; the web UI's Reasoning field; the MCP and A2A delegate's effort), else the profile's default for the provider (proofkin models effort, or models default --effort), which peers learn from the hello (a hello without one reads as none). The worker refuses a name that isn't an effort, and one its owner doesn't allow (MDL-7). Copilot gets it fitted to what the task's model supports (the nearest it supports below the one asked for, none if it supports none, and the task runs at the model's own if the CLI refuses it); Claude gets low to max (minimal is low) and Codex all of them, through the bridge. The result names the model with its effort, e.g. claude-opus-5.5 (max reasoning), in characters every version of Proofkin shows as they are, and so do the signed output, the audit log and the CLI; models list shows the efforts each Copilot model supports.",
       "tests": [
         "lib::models::a_task_works_at_the_effort_it_asks_for_else_the_default_fitted_to_its_model",
         "lib::models::what_copilot_says_about_a_model_is_read_leniently",
@@ -1376,15 +1376,16 @@
     {
       "id": "MDL-5",
       "area": "models",
-      "claim": "Wherever a model is chosen, the default model and reasoning effort are the selected choice, named when the agent that runs the task says them: the Run task form's Model list (the default, the models the chosen peer or this agent allows, or Another model… by name when it allows any; with Any peer or a squad, each peer's default) and Reasoning list (the default effort, then the levels), and the plan builder's Model and Reasoning fields for the step's peer. The This agent card lists the model and effort each provider's tasks run at; a boss that only delegates lists what its digital workers run.",
+      "claim": "Wherever a model is chosen, the default model and reasoning effort are the selected choice, named when the agent that runs the task says them: the Run task form's Model list (the default, then what the chosen peer or this agent lets you pick, see MDL-10; with Any peer or a squad, each peer's default) and Reasoning list (the default effort as the chosen model takes it, then the levels it allows that the model supports), and the plan builder's Model and Reasoning fields for the step's peer. The This agent card lists the model and effort each provider's tasks run at, and the models and efforts peers may ask for; a boss that only delegates lists what its digital workers run.",
       "tests": [
-        "ui::delegate_only_agents_allowlist_chat_peers_from_the_ui"
+        "ui::delegate_only_agents_allowlist_chat_peers_from_the_ui",
+        "ui::task_forms_offer_the_models_and_levels_the_worker_allows"
       ]
     },
     {
       "id": "MDL-6",
       "area": "models",
-      "claim": "A digital worker runs on its owner's model settings (default model, allowed models and reasoning effort) for each provider it sets nothing for, as it runs on its owner's accounts: its agent, its executor, its hello and the web UI use them, and proofkin models list says which are its owner's; a provider it sets anything for runs on its own setting.",
+      "claim": "A digital worker runs on its owner's model settings (default model, allowed models, reasoning effort and allowed efforts) for each provider it sets nothing for, as it runs on its owner's accounts: its agent, its executor, its hello and the web UI use them, and a running worker follows them when they change (MDL-8), and proofkin models list says which are its owner's; a provider it sets anything for runs on its own setting.",
       "tests": [
         "lib::profile::a_digital_worker_runs_on_its_owners_models_unless_it_sets_its_own"
       ]
@@ -1397,6 +1398,50 @@
         "lib::tracker::a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do",
         "lib::plan::a_step_working_on_an_issue_gets_its_text_as_external_content",
         "agents::a_step_gets_the_text_of_the_issue_it_works_on"
+      ]
+    },
+    {
+      "id": "MDL-7",
+      "area": "models",
+      "claim": "A profile's owner chooses the reasoning efforts tasks may ask a provider for (proofkin models allow <provider> --efforts <levels>|any, with or without models; the web UI's Models dialog), kept least to most in profile.json (all six is any, and left out). The default effort must be one of them, and the list keep it. A task asking for another is refused before it runs, naming the allowed ones; one asking for none works at the default, else the least allowed. Peers learn the list from the hello (a hello without one reads as any), cleaned of names that aren't efforts; a squad step with effort= goes first to members that allow it, and the plan check warns when every peer the step may go to says it doesn't.",
+      "tests": [
+        "lib::models::a_task_may_ask_only_for_the_reasoning_efforts_its_agent_allows",
+        "lib::protocol::hello_with_addresses_round_trips",
+        "lib::plan::steps_name_their_model_or_take_their_agents_and_the_check_warns_when_peers_refuse_it",
+        "lib::plan::squad_steps_pick_the_least_busy_capable_member",
+        "agents::workers_allow_only_some_efforts_and_tell_peers_the_models_they_offer"
+      ]
+    },
+    {
+      "id": "MDL-8",
+      "area": "models",
+      "claim": "A worker lists the models its Copilot account offers once it runs and tells peers the usable ones its tasks may ask for (only the allowed ones when it limits them), each with its name, vendor, cost multiplier and the reasoning efforts it supports (known efforts only, least to most), in its hello and, whenever its settings or that list change, in a models message older peers ignore; peers keep only well-formed, usable offers, at most 200 per provider, for the providers it serves. A running agent applies a change to its profile.json, and a digital worker to its owner's for the providers it sets nothing for, within seconds and without a restart: its next tasks run with them and its connected peers learn them.",
+      "tests": [
+        "lib::models::peers_learn_the_usable_models_they_may_ask_for",
+        "lib::protocol::hello_with_addresses_round_trips",
+        "agents::workers_allow_only_some_efforts_and_tell_peers_the_models_they_offer",
+        "agents::model_changes_reach_connected_peers_at_once",
+        "agents::running_agents_apply_profile_model_changes_and_workers_their_owners"
+      ]
+    },
+    {
+      "id": "MDL-9",
+      "area": "models",
+      "claim": "The web UI's Models dialog (Models… on the This agent card, and on each digital worker) lists the models the account offers, by vendor, to allow any or only those ticked (named for a provider that lists none), the reasoning levels to allow, and the defaults. Saving checks the settings as a whole (the defaults must be allowed; a provider the agent doesn't run, or an agent that isn't one of its digital workers, is refused and nothing is saved), writes profile.json and applies them at once: this agent's tasks and peers use them, and a digital worker uses its own or, again, its owner's. An agent that only delegates lists the models for its digital workers with a Copilot CLI started for the purpose.",
+      "tests": [
+        "ui::owners_choose_the_models_peers_may_pick_in_the_ui",
+        "lib::models::a_task_may_ask_only_for_the_reasoning_efforts_its_agent_allows",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
+      "id": "MDL-10",
+      "area": "models",
+      "claim": "The Run task form and the plan builder list what the chosen peer lets you pick: the models it allows, else all its account offers (by vendor, with their cost multiplier; a name typed by hand only for a peer that lists none), and the reasoning levels it allows that the chosen model supports, its defaults selected (the default level as the model takes it; a model without levels says so), the levels changing with the model. For Any peer or a squad they list what their peers allow together, and an Any peer task that names a model or an effort goes to a peer that allows them.",
+      "tests": [
+        "ui::task_forms_offer_the_models_and_levels_the_worker_allows",
+        "ui::any_peer_tasks_go_to_a_peer_that_allows_their_model",
+        "lib::plan::squad_steps_pick_the_least_busy_capable_member"
       ]
     }
   ]

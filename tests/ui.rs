@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use proofkin::audit::{AuditEntry, AuditLog};
+use proofkin::models::Offered;
 use proofkin::shares::ShareStore;
 use proofkin::ui::{self, UiInfo};
 use proofkin::{
@@ -31,6 +32,23 @@ impl Executor for Echo {
         // elsewhere keep their exact output).
         let model = (task.prompt == "hello").then(|| "echo-model-1".to_owned());
         Ok(Ran::new(format!("echo: {}", task.prompt), model))
+    }
+
+    /// Copilot offers two models: one with reasoning levels, one without.
+    async fn list_models(&self, provider: Provider) -> anyhow::Result<Vec<Offered>> {
+        let model = |id: &str, efforts: &[&str]| Offered {
+            id: id.into(),
+            name: id.into(),
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+            ..Default::default()
+        };
+        Ok(match provider {
+            Provider::Copilot => vec![
+                model("echo-big", &["low", "high", "max"]),
+                model("echo-small", &[]),
+            ],
+            Provider::Claude | Provider::Codex => Vec::new(),
+        })
     }
 }
 
@@ -177,11 +195,6 @@ async fn ui_requires_token_and_local_host_and_runs_tasks() {
 #[tokio::test]
 async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
     let home = tempfile::tempdir().unwrap();
-    let mut config = AgentConfig::new("boss", SecretKey::generate());
-    config.network = Network::Local;
-    config.bind = Some("127.0.0.1:0".parse().unwrap());
-    config.shares = ShareStore::with_data(home.path().join("data"));
-    let (agent, events) = Agent::bind(config).await.unwrap();
     // The models it sets are what its digital workers run; the page selects them.
     let mut profile = Profile::open_in(home.path(), "boss").unwrap();
     proofkin::models::set_default(
@@ -193,6 +206,13 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
     proofkin::models::set_effort(&mut profile.config.models, Provider::Copilot, Some("max"))
         .unwrap();
     profile.save().unwrap();
+    let mut config = AgentConfig::new("boss", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.shares = ShareStore::with_data(home.path().join("data"));
+    // As an agent starts: with its profile's models.
+    config.models = profile.models();
+    let (agent, events) = Agent::bind(config).await.unwrap();
     let info = UiInfo {
         profile,
         network: Network::Local,
@@ -717,6 +737,228 @@ async fn ui_gives_tasks_to_a_squad_member_and_moves_them_when_one_refuses() {
         "{}",
         claude.body
     );
+    boss.shutdown().await;
+    for (member, _) in members {
+        member.shutdown().await;
+    }
+}
+
+fn delegating(name: &str, id: iroh::EndpointId) -> TrustedPeer {
+    TrustedPeer {
+        name: name.into(),
+        id,
+        addrs: Default::default(),
+        can_delegate: true,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec!["data".into()],
+        m365: None,
+    }
+}
+
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+}
+
+/// The owner picks the models and reasoning levels peers may ask this agent for in the
+/// Models dialog, from those its account offers: checked, saved to profile.json and
+/// applied at once (connected peers learn them). The same for a digital worker, which
+/// may use its owner's settings instead.
+#[tokio::test]
+async fn owners_choose_the_models_peers_may_pick_in_the_ui() {
+    let home = tempfile::tempdir().unwrap();
+    let profile = Profile::open_in(home.path(), "worker").unwrap();
+    profile.save().unwrap();
+    let (worker_key, boss_key) = (SecretKey::generate(), SecretKey::generate());
+    let mut config = AgentConfig::new("worker", worker_key.clone());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.models = profile.models();
+    config.executor = Some(Arc::new(Echo));
+    config.shares = ShareStore::with_data(home.path().join("data"));
+    config.trust.allow(delegating("boss", boss_key.public()));
+    let (worker, events) = Agent::bind(config).await.unwrap();
+    let mut boss = AgentConfig::new("boss", boss_key);
+    boss.network = Network::Local;
+    boss.bind = Some("127.0.0.1:0".parse().unwrap());
+    boss.trust.allow(delegating("worker", worker_key.public()));
+    let (boss, _boss_events) = Agent::bind(boss).await.unwrap();
+    boss.connect(worker.addr()).await.unwrap();
+    wait_until("the boss is connected", || boss.peers().len() == 1).await;
+    // A digital worker of it, on its accounts.
+    let mut helper = Profile::open_in(home.path(), "helper").unwrap();
+    helper.config.owner = Some("worker".into());
+    helper.config.providers = vec![Provider::Copilot];
+    helper.save().unwrap();
+    let executor: Arc<dyn Executor> = Arc::new(Echo);
+    let info = UiInfo {
+        profile,
+        network: Network::Local,
+        serving: true,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: vec![Provider::Copilot],
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        worker.clone(),
+        events,
+        info,
+        Some(executor),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let call = |method: &'static str, path: &'static str, body: Option<&'static str>| {
+        let (host, token) = (host.clone(), token.to_owned());
+        async move { request(port, method, path, &host, Some(&token), body).await }
+    };
+    let saved_models = |name: &str| Profile::open_in(home.path(), name).unwrap().config.models;
+
+    // The dialog lists what its account offers.
+    let got = call("GET", "/api/models", None).await;
+    assert_eq!(got.status, 200, "{}", got.body);
+    let got = got.json();
+    assert_eq!(got["providers"], serde_json::json!(["copilot"]));
+    let listed: Vec<&str> = got["listed"]["copilot"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, ["echo-big", "echo-small"]);
+
+    // Only echo-big, at low or high reasoning (high unless asked): saved and applied, and
+    // the boss learns it, with only that model offered.
+    let only = r#"{"provider":"copilot","default":"echo-big","allowed":["echo-big"],"effort":"high","efforts":["high","low"]}"#;
+    let saved = call("PUT", "/api/models", Some(only)).await;
+    assert_eq!(saved.status, 200, "{}", saved.body);
+    let kept = saved_models("worker");
+    assert_eq!(kept[&Provider::Copilot].efforts, ["low", "high"]);
+    assert_eq!(worker.models(), kept);
+    wait_until("the boss learns them", || {
+        let peer = &boss.peers()[0];
+        peer.models == kept && peer.offers[&Provider::Copilot].len() == 1
+    })
+    .await;
+    let me = call("GET", "/api/state", None).await.json()["me"].clone();
+    assert_eq!(
+        me["models"]["copilot"]["efforts"],
+        serde_json::json!(["low", "high"])
+    );
+    assert_eq!(me["offers"]["copilot"][0]["id"], "echo-big");
+
+    // A default it doesn't allow, or a provider it doesn't run, is refused: nothing changes.
+    let bad = call(
+        "PUT",
+        "/api/models",
+        Some(r#"{"provider":"copilot","default":"echo-small","allowed":["echo-big"]}"#),
+    )
+    .await;
+    assert_eq!(bad.status, 400);
+    assert!(bad.body.contains("allow it first"), "{}", bad.body);
+    let claude = call("PUT", "/api/models", Some(r#"{"provider":"claude"}"#)).await;
+    assert_eq!(claude.status, 400, "{}", claude.body);
+    assert_eq!(saved_models("worker"), kept);
+
+    // A digital worker: its own settings, or its owner's.
+    let got = call("GET", "/api/workers/helper/models", None).await;
+    assert_eq!(got.status, 200, "{}", got.body);
+    let got = got.json();
+    assert_eq!(got["owner"], "worker");
+    assert_eq!(got["models"], serde_json::json!({}));
+    assert_eq!(got["owner_models"]["copilot"]["default"], "echo-big");
+    assert_eq!(got["listed"]["copilot"].as_array().unwrap().len(), 2);
+    let own = r#"{"provider":"copilot","allowed":["echo-small"]}"#;
+    let set = call("PUT", "/api/workers/helper/models", Some(own)).await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(
+        saved_models("helper")[&Provider::Copilot].allowed,
+        ["echo-small"]
+    );
+    let inherit = r#"{"provider":"copilot","inherit":true}"#;
+    let set = call("PUT", "/api/workers/helper/models", Some(inherit)).await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert!(saved_models("helper").is_empty(), "its owner's again");
+    let nobody = call("GET", "/api/workers/nobody/models", None).await;
+    assert_eq!(nobody.status, 400, "{}", nobody.body);
+    boss.shutdown().await;
+    worker.shutdown().await;
+}
+
+/// A task for Any peer that names a model goes to a peer that allows it (their hello
+/// says which), not simply the first.
+#[tokio::test]
+async fn any_peer_tasks_go_to_a_peer_that_allows_their_model() {
+    let home = tempfile::tempdir().unwrap();
+    let boss_key = SecretKey::generate();
+    let mut config = AgentConfig::new("boss", boss_key.clone());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let mut members = Vec::new();
+    for (name, allowed) in [("m1", vec!["echo-a".to_owned()]), ("m2", Vec::new())] {
+        let key = SecretKey::generate();
+        let mut member = AgentConfig::new(name, key.clone());
+        member.network = Network::Local;
+        member.bind = Some("127.0.0.1:0".parse().unwrap());
+        member.trust.allow(delegating("boss", boss_key.public()));
+        member.executor = Some(Arc::new(Echo));
+        member.shares = ShareStore::with_data(home.path().join(name));
+        proofkin::models::set_allowed(&mut member.models, Provider::Copilot, &allowed).unwrap();
+        config.trust.allow(delegating(name, key.public()));
+        members.push(Agent::bind(member).await.unwrap());
+    }
+    let (boss, events) = Agent::bind(config).await.unwrap();
+    for (member, _) in &members {
+        boss.connect(member.addr()).await.unwrap();
+    }
+    wait_until("both are connected", || boss.peers().len() == 2).await;
+    let info = UiInfo {
+        profile: Profile::open_in(home.path(), "boss").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        boss.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let start = |body: &'static str| {
+        let (host, token) = (host.clone(), token.to_owned());
+        async move {
+            let res = request(port, "POST", "/api/tasks", &host, Some(&token), Some(body)).await;
+            assert_eq!(res.status, 200, "{}", res.body);
+            res.json()["target"].clone()
+        }
+    };
+    let picky = start(r#"{"provider":"copilot","target":"auto","prompt":"x","model":"echo-b"}"#);
+    assert_eq!(picky.await, "m2", "m1 allows only echo-a");
+    let plain = start(r#"{"provider":"copilot","target":"auto","prompt":"x"}"#);
+    assert_eq!(plain.await, "m1", "any of them: the first");
     boss.shutdown().await;
     for (member, _) in members {
         member.shutdown().await;
@@ -2377,6 +2619,7 @@ async fn the_page_follows_the_ux_guidelines() {
     assert!(page.contains(r#"<meta name="theme-color""#));
     assert!(page.contains(r#"<script src="/tools.js" defer>"#));
     assert!(page.contains(r#"<script src="/markdown.js" defer>"#));
+    assert!(page.contains(r#"<script src="/models.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     assert!(page.contains(r#"<script src="/workers.js" defer>"#));
@@ -2403,6 +2646,7 @@ async fn the_page_follows_the_ux_guidelines() {
         "add-monitor-btn",
         "monitor-dialog",
         "team-dialog",
+        "models-dialog",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }
@@ -2436,6 +2680,7 @@ async fn the_page_follows_the_ux_guidelines() {
     for script in [
         "/app.js",
         "/markdown.js",
+        "/models.js",
         "/tools.js",
         "/plan-text.js",
         "/plan-builder.js",
@@ -2528,6 +2773,26 @@ fn task_text_shows_as_markdown_and_markup_stays_text() {
         .arg(&cases)
         .output()
         .expect("node must be installed to run the Markdown tests");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("ok: "), "{stdout}");
+}
+
+/// The Run task form and the plan builder offer what a worker lets peers pick: the
+/// models it allows, else all its account offers (by name only when it lists none), what
+/// several allow together, and the reasoning levels it allows that the model supports,
+/// with its defaults as the model takes them. The cases (tests/models.test.cjs) run in
+/// node, which loads ui/models.js as the page does.
+#[test]
+fn task_forms_offer_the_models_and_levels_the_worker_allows() {
+    let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/models.test.cjs");
+    let out = std::process::Command::new("node")
+        .arg(&cases)
+        .output()
+        .expect("node must be installed to run the model list tests");
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
