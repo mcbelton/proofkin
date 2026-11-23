@@ -132,6 +132,11 @@ pub struct LlmTask {
     /// commit references them, and a pull request from its branch closes them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<String>,
+    /// A pull request step: the worker opens the pull request from the branch an earlier
+    /// step's task committed to, and follows it until it is merged or closed, instead of
+    /// running a model (see [`crate::pulls`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<Box<crate::pulls::PullRequestAsk>>,
 }
 
 /// A task's title: the first line of `text`, trimmed. It ends at the first sentence end
@@ -187,7 +192,14 @@ impl LlmTask {
             team: None,
             title: None,
             issues: Vec::new(),
+            pull_request: None,
         }
+    }
+
+    /// Whether a model does the task: not a team step's (its lead's team does it) nor a
+    /// pull request step's (the worker opens the pull request).
+    pub fn runs_model(&self) -> bool {
+        self.team.is_none() && self.pull_request.is_none()
     }
 
     pub fn in_share(mut self, share: impl Into<String>) -> Self {

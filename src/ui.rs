@@ -102,6 +102,9 @@ struct TaskView {
     /// A team step: its lead hands the work down to its own team (it runs no model).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     team_step: bool,
+    /// A pull request step: its peer opens the pull request with the work before it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pull_request: bool,
     /// For peers' results: "verified" (signed by the peer for this output) or "unverified".
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<&'static str>,
@@ -192,6 +195,8 @@ struct StoredTask {
     approval: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     team_step: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pull_request: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evidence: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,6 +244,7 @@ impl From<&TaskView> for StoredTask {
             after: t.after.clone(),
             approval: t.approval,
             team_step: t.team_step,
+            pull_request: t.pull_request,
             evidence: t.evidence.map(str::to_owned),
             via: t.via.map(str::to_owned),
             run: t.run.clone(),
@@ -281,6 +287,7 @@ impl StoredTask {
             after: self.after,
             approval: self.approval,
             team_step: self.team_step,
+            pull_request: self.pull_request,
             evidence: known(self.evidence.as_deref(), &["verified", "unverified"]),
             preview: None,
             preview_label: None,
@@ -600,6 +607,7 @@ impl Shared {
                 after: step.after.clone(),
                 approval: step.approve,
                 team_step: step.team.is_some(),
+                pull_request: step.pr,
                 evidence: None,
                 preview: None,
                 preview_label: None,
@@ -1030,6 +1038,10 @@ pub async fn start_with_work(
         .route(
             "/api/shares/{name}/team",
             put(tools::set_team).delete(tools::remove_team),
+        )
+        .route(
+            "/api/shares/{name}/pull-requests",
+            put(tools::set_pull_requests),
         )
         .route("/api/squads", post(save_squad))
         .route("/api/squads/{name}", delete(remove_squad))
@@ -1552,6 +1564,7 @@ fn start_task(
         after: Vec::new(),
         approval: false,
         team_step: false,
+        pull_request: false,
         evidence: None,
         preview: None,
         preview_label: None,
@@ -2032,6 +2045,7 @@ fn start_plan(
             after: step.after.clone(),
             approval: step.approve,
             team_step: step.team.is_some(),
+            pull_request: step.pr,
             evidence: None,
             preview: None,
             preview_label: None,
@@ -4081,6 +4095,7 @@ mod tests {
             after: Vec::new(),
             approval: false,
             team_step: false,
+            pull_request: false,
             evidence: None,
             preview: None,
             preview_label: None,

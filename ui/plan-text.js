@@ -5,7 +5,7 @@ const planText = (() => {
   // Step and claim names: letters, digits, '-', '_' or '.', not starting with '.'.
   const NAME = /^(?!\.)[A-Za-z0-9._-]{1,64}$/;
   // Words that start a part of a step line, so never its name.
-  const KEYWORDS = new Set(["after", "approve", "team", "using"]);
+  const KEYWORDS = new Set(["after", "approve", "team", "pr", "using"]);
   // Step options (before what to do), by the option they set. Repeating a list
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
@@ -15,6 +15,8 @@ const planText = (() => {
   const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq", "model", "effort"]);
   // A team step is done and proven by the lead's team plan.
   const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent", "model", "effort"]);
+  // A pull request step opens the pull request with the work before it: only a time limit and an issue.
+  const IN_PR = new Set(["timeout", "issue"]);
   // A @workiq step asks Microsoft 365 for an answer: context, never proof. Its agent= is a Work IQ
   // agent id; it has no skills, MCP servers, checks, claims, patches, folder, model or search of its own.
   const WORKIQ = "@workiq";
@@ -28,6 +30,8 @@ const planText = (() => {
     teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers, agent, model or reasoning effort of its own.",
     workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, patches, skills, MCP servers, model, reasoning effort or search of its own.",
     workiqKind: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it can't be a sign-off or a team step.",
+    prOption: "A pull request step opens the pull request with the work before it: it takes only a time limit and an issue.",
+    prTarget: "A pull request step is opened by the agent that holds the folder's clone: a peer and its folder (@peer:folder).",
     ownStep: (id) => `Step ${id} can't wait for itself.`,
   };
 
@@ -116,7 +120,7 @@ const planText = (() => {
   /// are found, repeated options are merged, and a line of plain words is what to do.
   function parseStep(line) {
     const words = line.trim().split(/\s+/).filter(Boolean);
-    const step = { id: null, after: [], approve: false, team: false, target: null, using: null, options: [], todo: "" };
+    const step = { id: null, after: [], approve: false, team: false, pr: false, target: null, using: null, options: [], todo: "" };
     const found = [];
     let i = 0;
     if (NAME.test(words[0] ?? "") && !KEYWORDS.has(words[0])) step.id = words[i++];
@@ -125,10 +129,12 @@ const planText = (() => {
       if (word === "after" && !step.target && !step.after.length && next) {
         step.after = next.split(",").filter(Boolean);
         i++;
-      } else if (word === "approve" && !step.target && !step.approve && !step.team) {
+      } else if (word === "approve" && !step.target && !step.approve && !step.team && !step.pr) {
         step.approve = true;
-      } else if (word === "team" && !step.target && !step.approve && !step.team) {
+      } else if (word === "team" && !step.target && !step.approve && !step.team && !step.pr) {
         step.team = true;
+      } else if (word === "pr" && !step.target && !step.approve && !step.team && !step.pr) {
+        step.pr = true;
       } else if (isTarget(word) && !step.target) {
         step.target = word;
       } else if (word === "using" && step.target && !step.using && next) {
@@ -150,7 +156,7 @@ const planText = (() => {
   }
 
   /// A step as plan text, its parts in the order the parser reads them.
-  const formatStep = (s) => [s.id, s.after.length ? `after ${s.after.join(",")}` : "", s.approve ? "approve" : "", s.team ? "team" : "",
+  const formatStep = (s) => [s.id, s.after.length ? `after ${s.after.join(",")}` : "", s.approve ? "approve" : "", s.team ? "team" : "", s.pr ? "pr" : "",
     s.target, s.using ? `using ${s.using}` : "", ...s.options, s.todo].filter(Boolean).join(" ");
 
   /// The names of the plan's steps.
@@ -195,6 +201,7 @@ const planText = (() => {
       if (step.approve && part.startsWith("#")) return { error: ERRORS.squadSignoff };
       const workiq = part === WORKIQ || part.startsWith(`${WORKIQ}:`);
       if (workiq && (step.approve || step.team)) return { error: ERRORS.workiqKind };
+      if (step.pr && !/^@[^:]+:.+/.test(part)) return { error: ERRORS.prTarget };
       if (workiq && step.options.some((o) => NOT_IN_WORKIQ.has(optionOf(o)))) return { error: ERRORS.workiqOption };
       // A sign-off is by a person: the peer, not one of its folders. Work IQ has no folders.
       step.target = step.approve || workiq ? part.split(":")[0] : part;
@@ -205,12 +212,14 @@ const planText = (() => {
     } else {
       if (step.approve && NOT_IN_SIGNOFF.has(optionOf(part))) return { error: ERRORS.signoffOption };
       if (step.team && NOT_IN_TEAM.has(optionOf(part))) return { error: ERRORS.teamOption };
+      if (step.pr && !IN_PR.has(optionOf(part))) return { error: ERRORS.prOption };
       if (step.target === WORKIQ && NOT_IN_WORKIQ.has(optionOf(part))) return { error: ERRORS.workiqOption };
       setOption(step, part);
     }
     step.id ??= nextStepId(text);
     step.target ??= target;
-    step.todo ||= at.blockEnd > at.end ? "" : TODO;
+    // A pull request step's title is optional: no placeholder to type over.
+    step.todo ||= at.blockEnd > at.end || step.pr ? "" : TODO;
     const line = (kind === "step" ? at.line.match(/^\s*/)[0] : "") + formatStep(step);
     // Select a placeholder to type over: a new topic's name, or what to do.
     const topic = part === "save=topic" ? line.indexOf(" save=topic ") : -1;
@@ -473,10 +482,13 @@ const planText = (() => {
         if (s.approve || s.team) need("step", i, "target", ERRORS.workiqKind);
         else if (s.options.some((o) => NOT_IN_WORKIQ.has(optionOf(o)))) need("step", i, "target", ERRORS.workiqOption);
       }
-      if (blank(taskOf(s), TODO)) {
+      if (s.pr && s.target && !/^@[^:]+:.+/.test(s.target)) need("step", i, "target", ERRORS.prTarget);
+      if (s.pr && s.options.some((o) => !IN_PR.has(optionOf(o)))) need("step", i, "target", ERRORS.prOption);
+      // A pull request step without a title takes that of the work it opens.
+      if (!s.pr && blank(taskOf(s), TODO)) {
         need("step", i, "todo", s.approve ? "Say what to check before signing off" : "Say what this step should do");
       }
-      if (!s.approve && !s.team && s.target !== WORKIQ && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {
+      if (!s.approve && !s.team && !s.pr && s.target !== WORKIQ && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {
         need("step", i, "claims", "Without a check, this step can't prove a claim: pick a check, or let a sign-off prove it");
       }
     });

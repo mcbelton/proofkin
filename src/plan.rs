@@ -252,6 +252,11 @@ pub struct Step {
     /// [`crate::models::EFFORTS`]). None: the peer's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// A pull request step (`pr @peer:folder [title]`): the folder's agent opens the pull
+    /// request from the branch of the work before it there, and follows it until it is
+    /// merged (see [`crate::pulls`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pr: bool,
 }
 
 /// The `workiq=` sources, and the Work IQ capability each one names.
@@ -651,6 +656,35 @@ impl Plan {
         if !pending.is_empty() {
             let stuck: Vec<&str> = pending.keys().copied().collect();
             bail!("dependency cycle between steps: {}", stuck.join(", "));
+        }
+        for step in self.steps.iter().filter(|s| s.pr) {
+            let place = format!(
+                "{}:{}",
+                step.target,
+                step.share.as_deref().unwrap_or_default()
+            );
+            let sources = pr_sources(self, step);
+            if sources.is_empty() {
+                bail!(
+                    "pull request step '{}' comes after no step that works in {place}: there is no work to open it with",
+                    step.id
+                );
+            }
+            let here: Vec<&Step> = sources
+                .into_iter()
+                .filter(|s| s.target == step.target)
+                .collect();
+            let ends = chain_ends(self, &here);
+            if ends.len() > 1 {
+                bail!(
+                    "pull request step '{}' comes after steps {} that work in {place} on separate branches: a step builds on another's work only with apply=; or open a pull request for each",
+                    step.id,
+                    ends.iter()
+                        .map(|s| s.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                );
+            }
         }
         Ok(())
     }
@@ -1107,6 +1141,10 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     if team {
         words.next();
     }
+    let pr = !approve && !team && words.peek() == Some(&"pr");
+    if pr {
+        words.next();
+    }
     let target = words
         .next()
         .with_context(|| format!("who runs it is missing; {STEP_FORM}"))?;
@@ -1131,6 +1169,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         Target::Squad(name.to_owned())
     };
     let mut provider = Provider::Copilot;
+    let mut using = false;
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
     let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
     let mut agent = None;
@@ -1145,6 +1184,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                 let name = words.next().context("'using' needs a provider")?;
                 provider = clap::ValueEnum::from_str(name, true)
                     .map_err(|_| anyhow!("unknown provider {name:?}"))?;
+                using = true;
             }
             Some(word) if word.contains('=') => {
                 let (key, value) = word.split_once('=').expect("contains '='");
@@ -1254,8 +1294,36 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
             format!("{prompt}\n{continuation}")
         };
     }
-    if prompt.is_empty() {
+    if prompt.is_empty() && !pr {
         bail!("missing the task prompt: what to do comes last, after who runs it and the options");
+    }
+    if pr {
+        let given = [
+            ("using", using),
+            ("verify=", !checks.is_empty()),
+            ("attempts=", attempts.is_some()),
+            ("claims=", !claims.is_empty()),
+            ("apply=", apply.is_some()),
+            ("context=", !context.is_empty()),
+            ("save=", save.is_some()),
+            ("skill=", !skills.is_empty()),
+            ("mcp=", !mcp.is_empty()),
+            ("agent=", agent.is_some()),
+            ("workiq=", !workiq.is_empty()),
+            ("model=", model.is_some()),
+            ("effort=", effort.is_some()),
+            ("levels=", levels.is_some()),
+        ];
+        if let Some((what, _)) = given.iter().find(|(_, present)| *present) {
+            bail!(
+                "pull request step '{id}' opens a pull request with the work before it: it can't have {what}"
+            );
+        }
+        if !matches!(&target, Target::Peer(name) if name != "me") || share.is_none() {
+            bail!(
+                "pull request step '{id}' needs @peer:folder: the agent that holds the folder's clone, and the folder"
+            );
+        }
     }
     if levels.is_some() && target == Target::Workiq {
         bail!(
@@ -1303,6 +1371,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         workiq,
         model,
         effort,
+        pr,
     };
     if let Some(why) = step.workiq_refusal() {
         bail!("{why}");
@@ -1621,6 +1690,24 @@ fn unproven_fixes(plan: &Plan, claim: &ClaimDef) -> Vec<Fix> {
 /// Why `peer` can't run `step`, if it can't: provider, folder, checks, access.
 fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
     use crate::llm::Access;
+    if step.pr {
+        let folder = step.share.as_deref().unwrap_or_default();
+        return match peer.shares.iter().find(|s| s.name == folder) {
+            None => Some(format!(
+                "{} shares no folder '{folder}' with you, so it can't open its pull request",
+                peer.name
+            )),
+            Some(share) if !share.pull_requests => Some(format!(
+                "folder '{folder}' on {} doesn't take pull request steps (its owner allows them with: proofkin share pull-requests {folder}), or its agent is older",
+                peer.name
+            )),
+            Some(share) if share.access < Access::WorkspaceWrite => Some(format!(
+                "a pull request step needs edit access in '{folder}' on {}; you have {}",
+                peer.name, share.access
+            )),
+            Some(_) => None,
+        };
+    }
     if step.team.is_some() {
         let folder = step.share.as_deref().unwrap_or(crate::shares::DATA_SHARE);
         return match peer.shares.iter().find(|s| s.name == folder) {
@@ -2240,6 +2327,121 @@ fn ancestors(plan: &Plan, id: &str) -> std::collections::BTreeSet<String> {
         }
     }
     found
+}
+
+/// The steps whose work pull request step `pr` may open: those it waits for (directly or
+/// through others) that a model does in its folder, on its peer or on a squad (whose
+/// member may be its peer).
+fn pr_sources<'a>(plan: &'a Plan, pr: &Step) -> Vec<&'a Step> {
+    let before = ancestors(plan, &pr.id);
+    plan.steps
+        .iter()
+        .filter(|s| before.contains(&s.id) && !s.pr && !s.approve && s.team.is_none())
+        .filter(|s| s.share == pr.share)
+        .filter(|s| s.target == pr.target || matches!(s.target, Target::Squad(_)))
+        .collect()
+}
+
+/// Whether the work of `step` starts from that of step `id`: its `apply=` chain reaches it.
+fn applies(plan: &Plan, step: &Step, id: &str) -> bool {
+    let mut seen = HashSet::new();
+    let mut at = step.apply.as_deref();
+    while let Some(applied) = at {
+        if applied == id {
+            return true;
+        }
+        if !seen.insert(applied) {
+            break;
+        }
+        at = plan
+            .steps
+            .iter()
+            .find(|s| s.id == applied)
+            .and_then(|s| s.apply.as_deref());
+    }
+    false
+}
+
+/// Those of `steps` whose work none of the others starts from: one means its branch has
+/// the work of all of them (they are on its `apply=` chain).
+fn chain_ends<'a>(plan: &Plan, steps: &[&'a Step]) -> Vec<&'a Step> {
+    steps
+        .iter()
+        .copied()
+        .filter(|s| {
+            !steps
+                .iter()
+                .any(|other| other.id != s.id && applies(plan, other, &s.id))
+        })
+        .collect()
+}
+
+/// What pull request step `step` asks its peer for: to open it from the branch of the work
+/// before it in its folder there (that of the step whose branch has all of it), titled
+/// with the step's own words, else that step's.
+fn pr_ask(
+    plan: &Plan,
+    step: &Step,
+    states: &BTreeMap<String, StepState>,
+) -> Result<crate::pulls::PullRequestAsk> {
+    let Target::Peer(peer) = &step.target else {
+        bail!("a pull request step names its peer: @peer:folder");
+    };
+    let folder = step.share.as_deref().unwrap_or_default();
+    let made: Vec<(&Step, &crate::evidence::GitCommit)> = pr_sources(plan, step)
+        .into_iter()
+        .filter_map(|s| match &states[&s.id] {
+            StepState::Done {
+                peer: by,
+                evidence: Some(evidence),
+                ..
+            } if by == peer => evidence
+                .git
+                .as_ref()
+                .filter(|g| g.commit.is_some())
+                .map(|g| (s, g)),
+            _ => None,
+        })
+        .collect();
+    let steps: Vec<&Step> = made.iter().map(|(s, _)| *s).collect();
+    let ends = chain_ends(plan, &steps);
+    let tip = match ends.as_slice() {
+        [] => bail!(
+            "no step before it committed work to '{folder}' on {peer}: there is nothing to open a pull request with"
+        ),
+        [tip] => *tip,
+        many => bail!(
+            "steps {} committed to '{folder}' on {peer} on separate branches: a step has another's work only with apply=",
+            many.iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+    };
+    let git = made
+        .iter()
+        .find(|(s, _)| s.id == tip.id)
+        .map(|(_, g)| *g)
+        .expect("a step with a commit");
+    // Without words of its own, the title is that of the step that started the work.
+    let first = std::iter::successors(Some(tip), |s| {
+        s.apply
+            .as_ref()
+            .and_then(|a| plan.steps.iter().find(|x| &x.id == a))
+    })
+    .take(plan.steps.len())
+    .last()
+    .unwrap_or(tip);
+    let words = if step.own_text().trim().is_empty() {
+        first.own_text()
+    } else {
+        step.own_text()
+    };
+    Ok(crate::pulls::PullRequestAsk {
+        branch: git.branch.clone(),
+        commit: git.commit.clone().unwrap_or_default(),
+        title: crate::llm::title_of(words),
+    })
 }
 
 /// A plan checked and ready to run as `profile`'s agent (see [`start`]).
@@ -3033,6 +3235,25 @@ pub async fn run_plan_with(
                             chain: chain.clone(),
                             brief: step.own_text().to_owned(),
                         });
+                    }
+                    if step.pr {
+                        match pr_ask(plan, step, &states) {
+                            Ok(ask) => {
+                                task.prompt = format!(
+                                    "Open a pull request from {}: {}",
+                                    ask.branch, ask.title
+                                );
+                                task.title = Some(ask.title.clone());
+                                task.pull_request = Some(Box::new(ask));
+                            }
+                            Err(e) => {
+                                let state = StepState::failed(Some(peer.name), format!("{e:#}"));
+                                on_update(&step.id, &state);
+                                states.insert(step.id.clone(), state);
+                                changed = true;
+                                continue;
+                            }
+                        }
                     }
                     let origin = Origin {
                         run: ctx.run_id.clone(),
@@ -3855,6 +4076,7 @@ mod tests {
             },
             mcp_about: Default::default(),
             team: false,
+            pull_requests: false,
         };
         let peer = |name: &str, shares: Vec<ShareInfo>| PeerInfo {
             name: name.into(),
@@ -4187,6 +4409,166 @@ mod tests {
         assert_eq!(
             problems(lead(true, Access::WorkspaceWrite)),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn pull_request_steps_open_the_work_before_them_in_their_folder() {
+        let text = "impl @bob:app Write the parser\n\
+                    check after impl @bob:app apply=impl verify=test Check it\n\
+                    ok after check approve @me Ship it?\n\
+                    ship after ok pr @bob:app";
+        let plan = Plan::parse(text).unwrap();
+        let pr = &plan.steps[3];
+        assert!(pr.pr && !pr.approve && pr.team.is_none(), "{pr:?}");
+        assert_eq!((pr.share.as_deref(), pr.prompt.as_str()), (Some("app"), ""));
+        let titled = Plan::parse("a @bob:app do\np after a pr @bob:app Add the parser").unwrap();
+        assert_eq!(titled.steps[1].prompt, "Add the parser");
+        // After who runs it, "pr" is a word of the task.
+        assert!(!Plan::parse("x @bob pr review").unwrap().steps[0].pr);
+
+        let err = |text: &str| Plan::parse(text).unwrap_err().to_string();
+        for (text, why) in [
+            ("a @bob:app do\np after a pr @bob Go", "needs @peer:folder"),
+            (
+                "a #devs:app do\np after a pr #devs:app Go",
+                "needs @peer:folder",
+            ),
+            (
+                "a @bob:app do\np after a pr @me:app Go",
+                "needs @peer:folder",
+            ),
+            (
+                "a @bob:app do\np after a pr @bob:app verify=test Go",
+                "can't have verify=",
+            ),
+            (
+                "a @bob:app do\np after a pr @bob:app model=x Go",
+                "can't have model=",
+            ),
+            (
+                "a @bob:app do\np after a pr @bob:app using claude Go",
+                "can't have using",
+            ),
+            (
+                "a @bob:app do\np after a pr @bob:app apply=a Go",
+                "can't have apply=",
+            ),
+            (
+                "a @bob:other do\np after a pr @bob:app Go",
+                "comes after no step that works in @bob:app",
+            ),
+            (
+                "a @alice:app do\np after a pr @bob:app Go",
+                "comes after no step",
+            ),
+            (
+                "a @bob:app do\nok after a approve @me Fine?\np pr @bob:app Go",
+                "comes after no step",
+            ),
+            (
+                "a @bob:app do\nb @bob:app do\np after a,b pr @bob:app Go",
+                "steps a and b that work in @bob:app on separate branches",
+            ),
+            (
+                "a @bob:app do\nb after a @bob:app do\np after b pr @bob:app Go",
+                "separate branches",
+            ),
+        ] {
+            assert!(err(text).contains(why), "{text}: {}", err(text));
+        }
+        // A squad's member may be its peer: the squad's work counts.
+        Plan::parse("a #devs:app do\np after a pr @bob:app Go").unwrap();
+
+        // Its peer must take pull request steps in the folder, with edit access for you.
+        let bob = |pull_requests: bool, access: Access| PeerInfo {
+            name: "bob".into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: Vec::new(),
+            shares: vec![ShareInfo {
+                name: "app".into(),
+                access,
+                worktrees: true,
+                pull_requests,
+                ..Default::default()
+            }],
+            owner: None,
+            role: None,
+            load: None,
+            models: Default::default(),
+            offers: Default::default(),
+        };
+        assert!(
+            unable(pr, &bob(false, Access::Full))
+                .unwrap()
+                .contains("doesn't take pull request steps")
+        );
+        assert!(
+            unable(pr, &bob(true, Access::ReadOnly))
+                .unwrap()
+                .contains("needs edit access")
+        );
+        // It runs no model: bob needn't serve a provider.
+        assert_eq!(unable(pr, &bob(true, Access::WorkspaceWrite)), None);
+
+        // It opens the branch that has all the work (check's: it applied impl's), titled
+        // with the words of the step that started it.
+        let key = iroh::SecretKey::generate();
+        let done = |peer: &str, branch: &str, commit: Option<&str>| {
+            let mut evidence = Evidence::new(
+                crate::evidence::EvidenceKind::Task,
+                peer,
+                key.public(),
+                key.public(),
+                1,
+            );
+            evidence.git = Some(crate::evidence::GitCommit {
+                branch: branch.into(),
+                base: "base".into(),
+                commit: commit.map(Into::into),
+                files: vec!["parser.rs".into()],
+                patch_sha256: None,
+                left_out: Vec::new(),
+            });
+            StepState::Done {
+                peer: peer.into(),
+                output: "did it".into(),
+                evidence: Some(evidence),
+                verified: true,
+                patch: None,
+                model: None,
+            }
+        };
+        let mut states: BTreeMap<String, StepState> = [
+            ("impl", done("bob", "p2p/boss/1-1", Some("c1"))),
+            ("check", done("bob", "p2p/boss/2-2", Some("c2"))),
+            ("ok", StepState::Waiting),
+            ("ship", StepState::Waiting),
+        ]
+        .into_iter()
+        .map(|(id, s)| (id.to_owned(), s))
+        .collect();
+        let ask = pr_ask(&plan, pr, &states).unwrap();
+        assert_eq!(
+            (ask.branch.as_str(), ask.commit.as_str(), ask.title.as_str()),
+            ("p2p/boss/2-2", "c2", "Write the parser")
+        );
+        let ask = pr_ask(&titled, &titled.steps[1], &{
+            let mut s = BTreeMap::new();
+            s.insert("a".to_owned(), done("bob", "p2p/boss/3-3", Some("c3")));
+            s
+        })
+        .unwrap();
+        assert_eq!(ask.title, "Add the parser");
+        // Work that ran elsewhere, or committed nothing, isn't there to open.
+        states.insert("check".into(), done("alice", "p2p/boss/2-2", Some("c2")));
+        assert_eq!(pr_ask(&plan, pr, &states).unwrap().branch, "p2p/boss/1-1");
+        states.insert("impl".into(), done("bob", "p2p/boss/1-1", None));
+        assert!(
+            pr_ask(&plan, pr, &states)
+                .unwrap_err()
+                .to_string()
+                .contains("no step before it committed work to 'app' on bob"),
         );
     }
 
@@ -4546,6 +4928,7 @@ mod tests {
                 mcp: Vec::new(),
                 mcp_about: Default::default(),
                 team: false,
+                pull_requests: false,
             }],
             owner: None,
             role: None,
@@ -4702,6 +5085,7 @@ mod tests {
                 mcp: Vec::new(),
                 mcp_about: Default::default(),
                 team: false,
+                pull_requests: false,
             }],
             owner: None,
             role: None,
@@ -4825,6 +5209,7 @@ mod tests {
                 mcp: Vec::new(),
                 mcp_about: Default::default(),
                 team: false,
+                pull_requests: false,
             }],
             owner: None,
             role: None,

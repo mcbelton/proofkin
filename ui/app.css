@@ -367,7 +367,7 @@ fieldset.field legend { padding: 0; margin-bottom: 6px; font-weight: 600; font-s
 .task details { margin-top: 6px; }
 .task summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 12.5px; }
 .task pre { margin: 8px 0 0; padding: 10px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; font-family: var(--mono); font-size: 12.5px; }
-.task.failed pre { border-color: var(--danger); }
+.task.failed pre, .task.failed .result { border-color: var(--danger); }
 .task .result {
   margin-top: 8px; padding: 2px 12px; max-height: 420px; overflow: auto;
   background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -709,6 +709,7 @@ dialog.editor-dialog { width: min(1240px, calc(100vw - 32px)); height: calc(100v
   padding: 12px 14px; display: flex; flex-direction: column; gap: 14px;
 }
 .pb-step.signoff { border-left: 3px solid var(--accent); }
+.pb-step.pr { border-left: 3px solid var(--success); }
 .pb-head { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; }
 .pb-head .pb-field { width: 16ch; }
 .pb-head .icon-btn { margin-left: auto; }

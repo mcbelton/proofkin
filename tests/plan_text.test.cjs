@@ -185,6 +185,16 @@ cases.push(
     needs(planText.parsePlan("claim: C-1 x\nbuild team @alice:app claims=C-1 Build it")), ""],
   ["no checks on a team step", part("build team @alice:app Build| it", "verify=test"), `error: ${ERRORS.teamOption}`],
   ["a team step's timeout", part("build team @alice:app Build| it", "timeout=30m"), "build team @alice:app timeout=30m Build it[]"],
+  // A pull request step opens the pull request with the work before it: a title, if any,
+  // a time limit and an issue, from a peer's folder.
+  ["a pull request step comes back as it was", text(planText.parsePlan("ship after check pr @alice:app timeout=1d Add the parser")),
+    "ship after check pr @alice:app timeout=1d Add the parser"],
+  ["a pull request step needs no title", needs(planText.parsePlan("build @alice:app Build it\nship after build pr @alice:app")), ""],
+  ["a pull request step is opened from a folder", needs(planText.parsePlan("build @alice:app Build it\nship after build pr @alice")),
+    `step1.target: ${ERRORS.prTarget}`],
+  ["no checks on a pull request step", part("ship pr @alice:app Add| it", "verify=test"), `error: ${ERRORS.prOption}`],
+  ["no squad opens a pull request", part("ship pr |", "#devs:app"), `error: ${ERRORS.prTarget}`],
+  ["a pull request step's issue", part("ship pr @alice:app Add| it", "issue=#7"), "ship pr @alice:app issue=#7 Add it[]"],
   // model= names the model a step runs on; a sign-off, team step or @workiq step has none.
   ["a step's model", part("a @x Do| it", "model=gpt-5.5"), "a @x model=gpt-5.5 Do it[]"],
   ["a step's model replaces its model", part("a @x model=gpt-5.5 Do| it", "model=claude-sonnet-5.5"), "a @x model=claude-sonnet-5.5 Do it[]"],

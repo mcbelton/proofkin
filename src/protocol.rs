@@ -167,6 +167,8 @@ pub enum Phase {
     Committing,
     /// A lead's agent is running its team plan for it.
     Team,
+    /// The folder's agent opened the task's pull request and waits for it to be merged.
+    PullRequest,
     /// The connection to the worker dropped; waiting for it to come back.
     Reconnecting,
     /// A phase from a newer version.
@@ -181,6 +183,7 @@ impl<'de> Deserialize<'de> for Phase {
             "checking" => Phase::Checking,
             "committing" => Phase::Committing,
             "team" => Phase::Team,
+            "pull_request" => Phase::PullRequest,
             "reconnecting" => Phase::Reconnecting,
             _ => Phase::Other,
         })
