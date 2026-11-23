@@ -1343,9 +1343,11 @@
     {
       "id": "TRK-6",
       "area": "tracking",
-      "claim": "With a tracker linked, Plan mode and the plan editor say beside Run plan that the run is tracked in the tracker's repository (an issue for the run, a sub-issue per step), with a choice of a new issue, an issue it works on or not tracked, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's).",
+      "claim": "With a tracker linked, Plan mode and the plan editor offer Track on GitHub beside Run plan: a new issue (with a sub-issue per step), an existing issue it works on (by number) or don't track, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's). The line under it says what running the plan does there before it runs: the repository and the board (links that open a new tab), the account the issues are assigned to, the new issue's title when the plan names one, and that anyone can read them when the repository is public (the tracker reads its visibility; tracker status says it too), or that nothing goes to GitHub. An existing issue is looked up as its number is typed (GET /api/tracker/issues/N): its title, with a warning when it is closed (running reopens it), doesn't exist (the plan would run untracked) or can't be looked up; Run plan and Schedule… ask for the number when it is missing instead of opening a new issue.",
       "tests": [
-        "ui::the_plan_editor_keeps_plans_valid"
+        "ui::the_plan_editor_keeps_plans_valid",
+        "lib::tracker::the_web_ui_learns_who_can_read_the_issues_and_looks_up_the_one_a_run_works_on",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
       ]
     },
     {

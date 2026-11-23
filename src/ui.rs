@@ -990,6 +990,7 @@ pub async fn start_with_work(
             get(tracker_state).put(link_tracker).delete(unlink_tracker),
         )
         .route("/api/tracker/items", get(tracker_items))
+        .route("/api/tracker/issues/{number}", get(tracker_issue))
         .route("/api/tracker/add", post(add_to_board))
         .route("/api/tracker/sync", post(sync_tracker))
         .route("/api/skills", get(list_skills).post(tools::add_skill))
@@ -2844,6 +2845,24 @@ struct TrackerBody {
     repo: String,
     #[serde(default)]
     project: Option<String>,
+}
+
+/// Issue `number` of the tracker's repository, for the plan's "Existing issue" choice
+/// (`issue` null when there is no such issue).
+async fn tracker_issue(
+    State(s): State<AppState>,
+    Path(number): Path<u64>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let tracker = crate::tracker::open(&profile)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?
+        .ok_or_else(|| bad_request("no tracker is linked: link one on the Tracker card"))?;
+    let issue = tracker
+        .issue_summary(number)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(json!({ "repo": tracker.config.repo, "issue": issue })))
 }
 
 async fn link_tracker(

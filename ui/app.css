@@ -740,10 +740,13 @@ dialog.editor-dialog { width: min(1240px, calc(100vw - 32px)); height: calc(100v
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .insert:hover { border-color: var(--accent); color: var(--accent); }
-.editor-foot { display: flex; justify-content: flex-end; gap: 8px; }
+.editor-foot { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: flex-start; gap: 8px; }
 .plan-track { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 6px; color: var(--muted); }
 .plan-track select, .plan-track input { font-size: 12.5px; padding: 3px 6px; }
-.editor-foot .plan-track { margin: 0 auto 0 0; }
+/* What running the plan does on GitHub, under the choice. */
+.plan-track-note { flex-basis: 100%; margin: 0; font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
+.plan-track-note.warn { color: var(--warn); }
+.editor-foot .plan-track { flex: 1 1 320px; min-width: 0; margin: 0; }
 
 /* Plugins & tools */
 dialog.tall { height: calc(100vh - 64px); overflow: hidden; }

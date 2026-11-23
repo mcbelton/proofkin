@@ -452,6 +452,9 @@ pub struct Tracker {
     viewer: String,
     repo_id: String,
     pub repo_url: String,
+    /// Who can see the repository's issues: `public`, `private` or `internal` (none if
+    /// GitHub didn't say).
+    pub visibility: Option<String>,
     pub board: Option<Board>,
     /// Why the board isn't used, e.g. the account lacks the `project` scope.
     pub board_problem: Option<String>,
@@ -483,7 +486,7 @@ impl std::fmt::Display for MissingScope {
 
 impl std::error::Error for MissingScope {}
 
-const REPO_QUERY: &str = "query Repo($owner: String!, $name: String!) { viewer { id login } repository(owner: $owner, name: $name) { id url } }";
+const REPO_QUERY: &str = "query Repo($owner: String!, $name: String!) { viewer { id login } repository(owner: $owner, name: $name) { id url visibility } }";
 
 const BOARD_QUERY: &str = "query Board($login: String!, $number: Int!) { repositoryOwner(login: $login) { ... on ProjectV2Owner { projectV2(number: $number) { id title url fields(first: 50) { nodes { ... on ProjectV2FieldCommon { id name dataType } ... on ProjectV2SingleSelectField { options { id name } } } } } } } }";
 
@@ -522,6 +525,8 @@ impl Tracker {
             viewer: text(&viewer, "id"),
             repo_id: text(repo, "id"),
             repo_url: text(repo, "url"),
+            visibility: Some(text(repo, "visibility").to_ascii_lowercase())
+                .filter(|v| ["public", "private", "internal"].contains(&v.as_str())),
             api,
             config,
             board: None,
@@ -633,6 +638,7 @@ impl Tracker {
             repo: self.config.repo.clone(),
             host: self.config.host.clone(),
             repo_url: self.repo_url.clone(),
+            visibility: self.visibility.clone(),
             login: self.login.clone(),
             project: self.config.project.clone(),
             board: self.board.as_ref().map(|b| BoardInfo {
@@ -717,9 +723,22 @@ impl Tracker {
 
     /// The tracker repository's issues `numbers`; fails if one doesn't exist.
     async fn issues(&self, numbers: &[u64]) -> Result<HashMap<u64, Issue>> {
-        let mut found = HashMap::new();
+        let (found, missing) = self.find_issues(numbers).await?;
+        if let Some((n, why)) = missing.into_iter().next() {
+            bail!("there is no issue #{n} in {} ({why})", self.config.repo);
+        }
+        Ok(found)
+    }
+
+    /// The tracker repository's issues `numbers` that exist, and for the others why
+    /// GitHub found none.
+    async fn find_issues(
+        &self,
+        numbers: &[u64],
+    ) -> Result<(HashMap<u64, Issue>, BTreeMap<u64, String>)> {
+        let (mut found, mut missing) = (HashMap::new(), BTreeMap::new());
         if numbers.is_empty() {
-            return Ok(found);
+            return Ok((found, missing));
         }
         let (owner, name) = self.config.repo.split_once('/').unwrap_or_default();
         let fields = self.issue_fields();
@@ -745,14 +764,26 @@ impl Tracker {
                 Some(issue) => {
                     found.insert(*n, issue);
                 }
-                None => bail!(
-                    "there is no issue #{n} in {} ({})",
-                    self.config.repo,
-                    reply.error_for(&format!("n{n}"))
-                ),
+                None => {
+                    missing.insert(*n, reply.error_for(&format!("n{n}")));
+                }
             }
         }
-        Ok(found)
+        Ok((found, missing))
+    }
+
+    /// Issue `n` of the tracker repository, as the web UI shows the one a run would
+    /// work on (`track: #n`); none if there is no such issue.
+    pub async fn issue_summary(&self, n: u64) -> Result<Option<IssueSummary>> {
+        let (mut found, _) = self.find_issues(&[n]).await?;
+        Ok(found.remove(&n).map(|issue| IssueSummary {
+            number: issue.number,
+            title: issue.title,
+            url: issue.url,
+            open: issue.open,
+            parent: issue.parent,
+            sub_issues: issue.summary,
+        }))
     }
 
     /// Runs `ops` (in order, `BATCH` to a request); each one's result by position.
@@ -1424,6 +1455,8 @@ pub struct TrackerInfo {
     pub repo: String,
     pub host: String,
     pub repo_url: String,
+    /// Who can see its issues: `public`, `private` or `internal`.
+    pub visibility: Option<String>,
     pub login: String,
     pub project: Option<ProjectRef>,
     pub board: Option<BoardInfo>,
@@ -1441,6 +1474,19 @@ pub struct BoardInfo {
     pub statuses: Vec<String>,
     /// Whether it has the `Agent` field.
     pub agent_field: bool,
+}
+
+/// An issue a run could work on, as the web UI shows it before the run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IssueSummary {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub open: bool,
+    /// The issue it is a sub-issue of.
+    pub parent: Option<u64>,
+    /// Its sub-issues: (closed, all).
+    pub sub_issues: (u64, u64),
 }
 
 /// An item on the board (or an open issue, without a board).
@@ -2230,6 +2276,7 @@ impl Run {
                     viewer: self.tracker.viewer.clone(),
                     repo_id: self.tracker.repo_id.clone(),
                     repo_url: self.tracker.repo_url.clone(),
+                    visibility: self.tracker.visibility.clone(),
                     board: self.tracker.board.clone(),
                     board_problem: None,
                     board_scope: None,
@@ -2949,7 +2996,7 @@ mod tests {
                 .unwrap_or_default();
             let data = match name {
                 "Repo" => {
-                    json!({ "viewer": { "id": "U1", "login": "alice" }, "repository": { "id": "R1", "url": "https://github.com/acme/app" } })
+                    json!({ "viewer": { "id": "U1", "login": "alice" }, "repository": { "id": "R1", "url": "https://github.com/acme/app", "visibility": "PUBLIC" } })
                 }
                 "Board" if self.no_project_scope => {
                     return Ok(Reply::from_value(
@@ -3326,6 +3373,50 @@ mod tests {
         // A plan without claims that did every step is done: nothing waits for a merge.
         assert!(!fake.open(1) && !fake.open(2));
         assert_eq!(tracked.problems.len(), 1, "{:?}", tracked.problems);
+    }
+
+    /// Before a run, the web UI says who can read the tracker's issues, and looks up
+    /// the issue a run would work on (track: #N): its title, whether it is open (a run
+    /// on a closed one reopens it) and its sub-issues; none if there is no such issue.
+    #[tokio::test]
+    async fn the_web_ui_learns_who_can_read_the_issues_and_looks_up_the_one_a_run_works_on() {
+        let fake = Fake::with(&[
+            FakeIssue {
+                number: 12,
+                title: "Ship the tracker".into(),
+                ..FakeIssue::default()
+            },
+            FakeIssue {
+                number: 13,
+                open: true,
+                parent: Some(12),
+                ..FakeIssue::default()
+            },
+        ]);
+        let tracker = Tracker::connect(fake.clone(), config()).await.unwrap();
+        assert_eq!(tracker.info().visibility.as_deref(), Some("public"));
+        assert_eq!(
+            tracker.issue_summary(12).await.unwrap(),
+            Some(IssueSummary {
+                number: 12,
+                title: "Ship the tracker".into(),
+                url: "https://github.com/acme/app/issues/12".into(),
+                open: false,
+                parent: None,
+                sub_issues: (0, 1),
+            })
+        );
+        assert_eq!(
+            tracker.issue_summary(13).await.unwrap().unwrap().parent,
+            Some(12)
+        );
+        assert_eq!(tracker.issue_summary(99).await.unwrap(), None);
+        // A run on it can't be tracked: it says why.
+        let err = tracker.issues(&[12, 99]).await.unwrap_err().to_string();
+        assert!(
+            err.starts_with("there is no issue #99 in acme/app"),
+            "{err}"
+        );
     }
 
     /// Two runs at the same time on one issue each work on their own sub-issue for a

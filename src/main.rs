@@ -2499,8 +2499,15 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
 
 fn print_tracker(info: &proofkin::tracker::TrackerInfo, waiting: &[proofkin::tracker::WaitingRun]) {
     println!(
-        "issues: {} ({}), as {}",
-        info.repo, info.repo_url, info.login
+        "issues: {} ({}{}), as {}",
+        info.repo,
+        info.repo_url,
+        match info.visibility.as_deref() {
+            Some("public") => ", public: anyone can read them",
+            Some("internal") => ", internal: everyone in its enterprise can read them",
+            _ => "",
+        },
+        info.login
     );
     match (&info.board, &info.board_problem) {
         (Some(b), _) => println!(
