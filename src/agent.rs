@@ -2123,7 +2123,14 @@ impl Inner {
                     format!("opening the pull request from {}", ask.branch),
                 ),
             );
-            let opened = pulls.open(&share.name, ask, &task.issues, from).await?;
+            // Only the sign-offs that check out go on the pull request.
+            let mut checked = ask.clone();
+            checked.signoffs.retain(|s| s.checks_out(&id.to_string()));
+            let left_out = ask.signoffs.len() - checked.signoffs.len();
+            let run = origin.and_then(|o| o.run.as_deref());
+            let opened = pulls
+                .open(&share.name, &checked, &task.issues, from, run)
+                .await?;
             let mut state = opened.state.clone();
             let mut said = String::new();
             while state != "MERGED" && state != "CLOSED" {
@@ -2148,6 +2155,30 @@ impl Inner {
                 }
             }
             let merged = state == "MERGED";
+            let plural =
+                |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+            let mut with = Vec::new();
+            if opened.proof {
+                with.push("its signed proof".to_owned());
+            }
+            if !opened.existed && !checked.signoffs.is_empty() {
+                with.push(plural(checked.signoffs.len(), "sign-off"));
+            }
+            let mut notes = Vec::new();
+            if left_out > 0 {
+                notes.push(format!(
+                    "{} left out: {}",
+                    plural(left_out, "sign-off"),
+                    if left_out == 1 {
+                        "its record doesn't check out"
+                    } else {
+                        "their records don't check out"
+                    }
+                ));
+            }
+            if opened.existed {
+                notes.push("an earlier try of this step opened it".to_owned());
+            }
             let output = format!(
                 "Pull request #{} {}: {}\n\nIt has the work of branch `{}` (commit `{}`){}{}.",
                 opened.number,
@@ -2159,16 +2190,12 @@ impl Inner {
                 opened.url,
                 ask.branch,
                 ask.commit.chars().take(12).collect::<String>(),
-                if opened.proof {
-                    ", with its signed proof"
+                if with.is_empty() {
+                    String::new()
                 } else {
-                    ""
+                    format!(", with {}", with.join(" and "))
                 },
-                if opened.existed {
-                    "; an earlier try of this step opened it"
-                } else {
-                    ""
-                }
+                notes.iter().map(|n| format!("; {n}")).collect::<String>()
             );
             let mut evidence = Evidence::new(
                 EvidenceKind::Task,

@@ -898,6 +898,11 @@ ship after ok pr @alice:shop
   request with its owner's GitHub account. The pull request closes the issues the work is
   for (`Closes #N`, on a [tracked run](#tracked-work)), carries the commit's
   [proof](#pull-request-proof), and says who asked for it.
+- The pull request lists the plan's **sign-offs** before it: for each sign-off step it
+  comes after, who approved it, with their agent's key, when, and their note. Each comes
+  from the record the approver's agent signed. The folder's agent lists only approvals
+  that verify for exactly their words and that you asked for, and says how many it left
+  out. They are in the run's evidence too, which `proofkin runs verify` checks again.
 - The step then waits until the pull request is merged (done) or closed without being
   merged (failed), asking GitHub every minute. Its card links the pull request while it
   waits, and on a tracked run its issue is **In review**. Merging is up to the
