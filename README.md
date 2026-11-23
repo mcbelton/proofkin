@@ -964,6 +964,12 @@ review @alice:app verify=test Check the change:
   tasks never collide. Review or merge the branch (`git log p2p/boss/...`) when you're
   happy. Removed worktrees keep their branch. The commit's subject is the task's title (the
   first line of its own words, at most 100 characters), followed by who asked and who did it.
+  The task's report names the files the commit has (the first 20, then how many more).
+  New files of build and tool caches the model made while trying things stay out of it
+  (`__pycache__/`, `*.pyc`, `node_modules/`, `.pytest_cache/`, `.venv/`, a top-level
+  `target/`, `.DS_Store` and the like), and the report lists them under **Left out**. A
+  folder named like a cache that your repository already has (a `venv/` package, say) is
+  yours: its new files are committed.
 - **Retries**: when a task took more than one attempt, its output is the first attempt's
   report, then, for each later attempt, a line "Attempt 2 of 3, after these checks failed:
   fmt, clippy" and that attempt's report.
