@@ -70,6 +70,9 @@ pub struct AgentConfig {
     pub worktrees_dir: PathBuf,
     /// Runs the team plans of team steps peers hand this agent (none: it refuses them).
     pub team: Option<Arc<crate::team::TeamRunner>>,
+    /// Opens and follows the pull requests of peers' pull request steps, in folders whose
+    /// owner allows them (none: it refuses them; see [`crate::pulls`]).
+    pub pulls: Option<Arc<dyn crate::pulls::PullRequests>>,
     /// How long tasks wait for a dropped peer to come back (see [`TASK_GRACE`]).
     pub task_grace: Duration,
     /// Where the next id for the tasks it gives peers is kept, so ids go on after a
@@ -94,6 +97,7 @@ impl AgentConfig {
             models: crate::models::Models::new(),
             worktrees_dir: std::env::temp_dir().join("proofkin-worktrees"),
             team: None,
+            pulls: None,
             task_grace: TASK_GRACE,
             task_ids: None,
         }
@@ -478,6 +482,7 @@ struct Inner {
     /// requester asks again after a reconnect.
     last_progress: Mutex<HashMap<(EndpointId, u64), Progress>>,
     team: Option<Arc<crate::team::TeamRunner>>,
+    pulls: Option<Arc<dyn crate::pulls::PullRequests>>,
     task_grace: Duration,
     /// When peers that dropped were last seen, until they come back or are given up.
     left: Mutex<HashMap<EndpointId, Instant>>,
@@ -540,6 +545,7 @@ impl Agent {
             slots: Mutex::new(Slots::default()),
             last_progress: Mutex::new(HashMap::new()),
             team: config.team,
+            pulls: config.pulls,
             task_grace: config.task_grace,
             left: Mutex::new(HashMap::new()),
         });
@@ -979,7 +985,7 @@ impl Agent {
         let handle = peers
             .get(&peer)
             .ok_or_else(|| anyhow!("not connected to {}", peer.fmt_short()))?;
-        if task.team.is_none() && !handle.capabilities.contains(&task.provider) {
+        if task.runs_model() && !handle.capabilities.contains(&task.provider) {
             bail!("{} does not serve {}", handle.name, task.provider);
         }
         let request = Message::TaskRequest {
@@ -1890,8 +1896,8 @@ impl Inner {
             bail!("Codex tasks can't use MCP servers; ask for copilot or claude");
         }
         // The model it asks for must be one this agent's owner allows, and its effort a
-        // reasoning effort it allows (a team step runs no model).
-        if task.team.is_none() {
+        // reasoning effort it allows (team and pull request steps run no model).
+        if task.runs_model() {
             let choice = crate::models::choice(&self.models.lock().unwrap(), task.provider);
             if let Err(e) = choice
                 .pick(task.model.as_deref())
@@ -1955,6 +1961,9 @@ impl Inner {
             Ok(served) if served.evidence.team.is_some() => {
                 Err(anyhow!("the team run did not pass"))
             }
+            Ok(_) if task.pull_request.is_some() => {
+                Err(anyhow!("its pull request was closed without being merged"))
+            }
             Ok(served) => Err(anyhow!(
                 "checks failed: {}",
                 served
@@ -2013,6 +2022,13 @@ impl Inner {
                 )
                 .await;
         }
+        if let Some(ask) = &task.pull_request {
+            return self
+                .open_pull_request(
+                    id, from, task_id, task, ask, origin, cancel, granted, cancelled,
+                )
+                .await;
+        }
         let executor = self
             .executor
             .as_ref()
@@ -2036,6 +2052,142 @@ impl Inner {
         };
         // Dropping `work` stops the provider run (each backend aborts on drop) and
         // any check, and removes the task's worktree.
+        tokio::select! {
+            result = work => result,
+            _ = cancel => {
+                *cancelled = true;
+                Err(anyhow!("task cancelled by {from}"))
+            }
+        }
+    }
+
+    /// Runs pull request step `task` from `from` (see [`crate::pulls`]): opens the pull
+    /// request from the branch an earlier task of `from`'s committed to in this folder (or
+    /// finds the one opened for it before) and follows it until it is merged (done) or
+    /// closed (failed), saying where it is. It runs no model and takes no task slot.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_pull_request(
+        self: &Arc<Self>,
+        id: &EndpointId,
+        from: &str,
+        task_id: u64,
+        task: &LlmTask,
+        ask: &crate::pulls::PullRequestAsk,
+        origin: Option<&Origin>,
+        cancel: oneshot::Receiver<()>,
+        granted: &mut Option<Access>,
+        cancelled: &mut bool,
+    ) -> Result<Served> {
+        let pulls = self
+            .pulls
+            .clone()
+            .ok_or_else(|| anyhow!("{} doesn't open pull requests", self.name))?;
+        let (ctx, share) = self.admit_task(id, task)?;
+        if !share.pull_requests {
+            bail!(
+                "folder '{}' on {} doesn't take pull request steps; its owner allows them with: proofkin share pull-requests {}",
+                share.name,
+                self.name,
+                share.name
+            );
+        }
+        if !share.worktrees || ctx.access < Access::WorkspaceWrite {
+            bail!(
+                "a pull request step needs edit access in a folder shared with --worktrees; {from} has {} in '{}' on {}",
+                ctx.access,
+                share.name,
+                self.name
+            );
+        }
+        crate::pulls::check_own_work(
+            &share.path,
+            ask,
+            &id.to_string(),
+            &self.endpoint.id().to_string(),
+        )
+        .await?;
+        *granted = Some(ctx.access);
+        let _ = self.events.send(Event::TaskReceived {
+            from: from.to_owned(),
+            task_id,
+            provider: task.provider,
+            origin: origin.cloned(),
+            team: false,
+        });
+        let work = async {
+            self.send_progress(
+                id,
+                task_id,
+                Progress::new(
+                    Phase::PullRequest,
+                    format!("opening the pull request from {}", ask.branch),
+                ),
+            );
+            let opened = pulls.open(&share.name, ask, &task.issues, from).await?;
+            let mut state = opened.state.clone();
+            let mut said = String::new();
+            while state != "MERGED" && state != "CLOSED" {
+                if said != state {
+                    self.send_progress(
+                        id,
+                        task_id,
+                        Progress::new(
+                            Phase::PullRequest,
+                            format!(
+                                "pull request #{} is open: waiting for it to be merged ({})",
+                                opened.number, opened.url
+                            ),
+                        ),
+                    );
+                    said = state.clone();
+                }
+                tokio::time::sleep(pulls.poll()).await;
+                // GitHub not answering isn't an answer: it is asked again next time.
+                if let Ok(now) = pulls.state(&share.name, opened.number).await {
+                    state = now;
+                }
+            }
+            let merged = state == "MERGED";
+            let output = format!(
+                "Pull request #{} {}: {}\n\nIt has the work of branch `{}` (commit `{}`){}{}.",
+                opened.number,
+                if merged {
+                    "was merged"
+                } else {
+                    "was closed without being merged"
+                },
+                opened.url,
+                ask.branch,
+                ask.commit.chars().take(12).collect::<String>(),
+                if opened.proof {
+                    ", with its signed proof"
+                } else {
+                    ""
+                },
+                if opened.existed {
+                    "; an earlier try of this step opened it"
+                } else {
+                    ""
+                }
+            );
+            let mut evidence = Evidence::new(
+                EvidenceKind::Task,
+                &self.name,
+                self.endpoint.id(),
+                *id,
+                task_id,
+            );
+            evidence.share = Some(share.name.clone());
+            evidence.prompt_sha256 = sha256_hex(task.prompt.as_bytes());
+            let evidence = evidence.sign(&output, self.endpoint.secret_key());
+            Ok(Served {
+                ok: merged,
+                output,
+                evidence,
+                patch: None,
+                model: None,
+            })
+        };
         tokio::select! {
             result = work => result,
             _ = cancel => {

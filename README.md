@@ -721,6 +721,8 @@ one card: a bar of its steps (done, running, failed), the steps in the order the
 (each column waits for the one before), and each step as a task that waits, runs, finishes
 or is skipped. Cancelling the plan, or any of its steps, cancels the whole plan.
 
+<a id="plan-resume"></a>
+
 **A plan run goes on after its agent restarts.** The web UI keeps each plan run in the
 profile (`runs-in-progress\`) as its steps are sent and end: the steps that ended, with
 their results and patches, and each step's task exactly as it was sent, with its id. When
@@ -864,6 +866,49 @@ feature team @alice:app claims=F-1 Add CSV export to the report page
 - Work never goes back up: a lead never hands it to an agent it came down from, and a team
   plan step naming one fails with the reason.
 
+### Pull request steps: opening the pull request from the plan
+
+A plan can end with the pull request its work goes in with: a `pr` step, done by the agent
+that holds the [repository's clone](#github-repositories). Its owner lets peers do that per
+folder, in a repository linked to its profile:
+
+```powershell
+proofkin share pull-requests shop --profile alice   # --off stops it; share list shows it
+```
+
+or in the web UI, under **This agent > Shared folders > Takes pull request steps**. The
+boss then ends its plan with one:
+
+```text
+claim: F-1 Reports can be exported as CSV
+feature @alice:shop verify=test claims=F-1 Add CSV export to the report page
+review after feature #qa:shop apply=feature verify=test claims=F-1 Review the change
+ok after review approve @carol claims=F-1 Ship the CSV export?
+ship after ok pr @alice:shop
+```
+
+- The step opens the pull request from the branch of the work before it in that folder:
+  the branch of the step that has all of it (the others' work through `apply=`). The plan
+  check refuses steps that work in the folder on separate branches: open a pull request
+  for each, or make one apply the other's work. A title after the folder names the pull
+  request; without one it takes the title of the step that started the work.
+- The folder's agent first checks that the branch is work it did for you, as it was done:
+  the branch's head is the commit the step's signed record names, and the commit's record
+  (its git note) is its own, signed for you. It then pushes the branch and opens the pull
+  request with its owner's GitHub account. The pull request closes the issues the work is
+  for (`Closes #N`, on a [tracked run](#tracked-work)), carries the commit's
+  [proof](#pull-request-proof), and says who asked for it.
+- The step then waits until the pull request is merged (done) or closed without being
+  merged (failed), asking GitHub every minute. Its card links the pull request while it
+  waits, and on a tracked run its issue is **In review**. Merging is up to the
+  repository's reviewers: branch protection still decides what merging needs. A
+  `timeout=` on the step stops the wait; the pull request stays open.
+- Run again, for example when [the run goes on after a restart](#plan-resume), the step
+  finds the pull request it opened and follows that one.
+- It takes no options for a model, only `timeout=` and `issue=`. It needs edit access
+  (`workspace-write` or `full`) in the folder, and the folder must take pull request steps.
+  An older agent never says that its folder does, so it is never sent one.
+
 ### Scheduled plans
 
 An agent can run a plan or a playbook **on its own at set times**: a nightly `learn`, a
@@ -942,11 +987,12 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
 | `team @lead:folder`, `levels=N` | Instead of a model, the lead's team does it, with the folder's team plan ([team steps](#team-steps-handing-work-down-a-level)). `levels=` (1 to 3, default 1) is how many levels down it may go. |
+| `pr @peer:folder` | Instead of a model, the folder's agent opens the pull request with the work of the steps before it there, then waits until it is merged ([pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan)). Takes only `timeout=` and `issue=`. |
 | `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
 | `workiq=all` / `workiq=email,files` | Searches your Microsoft 365 (Work IQ) for the step's own words when the step is sent, and puts what it finds in the prompt before `Your task:`. `all` searches everything; a list names sources: `email`, `meetings`, `files`, `teams`, `people`, `connectors`. Not on sign-offs. See [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq). |
 | `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue, and its task gets the issue's title and body in front of it (as external content, secrets redacted, cut at 4,000 characters), so the plan needn't repeat them. |
 
-A step line is `name [after steps] [team] @peer[:folder] or #squad [options] what to do`: options
+A step line is `name [after steps] [team|pr] @peer[:folder] or #squad [options] what to do`: options
 go before the task text (the plan check warns about one typed after it, but not text in
 backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
@@ -1161,6 +1207,8 @@ and `review:` checks need only read access), `apply=` a `--worktrees` folder, an
 connected. A plan with errors is not started, and every reason is listed. The web UI
 checks plans as you type and shows the problems under the editor.
 
+<a id="github-repositories"></a>
+
 **GitHub repositories.** Sign a profile in with one of your GitHub CLI accounts, then link
 repositories. Each is cloned with that account into `~/.proofkin-repos/<profile>/<name>` and
 shared as a folder with a worktree per task. The token is fetched from `gh` when needed.
@@ -1181,7 +1229,9 @@ proofkin repo pr shop p2p/boss/12-1794781234 --title "Add CSV export" --profile 
 the repository's default branch with the profile's account. In the web UI the **GitHub**
 card does the same: **Sign in to GitHub** (pick a GitHub CLI account), **Link repo**
 (with checks, and which peers to share it with), **Sync**, and **Open PR** on each task
-branch. Digital workers use their owner's GitHub account.
+branch. Digital workers use their owner's GitHub account. A plan can also open the pull
+request itself, as its last step: see
+[pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan).
 
 #### When a task branch is done with
 
@@ -1234,6 +1284,8 @@ Enterprise), and **Grant access** on the
 Tracker card when its board lacks the `project` scope (or on the GitHub card, which lists
 what each scope of the account's token is for). The code shows in a dialog with **Copy
 code** and **Open GitHub**; closing the dialog cancels.
+
+<a id="pull-request-proof"></a>
 
 **Pull requests carry their proof.** When an agent's runtime commits a task's work, it
 keeps the evidence record it signed for the commit with the commit itself, as a git note
@@ -1942,6 +1994,13 @@ A worker decides exactly what each peer can see:
   The web UI sets and removes it too, under **This agent > Shared folders > Team plan…**
   (and through its API: `PUT /api/shares/<folder>/team` with
   `{"plan": "..."}` and `DELETE /api/shares/<folder>/team`).
+- `proofkin share pull-requests <folder>` lets peers with edit access end their plans with
+  a [pull request step](#pull-request-steps-opening-the-pull-request-from-the-plan) in a
+  linked repository's folder: your agent pushes the branch of work it did for them and
+  opens the pull request with your GitHub account, never for another peer's work or a
+  branch moved on since. `--off` stops it; in the web UI it is **Takes pull request steps**
+  under **This agent > Shared folders** (API: `PUT /api/shares/<folder>/pull-requests`
+  with `{"on": true}`).
 
 | | `data` (built in) | A folder you add |
 | --- | --- | --- |
@@ -2247,6 +2306,7 @@ Workflow for a change:
 - [src/ops.rs](src/ops.rs): monitors, metrics, incidents, TSG auto-fix, the debugging agent and ops reports
 - [src/skills.rs](src/skills.rs) and [skills/](skills): built-in and profile skills (instructions for plan steps)
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)
+- [src/pulls.rs](src/pulls.rs): pull request steps: the folder's agent opens the pull request with the work before it (only work it signed for the peer that asks) and follows it until it is merged or closed
 - [src/tracker.rs](src/tracker.rs): tracked work: plan runs as GitHub issues and sub-issues on a GitHub Project's board (GraphQL through `gh`)
 - [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait, and the content policy (`content.rs`: only `allowed` results, label allowlist per audience, redaction, size cap, envelope); see [docs/work-iq.md](docs/work-iq.md)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results

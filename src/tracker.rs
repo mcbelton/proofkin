@@ -2199,6 +2199,9 @@ impl Run {
             StepState::Running { peer, .. } => {
                 let (status, who) = if step.approve {
                     (Status::InReview, self.person(peer))
+                } else if step.pr {
+                    // Its pull request is open: it waits for a review and a merge.
+                    (Status::InReview, peer.clone())
                 } else {
                     (Status::InProgress, peer.clone())
                 };
@@ -2415,6 +2418,10 @@ fn step_title(step: &Step) -> String {
     let title = crate::llm::title_of(step.own_text());
     if step.approve {
         format!("Sign-off: {title}")
+    } else if step.pr && title.is_empty() {
+        "Pull request".to_owned()
+    } else if step.pr {
+        format!("Pull request: {title}")
     } else {
         title
     }
@@ -2500,6 +2507,10 @@ fn step_body(step: &Step, run_id: &str, agent: &str) -> String {
         }
     } else if step.team.is_some() {
         format!("{target}'s team does it.")
+    } else if step.pr {
+        format!(
+            "{target} opens the pull request with the work before it there, then waits until it is merged."
+        )
     } else if step.is_workiq() {
         "Proofkin asks Microsoft 365 (Work IQ) for it; the answer is cited context, never proof."
             .to_owned()

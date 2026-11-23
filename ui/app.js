@@ -324,7 +324,8 @@ function renderMe() {
               title: "Set what this agent's team does when a peer hands this folder a team step",
               onclick: (e) => openTeamDialog(s, e.currentTarget),
             }, "Team plan…"),
-            s.team ? el("span", { class: "small muted", text: `Takes team steps (${teamStepCount(s.team)} ${teamStepCount(s.team) === 1 ? "step" : "steps"})` }) : null)))));
+            s.team ? el("span", { class: "small muted", text: `Takes team steps (${teamStepCount(s.team)} ${teamStepCount(s.team) === 1 ? "step" : "steps"})` }) : null),
+          s.worktrees && ["workspace-write", "full"].includes(s.max_access) ? el("div", { class: "share-team" }, pullRequestsToggle(s)) : null))));
     }
   } else {
     fact("Providers", "None (delegates only)");
@@ -509,6 +510,10 @@ const expandedPrompts = new Set();
 const PROMPT_LINES = 4;
 
 function promptNode(t) {
+  // A pull request step without a title of its own takes that of the work it opens.
+  if (t.pull_request && !t.prompt.trim()) {
+    return el("div", { class: "task-prompt muted", text: "Opens the pull request with the work before it, titled as that work" });
+  }
   const text = el("div", { class: "task-prompt" }, renderMarkdown(t.prompt));
   const long = t.prompt.split("\n").length > PROMPT_LINES || t.prompt.length > PROMPT_LINES * 80;
   if (!long) return text;
@@ -558,12 +563,38 @@ function teamResult(t) {
   return at < 0 ? t.output : t.output.slice(at + 1);
 }
 
+/** A progress line's text, with the pull request it names (a pull request step) as a link. */
+function progressParts(text) {
+  const parts = [];
+  let at = 0;
+  for (const m of text.matchAll(/https:\/\/[^\s()]+\/pull\/(\d+)/g)) {
+    parts.push(text.slice(at, m.index), externalLink(m[0], m[0], `Pull request #${m[1]} on GitHub`));
+    at = m.index + m[0].length;
+  }
+  parts.push(text.slice(at));
+  return parts.filter((p) => p !== "");
+}
+
+/** `node` with the pull requests a pull request step's result names as links: its words are
+ * its agent's, not a model's (the Markdown of results never links). */
+function linkPullRequests(node) {
+  const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+  const texts = [];
+  while (walker.nextNode()) texts.push(walker.currentNode);
+  for (const text of texts) {
+    if (text.parentElement?.closest("code")) continue;
+    const parts = progressParts(text.textContent);
+    if (parts.some((p) => typeof p !== "string")) text.replaceWith(...parts);
+  }
+  return node;
+}
+
 function taskNode(t) {
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
   // The model that did the work, after the provider, once its provider (or peer) said.
   const runs = (label) => t.model ? `${label} · ${t.model}` : label;
   const title = t.step
-    ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : runs(providerLabel(t.provider))} → ${t.target}`
+    ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : t.pull_request ? "Pull request" : runs(providerLabel(t.provider))} → ${t.target}`
     : `#${t.id} · ${runs(providerLabel(t.provider))} → ${t.target}${t.squad ? ` · #${t.squad}` : ""}`;
   // Started by another agent (over MCP or A2A), not in this UI; or a step of a team
   // run this agent leads for a peer.
@@ -592,7 +623,7 @@ function taskNode(t) {
     meta);
   // What its peer last said it is doing (queued, attempt 2 of 3, running a check…).
   if (t.status === "running" && t.progress?.text) {
-    node.append(el("p", { class: `task-progress ${t.progress.phase ?? ""}`, text: t.progress.text }));
+    node.append(el("p", { class: `task-progress ${t.progress.phase ?? ""}` }, ...progressParts(t.progress.text)));
   }
   // A team step: its lead's team, live, then as the team run ended.
   const team = t.status === "running" ? t.progress?.steps : t.team?.steps;
@@ -634,9 +665,13 @@ function taskNode(t) {
     const open = openResults.has(t.id) ? openResults.get(t.id) : true;
     const details = el("details", { open: open || undefined },
       el("summary", { text: t.status === "failed" ? "Error" : "Result" }),
-      t.status === "failed"
+      // A pull request step's ending is in its own words (its pull request was closed),
+      // with the link: shown as written, not as raw text.
+      t.status === "failed" && !t.pull_request
         ? el("pre", { text: t.output, tabindex: "0" })
-        : el("div", { class: "result", tabindex: "0" }, renderMarkdown(teamResult(t))),
+        : t.pull_request
+          ? linkPullRequests(el("div", { class: "result", tabindex: "0" }, renderMarkdown(t.output)))
+          : el("div", { class: "result", tabindex: "0" }, renderMarkdown(teamResult(t))),
       el("button", { type: "button", class: "btn small", onclick: () => copy(t.output, "Result") }, icon(ICONS.copy), "Copy"));
     details.addEventListener("toggle", () => openResults.set(t.id, details.open));
     node.append(details);
@@ -829,6 +864,30 @@ function openTeamDialog(share, opener) {
   }, { once: true });
   $("#team-dialog").showModal();
   plan.focus();
+}
+
+/** Whether peers may end a plan with a pull request step in shared folder `s`: this agent
+ * then pushes their tasks' branch and opens the pull request with its GitHub account. */
+function pullRequestsToggle(s) {
+  const input = el("input", { type: "checkbox", checked: Boolean(s.pull_requests) });
+  input.addEventListener("change", async () => {
+    const on = input.checked;
+    input.disabled = true;
+    try {
+      await api(`/api/shares/${encodeURIComponent(s.name)}/pull-requests`, { method: "PUT", body: JSON.stringify({ on }) });
+      toast(on ? `${s.name} takes pull request steps` : `${s.name} no longer takes pull request steps`);
+      await loadState();
+    } catch (err) {
+      input.checked = !on;
+      toast(err.message, "error");
+    } finally {
+      input.disabled = false;
+    }
+  });
+  return el("label", {
+    class: "check small",
+    title: "Peers with edit access may end a plan with a pull request step here: this agent pushes the branch of their tasks' work and opens the pull request with your GitHub account, then follows it until it is merged",
+  }, input, el("span", { text: "Takes pull request steps" }));
 }
 
 /// Runs a team plan request with `button` disabled and saying `busy`; on success closes

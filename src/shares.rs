@@ -39,6 +39,11 @@ pub struct Share {
     /// [`crate::team`]): plan text whose `{task}` is the task handed down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
+    /// Peers with edit access may end a plan with a pull request step here: this agent
+    /// pushes the branch of their tasks' work and opens the pull request with the owner's
+    /// GitHub account (a linked repository shared with worktrees; see [`crate::pulls`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pull_requests: bool,
 }
 
 /// What a peer learns about a share: its name, the access it would get and the
@@ -61,6 +66,10 @@ pub struct ShareInfo {
     /// with its owner).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub team: bool,
+    /// The folder takes pull request steps (its owner allows them; older agents never
+    /// say so, so they are never sent one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pull_requests: bool,
 }
 
 /// How an owner offers an MCP server in a shared folder (see [`ShareStore::offer_mcp`]).
@@ -119,6 +128,7 @@ impl ShareStore {
                 worktrees: false,
                 mcp: BTreeMap::new(),
                 team: None,
+                pull_requests: false,
             }],
         }
     }
@@ -199,6 +209,7 @@ impl ShareStore {
         }
         let mcp = self.get(name).map(|s| s.mcp.clone()).unwrap_or_default();
         let team = self.get(name).and_then(|s| s.team.clone());
+        let pull_requests = worktrees && self.get(name).is_some_and(|s| s.pull_requests);
         self.shares.retain(|s| s.name != name);
         self.shares.push(Share {
             name: name.to_owned(),
@@ -208,8 +219,31 @@ impl ShareStore {
             worktrees,
             mcp,
             team,
+            pull_requests,
         });
         Ok(self.shares.last().expect("just pushed"))
+    }
+
+    /// Lets peers with edit access end their plans with pull request steps in share
+    /// `share` (`on`), or stops letting them. The folder must be shared with worktrees,
+    /// as pull requests come from its tasks' branches.
+    pub fn set_pull_requests(&mut self, share: &str, on: bool) -> Result<()> {
+        if share == DATA_SHARE && on {
+            bail!("the built-in '{DATA_SHARE}' share has no branches to open pull requests from");
+        }
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|s| s.name == share)
+            .with_context(|| format!("no share named '{share}'"))?;
+        if on && !share.worktrees {
+            bail!(
+                "'{}' isn't shared with --worktrees: pull requests come from the branches its tasks commit to",
+                share.name
+            );
+        }
+        share.pull_requests = on;
+        Ok(())
     }
 
     /// Sets (or with `None` removes) the team plan of share `share`; the plan must be
@@ -344,6 +378,7 @@ impl ShareStore {
                         .map(|(name, server)| ((*name).clone(), server.description.clone()))
                         .collect(),
                     team: s.team.is_some(),
+                    pull_requests: s.pull_requests && s.worktrees,
                 }
             })
             .collect()
@@ -361,6 +396,37 @@ fn plain_path(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_folders_with_worktrees_take_pull_request_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, plain) = (dir.path().join("repo"), dir.path().join("plain"));
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut store = ShareStore::with_data(dir.path().join("data"));
+        store
+            .add_with("repo", &repo, Access::WorkspaceWrite, BTreeMap::new(), true)
+            .unwrap();
+        store.add("plain", &plain, Access::WorkspaceWrite).unwrap();
+        let refused = store.set_pull_requests("plain", true).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("isn't shared with --worktrees")
+        );
+        assert!(store.set_pull_requests(DATA_SHARE, true).is_err());
+        store.set_pull_requests("repo", true).unwrap();
+        assert!(store.visible(&["repo".to_owned()], Access::Full)[0].pull_requests);
+        // Shared again, it keeps taking them, unless it no longer has worktrees.
+        store
+            .add_with("repo", &repo, Access::Full, BTreeMap::new(), true)
+            .unwrap();
+        assert!(store.get("repo").unwrap().pull_requests);
+        store
+            .add_with("repo", &repo, Access::Full, BTreeMap::new(), false)
+            .unwrap();
+        assert!(!store.get("repo").unwrap().pull_requests);
+    }
 
     #[test]
     fn data_folder_is_built_in_read_only_and_per_profile() {

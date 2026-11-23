@@ -50,6 +50,15 @@ const planBuilder = (() => {
     return { Teams: folders, Squads: squads };
   }
 
+  /// Who can open a pull request step's pull request: a peer's folder that takes them (a
+  /// linked repository whose owner allows it), where you have edit access.
+  function openers() {
+    const folders = state.peers.flatMap((p) => (p.shares ?? [])
+      .filter((f) => f.pull_requests && ["workspace-write", "full"].includes(f.access))
+      .map((f) => [`@${p.name}:${f.name}`, `${p.name}, from ${f.name}`]));
+    return { Folders: folders };
+  }
+
   /// Who can sign off: you, or a teammate on the allowlist.
   function signers() {
     return {
@@ -178,9 +187,9 @@ const planBuilder = (() => {
     const name = el("input", { type: "text", class: "mono pb-id", spellcheck: "false", autocomplete: "off" });
     name.value = s.id;
     name.addEventListener("change", () => rename("step", s, name));
-    const current = s.approve ? "signoff" : s.team ? "team" : "task";
+    const current = stepKind(s);
     const kind = el("div", { class: "segmented pb-kind", role: "radiogroup", "aria-label": `Step ${s.id} is` },
-      ...[["task", "Agent task"], ["team", "Team task"], ["signoff", "Sign-off"]].map(([name, label]) => el("button", {
+      ...[["task", "Agent task"], ["team", "Team task"], ["signoff", "Sign-off"], ["pr", "Pull request"]].map(([name, label]) => el("button", {
         type: "button", role: "radio", "aria-checked": String(current === name),
         tabindex: current === name ? "0" : "-1", "data-key": `${k}-kind-${name}`,
       }, label)));
@@ -199,23 +208,28 @@ const planBuilder = (() => {
       el("span", { class: "pb-badge", "data-badge": k, hidden: true, text: "Incomplete" }),
       remove);
 
-    const who = select(s.approve ? signers() : s.team ? leads() : runners(), s.target,
-      s.approve ? "Choose who signs off…" : s.team ? "Choose whose team does it…" : "Choose who does it…");
+    const who = select(s.approve ? signers() : s.team ? leads() : s.pr ? openers() : runners(), s.target,
+      s.approve ? "Choose who signs off…" : s.team ? "Choose whose team does it…" : s.pr ? "Choose whose clone opens it…" : "Choose who does it…");
     who.addEventListener("change", () => {
       s.target = who.value || null;
       if (s.approve) s.target = s.target?.split(":")[0] ?? null;
       changed(true);
     });
     const todo = el("textarea", {
-      rows: 3, spellcheck: "true",
+      rows: s.pr ? 1 : 3, spellcheck: "true",
       placeholder: s.approve ? "What the approver checks, e.g. The ADRs cover every decision and the contract has examples"
+        : s.pr ? "Its title, e.g. Accept empty input in the parser (without one: the title of the work it opens)"
         : "What the agent does, e.g. Write the ADRs for the login change, and its REST API contract",
     });
     todo.value = planText.isTodo(planText.taskOf(s)) ? "" : planText.taskOf(s);
     // The text may go on over several lines: they are written under the step, indented.
     todo.addEventListener("input", () => { planText.setTask(s, todo.value); changed(); });
 
-    const body = s.team
+    const body = s.pr
+      ? [field(`${k}-target`, "Whose clone opens it", who, "A peer's folder that takes pull request steps: its agent pushes the branch with the work of the steps before it there and opens the pull request with its owner's GitHub account"),
+        field(`${k}-todo`, "Title", todo, "It closes the issues the work is for, carries the work's signed proof, and waits until it is merged"),
+        waitsField(s, k), moreOptions(s, k)]
+      : s.team
       ? [field(`${k}-target`, "Whose team does it", who, "A peer's folder with a team plan: its agent runs the plan on its own team, and you see each of its steps as it goes"),
         field(`${k}-todo`, "What to do", todo),
         provesField(s, k, true), waitsField(s, k), moreOptions(s, k)]
@@ -228,7 +242,7 @@ const planBuilder = (() => {
         agentField(s, k),
         skillsField(s, k), checksField(s, k), provesField(s, k, planText.valuesOf(s, "verify").length > 0),
         waitsField(s, k), moreOptions(s, k)];
-    return el("li", { class: `pb-step${s.approve ? " signoff" : ""}${s.team ? " team" : ""}`, "data-card": k }, head, ...body,
+    return el("li", { class: `pb-step${s.approve ? " signoff" : ""}${s.team ? " team" : ""}${s.pr ? " pr" : ""}`, "data-card": k }, head, ...body,
       el("div", { class: "pb-marks", "data-marks": k }));
   }
 
@@ -360,6 +374,7 @@ const planBuilder = (() => {
     });
     items.push(field(`${k}-issue`, "Its issue", issue, "An issue of the tracker's repository it works on; without one, a tracked run gives it a sub-issue"));
     set += Boolean(issue.value);
+    if (s.pr) return details(`${k}-more`, `More options${set ? ` (${set} set)` : ""}`, items);
     if (s.team) {
       const levels = el("select", {}, ...[1, 2, 3].map((n) => el("option", {
         value: String(n), text: n === 1 ? "Their team does it" : `It may go ${n} levels down (their team's own team steps)`,
@@ -485,7 +500,7 @@ const planBuilder = (() => {
     const to = input.value.trim();
     const list = kind === "claim" ? plan.claims : plan.steps;
     if (to === item.id) return;
-    const why = !/^(?!\.)[A-Za-z0-9._-]{1,64}$/.test(to) || (kind === "step" && ["after", "approve", "team", "using"].includes(to))
+    const why = !/^(?!\.)[A-Za-z0-9._-]{1,64}$/.test(to) || (kind === "step" && ["after", "approve", "team", "pr", "using"].includes(to))
       ? "Use letters, digits, '-', '_' or '.'"
       : list.some((x) => x !== item && x.id === to) ? `There is already a ${kind} called ${to}` : null;
     if (why) {
@@ -497,12 +512,24 @@ const planBuilder = (() => {
     changed(true);
   }
 
+  /// What a step is: an agent task, a team task, a sign-off or a pull request.
+  const stepKind = (s) => (s.approve ? "signoff" : s.team ? "team" : s.pr ? "pr" : "task");
+
   function setKind(s, kind) {
-    const was = s.approve ? "signoff" : s.team ? "team" : "task";
+    const was = stepKind(s);
     if (was === kind) return;
     s.approve = kind === "signoff";
     s.team = kind === "team";
-    if (kind === "signoff") {
+    s.pr = kind === "pr";
+    if (kind === "pr") {
+      // Opened from the work before it: only a time limit and an issue of its own.
+      s.target = null;
+      s.using = null;
+      for (const word of [...s.options]) {
+        const option = word.slice(0, word.indexOf("="));
+        if (!["timeout", "issue"].includes(option)) planText.setValues(s, option, null);
+      }
+    } else if (kind === "signoff") {
       // A person's decision: no folder, checks, retries, patch, saved result, tools or agent.
       s.target = "@me";
       s.using = null;

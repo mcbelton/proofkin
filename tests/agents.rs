@@ -11,6 +11,7 @@ use proofkin::audit::{AuditLog, Outcome};
 use proofkin::mcp::McpServer;
 use proofkin::plan::{Plan, RunContext, SquadStore, StepState, run_plan, run_plan_with};
 use proofkin::protocol::Phase;
+use proofkin::pulls::{Opened, PullRequestAsk, PullRequests};
 use proofkin::runs::{RunRecord, Verdict};
 use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
 use proofkin::{
@@ -154,6 +155,8 @@ struct Node {
     /// How long its tasks wait for a dropped peer (short, so tests don't wait long).
     grace: Duration,
     team: Option<Arc<proofkin::team::TeamRunner>>,
+    /// Opens the pull requests of pull request steps (see [`FakePulls`]).
+    pulls: Option<Arc<dyn PullRequests>>,
     /// Its providers' default models and the ones tasks may ask for.
     models: proofkin::models::Models,
 }
@@ -172,6 +175,7 @@ impl Node {
             role: None,
             grace: Duration::from_secs(2),
             team: None,
+            pulls: None,
             models: Default::default(),
         }
     }
@@ -215,6 +219,7 @@ impl Node {
         config.models = self.models;
         config.task_grace = self.grace;
         config.team = self.team;
+        config.pulls = self.pulls;
         config.worktrees_dir = std::env::temp_dir()
             .join("p2p-test-worktrees")
             .join(format!("{}-{}", self.name, self.key.public().fmt_short()));
@@ -1835,6 +1840,257 @@ async fn worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch()
     assert!(evidence.checks_passed());
     assert_eq!(evidence.signer_id, reviewer.id().to_string());
     assert!(!review_repo.path().join("feature.txt").exists());
+}
+
+/// A pull request [`FakePulls`] opened: the folder, the ask, the issues and who asked.
+type OpenedWith = (String, PullRequestAsk, Vec<String>, String);
+
+/// Pull requests kept in memory: each one opened is open until the test merges or closes
+/// it, and opening the same work again finds it.
+#[derive(Default)]
+struct FakePulls {
+    opened: Mutex<Vec<OpenedWith>>,
+    /// Each one's state, by number (from 1).
+    states: Mutex<std::collections::BTreeMap<u64, String>>,
+}
+
+#[async_trait]
+impl PullRequests for FakePulls {
+    async fn open(
+        &self,
+        share: &str,
+        ask: &PullRequestAsk,
+        issues: &[String],
+        by: &str,
+    ) -> anyhow::Result<Opened> {
+        let mut opened = self.opened.lock().unwrap();
+        let mut states = self.states.lock().unwrap();
+        let (number, existed) = match opened.iter().position(|(_, a, _, _)| a == ask) {
+            Some(i) => (i as u64 + 1, true),
+            None => {
+                opened.push((share.into(), ask.clone(), issues.to_vec(), by.into()));
+                states.insert(opened.len() as u64, "OPEN".into());
+                (opened.len() as u64, false)
+            }
+        };
+        Ok(Opened {
+            number,
+            url: format!("https://github.com/acme/app/pull/{number}"),
+            state: states[&number].clone(),
+            existed,
+            proof: true,
+        })
+    }
+
+    async fn state(&self, _share: &str, number: u64) -> anyhow::Result<String> {
+        Ok(self.states.lock().unwrap()[&number].clone())
+    }
+
+    fn poll(&self) -> Duration {
+        Duration::from_millis(50)
+    }
+}
+
+impl FakePulls {
+    /// Once pull request `number` is opened, sets its state to `state`.
+    async fn when_opened(&self, number: u64, state: &str) {
+        timeout(Duration::from_secs(30), async {
+            while !self.states.lock().unwrap().contains_key(&number) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the pull request was opened");
+        self.states.lock().unwrap().insert(number, state.into());
+    }
+}
+
+#[tokio::test]
+async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merged() {
+    let repo = git_repo();
+    let pulls = Arc::new(FakePulls::default());
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let (mut boss, mut eve) = (Node::new("boss"), Node::new("eve"));
+    mutual(&mut worker, &mut boss);
+    mutual(&mut worker, &mut eve);
+    worker
+        .shares
+        .add_with(
+            "app",
+            repo.path(),
+            Access::WorkspaceWrite,
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    worker.grant("boss", Access::WorkspaceWrite, &["app"]);
+    worker.grant("eve", Access::WorkspaceWrite, &["app"]);
+    worker.pulls = Some(pulls.clone());
+    let mut allowed = worker.shares.clone();
+    allowed.set_pull_requests("app", true).unwrap();
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    let (eve, _ee) = eve.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    eve.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    wait_for_peers(&eve, 1).await;
+    let plan = Plan::parse(
+        "impl @worker:app create feature.txt\n\
+         check after impl @worker:app apply=impl Check the feature\n\
+         ship after check pr @worker:app",
+    )
+    .unwrap();
+    let squads = SquadStore::default();
+
+    // Its owner doesn't let peers open pull requests there yet: the step isn't sent.
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan(&boss, &squads, &plan, |_, _| {}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(states["check"], StepState::Done { .. }),
+        "{states:?}"
+    );
+    assert!(
+        matches!(&states["ship"], StepState::Failed { error, .. } if error.contains("doesn't take pull request steps")),
+        "{:?}",
+        states["ship"]
+    );
+    assert!(pulls.opened.lock().unwrap().is_empty());
+
+    // Allowed: it opens the pull request from check's branch (it has impl's work too),
+    // named after the work, and waits until it is merged.
+    worker.set_shares(allowed);
+    timeout(Duration::from_secs(10), async {
+        while !boss.peers()[0].shares.iter().any(|s| s.pull_requests) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("boss learns the folder takes pull request steps");
+    let merge = {
+        let pulls = pulls.clone();
+        tokio::spawn(async move { pulls.when_opened(1, "MERGED").await })
+    };
+    let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let states = {
+        let said = said.clone();
+        timeout(
+            Duration::from_secs(60),
+            run_plan(&boss, &squads, &plan, move |id, state| {
+                if let (
+                    "ship",
+                    StepState::Running {
+                        progress: Some(p), ..
+                    },
+                ) = (id, state)
+                {
+                    said.lock().unwrap().push(p.text.clone());
+                }
+            }),
+        )
+        .await
+        .unwrap()
+    };
+    merge.await.unwrap();
+    let StepState::Done {
+        evidence: Some(checked),
+        ..
+    } = &states["check"]
+    else {
+        panic!("{:?}", states["check"]);
+    };
+    let branch = checked.git.clone().unwrap();
+    let (share, ask, issues, by) = pulls.opened.lock().unwrap()[0].clone();
+    assert_eq!((share.as_str(), by.as_str()), ("app", "boss"));
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(
+        (Some(ask.branch.clone()), Some(ask.commit.clone())),
+        (Some(branch.branch.clone()), branch.commit.clone())
+    );
+    assert_eq!(ask.title, "create feature.txt");
+    let shown = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["show", &format!("{}:feature.txt", ask.branch)])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&shown.stdout),
+        "made by the model\n"
+    );
+    match &states["ship"] {
+        StepState::Done {
+            output,
+            evidence: Some(e),
+            verified,
+            ..
+        } => {
+            assert!(
+                output.starts_with(
+                    "Pull request #1 was merged: https://github.com/acme/app/pull/1\n"
+                ),
+                "{output}"
+            );
+            assert!(
+                *verified && e.signer == "worker" && e.git.is_none(),
+                "{e:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        said.lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.contains("pull request #1 is open: waiting for it to be merged")),
+        "{said:?}"
+    );
+
+    // A pull request closed without being merged fails the step.
+    let close = {
+        let pulls = pulls.clone();
+        tokio::spawn(async move { pulls.when_opened(2, "CLOSED").await })
+    };
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan(&boss, &squads, &plan, |_, _| {}),
+    )
+    .await
+    .unwrap();
+    close.await.unwrap();
+    assert!(
+        matches!(&states["ship"], StepState::Failed { error, .. } if error.contains("#2 was closed without being merged: https://github.com/acme/app/pull/2")),
+        "{:?}",
+        states["ship"]
+    );
+
+    // Only the peer the work was done for opens it, and only as it was done.
+    let mut task = LlmTask::new(Provider::Copilot, "open it").in_share("app");
+    task.pull_request = Some(Box::new(ask.clone()));
+    let refused = eve
+        .delegate_verified(worker.id(), task.clone())
+        .await
+        .unwrap();
+    assert!(
+        !refused.ok && refused.output.contains("was done for another peer"),
+        "{}",
+        refused.output
+    );
+    task.pull_request = Some(Box::new(PullRequestAsk {
+        commit: "0".repeat(40),
+        ..ask
+    }));
+    let refused = boss.delegate_verified(worker.id(), task).await.unwrap();
+    assert!(
+        !refused.ok && refused.output.contains("moved on from the step's commit"),
+        "{}",
+        refused.output
+    );
+    assert_eq!(pulls.opened.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

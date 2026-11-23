@@ -23,6 +23,7 @@ pub mod plugins;
 pub mod preview;
 pub mod profile;
 pub mod protocol;
+pub mod pulls;
 pub mod redact;
 pub mod render;
 pub mod runs;

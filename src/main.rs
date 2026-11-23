@@ -1041,6 +1041,24 @@ example:
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Let peers with edit access end their plans with a pull request step in a linked
+    /// repository's folder (`ship after work pr @you:folder Title`), or stop letting them.
+    #[command(after_help = "\
+Your agent then pushes the branch their earlier steps committed to and opens the pull
+request with your GitHub account, closing the issues the work is for and carrying its
+signed proof, and follows it until it is merged or closed. It opens only work it did for
+the peer that asks, as it was done. Branch protection still decides what merging needs.
+example:
+  proofkin share pull-requests app --profile alice")]
+    PullRequests {
+        /// The shared folder (a repository linked with `repo link`).
+        name: String,
+        /// Stop taking pull request steps.
+        #[arg(long)]
+        off: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Stop sharing a folder.
     Remove {
         name: String,
@@ -1785,6 +1803,9 @@ fn share_extras(share: &proofkin::shares::Share) -> String {
     }
     if share.worktrees {
         extras += "; a git worktree per editing task";
+    }
+    if share.pull_requests {
+        extras += "; takes pull request steps";
     }
     if !share.mcp.is_empty() {
         extras += &format!(
@@ -3508,6 +3529,33 @@ fn run_share(command: ShareCommand) -> Result<()> {
                 ),
             }
         }
+        ShareCommand::PullRequests { name, off, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            if !off {
+                proofkin::github::RepoStore::load(&profile.repos_path())?
+                    .get(&name)
+                    .with_context(|| {
+                        format!(
+                            "pull requests need a GitHub repository linked as '{name}' (repo link)"
+                        )
+                    })?;
+            }
+            let data = profile.data_folder();
+            proofkin::shares::ShareStore::update(&profile.shares_path(), data, |shares| {
+                shares.set_pull_requests(&name, !off)
+            })?;
+            if off {
+                println!(
+                    "profile '{}': '{name}' no longer takes pull request steps",
+                    profile.name
+                );
+            } else {
+                println!(
+                    "profile '{}': '{name}' takes pull request steps from peers with edit access; they end a plan with: ship after <steps> pr @{}:{name} <title>",
+                    profile.name, profile.name
+                );
+            }
+        }
         ShareCommand::Remove { name, profile } => {
             let profile = Profile::open(&profile.name)?;
             let mut shares = profile.shares()?;
@@ -4306,6 +4354,9 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             config.executor = executor.clone().map(|e| e as Arc<dyn Executor>);
             config.audit = Some(Arc::new(AuditLog::new(profile.audit_path())));
             config.team = Some(Arc::new(proofkin::team::TeamRunner::new(profile.clone())));
+            config.pulls = Some(Arc::new(proofkin::pulls::ProfilePulls::new(
+                profile.clone(),
+            )));
         }
         Agent::bind(config).await?
     };

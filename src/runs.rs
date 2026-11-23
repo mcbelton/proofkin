@@ -369,6 +369,7 @@ impl RunRecord {
             workiq: Vec::new(),
             model: task.model.clone(),
             effort: task.effort.clone(),
+            pr: false,
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims
@@ -581,6 +582,8 @@ impl RunRecord {
             "approval".to_owned()
         } else if step.team.is_some() {
             "team".to_owned()
+        } else if step.pr {
+            "pull request".to_owned()
         } else {
             step.provider.to_string()
         };

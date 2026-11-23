@@ -478,6 +478,19 @@
       ]
     },
     {
+      "id": "PLAN-3",
+      "area": "plans",
+      "claim": "A plan can end with a pull request step (name after steps pr @peer:folder [title]): the folder's agent opens the pull request from the branch of the work before it in that folder (the step whose branch has the others' work through apply=; separate branches, a step without a folder, a squad, @me and model options are refused by the plan check), titled with the step's words or else those of the step that started the work. It is sent only to a folder whose owner lets peers open pull requests there (share pull-requests, or Takes pull request steps in the web UI; only folders with worktrees, and older agents never say so) and to a peer with edit access; the folder's agent opens it only for work it signed for that peer, with the branch's head still the step's commit, and runs no model. The step waits, saying the pull request is open with its link, until it is merged (done, with a signed record) or closed without being merged (failed); a second try finds the pull request it opened.",
+      "tests": [
+        "agents::a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merged",
+        "lib::plan::pull_request_steps_open_the_work_before_them_in_their_folder",
+        "lib::shares::only_folders_with_worktrees_take_pull_request_steps",
+        "lib::pulls::only_task_branches_are_asked_for",
+        "lib::pulls::a_description_closes_the_issues_and_names_who_asked",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
       "id": "LRN-1",
       "area": "knowledge",
       "claim": "The system keeps learning: the ops summary (health, incidents, usage) is written into the knowledge base (kb learn, and hourly by agents with monitors) for context=all and the learn playbook, and learned TSGs fix repeats without the model.",

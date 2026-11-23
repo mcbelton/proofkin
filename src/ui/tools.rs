@@ -650,6 +650,54 @@ pub(super) async fn remove_team(
 }
 
 #[derive(Deserialize)]
+pub(super) struct PullRequestsBody {
+    on: bool,
+}
+
+/// Lets peers with edit access end their plans with pull request steps in a shared
+/// folder (a linked repository shared with worktrees), or stops letting them.
+pub(super) async fn set_pull_requests(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<PullRequestsBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.on {
+        crate::github::RepoStore::load(&s.info.profile.repos_path())
+            .map_err(err400)?
+            .get(&name)
+            .map_err(|_| {
+                bad_request(format!(
+                    "'{name}' isn't a linked GitHub repository: pull requests are opened in one (link it under Repositories)"
+                ))
+            })?;
+    }
+    let (found, shares) = s
+        .info
+        .profile
+        .update_shares(|shares| {
+            if shares.get(&name).is_none() {
+                return Ok(false);
+            }
+            shares.set_pull_requests(&name, body.on)?;
+            Ok(true)
+        })
+        .map_err(err400)?;
+    if !found {
+        return Err(no_share(&name));
+    }
+    shares_changed(
+        &s,
+        shares,
+        if body.on {
+            format!("'{name}' takes pull request steps from peers with edit access")
+        } else {
+            format!("'{name}' no longer takes pull request steps")
+        },
+    );
+    Ok(Json(json!({ "name": name, "on": body.on })))
+}
+
+#[derive(Deserialize)]
 pub(super) struct OfferEdit {
     #[serde(default)]
     access: Option<Access>,
