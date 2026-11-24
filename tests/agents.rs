@@ -2489,14 +2489,11 @@ async fn a_sign_off_asks_for_changes_and_the_work_is_done_again_from_where_it_wa
                 &plan,
                 &RunContext::default(),
                 move |id, state| {
-                    if let (
-                        "impl",
-                        StepState::Running {
-                            progress: Some(p), ..
-                        },
-                    ) = (id, state)
+                    if let StepState::Running {
+                        progress: Some(p), ..
+                    } = state
                     {
-                        said.lock().unwrap().push(p.text.clone());
+                        said.lock().unwrap().push(format!("{id}: {}", p.text));
                     }
                 },
             ),
@@ -2532,12 +2529,14 @@ async fn a_sign_off_asks_for_changes_and_the_work_is_done_again_from_where_it_wa
     );
     let git = e.git.as_ref().unwrap();
     assert_eq!(git.files, ["changes.txt", "feature.txt"]);
-    assert!(
-        said.lock()
-            .unwrap()
-            .contains(&"done again: boss asked for changes at ok: Add a changelog line".to_owned()),
-        "{said:?}"
-    );
+    // Each card said what was going on.
+    let said = said.lock().unwrap().clone();
+    for text in [
+        "ok: boss asked for changes (round 1 of 1): Add a changelog line; asks again once impl is done again",
+        "impl: done again: boss asked for changes at ok: Add a changelog line",
+    ] {
+        assert!(said.contains(&text.to_owned()), "{text}: {said:?}");
+    }
     assert!(
         matches!(&states["ok"], StepState::Done { output, .. } if output == "Approved by boss: Good now"),
         "{:?}",

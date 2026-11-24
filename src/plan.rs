@@ -3920,9 +3920,22 @@ pub async fn run_plan_with(
                             .collect();
                         if used < allowed && !redo.is_empty() {
                             // The work it is on is done again with their note, then they
-                            // are asked again.
+                            // are asked again; its card says so meanwhile.
                             rounds.insert(id.clone(), used + 1);
                             asked.insert(id.clone(), note.clone());
+                            let waiting = StepState::Running {
+                                peer: peer.clone(),
+                                progress: Some(Progress::new(
+                                    Phase::Running,
+                                    format!(
+                                        "{by} asked for changes (round {} of {allowed}): {}; asks again once {} {} done again",
+                                        used + 1,
+                                        crate::runs::one_line(&note),
+                                        redo.join(", "),
+                                        if redo.len() == 1 { "is" } else { "are" }
+                                    ),
+                                )),
+                            };
                             for s in redo {
                                 let patch = match &states[&s] {
                                     StepState::Done { patch, .. } => patch.clone(),
@@ -3940,7 +3953,7 @@ pub async fn run_plan_with(
                                 on_update(&s, &StepState::Waiting);
                                 states.insert(s, StepState::Waiting);
                             }
-                            on_update(&id, &StepState::Waiting);
+                            on_update(&id, &waiting);
                             states.insert(id, StepState::Waiting);
                             continue;
                         }
