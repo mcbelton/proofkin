@@ -2603,6 +2603,40 @@ impl Inner {
             self.send_progress(&peer, task_id, Progress::new(Phase::Queued, text));
         }
     }
+    /// Brings folder `share`'s clone up to its repository's latest commit before task
+    /// `task_id` from `id` starts in it, if it is a linked repository's clone, telling the
+    /// requester. Returns a note for the task's result when the task starts from the
+    /// folder as it was instead.
+    async fn update_folder(&self, id: &EndpointId, task_id: u64, share: &Share) -> Option<String> {
+        use crate::github::CloneUpdate;
+        let pulls = self.pulls.as_ref()?;
+        let name = &share.name;
+        let (text, note) = match pulls.update(name).await {
+            Ok(CloneUpdate::NotLinked | CloneUpdate::Current { .. }) => return None,
+            Ok(CloneUpdate::Moved { head, commits }) => (
+                format!(
+                    "updated folder '{name}' to its repository's latest commit {head} ({commits} newer commit{})",
+                    if commits == 1 { "" } else { "s" }
+                ),
+                None,
+            ),
+            Ok(CloneUpdate::Kept { head, why }) => (
+                format!("starting from commit {head} of folder '{name}' as it was: {why}"),
+                Some(format!(
+                    "Note: this task started from commit {head} of folder '{name}' as it was, not brought up to date with its repository: {why}."
+                )),
+            ),
+            Err(e) => (
+                format!("starting from folder '{name}' as it was: {e:#}"),
+                Some(format!(
+                    "Note: this task started from folder '{name}' as it was; it couldn't be brought up to date with its repository: {e:#}."
+                )),
+            ),
+        };
+        self.send_progress(id, task_id, Progress::new(Phase::Running, text));
+        note
+    }
+
     /// Runs an admitted task: in its own worktree if the folder uses them, applying
     /// the requester's patch, then the model and the requested checks, retrying
     /// with the failures while attempts are left. Returns the signed evidence.
@@ -2617,6 +2651,8 @@ impl Inner {
         mut ctx: TaskContext,
         share: &Share,
     ) -> Result<Served> {
+        // A linked repository's clone first gets the repository's latest commit.
+        let kept = self.update_folder(id, task_id, share).await;
         let worktree = if share.worktrees && ctx.access >= Access::WorkspaceWrite {
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2759,6 +2795,9 @@ impl Inner {
             } else {
                 part.trim_end()
             };
+        }
+        if let Some(note) = &kept {
+            output = format!("{}\n\n{note}", output.trim_end());
         }
         // Results leave this machine: secrets the model or a check printed stay here.
         output = crate::redact::redact_with_note(&output, &self.name);

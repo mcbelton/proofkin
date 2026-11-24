@@ -1420,6 +1420,15 @@
       ]
     },
     {
+      "id": "GH-9",
+      "area": "github",
+      "claim": "A task in a linked repository's folder starts from the repository's latest commit: before it starts, its agent fetches the repository's branch (unless the clone fetched it in the last minute) and fast-forwards the clone, telling the requester (updated folder 'app' to its repository's latest commit abc1234 (N newer commits)). The clone is left as it is when the repository can't be reached, it has another branch checked out, its branch has commits the repository's hasn't, or the update would overwrite its local changes; the task then starts from the clone's commit and its result says which one and why.",
+      "tests": [
+        "agents::a_task_in_a_linked_repository_starts_from_its_latest_commit",
+        "github::linked_repositories_clone_share_sync_push_and_open_pull_requests"
+      ]
+    },
+    {
       "id": "EDD-9",
       "area": "evidence",
       "claim": "A sign-off's approver can ask for changes instead of approving or rejecting (web UI Ask for changes, terminal /changes N WHAT, POST /api/approvals/ID with changes and a note; signed as not approved, saying so) while the sign-off allows another round (changes=N on it, 0 to 5, default 2; only sign-offs take it): the steps a model did that it waits for directly are done again, each from its own earlier commit with the note, their cards saying so, then the sign-off asks again with the new results and the note it answered. A request that doesn't offer it refuses it, and asking for changes needs a note.",

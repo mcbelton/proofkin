@@ -18,7 +18,7 @@ use serde_json::json;
 use tokio::process::Command;
 
 use crate::evidence::{Evidence, EvidenceKind};
-use crate::github::{GithubCredentials, Repo};
+use crate::github::{CloneUpdate, GithubCredentials, Repo};
 use crate::tracker::Api;
 
 /// How often an open pull request's state is asked of GitHub.
@@ -203,6 +203,13 @@ pub trait PullRequests: Send + Sync {
     /// request for one it can't ask. Its own account, the pull request's author, isn't
     /// asked.
     async fn request_reviews(&self, share: &str, number: u64, logins: &[String]) -> Vec<Review>;
+
+    /// Brings folder `share`'s clone up to its repository's latest commit before a task
+    /// starts in it, if the folder is a linked repository's clone (see
+    /// [`GithubCredentials::update_clone`]); other folders are left as they are.
+    async fn update(&self, _share: &str) -> Result<CloneUpdate> {
+        Ok(CloneUpdate::NotLinked)
+    }
 
     /// How long to wait before asking again about an open pull request.
     fn poll(&self) -> Duration {
@@ -484,6 +491,20 @@ impl PullRequests for ProfilePulls {
             });
         }
         reviews
+    }
+
+    async fn update(&self, share: &str) -> Result<CloneUpdate> {
+        let profile = self.profile.reload()?;
+        let Ok(repo) = crate::github::RepoStore::load(&profile.repos_path())?
+            .get(share)
+            .cloned()
+        else {
+            return Ok(CloneUpdate::NotLinked);
+        };
+        profile
+            .github()?
+            .update_clone(&repo, crate::github::FETCH_AGE)
+            .await
     }
 }
 
