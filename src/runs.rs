@@ -370,6 +370,7 @@ impl RunRecord {
             model: task.model.clone(),
             effort: task.effort.clone(),
             pr: false,
+            reviewers: None,
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims

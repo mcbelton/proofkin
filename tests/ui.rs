@@ -253,6 +253,7 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
         access: Access::ReadOnly,
         shares: Vec::new(),
         m365: None,
+        github: None,
     });
     let (stranger, _stranger_events) = Agent::bind(stranger).await.unwrap();
     let _ = stranger.connect(agent.addr()).await;
@@ -364,6 +365,42 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
     assert_eq!(bad.status, 400, "{}", bad.body);
     let unknown = SecretKey::generate().public().to_string();
     assert_eq!(put(unknown, r#"{"delegate":false}"#).await.status, 404);
+
+    // Change… also sets its GitHub account (pull request steps ask it to review); without
+    // one given, it is kept, also when pal is allowlisted again; empty forgets it.
+    let github = |id: &iroh::EndpointId| agent.trusted().get(id).and_then(|p| p.github.clone());
+    let set = put(
+        peer.to_string(),
+        r#"{"delegate":false,"github":"@octo-cat"}"#,
+    )
+    .await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(github(&peer).as_deref(), Some("octo-cat"));
+    assert_eq!(
+        put(peer.to_string(), r#"{"delegate":false}"#).await.status,
+        200
+    );
+    let again = request(port, "POST", "/api/trust", &host, Some(token), Some(&chat)).await;
+    assert_eq!(again.status, 200, "{}", again.body);
+    assert_eq!(github(&peer).as_deref(), Some("octo-cat"));
+    let state = request(port, "GET", "/api/state", &host, Some(token), None)
+        .await
+        .json();
+    assert_eq!(state["trusted"][0]["github"], "octo-cat", "{state}");
+    let bad = put(
+        peer.to_string(),
+        r#"{"delegate":false,"github":"no such login"}"#,
+    )
+    .await;
+    assert_eq!(bad.status, 400, "{}", bad.body);
+    assert!(bad.body.contains("isn't a GitHub login"), "{}", bad.body);
+    assert_eq!(
+        put(peer.to_string(), r#"{"delegate":false,"github":""}"#)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(github(&peer), None);
 
     agent.shutdown().await;
 }
@@ -640,6 +677,7 @@ async fn a_plan_goes_on_after_its_agent_restarts() {
         access: Access::ReadOnly,
         shares: vec!["data".into()],
         m365: None,
+        github: None,
     };
     let gate = || Arc::new(tokio::sync::Semaphore::new(0));
     let (early, mid, late) = (gate(), gate(), gate());
@@ -926,6 +964,7 @@ async fn ui_gives_tasks_to_a_squad_member_and_moves_them_when_one_refuses() {
         access: Access::ReadOnly,
         shares: vec!["data".into()],
         m365: None,
+        github: None,
     };
     let mut config = AgentConfig::new("boss", boss_key.clone());
     config.network = Network::Local;
@@ -1065,6 +1104,7 @@ fn delegating(name: &str, id: iroh::EndpointId) -> TrustedPeer {
         access: Access::ReadOnly,
         shares: vec!["data".into()],
         m365: None,
+        github: None,
     }
 }
 
@@ -1290,6 +1330,7 @@ async fn ui_runs_plans_and_shows_squads() {
         access: Access::ReadOnly,
         shares: vec!["data".into()],
         m365: None,
+        github: None,
     };
     let mut worker = AgentConfig::new("worker", worker_key.clone());
     worker.network = Network::Local;
@@ -1687,6 +1728,7 @@ async fn a_running_plan_step_keeps_its_folder_in_its_target() {
         access: Access::ReadOnly,
         shares: vec!["data".into(), "docs".into()],
         m365: None,
+        github: None,
     };
     let mut worker = AgentConfig::new("worker", worker_key.clone());
     worker.network = Network::Local;
@@ -3333,6 +3375,7 @@ async fn team_runs_show_on_the_bosss_step_and_the_leads_page() {
             access,
             shares: shares.iter().map(|s| (*s).to_owned()).collect(),
             m365: None,
+            github: None,
         }
     };
     let local = |config: &mut AgentConfig| {

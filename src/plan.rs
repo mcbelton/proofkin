@@ -257,7 +257,16 @@ pub struct Step {
     /// merged (see [`crate::pulls`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pr: bool,
+    /// Who a pull request step asks to review (`reviewers=me,carol,octocat`): `me` is this
+    /// profile's GitHub account, an allowlisted peer is the account the allowlist has for
+    /// it, any other name is a GitHub login. Empty (`reviewers=none`): no one. None: those
+    /// who signed off before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewers: Option<Vec<String>>,
 }
+
+/// The most reviewers a pull request step names.
+pub const MAX_REVIEWERS: usize = 10;
 
 /// The `workiq=` sources, and the Work IQ capability each one names.
 pub const WORKIQ_SOURCES: &[(&str, &str)] = &[
@@ -802,7 +811,8 @@ impl Plan {
 
 /// Who may receive Microsoft 365 content (docs/work-iq.md, section 4): the peers the
 /// allowlist grants it to, for the labels it names, and the owner's own digital workers,
-/// who may have all of it.
+/// who may have all of it. With the GitHub accounts it knows, it also says who a pull
+/// request step asks to review.
 #[derive(Debug, Clone, Default)]
 pub struct Recipients {
     pub trust: TrustStore,
@@ -812,6 +822,9 @@ pub struct Recipients {
     pub profile: Option<String>,
     /// Whether the profile has a Work IQ account for `workiq=` steps.
     pub workiq_account: bool,
+    /// The profile's own GitHub login (see [`crate::profile::Profile::github_user`]): pull
+    /// request steps ask it to review for `reviewers=me` and for the owner's own sign-offs.
+    pub github: Option<String>,
 }
 
 impl Recipients {
@@ -821,6 +834,7 @@ impl Recipients {
             workers,
             profile: None,
             workiq_account: false,
+            github: None,
         }
     }
 
@@ -832,6 +846,7 @@ impl Recipients {
             workers: crate::workers::worker_ids(profile).unwrap_or_default(),
             profile: Some(profile.name.clone()),
             workiq_account: profile.workiq_account().is_ok(),
+            github: profile.github_user(),
         }
     }
 
@@ -1176,6 +1191,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     let mut workiq = Vec::new();
     let (mut model, mut effort) = (None, None);
     let (mut levels, mut timeout, mut issue) = (None, None, None);
+    let mut reviewers: Option<Vec<String>> = None;
     let mut once = std::collections::HashSet::new();
     loop {
         match words.peek().copied() {
@@ -1278,6 +1294,21 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                             anyhow!("issue= needs an issue number, e.g. issue=#12, got {value:?}")
                         })?);
                     }
+                    "reviewers" | "reviewer" => {
+                        let list = reviewers.get_or_insert_with(Vec::new);
+                        add(list, value);
+                        if list.is_empty() {
+                            bail!("reviewers= needs GitHub logins, peer names, me or none");
+                        }
+                        if let Some(bad) = list
+                            .iter()
+                            .find(|r| validate_name(r).is_err() && !crate::github::login_ok(r))
+                        {
+                            bail!(
+                                "reviewers= needs GitHub logins, peer names, me or none, got {bad:?}"
+                            );
+                        }
+                    }
                     _ => break,
                 }
                 words.next();
@@ -1323,6 +1354,20 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
             bail!(
                 "pull request step '{id}' needs @peer:folder: the agent that holds the folder's clone, and the folder"
             );
+        }
+    }
+    if let Some(list) = &mut reviewers {
+        if !pr {
+            bail!("reviewers= is for pull request steps (name after steps pr @peer:folder)");
+        }
+        if list.iter().any(|r| r.eq_ignore_ascii_case("none")) {
+            if list.len() > 1 {
+                bail!("reviewers=none asks no one; don't name reviewers with it");
+            }
+            list.clear();
+        }
+        if list.len() > MAX_REVIEWERS {
+            bail!("reviewers= names at most {MAX_REVIEWERS} reviewers");
         }
     }
     if levels.is_some() && target == Target::Workiq {
@@ -1372,6 +1417,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         model,
         effort,
         pr,
+        reviewers,
     };
     if let Some(why) = step.workiq_refusal() {
         bail!("{why}");
@@ -1937,6 +1983,11 @@ pub fn preflight(
                 ),
             );
         }
+        if step.pr {
+            for (error, message) in reviewer_problems(plan, step, recipients) {
+                report(Some(step), error, message);
+            }
+        }
         let candidates: Vec<&PeerInfo> = match &step.target {
             Target::Workiq => continue,
             Target::Peer(name) if name == "me" => {
@@ -2466,7 +2517,136 @@ fn pr_ask(
         commit: git.commit.clone().unwrap_or_default(),
         title: crate::llm::title_of(words),
         signoffs,
+        reviewers: Vec::new(),
     })
+}
+
+/// The GitHub accounts pull request step `step` asks to review (see [`Step::reviewers`]):
+/// those it names, else those of the people whose sign-offs it carries (`signoffs`), as
+/// this agent (`own`) and its allowlist know them. A name without a known account is left
+/// out; the plan check warned about it.
+fn reviewers_for(
+    step: &Step,
+    signoffs: &[crate::pulls::SignOff],
+    own: &EndpointId,
+    recipients: &Recipients,
+) -> Vec<String> {
+    let account_of = |id: &EndpointId| {
+        if id == own {
+            recipients.github.clone()
+        } else {
+            recipients.trust.get(id).and_then(|p| p.github.clone())
+        }
+    };
+    let found: Vec<Option<String>> = match &step.reviewers {
+        Some(names) => names
+            .iter()
+            .map(|name| {
+                if name == "me" {
+                    recipients.github.clone()
+                } else if let Some(peer) = recipients.trust.get_by_name(name) {
+                    peer.github.clone()
+                } else {
+                    Some(name.clone()).filter(|n| crate::github::login_ok(n))
+                }
+            })
+            .collect(),
+        None => signoffs
+            .iter()
+            .map(|s| {
+                s.evidence
+                    .signer_id
+                    .parse::<EndpointId>()
+                    .ok()
+                    .and_then(|id| account_of(&id))
+            })
+            .collect(),
+    };
+    let mut logins: Vec<String> = Vec::new();
+    for login in found.into_iter().flatten() {
+        if !logins.iter().any(|l| l.eq_ignore_ascii_case(&login)) {
+            logins.push(login);
+        }
+    }
+    logins.truncate(MAX_REVIEWERS);
+    logins
+}
+
+/// What the plan check says about who pull request step `step` asks to review, each with
+/// whether it is an error: a name in its `reviewers=` (or a person signing off before it,
+/// when it names none) whose GitHub account isn't known isn't asked; a name that can't be
+/// anyone is an error.
+fn reviewer_problems(plan: &Plan, step: &Step, recipients: &Recipients) -> Vec<(bool, String)> {
+    let profile = recipients
+        .profile
+        .as_ref()
+        .map(|p| format!(" --profile {p}"))
+        .unwrap_or_default();
+    let not_signed_in = |what: &str| {
+        format!(
+            "{what}, but this profile isn't signed in to GitHub, so you aren't asked to review the pull request; sign in with: proofkin github login --gh-user <login>{profile}"
+        )
+    };
+    let no_account = |what: &str, peer: &str| {
+        format!(
+            "{what}, but the allowlist has no GitHub account for {peer}, so {peer} isn't asked to review the pull request; set one with: proofkin peers github {peer} <login>{profile}"
+        )
+    };
+    let mut problems = Vec::new();
+    match &step.reviewers {
+        Some(names) => {
+            for name in names {
+                if name == "me" {
+                    if recipients.github.is_none() {
+                        problems.push((false, not_signed_in("reviewers= names me")));
+                    }
+                } else if let Some(peer) = recipients.trust.get_by_name(name) {
+                    if peer.github.is_none() {
+                        let what = format!("reviewers= names {name}");
+                        problems.push((false, no_account(&what, name)));
+                    }
+                } else if !crate::github::login_ok(name) {
+                    problems.push((
+                        true,
+                        format!(
+                            "reviewers= names {name:?}, who isn't on the allowlist and can't be a GitHub login"
+                        ),
+                    ));
+                }
+            }
+        }
+        None => {
+            let before = ancestors(plan, &step.id);
+            for s in plan
+                .steps
+                .iter()
+                .filter(|s| s.approve && before.contains(&s.id))
+            {
+                let Target::Peer(name) = &s.target else {
+                    continue;
+                };
+                let message = if name == "me" {
+                    if recipients.github.is_some() {
+                        continue;
+                    }
+                    not_signed_in(&format!("you sign off in step '{}'", s.id))
+                } else if recipients
+                    .trust
+                    .get_by_name(name)
+                    .is_some_and(|p| p.github.is_none())
+                {
+                    no_account(&format!("{name} signs off in step '{}'", s.id), name)
+                } else {
+                    continue;
+                };
+                problems.push((
+                    false,
+                    format!("{message}; or ask no one with reviewers=none"),
+                ));
+            }
+        }
+    }
+    problems
 }
 
 /// A plan checked and ready to run as `profile`'s agent (see [`start`]).
@@ -3263,7 +3443,13 @@ pub async fn run_plan_with(
                     }
                     if step.pr {
                         match pr_ask(plan, step, &states) {
-                            Ok(ask) => {
+                            Ok(mut ask) => {
+                                ask.reviewers = reviewers_for(
+                                    step,
+                                    &ask.signoffs,
+                                    &agent.id(),
+                                    &fresh_recipients(agent, ctx),
+                                );
                                 task.prompt = format!(
                                     "Open a pull request from {}: {}",
                                     ask.branch, ask.title
@@ -4598,6 +4784,132 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_steps_ask_who_signed_off_or_the_reviewers_they_name() {
+        let pr = |options: &str| {
+            Plan::parse(&format!(
+                "a @bob:app do\nok after a approve @carol Fine?\nme-ok after a approve @me Fine?\np after ok,me-ok pr @bob:app {options} Go"
+            ))
+            .unwrap()
+        };
+        assert_eq!(pr("").steps[3].reviewers, None);
+        assert_eq!(
+            pr("reviewers=me,carol reviewer=octocat,carol").steps[3].reviewers,
+            Some(vec!["me".into(), "carol".into(), "octocat".into()])
+        );
+        assert_eq!(pr("reviewers=None").steps[3].reviewers, Some(Vec::new()));
+        let err = |text: &str| Plan::parse(text).unwrap_err().to_string();
+        for (text, why) in [
+            (
+                "a @bob:app reviewers=me do",
+                "reviewers= is for pull request steps",
+            ),
+            (
+                "a @bob:app do\np after a pr @bob:app reviewers=none,me Go",
+                "reviewers=none asks no one",
+            ),
+            (
+                "a @bob:app do\np after a pr @bob:app reviewers=a/b Go",
+                "needs GitHub logins, peer names, me or none, got \"a/b\"",
+            ),
+            (
+                "a @bob:app do\np after a pr @bob:app reviewers=, Go",
+                "reviewers= needs GitHub logins",
+            ),
+            (
+                "a @bob:app do\np after a pr @bob:app reviewers=a,b,c,d,e,f,g,h,i,j,k Go",
+                "at most 10 reviewers",
+            ),
+        ] {
+            assert!(err(text).contains(why), "{text}: {}", err(text));
+        }
+
+        // You are me-gh on GitHub; the allowlist knows carol's account, not dave's.
+        let key = || iroh::SecretKey::generate().public();
+        let (own, carol, dave) = (key(), key(), key());
+        let mut trust = TrustStore::default();
+        for (name, id, github) in [("carol", carol, Some("carol-gh")), ("dave", dave, None)] {
+            trust.allow(crate::trust::TrustedPeer {
+                name: name.into(),
+                id,
+                addrs: Default::default(),
+                can_delegate: false,
+                tasks_per_hour: 5,
+                access: Access::ReadOnly,
+                shares: Vec::new(),
+                m365: None,
+                github: github.map(Into::into),
+            });
+        }
+        let mut recipients = Recipients::new(trust, Vec::new());
+        recipients.profile = Some("boss".into());
+        recipients.github = Some("me-gh".into());
+        let signed = |by: EndpointId| crate::pulls::SignOff {
+            step: "ok".into(),
+            output: "Approved".into(),
+            evidence: Evidence::new(crate::evidence::EvidenceKind::Approval, "x", by, own, 1),
+        };
+        // Naming no one, it asks those who signed off whose accounts are known, each once.
+        let signoffs = [signed(carol), signed(own), signed(dave), signed(carol)];
+        let plan = pr("");
+        assert_eq!(
+            reviewers_for(&plan.steps[3], &signoffs, &own, &recipients),
+            ["carol-gh", "me-gh"]
+        );
+        let named = pr("reviewers=me,carol,dave,octocat,ME-GH");
+        assert_eq!(
+            reviewers_for(&named.steps[3], &signoffs, &own, &recipients),
+            ["me-gh", "carol-gh", "octocat"]
+        );
+        assert!(
+            reviewers_for(&pr("reviewers=none").steps[3], &signoffs, &own, &recipients).is_empty()
+        );
+
+        // The plan check says who isn't asked, and why.
+        let check = |text: &str, recipients: &Recipients| {
+            let plan = Plan::parse(text).unwrap();
+            let step = plan.steps.iter().find(|s| s.pr).unwrap().clone();
+            reviewer_problems(&plan, &step, recipients)
+        };
+        let three = "a @bob:app do\nok after a approve @carol Fine?\nd-ok after a approve @dave Fine?\nme-ok after a approve @me Fine?\np after ok,d-ok,me-ok pr @bob:app";
+        assert_eq!(
+            check(three, &recipients),
+            [(
+                false,
+                "dave signs off in step 'd-ok', but the allowlist has no GitHub account for dave, so dave isn't asked to review the pull request; set one with: proofkin peers github dave <login> --profile boss; or ask no one with reviewers=none".to_owned()
+            )]
+        );
+        let mut signed_out = recipients.clone();
+        signed_out.github = None;
+        let found = check(three, &signed_out);
+        assert!(
+            found.len() == 2
+                && found[1].1.starts_with(
+                    "you sign off in step 'me-ok', but this profile isn't signed in to GitHub, so you aren't asked to review the pull request; sign in with: proofkin github login --gh-user <login> --profile boss"
+                ),
+            "{found:?}"
+        );
+        assert!(check(&format!("{three} reviewers=none"), &signed_out).is_empty());
+        let found = check(
+            "a @bob:app do\np after a pr @bob:app reviewers=me,carol,dave,octocat,x_y Go",
+            &signed_out,
+        );
+        let errors: Vec<bool> = found.iter().map(|(error, _)| *error).collect();
+        assert_eq!(errors, [false, false, true], "{found:?}");
+        assert!(
+            found[0]
+                .1
+                .starts_with("reviewers= names me, but this profile isn't signed in")
+        );
+        assert!(found[1].1.starts_with(
+            "reviewers= names dave, but the allowlist has no GitHub account for dave"
+        ));
+        assert_eq!(
+            found[2].1,
+            "reviewers= names \"x_y\", who isn't on the allowlist and can't be a GitHub login"
+        );
+    }
+
+    #[test]
     fn squad_steps_pick_the_least_busy_capable_member() {
         let peer = |name: &str, providers: Vec<Provider>, shares: &[&str]| PeerInfo {
             name: name.into(),
@@ -4971,6 +5283,7 @@ mod tests {
             access: Access::ReadOnly,
             shares: vec![crate::shares::DATA_SHARE.into()],
             m365: None,
+            github: None,
         });
         let mut recipients = Recipients::new(trust, Vec::new());
         recipients.profile = Some("boss".into());
@@ -5139,6 +5452,7 @@ mod tests {
                     labels: labels.iter().map(|l| (*l).to_owned()).collect(),
                     tools: false,
                 }),
+                github: None,
             });
         }
         let helper = peers[3].id;
@@ -5266,6 +5580,7 @@ mod tests {
                 access: Access::ReadOnly,
                 shares: vec![crate::shares::DATA_SHARE.into()],
                 m365,
+                github: None,
             });
         }
         let id = |name: &str| peers.iter().find(|p| p.name == name).unwrap().id;

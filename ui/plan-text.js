@@ -9,14 +9,16 @@ const planText = (() => {
   // Step options (before what to do), by the option they set. Repeating a list
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
-    ["context", "context"], ["claims", "claims"], ["claim", "claims"], ["workiq", "workiq"]]);
+    ["context", "context"], ["claims", "claims"], ["claim", "claims"], ["workiq", "workiq"],
+    ["reviewers", "reviewers"], ["reviewer", "reviewers"]]);
   const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue", "model", "effort"]);
   // A sign-off is a person's decision: no checks, retries, patches, saved result, agent, model, effort or search.
   const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq", "model", "effort"]);
   // A team step is done and proven by the lead's team plan.
   const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent", "model", "effort"]);
-  // A pull request step opens the pull request with the work before it: only a time limit and an issue.
-  const IN_PR = new Set(["timeout", "issue"]);
+  // A pull request step opens the pull request with the work before it: only a time limit, an
+  // issue and who reviews it (an option only it has).
+  const IN_PR = new Set(["timeout", "issue", "reviewers"]);
   // A @workiq step asks Microsoft 365 for an answer: context, never proof. Its agent= is a Work IQ
   // agent id; it has no skills, MCP servers, checks, claims, patches, folder, model or search of its own.
   const WORKIQ = "@workiq";
@@ -30,8 +32,9 @@ const planText = (() => {
     teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers, agent, model or reasoning effort of its own.",
     workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, patches, skills, MCP servers, model, reasoning effort or search of its own.",
     workiqKind: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it can't be a sign-off or a team step.",
-    prOption: "A pull request step opens the pull request with the work before it: it takes only a time limit and an issue.",
+    prOption: "A pull request step opens the pull request with the work before it: it takes only a time limit, an issue and who reviews it.",
     prTarget: "A pull request step is opened by the agent that holds the folder's clone: a peer and its folder (@peer:folder).",
+    reviewersOption: "Only a pull request step asks for reviews (reviewers=).",
     ownStep: (id) => `Step ${id} can't wait for itself.`,
   };
 
@@ -213,6 +216,7 @@ const planText = (() => {
       if (step.approve && NOT_IN_SIGNOFF.has(optionOf(part))) return { error: ERRORS.signoffOption };
       if (step.team && NOT_IN_TEAM.has(optionOf(part))) return { error: ERRORS.teamOption };
       if (step.pr && !IN_PR.has(optionOf(part))) return { error: ERRORS.prOption };
+      if (!step.pr && optionOf(part) === "reviewers") return { error: ERRORS.reviewersOption };
       if (step.target === WORKIQ && NOT_IN_WORKIQ.has(optionOf(part))) return { error: ERRORS.workiqOption };
       setOption(step, part);
     }
@@ -484,6 +488,7 @@ const planText = (() => {
       }
       if (s.pr && s.target && !/^@[^:]+:.+/.test(s.target)) need("step", i, "target", ERRORS.prTarget);
       if (s.pr && s.options.some((o) => !IN_PR.has(optionOf(o)))) need("step", i, "target", ERRORS.prOption);
+      if (!s.pr && valuesOf(s, "reviewers").length) need("step", i, "target", ERRORS.reviewersOption);
       // A pull request step without a title takes that of the work it opens.
       if (!s.pr && blank(taskOf(s), TODO)) {
         need("step", i, "todo", s.approve ? "Say what to check before signing off" : "Say what this step should do");

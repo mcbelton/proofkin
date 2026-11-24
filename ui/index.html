@@ -302,6 +302,11 @@
         <span>Name <span class="muted">(optional with a ticket)</span></span>
         <input id="add-name" type="text" maxlength="64" spellcheck="false">
       </label>
+      <label class="field">
+        <span>GitHub account <span class="muted">(optional)</span></span>
+        <input id="add-github" type="text" maxlength="39" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="octocat…" aria-describedby="github-hint">
+        <span class="muted small" id="github-hint">Pull request steps ask this account to review when this peer signs off on the work, or a step names it in <span class="mono">reviewers=</span>.</span>
+      </label>
       <label class="check">
         <input id="add-delegate" type="checkbox">
         <span>Allow this peer to run tasks on this agent's accounts</span>

@@ -2063,8 +2063,9 @@ impl Inner {
 
     /// Runs pull request step `task` from `from` (see [`crate::pulls`]): opens the pull
     /// request from the branch an earlier task of `from`'s committed to in this folder (or
-    /// finds the one opened for it before) and follows it until it is merged (done) or
-    /// closed (failed), saying where it is. It runs no model and takes no task slot.
+    /// finds the one opened for it before), asks the step's reviewers to review one it
+    /// opened, and follows it until it is merged (done) or closed (failed), saying where it
+    /// is. It runs no model and takes no task slot.
     #[allow(clippy::too_many_arguments)]
     async fn open_pull_request(
         self: &Arc<Self>,
@@ -2131,6 +2132,35 @@ impl Inner {
             let opened = pulls
                 .open(&share.name, &checked, &task.issues, from, run)
                 .await?;
+            // Reviewers are asked once, when it is opened: asking again would ask those who
+            // reviewed it already to review it again.
+            let mut reviews = Vec::new();
+            if !opened.existed {
+                let (logins, not) = crate::pulls::reviewers_to_ask(&checked);
+                if !logins.is_empty() {
+                    self.send_progress(
+                        id,
+                        task_id,
+                        Progress::new(
+                            Phase::PullRequest,
+                            format!(
+                                "asking {} to review pull request #{}",
+                                logins.join(", "),
+                                opened.number
+                            ),
+                        ),
+                    );
+                    reviews = pulls
+                        .request_reviews(&share.name, opened.number, &logins)
+                        .await;
+                }
+                reviews.extend(not);
+            }
+            let asked: Vec<&str> = reviews
+                .iter()
+                .filter(|r| r.not_asked.is_none())
+                .map(|r| r.login.as_str())
+                .collect();
             let mut state = opened.state.clone();
             let mut said = String::new();
             while state != "MERGED" && state != "CLOSED" {
@@ -2141,8 +2171,14 @@ impl Inner {
                         Progress::new(
                             Phase::PullRequest,
                             format!(
-                                "pull request #{} is open: waiting for it to be merged ({})",
-                                opened.number, opened.url
+                                "pull request #{} is open{}: waiting for it to be merged ({})",
+                                opened.number,
+                                if asked.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(", with a review asked of {}", asked.join(", "))
+                                },
+                                opened.url
                             ),
                         ),
                     );
@@ -2180,7 +2216,7 @@ impl Inner {
                 notes.push("an earlier try of this step opened it".to_owned());
             }
             let output = format!(
-                "Pull request #{} {}: {}\n\nIt has the work of branch `{}` (commit `{}`){}{}.",
+                "Pull request #{} {}: {}\n\nIt has the work of branch `{}` (commit `{}`){}{}.{}",
                 opened.number,
                 if merged {
                     "was merged"
@@ -2195,7 +2231,8 @@ impl Inner {
                 } else {
                     format!(", with {}", with.join(" and "))
                 },
-                notes.iter().map(|n| format!("; {n}")).collect::<String>()
+                notes.iter().map(|n| format!("; {n}")).collect::<String>(),
+                crate::pulls::reviews_text(&reviews)
             );
             let mut evidence = Evidence::new(
                 EvidenceKind::Task,

@@ -312,6 +312,58 @@ impl GithubCredentials {
         branch_proof(&repo.path, branch, profile, pushed).await
     }
 
+    /// Asks GitHub account `login` to review pull request `number` of the repository. GitHub
+    /// refuses accounts that aren't its collaborators, and the pull request's author; the
+    /// error says why, in its words.
+    pub async fn request_reviewer(&self, repo: &Repo, number: u64, login: &str) -> Result<()> {
+        if !login_ok(login) {
+            bail!("{login:?} isn't a GitHub login");
+        }
+        let mut cmd = Command::new(gh_program());
+        cmd.args([
+            "api",
+            "--method",
+            "POST",
+            "--hostname",
+            &self.host,
+            &format!("repos/{}/pulls/{number}/requested_reviewers", repo.slug),
+            "--input",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+        for var in INHERITED_CREDENTIAL_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env("GH_TOKEN", &self.token)
+            .env("GH_HOST", &self.host)
+            .env("GH_PROMPT_DISABLED", "1");
+        let mut child = cmd.spawn().context("running the GitHub CLI (gh)")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let body = serde_json::json!({ "reviewers": [login] }).to_string();
+            stdin
+                .write_all(body.as_bytes())
+                .await
+                .context("sending the request to the GitHub CLI")?;
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .context("running the GitHub CLI (gh)")?;
+        if out.status.success() {
+            return Ok(());
+        }
+        // GitHub's message, from its JSON answer or the CLI's.
+        let said = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .ok()
+            .and_then(|v| v["message"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| String::from_utf8_lossy(&out.stderr).trim().to_owned());
+        bail!("{}", reviewer_refusal(&said, &repo.slug))
+    }
+
     /// Opens a pull request from `head` into the repository's branch; returns its URL.
     pub async fn create_pr(
         &self,
@@ -950,6 +1002,29 @@ pub fn default_host() -> &'static str {
     DEFAULT_GITHUB_HOST
 }
 
+/// Whether `login` can be a GitHub account's login: 1 to 39 letters, digits and hyphens,
+/// not starting or ending with a hyphen.
+pub fn login_ok(login: &str) -> bool {
+    (1..=39).contains(&login.len())
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+}
+
+/// Why GitHub didn't ask a reviewer, in a few words: GitHub's message `said`, shortened when
+/// it is one it is known to give.
+fn reviewer_refusal(said: &str, slug: &str) -> String {
+    if said.contains("not a collaborator") {
+        format!("not a collaborator of {slug}")
+    } else if said.contains("pull request author") {
+        "the pull request's author".to_owned()
+    } else if said.is_empty() {
+        "GitHub didn't say why".to_owned()
+    } else {
+        said.trim_start_matches("gh: ").chars().take(200).collect()
+    }
+}
+
 /// What a pull request from a task's branch carries as proof (see [`branch_proof`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Proof {
@@ -1211,6 +1286,36 @@ fn proof_markdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewers_are_github_logins_and_a_refusal_says_why_in_a_few_words() {
+        for ok in ["octocat", "a", "mc-belton", "A1-b2"] {
+            assert!(login_ok(ok), "{ok}");
+        }
+        let long = "a".repeat(40);
+        for bad in ["", "-x", "x-", "a_b", "a.b", "a b", "@x", long.as_str()] {
+            assert!(!login_ok(bad), "{bad}");
+        }
+        assert_eq!(
+            reviewer_refusal(
+                "Reviews may only be requested from collaborators. One or more of the users or teams you specified is not a collaborator of the acme/app repository.",
+                "acme/app"
+            ),
+            "not a collaborator of acme/app"
+        );
+        assert_eq!(
+            reviewer_refusal(
+                "Review cannot be requested from pull request author.",
+                "acme/app"
+            ),
+            "the pull request's author"
+        );
+        assert_eq!(reviewer_refusal("", "acme/app"), "GitHub didn't say why");
+        assert_eq!(
+            reviewer_refusal("gh: Not Found (HTTP 404)", "acme/app"),
+            "Not Found (HTTP 404)"
+        );
+    }
 
     #[test]
     fn renamed_files_are_compared_at_their_new_path() {

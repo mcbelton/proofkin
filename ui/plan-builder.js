@@ -228,7 +228,7 @@ const planBuilder = (() => {
     const body = s.pr
       ? [field(`${k}-target`, "Whose clone opens it", who, "A peer's folder that takes pull request steps: its agent pushes the branch with the work of the steps before it there and opens the pull request with its owner's GitHub account"),
         field(`${k}-todo`, "Title", todo, "It closes the issues the work is for, carries the work's signed proof, and waits until it is merged"),
-        waitsField(s, k), moreOptions(s, k)]
+        reviewersField(s, k), waitsField(s, k), moreOptions(s, k)]
       : s.team
       ? [field(`${k}-target`, "Whose team does it", who, "A peer's folder with a team plan: its agent runs the plan on its own team, and you see each of its steps as it goes"),
         field(`${k}-todo`, "What to do", todo),
@@ -244,6 +244,22 @@ const planBuilder = (() => {
         waitsField(s, k), moreOptions(s, k)];
     return el("li", { class: `pb-step${s.approve ? " signoff" : ""}${s.team ? " team" : ""}${s.pr ? " pr" : ""}`, "data-card": k }, head, ...body,
       el("div", { class: "pb-marks", "data-marks": k }));
+  }
+
+  /// Who a pull request step asks to review it (reviewers=): without any, those who
+  /// signed off before it.
+  function reviewersField(s, k) {
+    const input = el("input", {
+      type: "text", placeholder: "me, carol, octocat…", autocomplete: "off", autocapitalize: "off", spellcheck: "false",
+    });
+    input.value = planText.valuesOf(s, "reviewers").join(", ");
+    input.addEventListener("change", () => {
+      const names = input.value.split(/[\s,]+/).map((n) => n.replace(/^@/, "")).filter(Boolean);
+      planText.setValues(s, "reviewers", names);
+      changed();
+    });
+    return field(`${k}-reviewers`, "Who reviews it", input,
+      "me, peers of your allowlist (the GitHub account it has for them) or GitHub logins; none asks no one. Empty: those who signed off before it");
   }
 
   /// The agent a task acts as (from a plugin or the profile's own): what it brings.
@@ -521,13 +537,15 @@ const planBuilder = (() => {
     s.approve = kind === "signoff";
     s.team = kind === "team";
     s.pr = kind === "pr";
+    // Only a pull request step asks for reviews.
+    if (kind !== "pr") planText.setValues(s, "reviewers", null);
     if (kind === "pr") {
-      // Opened from the work before it: only a time limit and an issue of its own.
+      // Opened from the work before it: only a time limit, an issue and its reviewers.
       s.target = null;
       s.using = null;
       for (const word of [...s.options]) {
         const option = word.slice(0, word.indexOf("="));
-        if (!["timeout", "issue"].includes(option)) planText.setValues(s, option, null);
+        if (!["timeout", "issue", "reviewers", "reviewer"].includes(option)) planText.setValues(s, option, null);
       }
     } else if (kind === "signoff") {
       // A person's decision: no folder, checks, retries, patch, saved result, tools or agent.

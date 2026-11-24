@@ -491,9 +491,10 @@ with `/ticket`.
 | Peers command | Description |
 | --- | --- |
 | `proofkin peers id --profile P` | Show P's endpoint id and ticket |
-| `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N] [--m365 LABELS\|off [--m365-tools]]` | Allowlist a peer (re-run to change its rights). `--m365 General,Public,unlabeled` lets it receive Microsoft 365 content with those labels, `--m365-tools` lets its tasks use your Work IQ (read only), `--m365 off` removes the grant; without `--m365` a grant is kept |
+| `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N] [--m365 LABELS\|off [--m365-tools]] [--github LOGIN\|--no-github]` | Allowlist a peer (re-run to change its rights). `--m365 General,Public,unlabeled` lets it receive Microsoft 365 content with those labels, `--m365-tools` lets its tasks use your Work IQ (read only), `--m365 off` removes the grant; without `--m365` a grant is kept. `--github` sets its GitHub account, which [pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan) ask to review; without it an account set before is kept |
 | `proofkin share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--check NAME=COMMAND ...]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
 | `proofkin peers list --profile P` | List allowlisted peers and their rights |
+| `proofkin peers github <name-or-id> <login>\|--off --profile P` | Set (or forget) an allowlisted peer's GitHub account without changing its rights. A running agent uses it after it restarts; the web UI's **Change…** sets it at once |
 | `proofkin peers remove <name-or-id> --profile P` | Remove a peer |
 
 **LAN or VPN without internet services:** `--network local --listen <IP:PORT>` uses direct
@@ -903,6 +904,17 @@ ship after ok pr @alice:shop
   from the record the approver's agent signed. The folder's agent lists only approvals
   that verify for exactly their words and that you asked for, and says how many it left
   out. They are in the run's evidence too, which `proofkin runs verify` checks again.
+- The people who signed off are **asked to review** the pull request, by their GitHub
+  accounts: yours (the account your profile's repositories use, `proofkin github login`)
+  for your own sign-offs, and for a peer's, the account your allowlist has for it (set
+  with `proofkin peers github carol <login>`, or **Change…** on the allowlist).
+  `reviewers=` names others instead: `me`, a peer on your allowlist, or any GitHub login
+  (`reviewers=me,carol,octocat`, at most 10); `reviewers=none` asks no one. The plan check
+  warns about each one it can't ask, saying how to set the account. The folder's agent
+  asks GitHub for each one when it opens the pull request (never again for one it opened
+  before); GitHub only asks the repository's collaborators, and never the pull request's
+  author (the agent's owner). The step's result says who was asked, and who wasn't and
+  why.
 - The step then waits until the pull request is merged (done) or closed without being
   merged (failed), asking GitHub every minute. Its card links the pull request while it
   waits, and on a tracked run its issue is **In review**. Merging is up to the
@@ -910,9 +922,9 @@ ship after ok pr @alice:shop
   `timeout=` on the step stops the wait; the pull request stays open.
 - Run again, for example when [the run goes on after a restart](#plan-resume), the step
   finds the pull request it opened and follows that one.
-- It takes no options for a model, only `timeout=` and `issue=`. It needs edit access
-  (`workspace-write` or `full`) in the folder, and the folder must take pull request steps.
-  An older agent never says that its folder does, so it is never sent one.
+- It takes no options for a model, only `timeout=`, `issue=` and `reviewers=`. It needs
+  edit access (`workspace-write` or `full`) in the folder, and the folder must take pull
+  request steps. An older agent never says that its folder does, so it is never sent one.
 
 ### Scheduled plans
 
@@ -992,7 +1004,8 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
 | `team @lead:folder`, `levels=N` | Instead of a model, the lead's team does it, with the folder's team plan ([team steps](#team-steps-handing-work-down-a-level)). `levels=` (1 to 3, default 1) is how many levels down it may go. |
-| `pr @peer:folder` | Instead of a model, the folder's agent opens the pull request with the work of the steps before it there, then waits until it is merged ([pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan)). Takes only `timeout=` and `issue=`. |
+| `pr @peer:folder` | Instead of a model, the folder's agent opens the pull request with the work of the steps before it there, then waits until it is merged ([pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan)). Takes only `timeout=`, `issue=` and `reviewers=`. |
+| `reviewers=me,carol,octocat` | On a `pr` step: who is asked to review the pull request, by GitHub account (`me`, a peer on your allowlist, or a GitHub login; `none` asks no one). Without it, those who signed off before it are asked. |
 | `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
 | `workiq=all` / `workiq=email,files` | Searches your Microsoft 365 (Work IQ) for the step's own words when the step is sent, and puts what it finds in the prompt before `Your task:`. `all` searches everything; a list names sources: `email`, `meetings`, `files`, `teams`, `people`, `connectors`. Not on sign-offs. See [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq). |
 | `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue, and its task gets the issue's title and body in front of it (as external content, secrets redacted, cut at 4,000 characters), so the plan needn't repeat them. |
@@ -1725,9 +1738,11 @@ proofkin --name me --providers copilot --serve --ui
 - **Connected peers** with the providers they serve and how busy they are ("idle",
   "1/2 busy", "2/2 busy · 1 waiting"; hover for how many of those tasks are yours), live.
 - **Allowlist**: add a peer by pasting their ticket (optionally letting them delegate, with an
-  hourly limit and an access level: read only, edit files, or full), change what one may do
-  (**Change…**: it stays connected), or remove one; changes are saved to the profile's
-  `peers.json` and take effect at once (removed peers are disconnected).
+  hourly limit and an access level: read only, edit files, or full, and with their GitHub
+  account, which [pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan)
+  ask to review), change what one may do or its GitHub account (**Change…**: it stays
+  connected), or remove one; changes are saved to the profile's `peers.json` and take
+  effect at once (removed peers are disconnected).
 - **Digital workers**: create [digital workers](#digital-workers) that run on your
   sign-ins (sign in to Copilot right there with a GitHub CLI account), in the folders you
   pick; start and stop them, choose whether they start with this agent, set their

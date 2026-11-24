@@ -446,6 +446,7 @@ impl Shared {
                     "access": t.access,
                     "shares": t.shares,
                     "m365": t.m365,
+                    "github": t.github,
                     "connected": peers.iter().any(|p| p.id == t.id),
                 })
             })
@@ -3916,6 +3917,24 @@ struct AllowBody {
     access: Access,
     /// Folders the peer's tasks may use (default: the `data` share).
     shares: Option<Vec<String>>,
+    /// The peer's GitHub account; absent keeps the one set, empty forgets it.
+    github: Option<String>,
+}
+
+/// The GitHub account a peer's entry gets from `given` (see [`AllowBody::github`]), else
+/// the one it has (`kept`).
+fn github_account(given: Option<String>, kept: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(given) = given else {
+        return Ok(kept);
+    };
+    let login = given.trim().trim_start_matches('@');
+    if login.is_empty() {
+        Ok(None)
+    } else if crate::github::login_ok(login) {
+        Ok(Some(login.to_owned()))
+    } else {
+        Err(bad_request(format!("{login:?} isn't a GitHub login")))
+    }
 }
 
 async fn allow_peer(
@@ -3936,6 +3955,10 @@ async fn allow_peer(
     }
     let shares = granted_shares(&s, body.delegate, body.shares)?;
     let m365 = s.agent.trusted().m365_of(&ticket.addr.id, &name);
+    let github = github_account(
+        body.github,
+        s.agent.trusted().github_of(&ticket.addr.id, &name),
+    )?;
     s.agent.allow(TrustedPeer {
         name: name.clone(),
         id: ticket.addr.id,
@@ -3951,6 +3974,7 @@ async fn allow_peer(
         },
         shares: shares.clone(),
         m365,
+        github,
     });
     s.save_trust()?;
     s.system(
@@ -4002,10 +4026,13 @@ struct PeerGrantBody {
     #[serde(default)]
     access: Access,
     shares: Option<Vec<String>>,
+    /// The peer's GitHub account; absent keeps the one set, empty forgets it.
+    github: Option<String>,
 }
 
-/// Changes what an allowlisted peer may do, keeping its name, addresses and Microsoft
-/// 365 grant: a connected peer stays connected and learns its folders at once.
+/// Changes what an allowlisted peer may do (and its GitHub account), keeping its name,
+/// addresses and Microsoft 365 grant: a connected peer stays connected and learns its
+/// folders at once.
 async fn change_peer(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -4024,6 +4051,7 @@ async fn change_peer(
         ));
     };
     let shares = granted_shares(&s, body.delegate, body.shares)?;
+    peer.github = github_account(body.github, peer.github.take())?;
     peer.can_delegate = body.delegate;
     peer.tasks_per_hour = body
         .tasks_per_hour

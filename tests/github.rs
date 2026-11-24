@@ -178,6 +178,7 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
             access: Access::Full,
             shares: vec![],
             m365: None,
+            github: None,
         }],
     }
     .save(&profile.trust_path())
