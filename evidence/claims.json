@@ -175,7 +175,7 @@
     {
       "id": "SEC-4",
       "area": "security",
-      "claim": "Shell commands need full access and run in an OS sandbox with no network and no bypass; obvious escapes are refused before they run.",
+      "claim": "Shell commands need full access and run in an OS sandbox with no network and no bypass; obvious escapes are refused before they run. The sandbox confines the model's commands only: the MCP servers a task may use (its folder owner's, and the checks server) run with the owner's rights, as at the other access levels and as the checks after the model.",
       "tests": [
         "lib::llm::copilot::shell_needs_full_access_and_no_urls_or_outside_paths",
         "lib::llm::copilot::shell_runs_in_an_offline_sandbox_without_bypass",
@@ -1452,11 +1452,12 @@
     {
       "id": "EDD-11",
       "area": "evidence",
-      "claim": "A task that asks for its folder's checks gives its model (Copilot or Claude; not Codex, which takes no MCP servers) a run_check tool: the worker starts proofkin task-checks as the task's MCP server proofkin-checks, which runs one of the step's checks in the task's workspace and answers whether it passed, with its exit code, time and the end of its output (secrets redacted), at most 10 runs a task, each up to 10 minutes. A check the step doesn't name is refused, and so is an 11th run. The runtime still runs the checks after the model, and only those runs are evidence.",
+      "claim": "A task that asks for its folder's checks gives its model (Copilot or Claude; not Codex, which takes no MCP servers) a run_check tool: the worker starts proofkin task-checks as the task's MCP server proofkin-checks, which runs one of the step's checks in the task's workspace, outside the model's sandbox as the runtime does, and answers whether it passed, with its exit code, time and the end of its output (secrets redacted), at most 10 runs a task, each up to 10 minutes. A check the step doesn't name is refused, and so is an 11th run. The runtime still runs the checks after the model, and only those runs are evidence.",
       "tests": [
         "agents::a_tasks_model_runs_its_checks_while_it_works",
         "lib::checks_mcp::the_model_runs_the_steps_checks_while_it_works_a_few_times",
-        "lib::checks_mcp::a_worker_starts_it_with_the_steps_checks_in_the_tasks_workspace"
+        "lib::checks_mcp::a_worker_starts_it_with_the_steps_checks_in_the_tasks_workspace",
+        "lib::llm::copilot::shell_runs_in_an_offline_sandbox_without_bypass"
       ]
     },
     {
@@ -1523,11 +1524,12 @@
     {
       "id": "TRK-7",
       "area": "tracking",
-      "claim": "A step that names an issue (issue=#N) on a tracked run gets the issue's title and body, as its tracker has them, in front of its task as external content (Proofkin's own markers left out, secrets redacted, cut at 4,000 characters; after the earlier steps' results), so the plan needn't repeat them and the model needn't look them up; a sign-off shows them to the person. Steps that name no issue get none.",
+      "claim": "A step that names an issue (issue=#N) on a tracked run gets the issue's title and body, as its tracker has them, in front of its task as external content (Proofkin's own markers left out, secrets redacted, cut at 20,000 characters saying how much was left out and where the whole issue is; after the earlier steps' results), so the plan needn't repeat them and the model needn't look them up; a sign-off shows them to the person. Steps that name no issue get none.",
       "tests": [
         "lib::tracker::a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do",
         "lib::plan::a_step_working_on_an_issue_gets_its_text_as_external_content",
-        "agents::a_step_gets_the_text_of_the_issue_it_works_on"
+        "agents::a_step_gets_the_text_of_the_issue_it_works_on",
+        "lib::tracker::a_long_issue_comes_whole_and_one_past_the_limit_says_what_was_cut"
       ]
     },
     {

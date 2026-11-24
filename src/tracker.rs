@@ -1836,12 +1836,13 @@ struct Run {
     texts: HashMap<String, String>,
 }
 
-/// The most of an issue's text a step's task gets.
-const MAX_ISSUE_TEXT: usize = 4_000;
+/// The most of an issue's text a step's task gets: room for a detailed spec.
+const MAX_ISSUE_TEXT: usize = 20_000;
 
 /// What a step working on `issue` (of `repo`) gets to read of it: its title and body,
 /// without Proofkin's own markers, secrets redacted, cut at [`MAX_ISSUE_TEXT`]
-/// characters. People wrote it: the task gets it as external content.
+/// characters (saying how much is left out, and where the whole issue is). People wrote
+/// it: the task gets it as external content.
 fn issue_text(repo: &str, issue: &Issue) -> String {
     let body: Vec<&str> = issue
         .body
@@ -1856,7 +1857,12 @@ fn issue_text(repo: &str, issue: &Issue) -> String {
     );
     let text = crate::redact::redact(text.trim_end()).0;
     match text.char_indices().nth(MAX_ISSUE_TEXT) {
-        Some((at, _)) => format!("{}\n[... cut]", &text[..at]),
+        Some((at, _)) => format!(
+            "{}\n[... cut: {} more characters; the whole issue is {}]",
+            &text[..at],
+            text[at..].chars().count(),
+            issue.url
+        ),
         None => text,
     }
 }
@@ -4354,5 +4360,36 @@ mod tests {
         assert_eq!(field.option(Status::InReview), Some("2"));
         assert_eq!(field.option(Status::Done), Some("3"));
         assert_eq!(fenced("a ```b``` c"), "````text\na ```b``` c\n````");
+    }
+
+    #[test]
+    fn a_long_issue_comes_whole_and_one_past_the_limit_says_what_was_cut() {
+        let issue = |body: String| Issue {
+            id: "I_160".into(),
+            number: 160,
+            title: "Spec".into(),
+            url: "https://github.com/acme/app/issues/160".into(),
+            open: true,
+            body,
+            parent: None,
+            item: None,
+            status: None,
+            subs: Vec::new(),
+            summary: (0, 0),
+        };
+        // A detailed spec of several thousand characters comes whole.
+        let spec = "x".repeat(15_000);
+        assert_eq!(
+            issue_text("acme/app", &issue(spec.clone())),
+            format!("acme/app#160 Spec\n\n{spec}")
+        );
+        // Past the limit, the cut says how much is left out and where the whole issue is.
+        let text = issue_text("acme/app", &issue("y".repeat(MAX_ISSUE_TEXT)));
+        let (kept, cut) = text.split_once("\n[... cut: ").unwrap();
+        assert_eq!(kept.chars().count(), MAX_ISSUE_TEXT);
+        assert_eq!(
+            cut,
+            "19 more characters; the whole issue is https://github.com/acme/app/issues/160]"
+        );
     }
 }
