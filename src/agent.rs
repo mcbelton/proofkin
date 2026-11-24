@@ -2708,6 +2708,8 @@ impl Inner {
         let mut results = Vec::<crate::evidence::CheckResult>::new();
         let (mut reports, mut used) = (Vec::<String>::new(), 0);
         let mut failed_before = Vec::<String>::new();
+        // The last attempt ended because the model's run stopped, not because checks failed.
+        let mut stopped_before = false;
         // The model that did the work, and its effort: the latest attempt's, as its
         // provider says.
         let (mut model, mut effort) = (None, None);
@@ -2716,6 +2718,9 @@ impl Inner {
             let text = match (attempts, used) {
                 (1, _) => "the model is working".to_owned(),
                 (n, 1) => format!("attempt 1 of {n}: the model is working"),
+                (n, k) if stopped_before => format!(
+                    "attempt {k} of {n}: the model is working, going on from where its last run stopped"
+                ),
                 (n, k) => format!(
                     "attempt {k} of {n}: the model is working, told what failed ({})",
                     failed_before.join(", ")
@@ -2730,7 +2735,43 @@ impl Inner {
                     ..Progress::new(Phase::Running, text)
                 },
             );
-            let ran = executor.execute(&prompt, &ctx).await?;
+            let ran = match executor.execute(&prompt, &ctx).await {
+                Ok(ran) => ran,
+                // The run stopped before the model finished (it ran out of time, or its
+                // provider failed): the next attempt goes on from what it changed.
+                Err(e) if used < attempts => {
+                    let why = format!("{e:#}");
+                    reports.push(format!("The model's run stopped before it finished: {why}"));
+                    reports.push(format!(
+                        "Attempt {} of {attempts}, after the model's run stopped",
+                        used + 1
+                    ));
+                    stopped_before = true;
+                    prompt.prompt = crate::evidence::resume_prompt(&task.prompt, &why);
+                    continue;
+                }
+                Err(e) => {
+                    let mut why = format!("{e:#}");
+                    // What the model changed stays on the task's branch, to look at or go on from.
+                    if let Some(wt) = &worktree {
+                        let message = format!(
+                            "{} (unfinished)\n\nTask {task_id} from {from}: the model's run stopped before it finished. Kept by {} with Proofkin.",
+                            commit_subject(task),
+                            self.name
+                        );
+                        if let Ok((record, _)) = wt.commit(&message).await
+                            && let Some(commit) = record.commit
+                        {
+                            why += &format!(
+                                " (what it changed is on branch {}, commit {})",
+                                wt.branch,
+                                commit.chars().take(12).collect::<String>()
+                            );
+                        }
+                    }
+                    bail!("{why}");
+                }
+            };
             model = ran.model.or(model);
             effort = ran.effort.or(effort);
             reports.push(ran.output);
@@ -2775,6 +2816,7 @@ impl Inner {
                 .filter(|r| !r.passed)
                 .map(|r| r.name.clone())
                 .collect();
+            stopped_before = false;
             if used < attempts {
                 reports.push(format!(
                     "Attempt {} of {attempts}, after these checks failed: {}",
@@ -2823,13 +2865,7 @@ impl Inner {
                 task_id,
                 Progress::new(Phase::Committing, "committing the work"),
             );
-            let first = task.prompt.lines().next().unwrap_or_default();
-            let subject = task
-                .title
-                .as_deref()
-                .map(crate::llm::title_of)
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| crate::llm::title_of(first));
+            let subject = commit_subject(task);
             let mut message = format!(
                 "{subject}\n\nTask {task_id} from {from}, done by {} with Proofkin.",
                 self.name
@@ -2891,6 +2927,16 @@ impl Inner {
             model: crate::models::with_effort(model, effort.as_deref()),
         })
     }
+}
+
+/// The subject of the commit of `task`'s work: its title, else its first line's.
+fn commit_subject(task: &LlmTask) -> String {
+    let first = task.prompt.lines().next().unwrap_or_default();
+    task.title
+        .as_deref()
+        .map(crate::llm::title_of)
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| crate::llm::title_of(first))
 }
 
 /// A peer's models as its hello says, kept only as far as they make sense: well-formed
