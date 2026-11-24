@@ -263,7 +263,17 @@ pub struct Step {
     /// who signed off before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewers: Option<Vec<String>>,
+    /// How many times a sign-off's approver may ask for changes (`changes=N`, at most
+    /// [`MAX_CHANGE_ROUNDS`]; 0: they only approve or reject): the work it is on is done
+    /// again with their note, then they are asked again. None: [`DEFAULT_CHANGE_ROUNDS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<u32>,
 }
+
+/// How many times a sign-off's approver may ask for changes unless it says (`changes=`).
+pub const DEFAULT_CHANGE_ROUNDS: u32 = 2;
+/// The most rounds of changes a sign-off allows.
+pub const MAX_CHANGE_ROUNDS: u32 = 5;
 
 /// The most reviewers a pull request step names.
 pub const MAX_REVIEWERS: usize = 10;
@@ -1192,6 +1202,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     let (mut model, mut effort) = (None, None);
     let (mut levels, mut timeout, mut issue) = (None, None, None);
     let mut reviewers: Option<Vec<String>> = None;
+    let mut changes: Option<u32> = None;
     let mut once = std::collections::HashSet::new();
     loop {
         match words.peek().copied() {
@@ -1215,6 +1226,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                         | "issue"
                         | "model"
                         | "effort"
+                        | "changes"
                 ) && !once.insert(key)
                 {
                     bail!("{key}= is given twice; a step has one");
@@ -1297,6 +1309,15 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                     "reviewers" | "reviewer" => {
                         add(reviewers.get_or_insert_with(Vec::new), value);
                     }
+                    "changes" => {
+                        let n: u32 = value.parse().map_err(|_| {
+                            anyhow!("changes= needs a number of rounds, got {value:?}")
+                        })?;
+                        if n > MAX_CHANGE_ROUNDS {
+                            bail!("changes= allows at most {MAX_CHANGE_ROUNDS} rounds");
+                        }
+                        changes = Some(n);
+                    }
                     _ => break,
                 }
                 words.next();
@@ -1350,6 +1371,11 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         }
         check_reviewers(list)?;
     }
+    if changes.is_some() && !approve {
+        bail!(
+            "changes= is for sign-offs (name after steps approve @person): how many times the approver may ask for changes"
+        );
+    }
     if levels.is_some() && target == Target::Workiq {
         bail!(
             "@workiq step '{id}' can't have levels=: an answer from Microsoft 365 is context and never proof"
@@ -1398,6 +1424,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         effort,
         pr,
         reviewers,
+        changes,
     };
     if let Some(why) = step.workiq_refusal() {
         bail!("{why}");
@@ -3015,7 +3042,13 @@ pub enum SentWork {
         origin: Option<Origin>,
     },
     /// An approval request.
-    Approval { title: String, text: String },
+    Approval {
+        title: String,
+        text: String,
+        /// The approver may ask for changes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        changes: bool,
+    },
 }
 
 /// A run going on after its agent restarted: its steps that had finished, as they ended
@@ -3153,13 +3186,22 @@ fn rejoin(
         (SentWork::Task { .. }, None) => {
             Box::pin(async { Err(anyhow!("it isn't known which peer has its task")) })
         }
-        (SentWork::Approval { title, text }, approver) => {
+        (
+            SentWork::Approval {
+                title,
+                text,
+                changes,
+            },
+            approver,
+        ) => {
             let (agent, task_id) = (agent.clone(), sent.task_id);
-            Box::pin(async move {
-                agent
-                    .rejoin_approval(approver, task_id, &title, &text)
-                    .await
-            })
+            let ask = crate::agent::ApprovalAsk {
+                title,
+                text,
+                preview: BTreeMap::new(),
+                changes,
+            };
+            Box::pin(async move { agent.rejoin_approval(approver, task_id, &ask).await })
         }
     };
     (sent.peer, work)
@@ -3405,6 +3447,11 @@ pub async fn run_plan_with(
     let mut moved: HashMap<String, String> = HashMap::new();
     let mut chain: Vec<String> = ctx.chain.iter().map(ToString::to_string).collect();
     chain.push(agent.id().to_string());
+    // The rounds of changes each sign-off's approver asked for, the note of their last
+    // one, and the steps to do again for them (see [`Step::changes`]).
+    let mut rounds: HashMap<String, u32> = HashMap::new();
+    let mut asked: HashMap<String, String> = HashMap::new();
+    let mut reworks: HashMap<String, Rework> = HashMap::new();
     loop {
         // Skip steps whose prerequisites failed; start steps whose prerequisites are done.
         let mut changed = true;
@@ -3476,6 +3523,8 @@ pub async fn run_plan_with(
                     .unwrap_or_default();
                 let prompt = step_prompt_with(step, &deps, &issue);
                 let fail = |error: String| StepState::failed(None, error);
+                // What its card says while it is done again for a sign-off's changes.
+                let mut again: Option<String> = None;
                 let (peer_name, work): (
                     String,
                     std::pin::Pin<Box<dyn Future<Output = Result<Delivered>> + Send>>,
@@ -3510,7 +3559,19 @@ pub async fn run_plan_with(
                             }
                             let (agent, title) = (agent.clone(), format!("Plan step {}", step.id));
                             // A person reads it: the rule for models is left out.
-                            let text = approval_text(&prompt);
+                            let mut text = approval_text(&prompt);
+                            let round = rounds.get(&step.id).copied().unwrap_or(0);
+                            if let Some(note) = asked.get(&step.id) {
+                                text = format!(
+                                    "**Asked again** (round {} of changes): you asked for changes, and the work was done again with your note; its new results are below.\n\n> {}\n\n---\n\n{text}",
+                                    round,
+                                    note.replace('\n', "\n> ")
+                                );
+                            }
+                            // They may ask for changes while it allows more rounds, and there
+                            // is work to do again.
+                            let changes = round < step.changes.unwrap_or(DEFAULT_CHANGE_ROUNDS)
+                                && !redoable(plan, step, &states).is_empty();
                             let task_id = agent.new_task_id();
                             if let Some(journal) = &ctx.journal {
                                 agent.keep_on_exit(task_id);
@@ -3523,18 +3584,21 @@ pub async fn run_plan_with(
                                         work: SentWork::Approval {
                                             title: title.clone(),
                                             text: text.clone(),
+                                            changes,
                                         },
                                     },
                                 );
                             }
+                            let ask = crate::agent::ApprovalAsk {
+                                title,
+                                text,
+                                preview,
+                                changes,
+                            };
                             (
                                 name,
                                 Box::pin(async move {
-                                    agent
-                                        .request_approval_as(
-                                            approver, task_id, &title, &text, preview,
-                                        )
-                                        .await
+                                    agent.request_approval_as(approver, task_id, &ask).await
                                 }),
                             )
                         }
@@ -3607,6 +3671,18 @@ pub async fn run_plan_with(
                         states.insert(step.id.clone(), state);
                         changed = true;
                         continue;
+                    }
+                    // Done again for the changes a sign-off's approver asked for: from its
+                    // earlier work, with their note.
+                    if let Some(rework) = reworks.remove(&step.id) {
+                        task.patch = rework.patch.clone().or(task.patch.take());
+                        task.prompt = format!("{}\n\n{}", task.prompt, rework_text(&rework));
+                        again = Some(format!(
+                            "done again: {} asked for changes at {}: {}",
+                            rework.by,
+                            rework.signoff,
+                            crate::runs::one_line(&rework.note)
+                        ));
                     }
                     if let Some(levels) = step.team {
                         task.team = Some(crate::team::TeamRequest {
@@ -3683,7 +3759,8 @@ pub async fn run_plan_with(
                     peer: peer_name.clone(),
                     progress: moved
                         .remove(&step.id)
-                        .map(|why| Progress::new(Phase::Running, format!("moved here: {why}"))),
+                        .map(|why| Progress::new(Phase::Running, format!("moved here: {why}")))
+                        .or_else(|| again.map(|text| Progress::new(Phase::Running, text))),
                 };
                 on_update(&step.id, &state);
                 states.insert(step.id.clone(), state);
@@ -3714,6 +3791,48 @@ pub async fn run_plan_with(
                     }
                 }
                 let state = match result {
+                    Ok(delivered) if step.approve && changes_asked(&delivered).is_some() => {
+                        let (by, note) = changes_asked(&delivered).unwrap_or_default();
+                        let used = rounds.get(&id).copied().unwrap_or(0);
+                        let allowed = step.changes.unwrap_or(DEFAULT_CHANGE_ROUNDS);
+                        let redo: Vec<String> = redoable(plan, step, &states)
+                            .iter()
+                            .map(|s| s.id.clone())
+                            .collect();
+                        if used < allowed && !redo.is_empty() {
+                            // The work it is on is done again with their note, then they
+                            // are asked again.
+                            rounds.insert(id.clone(), used + 1);
+                            asked.insert(id.clone(), note.clone());
+                            for s in redo {
+                                let patch = match &states[&s] {
+                                    StepState::Done { patch, .. } => patch.clone(),
+                                    _ => None,
+                                };
+                                reworks.insert(
+                                    s.clone(),
+                                    Rework {
+                                        signoff: id.clone(),
+                                        by: by.clone(),
+                                        note: note.clone(),
+                                        patch,
+                                    },
+                                );
+                                on_update(&s, &StepState::Waiting);
+                                states.insert(s, StepState::Waiting);
+                            }
+                            on_update(&id, &StepState::Waiting);
+                            states.insert(id, StepState::Waiting);
+                            continue;
+                        }
+                        let mut state = StepState::from_delivered(peer, step, delivered);
+                        if let StepState::Failed { error, .. } = &mut state {
+                            error.push_str(&format!(
+                                "\n\nIt allows no more rounds of changes (changes={allowed})."
+                            ));
+                        }
+                        state
+                    }
                     Ok(delivered) => StepState::from_delivered(peer, step, delivered),
                     Err(e) => StepState::failed(Some(peer), format!("{e:#}")),
                 };
@@ -3735,6 +3854,58 @@ pub async fn run_plan_with(
     debug_assert!(states.values().all(StepState::finished));
     states
 }
+/// A step done again because a sign-off's approver asked for changes (see
+/// [`Step::changes`]).
+struct Rework {
+    /// The sign-off, and who answered it.
+    signoff: String,
+    by: String,
+    /// What they asked to change.
+    note: String,
+    /// The step's earlier work, applied first so its model changes it rather than starting
+    /// over (none: it changed no files).
+    patch: Option<String>,
+}
+
+/// What the model doing a step again is told about the changes asked for.
+fn rework_text(rework: &Rework) -> String {
+    format!(
+        "## Changes asked for\n\n{} reviewed the result of this step at sign-off {} and asked for changes:\n\n{}\n\nYour earlier work on this step is applied in your workspace already: change it as asked, and say what you changed.",
+        rework.by, rework.signoff, rework.note
+    )
+}
+
+/// The steps a sign-off's approver may have done again when they ask for changes: the
+/// steps a model does that it waits for directly, done.
+fn redoable<'a>(
+    plan: &'a Plan,
+    signoff: &Step,
+    states: &BTreeMap<String, StepState>,
+) -> Vec<&'a Step> {
+    plan.steps
+        .iter()
+        .filter(|s| signoff.after.contains(&s.id))
+        .filter(|s| !s.approve && !s.pr && s.team.is_none() && !s.is_workiq())
+        .filter(|s| matches!(states.get(&s.id), Some(StepState::Done { .. })))
+        .collect()
+}
+
+/// The approver and note of an answer that asks for changes, if it is one: a validly
+/// signed approval they didn't give, saying so (see [`crate::agent::Answer::Changes`]).
+fn changes_asked(d: &Delivered) -> Option<(String, String)> {
+    let e = d.evidence.as_ref()?;
+    if !d.verified || e.kind != crate::evidence::EvidenceKind::Approval || e.approved != Some(false)
+    {
+        return None;
+    }
+    let said = d.output.strip_prefix(crate::agent::CHANGES_ASKED)?;
+    let note = said
+        .split_once(": ")
+        .map(|(_, note)| note.trim().to_owned())
+        .unwrap_or_default();
+    Some((e.signer.clone(), note))
+}
+
 /// The person who must approve `step`: a connected peer by name, or `@me` (None).
 fn choose_approver(step: &Step, peers: &[PeerInfo]) -> Result<(Option<iroh::EndpointId>, String)> {
     match &step.target {
@@ -5089,6 +5260,65 @@ mod tests {
             found[2].1,
             "reviewers= names \"x.y\", who isn't on the allowlist and can't be a GitHub login"
         );
+    }
+
+    #[test]
+    fn sign_offs_say_how_often_their_approver_may_ask_for_changes() {
+        let plan = Plan::parse(
+            "a @bob:app do\n\
+             ok after a approve @me Fine?\n\
+             strict after a approve @carol changes=0 Fine?\n\
+             patient after a approve @carol changes=5 Fine?",
+        )
+        .unwrap();
+        let rounds: Vec<Option<u32>> = plan.steps.iter().map(|s| s.changes).collect();
+        assert_eq!(rounds, [None, None, Some(0), Some(5)]);
+        let err = |text: &str| Plan::parse(text).unwrap_err().to_string();
+        for (text, why) in [
+            ("a @bob changes=1 do", "changes= is for sign-offs"),
+            (
+                "a @bob do\nok after a approve @me changes=6 Fine?",
+                "at most 5 rounds",
+            ),
+            (
+                "a @bob do\nok after a approve @me changes=x Fine?",
+                "changes= needs a number",
+            ),
+            (
+                "a @bob do\nok after a approve @me changes=1 changes=2 Fine?",
+                "changes= is given twice",
+            ),
+        ] {
+            assert!(err(text).contains(why), "{text}: {}", err(text));
+        }
+        // Only the work a model did that it waits for directly is done again.
+        let plan = Plan::parse(
+            "a @bob:app do\nb @bob:app do\nfirst after a approve @me Fine?\nok after b,first approve @me Fine?",
+        )
+        .unwrap();
+        let done = |peer: &str| StepState::Done {
+            peer: peer.into(),
+            output: "ok".into(),
+            evidence: None,
+            verified: true,
+            patch: None,
+            model: None,
+        };
+        let states: BTreeMap<String, StepState> = [
+            ("a", done("bob")),
+            ("b", done("bob")),
+            ("first", done("you")),
+            ("ok", StepState::Waiting),
+        ]
+        .into_iter()
+        .map(|(id, s)| (id.to_owned(), s))
+        .collect();
+        let redo: Vec<&str> = redoable(&plan, &plan.steps[3], &states)
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(redo, ["b"]);
+        assert!(redoable(&plan, &plan.steps[2], &BTreeMap::new()).is_empty());
     }
 
     #[test]

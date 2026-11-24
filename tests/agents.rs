@@ -88,6 +88,14 @@ impl Executor for FakeExecutor {
 
 impl FakeExecutor {
     async fn answer(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
+        // Done again for the changes a sign-off asked for: it says whether its earlier work
+        // is there, and writes down what it was asked.
+        if let Some((_, asked)) = task.prompt.split_once("## Changes asked for\n\n") {
+            let earlier =
+                std::fs::read_to_string(ctx.workspace.join("feature.txt")).unwrap_or_default();
+            std::fs::write(ctx.workspace.join("changes.txt"), asked)?;
+            return Ok(format!("changed it; its earlier work said {earlier:?}"));
+        }
         // "create <file>" as a plan step's own task (after the earlier steps' results).
         let own = task
             .prompt
@@ -2403,6 +2411,131 @@ async fn a_folder_owner_approves_each_pull_request_and_a_run_card_asks_for_one()
     );
     assert!(worker.approvals().is_empty());
     assert_eq!(pulls.opened.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_sign_off_asks_for_changes_and_the_work_is_done_again_from_where_it_was() {
+    use proofkin::agent::Answer;
+    let repo = git_repo();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker
+        .shares
+        .add_with(
+            "app",
+            repo.path(),
+            Access::WorkspaceWrite,
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    worker.grant("boss", Access::WorkspaceWrite, &["app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let plan = Plan::parse(
+        "impl @worker:app create feature.txt\n\
+         ok after impl approve @me changes=1 Ship it?",
+    )
+    .unwrap();
+    // You ask for changes; asked again, with no rounds left, you may only approve or reject.
+    let answers = {
+        let boss = boss.clone();
+        tokio::spawn(async move {
+            let mut seen: Vec<proofkin::agent::ApprovalInfo> = Vec::new();
+            while seen.len() < 2 {
+                for a in boss.approvals() {
+                    if a.changes {
+                        assert!(boss.answer(a.id, Answer::Changes, "  ").await.is_err());
+                        boss.answer(a.id, Answer::Changes, "Add a changelog line")
+                            .await
+                            .unwrap();
+                    } else {
+                        let refused = boss.answer(a.id, Answer::Changes, "More").await;
+                        assert!(
+                            refused
+                                .unwrap_err()
+                                .to_string()
+                                .contains("can only be approved or rejected")
+                        );
+                        boss.answer(a.id, Answer::Approve, "Good now")
+                            .await
+                            .unwrap();
+                    }
+                    seen.push(a);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            seen
+        })
+    };
+    let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let states = {
+        let said = said.clone();
+        timeout(
+            Duration::from_secs(60),
+            run_plan_with(
+                &boss,
+                &SquadStore::default(),
+                &plan,
+                &RunContext::default(),
+                move |id, state| {
+                    if let (
+                        "impl",
+                        StepState::Running {
+                            progress: Some(p), ..
+                        },
+                    ) = (id, state)
+                    {
+                        said.lock().unwrap().push(p.text.clone());
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap()
+    };
+    let seen = timeout(Duration::from_secs(10), answers)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(seen[0].changes && !seen[1].changes, "{seen:?}");
+    assert!(
+        seen[1]
+            .text
+            .starts_with("**Asked again** (round 1 of changes)")
+            && seen[1].text.contains("> Add a changelog line"),
+        "{}",
+        seen[1].text
+    );
+    // impl was done again from its earlier work, with your note, as its card said.
+    let StepState::Done {
+        output,
+        evidence: Some(e),
+        ..
+    } = &states["impl"]
+    else {
+        panic!("{:?}", states["impl"]);
+    };
+    assert!(
+        output.starts_with("changed it; its earlier work said \"made by the model\\n\"\n"),
+        "{output}"
+    );
+    let git = e.git.as_ref().unwrap();
+    assert_eq!(git.files, ["changes.txt", "feature.txt"]);
+    assert!(
+        said.lock()
+            .unwrap()
+            .contains(&"done again: boss asked for changes at ok: Add a changelog line".to_owned()),
+        "{said:?}"
+    );
+    assert!(
+        matches!(&states["ok"], StepState::Done { output, .. } if output == "Approved by boss: Good now"),
+        "{:?}",
+        states["ok"]
+    );
 }
 
 #[tokio::test]

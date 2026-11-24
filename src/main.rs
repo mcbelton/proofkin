@@ -27,6 +27,7 @@ commands:
   /runs                                 list saved evidence runs (proofkin runs show <id> for a report)
   /approvals                            list approval requests waiting for you
   /approve <n> [note], /reject <n> <why>  answer approval request n (signed with your key)
+  /changes <n> <what>                   ask for changes instead: the work is done again, then you are asked again
   /squads                               list your squads and which members are online
   /peers                                list connected peers and the providers they serve
   /ticket                               print this agent's ticket (give it to peers)
@@ -4689,7 +4690,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     reason,
                 } => println!("> task #{task_id} from {from} refused: {reason}"),
                 Event::ApprovalRequested { id, from, title } => println!(
-                    "? {from} asks you to approve: {title}\n  see it with /approvals, then /approve {id} [note] or /reject {id} <why>"
+                    "? {from} asks you to approve: {title}\n  see it with /approvals, then /approve {id} [note] or /reject {id} <why> (or /changes {id} <what>, where /approvals offers it)"
                 ),
                 Event::ApprovalClosed { .. } => {}
             }
@@ -4901,7 +4902,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 }
                 for a in open {
                     println!(
-                        "=== #{} from {}: {} ===\n{}\n{}=== /approve {} [note] or /reject {} <why> ===",
+                        "=== #{} from {}: {} ===\n{}\n{}=== /approve {} [note]{} or /reject {} <why> ===",
                         a.id,
                         a.from,
                         a.title,
@@ -4916,23 +4917,39 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                             None => "",
                         },
                         a.id,
+                        if a.changes {
+                            format!(", /changes {} <what to change>", a.id)
+                        } else {
+                            String::new()
+                        },
                         a.id
                     );
                 }
             }
-            "/approve" | "/reject" => {
+            "/approve" | "/reject" | "/changes" => {
+                use proofkin::agent::Answer;
                 let (n, note) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
-                let approved = command == "/approve";
+                let answer = match command {
+                    "/approve" => Answer::Approve,
+                    "/changes" => Answer::Changes,
+                    _ => Answer::Reject,
+                };
                 match n.parse::<u64>() {
                     Err(_) => eprintln!("usage: {command} <n> [note] (see /approvals)"),
-                    Ok(_) if !approved && note.trim().is_empty() => {
+                    Ok(_) if answer == Answer::Reject && note.trim().is_empty() => {
                         eprintln!("say why: /reject {n} <why>")
                     }
-                    Ok(id) => match agent.answer_approval(id, approved, note).await {
-                        Ok(()) => println!(
-                            "{} request {id}",
-                            if approved { "approved" } else { "rejected" }
-                        ),
+                    Ok(_) if answer == Answer::Changes && note.trim().is_empty() => {
+                        eprintln!("say what to change: /changes {n} <what>")
+                    }
+                    Ok(id) => match agent.answer(id, answer, note).await {
+                        Ok(()) => match answer {
+                            Answer::Approve => println!("approved request {id}"),
+                            Answer::Reject => println!("rejected request {id}"),
+                            Answer::Changes => println!(
+                                "asked for changes on request {id}: the work is done again, then you are asked again"
+                            ),
+                        },
                         Err(e) => eprintln!("{e:#}"),
                     },
                 }

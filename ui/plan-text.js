@@ -11,7 +11,7 @@ const planText = (() => {
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
     ["context", "context"], ["claims", "claims"], ["claim", "claims"], ["workiq", "workiq"],
     ["reviewers", "reviewers"], ["reviewer", "reviewers"]]);
-  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue", "model", "effort"]);
+  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue", "model", "effort", "changes"]);
   // A sign-off is a person's decision: no checks, retries, patches, saved result, agent, model, effort or search.
   const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq", "model", "effort"]);
   // A team step is done and proven by the lead's team plan.
@@ -35,6 +35,7 @@ const planText = (() => {
     prOption: "A pull request step opens the pull request with the work before it: it takes only a time limit, an issue and who reviews it.",
     prTarget: "A pull request step is opened by the agent that holds the folder's clone: a peer and its folder (@peer:folder).",
     reviewersOption: "Only a pull request step asks for reviews (reviewers=).",
+    changesOption: "Only a sign-off says how often its approver may ask for changes (changes=).",
     ownStep: (id) => `Step ${id} can't wait for itself.`,
   };
 
@@ -217,6 +218,7 @@ const planText = (() => {
       if (step.team && NOT_IN_TEAM.has(optionOf(part))) return { error: ERRORS.teamOption };
       if (step.pr && !IN_PR.has(optionOf(part))) return { error: ERRORS.prOption };
       if (!step.pr && optionOf(part) === "reviewers") return { error: ERRORS.reviewersOption };
+      if (!step.approve && optionOf(part) === "changes") return { error: ERRORS.changesOption };
       if (step.target === WORKIQ && NOT_IN_WORKIQ.has(optionOf(part))) return { error: ERRORS.workiqOption };
       setOption(step, part);
     }
@@ -489,6 +491,7 @@ const planText = (() => {
       if (s.pr && s.target && !/^@[^:]+:.+/.test(s.target)) need("step", i, "target", ERRORS.prTarget);
       if (s.pr && s.options.some((o) => !IN_PR.has(optionOf(o)))) need("step", i, "target", ERRORS.prOption);
       if (!s.pr && valuesOf(s, "reviewers").length) need("step", i, "target", ERRORS.reviewersOption);
+      if (!s.approve && valuesOf(s, "changes").length) need("step", i, "target", ERRORS.changesOption);
       // A pull request step without a title takes that of the work it opens.
       if (!s.pr && blank(taskOf(s), TODO)) {
         need("step", i, "todo", s.approve ? "Say what to check before signing off" : "Say what this step should do");

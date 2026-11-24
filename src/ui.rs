@@ -4048,6 +4048,10 @@ struct ApprovalBody {
     approved: bool,
     #[serde(default)]
     note: String,
+    /// Not approved yet: the work is done again with the note, then you are asked again
+    /// (only for a request that offers it).
+    #[serde(default)]
+    changes: bool,
 }
 
 async fn answer_approval(
@@ -4055,23 +4059,32 @@ async fn answer_approval(
     Path(id): Path<u64>,
     Json(body): Json<ApprovalBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if !body.approved && body.note.trim().is_empty() {
-        return Err(bad_request("say why you reject it"));
+    use crate::agent::Answer;
+    let answer = match (body.approved, body.changes) {
+        (true, _) => Answer::Approve,
+        (false, true) => Answer::Changes,
+        (false, false) => Answer::Reject,
+    };
+    if answer != Answer::Approve && body.note.trim().is_empty() {
+        return Err(bad_request(if answer == Answer::Changes {
+            "say what to change"
+        } else {
+            "say why you reject it"
+        }));
     }
     s.agent
-        .answer_approval(id, body.approved, &body.note)
+        .answer(id, answer, &body.note)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?;
     s.system(
         "info",
-        format!(
-            "You {} request #{id}",
-            if body.approved {
-                "approved"
-            } else {
-                "rejected"
-            }
-        ),
+        match answer {
+            Answer::Approve => format!("You approved request #{id}"),
+            Answer::Reject => format!("You rejected request #{id}"),
+            Answer::Changes => format!(
+                "You asked for changes on request #{id}: the work is done again, then you are asked again"
+            ),
+        },
     );
     Ok(Json(json!({ "answered": id })))
 }

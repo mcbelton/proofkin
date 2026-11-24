@@ -371,6 +371,7 @@ impl RunRecord {
             effort: task.effort.clone(),
             pr: false,
             reviewers: None,
+            changes: None,
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims
@@ -882,7 +883,7 @@ pub(crate) fn team_line(s: &StepRecord) -> String {
 }
 
 /// `text` on one line, each run of whitespace a single space.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

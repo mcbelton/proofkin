@@ -1068,18 +1068,25 @@ function renderApprovals() {
   $("#approvals-panel").hidden = !approvals.length;
   $("#approvals-count").textContent = approvals.length;
   list.replaceChildren(...approvals.map((a) => {
-    const note = el("input", { type: "text", class: "approval-note", maxlength: "500", "aria-label": `Note for request ${a.id}`, placeholder: "Note (required to reject)" });
+    const note = el("input", {
+      type: "text", class: "approval-note", maxlength: "500", "aria-label": `Note for request ${a.id}`,
+      placeholder: a.changes ? "Note (required to ask for changes or reject)" : "Note (required to reject)",
+    });
     const error = el("p", { class: "form-error", role: "alert" });
-    const answer = async (approved, button) => {
-      if (!approved && !note.value.trim()) {
-        error.textContent = "Say why you reject it.";
+    // approve: true, "changes" or false (reject).
+    const answer = async (how, button) => {
+      if (how !== true && !note.value.trim()) {
+        error.textContent = how === "changes" ? "Say what to change." : "Say why you reject it.";
         note.focus();
         return;
       }
       button.disabled = true;
       try {
-        await api(`/api/approvals/${a.id}`, { method: "POST", body: JSON.stringify({ approved, note: note.value }) });
-        toast(approved ? "Approved" : "Rejected");
+        await api(`/api/approvals/${a.id}`, {
+          method: "POST",
+          body: JSON.stringify({ approved: how === true, changes: how === "changes", note: note.value }),
+        });
+        toast(how === true ? "Approved" : how === "changes" ? "Asked for changes: the work is done again, then you're asked again" : "Rejected");
       } catch (err) {
         button.disabled = false;
         error.textContent = err.message;
@@ -1103,6 +1110,13 @@ function renderApprovals() {
       error,
       el("div", { class: "approval-actions" },
         el("button", { type: "button", class: "btn primary small", onclick: (e) => answer(true, e.currentTarget) }, "Approve"),
+        a.changes
+          ? el("button", {
+            type: "button", class: "btn small",
+            title: "The work is done again with your note, then you're asked again",
+            onclick: (e) => answer("changes", e.currentTarget),
+          }, "Ask for changes")
+          : null,
         el("button", { type: "button", class: "btn small danger", onclick: (e) => answer(false, e.currentTarget) }, "Reject")));
   }));
 }
