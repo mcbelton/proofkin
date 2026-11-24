@@ -518,6 +518,18 @@ const planBuilder = (() => {
       items.push(field(`${k}-apply`, "Start from", apply, "Another peer checks that work independently, in its own worktree"));
       set += Boolean(applied);
     }
+    // The work of an earlier run's step, merged or not (base=RUN:STEP).
+    const based = planText.valuesOf(s, "base")[0] ?? "";
+    if (!s.team && (folder?.worktrees || based)) {
+      const base = el("input", {
+        type: "text", placeholder: "20261124-031414-851a6:impl…", autocomplete: "off", autocapitalize: "off", spellcheck: "false",
+      });
+      base.value = based;
+      base.addEventListener("change", () => { planText.setValues(s, "base", base.value.trim() || null); changed(); });
+      items.push(field(`${k}-base`, "Or start from an earlier run's work", base,
+        "An evidence run and its step (RUN:STEP): its commit, merged or not, is applied first. A run's card has Build on it"));
+      set += Boolean(based);
+    }
     return details(`${k}-more`, `More options${set ? ` (${set} set)` : ""}`, items);
   }
 
@@ -563,12 +575,12 @@ const planBuilder = (() => {
       // A person's decision: no folder, checks, retries, patch, saved result, tools or agent.
       s.target = "@me";
       s.using = null;
-      for (const option of ["verify", "attempts", "apply", "save", "mcp", "agent", "levels"]) planText.setValues(s, option, null);
+      for (const option of ["verify", "attempts", "apply", "save", "mcp", "agent", "levels", "base"]) planText.setValues(s, option, null);
     } else if (kind === "team") {
       // The lead's team plan does and proves it: no checks, retries, patch, tools or agent of its own.
       s.target = null;
       s.using = null;
-      for (const option of ["verify", "attempts", "apply", "mcp", "agent"]) planText.setValues(s, option, null);
+      for (const option of ["verify", "attempts", "apply", "mcp", "agent", "base"]) planText.setValues(s, option, null);
     } else {
       s.target = null;
       planText.setValues(s, "levels", null);

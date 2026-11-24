@@ -268,6 +268,10 @@ pub struct Step {
     /// again with their note, then they are asked again. None: [`DEFAULT_CHANGE_ROUNDS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<u32>,
+    /// The work it starts from (`base=RUN:STEP`): the commit step STEP of evidence run RUN
+    /// made, merged or not, applied in its worktree first (see [`base_patch`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// How many times a sign-off's approver may ask for changes unless it says (`changes=`).
@@ -835,6 +839,9 @@ pub struct Recipients {
     /// The profile's own GitHub login (see [`crate::profile::Profile::github_user`]): pull
     /// request steps ask it to review for `reviewers=me` and for the owner's own sign-offs.
     pub github: Option<String>,
+    /// Where the profile keeps its evidence runs: `base=` steps start from their work (see
+    /// [`base_patch`]).
+    pub runs_dir: Option<std::path::PathBuf>,
 }
 
 impl Recipients {
@@ -845,6 +852,7 @@ impl Recipients {
             profile: None,
             workiq_account: false,
             github: None,
+            runs_dir: None,
         }
     }
 
@@ -857,6 +865,7 @@ impl Recipients {
             profile: Some(profile.name.clone()),
             workiq_account: profile.workiq_account().is_ok(),
             github: profile.github_user(),
+            runs_dir: Some(profile.runs_dir()),
         }
     }
 
@@ -1203,6 +1212,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
     let (mut levels, mut timeout, mut issue) = (None, None, None);
     let mut reviewers: Option<Vec<String>> = None;
     let mut changes: Option<u32> = None;
+    let mut base: Option<String> = None;
     let mut once = std::collections::HashSet::new();
     loop {
         match words.peek().copied() {
@@ -1227,6 +1237,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                         | "model"
                         | "effort"
                         | "changes"
+                        | "base"
                 ) && !once.insert(key)
                 {
                     bail!("{key}= is given twice; a step has one");
@@ -1318,6 +1329,20 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                         }
                         changes = Some(n);
                     }
+                    "base" => {
+                        let named = value
+                            .split_once(':')
+                            .filter(|(run, step)| {
+                                validate_name(run).is_ok() && validate_name(step).is_ok()
+                            })
+                            .is_some();
+                        if !named {
+                            bail!(
+                                "base= needs an evidence run and its step, e.g. base=20261124-031414-851a6:impl, got {value:?}"
+                            );
+                        }
+                        base = Some(value.to_owned());
+                    }
                     _ => break,
                 }
                 words.next();
@@ -1376,6 +1401,30 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
             "changes= is for sign-offs (name after steps approve @person): how many times the approver may ask for changes"
         );
     }
+    if base.is_some() {
+        if approve || team || pr || target == Target::Workiq {
+            bail!(
+                "base= is for steps a model does in a folder: step '{id}' {}",
+                if approve {
+                    "is a person's sign-off"
+                } else if team {
+                    "is a team step"
+                } else if pr {
+                    "opens a pull request with the work before it"
+                } else {
+                    "is answered by Work IQ"
+                }
+            );
+        }
+        if apply.is_some() {
+            bail!(
+                "step '{id}' starts from one earlier work: base= (another run's) or apply= (this run's), not both"
+            );
+        }
+        if share.is_none() {
+            bail!("step '{id}' has base=, so it needs a folder: @peer:folder or #squad:folder");
+        }
+    }
     if levels.is_some() && target == Target::Workiq {
         bail!(
             "@workiq step '{id}' can't have levels=: an answer from Microsoft 365 is context and never proof"
@@ -1425,6 +1474,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         pr,
         reviewers,
         changes,
+        base,
     };
     if let Some(why) = step.workiq_refusal() {
         bail!("{why}");
@@ -1861,9 +1911,16 @@ fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
             share.access, peer.name
         ));
     }
-    if step.apply.is_some() && !(share.worktrees && share.access >= Access::WorkspaceWrite) {
+    if (step.apply.is_some() || step.base.is_some())
+        && !(share.worktrees && share.access >= Access::WorkspaceWrite)
+    {
         return Some(format!(
-            "apply= needs edit access in a folder shared with --worktrees; '{folder}' on {} isn't",
+            "{}= needs edit access in a folder shared with --worktrees; '{folder}' on {} isn't",
+            if step.apply.is_some() {
+                "apply"
+            } else {
+                "base"
+            },
             peer.name
         ));
     }
@@ -2035,6 +2092,11 @@ pub fn preflight(
             for (error, message) in reviewer_problems(plan, step, recipients) {
                 report(Some(step), error, message);
             }
+        }
+        if let (Some(base), Some(dir)) = (&step.base, &recipients.runs_dir)
+            && let Err(e) = base_patch(dir, base)
+        {
+            report(Some(step), true, format!("base={base}: {e:#}"));
         }
         let candidates: Vec<&PeerInfo> = match &step.target {
             Target::Workiq => continue,
@@ -2695,6 +2757,46 @@ fn reviewer_problems(plan: &Plan, step: &Step, recipients: &Recipients) -> Vec<(
         }
     }
     problems
+}
+
+/// The patch of the work `base=RUN:STEP` names, as evidence run RUN in `runs_dir` keeps
+/// it: the commit step STEP made, whose signed record (and the patch's hash in it) must
+/// check out.
+pub fn base_patch(runs_dir: &Path, base: &str) -> Result<String> {
+    let (run_id, step) = base
+        .split_once(':')
+        .context("base= names an evidence run and its step: RUN:STEP")?;
+    let run = crate::runs::RunRecord::load(runs_dir, run_id)
+        .with_context(|| format!("there is no evidence run {run_id} in this profile"))?;
+    let (run, checks) = run.reverified(Some(&runs_dir.join(&run.id)));
+    let record = run
+        .steps
+        .iter()
+        .find(|s| s.step.id == step)
+        .with_context(|| format!("evidence run {run_id} has no step {step}"))?;
+    match &record.state {
+        StepState::Done {
+            verified: true,
+            evidence: Some(e),
+            ..
+        } if e.git.as_ref().is_some_and(|g| g.commit.is_some()) => {}
+        StepState::Done {
+            verified: false, ..
+        } => {
+            let why = checks
+                .into_iter()
+                .find(|(id, _)| id == step)
+                .and_then(|(_, r)| r.err())
+                .map(|e| format!(": {e:#}"))
+                .unwrap_or_default();
+            bail!("the record of step {step} of evidence run {run_id} doesn't check out{why}");
+        }
+        _ => bail!(
+            "step {step} of evidence run {run_id} has no commit to start from (it changed no files, failed, or its folder isn't shared with --worktrees)"
+        ),
+    }
+    std::fs::read_to_string(runs_dir.join(run_id).join(format!("{step}.patch")))
+        .with_context(|| format!("evidence run {run_id} kept no patch of step {step}"))
 }
 
 /// Work of a finished run that a pull request can be opened from, as [`run_work`] finds it.
@@ -3672,6 +3774,23 @@ pub async fn run_plan_with(
                         changed = true;
                         continue;
                     }
+                    // It starts from an earlier run's work, merged or not.
+                    if let Some(base) = &step.base {
+                        let patch = match ctx.recipients.runs_dir.as_deref() {
+                            Some(dir) => base_patch(dir, base),
+                            None => Err(anyhow!("this run has no evidence runs to start from")),
+                        };
+                        match patch {
+                            Ok(patch) => task.patch = Some(patch),
+                            Err(e) => {
+                                let state = fail(format!("base={base}: {e:#}"));
+                                on_update(&step.id, &state);
+                                states.insert(step.id.clone(), state);
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
                     // Done again for the changes a sign-off's approver asked for: from its
                     // earlier work, with their note.
                     if let Some(rework) = reworks.remove(&step.id) {
@@ -3801,9 +3920,22 @@ pub async fn run_plan_with(
                             .collect();
                         if used < allowed && !redo.is_empty() {
                             // The work it is on is done again with their note, then they
-                            // are asked again.
+                            // are asked again; its card says so meanwhile.
                             rounds.insert(id.clone(), used + 1);
                             asked.insert(id.clone(), note.clone());
+                            let waiting = StepState::Running {
+                                peer: peer.clone(),
+                                progress: Some(Progress::new(
+                                    Phase::Running,
+                                    format!(
+                                        "{by} asked for changes (round {} of {allowed}): {}; asks again once {} {} done again",
+                                        used + 1,
+                                        crate::runs::one_line(&note),
+                                        redo.join(", "),
+                                        if redo.len() == 1 { "is" } else { "are" }
+                                    ),
+                                )),
+                            };
                             for s in redo {
                                 let patch = match &states[&s] {
                                     StepState::Done { patch, .. } => patch.clone(),
@@ -3821,7 +3953,7 @@ pub async fn run_plan_with(
                                 on_update(&s, &StepState::Waiting);
                                 states.insert(s, StepState::Waiting);
                             }
-                            on_update(&id, &StepState::Waiting);
+                            on_update(&id, &waiting);
                             states.insert(id, StepState::Waiting);
                             continue;
                         }
@@ -5319,6 +5451,91 @@ mod tests {
             .collect();
         assert_eq!(redo, ["b"]);
         assert!(redoable(&plan, &plan.steps[2], &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_step_starts_from_an_earlier_runs_work_as_its_record_has_it() {
+        let plan = Plan::parse("a @bob:app base=run-1:impl do").unwrap();
+        assert_eq!(plan.steps[0].base.as_deref(), Some("run-1:impl"));
+        let err = |text: &str| Plan::parse(text).unwrap_err().to_string();
+        for (text, why) in [
+            (
+                "a @bob:app base=nope do",
+                "base= needs an evidence run and its step",
+            ),
+            ("a @bob base=r:s do", "has base=, so it needs a folder"),
+            (
+                "a @bob:app do\nb after a @bob:app apply=a base=r:s do",
+                "base= (another run's) or apply= (this run's), not both",
+            ),
+            (
+                "a @bob:app do\nok after a approve @me base=r:s Fine?",
+                "step 'ok' is a person's sign-off",
+            ),
+            ("x team @bob:app base=r:s do", "step 'x' is a team step"),
+            (
+                "a @bob:app do\np after a pr @bob:app base=r:s",
+                "opens a pull request with the work before it",
+            ),
+            ("q @workiq base=r:s What changed?", "is answered by Work IQ"),
+        ] {
+            assert!(err(text).contains(why), "{text}: {}", err(text));
+        }
+
+        // The patch comes from the run's signed record, which must check out.
+        let (bob, own) = (iroh::SecretKey::generate(), iroh::SecretKey::generate());
+        let patch = "diff --git a/x b/x\n";
+        let mut e = Evidence::new(
+            crate::evidence::EvidenceKind::Task,
+            "bob",
+            bob.public(),
+            own.public(),
+            1,
+        );
+        e.share = Some("app".into());
+        e.git = Some(crate::evidence::GitCommit {
+            branch: "p2p/boss/1".into(),
+            base: "base".into(),
+            commit: Some("c1".into()),
+            files: vec!["x".into()],
+            patch_sha256: Some(crate::evidence::sha256_hex(patch.as_bytes())),
+            left_out: Vec::new(),
+        });
+        let states: BTreeMap<String, StepState> = [(
+            "impl".to_owned(),
+            StepState::Done {
+                peer: "bob".into(),
+                output: "did it".into(),
+                evidence: Some(e.sign("did it", &bob)),
+                verified: true,
+                patch: Some(patch.into()),
+                model: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let made = Plan::parse("impl @bob:app do").unwrap();
+        let mut run =
+            crate::runs::RunRecord::new("boss", &own.public().to_string(), "", &made, &states, 0);
+        run.id = "run-1".into();
+        let dir = tempfile::tempdir().unwrap();
+        run.save(dir.path()).unwrap();
+        assert_eq!(base_patch(dir.path(), "run-1:impl").unwrap(), patch);
+        for (base, why) in [
+            (
+                "run-2:impl",
+                "there is no evidence run run-2 in this profile",
+            ),
+            ("run-1:nope", "evidence run run-1 has no step nope"),
+        ] {
+            assert_eq!(base_patch(dir.path(), base).unwrap_err().to_string(), why);
+        }
+        std::fs::write(dir.path().join("run-1").join("impl.patch"), "changed\n").unwrap();
+        let tampered = format!("{:#}", base_patch(dir.path(), "run-1:impl").unwrap_err());
+        assert!(
+            tampered.starts_with("the record of step impl of evidence run run-1 doesn't check out"),
+            "{tampered}"
+        );
     }
 
     #[test]

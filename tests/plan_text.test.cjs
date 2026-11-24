@@ -205,6 +205,10 @@ cases.push(
   ["only a sign-off takes changes=", part("build @alice:app Build| it", "changes=1"), `error: ${ERRORS.changesOption}`],
   ["changes= typed on another step", needs(planText.parsePlan("build @alice:app changes=1 Build it")),
     `step0.target: ${ERRORS.changesOption}`],
+  ["a step starts from an earlier run's work", part("build @alice:app Build| it", "base=run-1:impl"),
+    "build @alice:app base=run-1:impl Build it[]"],
+  ["a sign-off starts from no work", part("ok after build approve @me Ship| it?", "base=run-1:impl"),
+    `error: ${ERRORS.signoffOption}`],
   // model= names the model a step runs on; a sign-off, team step or @workiq step has none.
   ["a step's model", part("a @x Do| it", "model=gpt-5.5"), "a @x model=gpt-5.5 Do it[]"],
   ["a step's model replaces its model", part("a @x model=gpt-5.5 Do| it", "model=claude-sonnet-5.5"), "a @x model=claude-sonnet-5.5 Do it[]"],

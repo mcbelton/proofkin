@@ -1014,6 +1014,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `attempts=N` | While checks fail, the model tries again (up to 5 times), each time given the failing output. |
 | `claims=ID,...` | The claims this step's evidence counts towards. Claims must be defined with a `claim:` line first. |
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
+| `base=RUN:STEP` | Starts from the commit step STEP of an earlier evidence run RUN made, merged or not: its patch, from the run's signed record (which must check out), is applied in this step's worktree first. The plan check says when the run, its step or its patch isn't there. Not with `apply=`; needs edit access in a `--worktrees` folder. A run's card has **Build on it…**, which starts such a plan. |
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
 | `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step names one). Not on sign-offs. |
 | `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (default: the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
@@ -1889,7 +1890,8 @@ proofkin --name me --providers copilot --serve --ui
   about and its verdict. Open one to read its report (claims, checks, commits, signatures)
   and a fresh signature check, or **Download** its `run.json` for anyone to verify
   (`proofkin runs verify --file`). Its work can go in a pull request from there
-  ([after the run](#pull-request-steps-opening-the-pull-request-from-the-plan)). Results
+  ([after the run](#pull-request-steps-opening-the-pull-request-from-the-plan)), or a new
+  plan can start from it before it is merged (**Build on it…**, `base=RUN:STEP`). Results
   that carry valid signed evidence show **Signed ✓**.
 - **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
 - **Get started**: a new agent (nobody on its allowlist yet) shows its first steps in
