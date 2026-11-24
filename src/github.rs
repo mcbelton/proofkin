@@ -77,6 +77,27 @@ impl RepoStore {
     }
 }
 
+/// How recently a linked repository's clone may have fetched its branch for a task to
+/// start in it without fetching the branch again.
+pub const FETCH_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One clone update at a time, so tasks starting together fetch once.
+static UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What bringing a folder's clone up to date did as a task was about to start in it (see
+/// [`GithubCredentials::update_clone`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloneUpdate {
+    /// The folder isn't a linked repository's clone: it is left as it is.
+    NotLinked,
+    /// The clone has the repository's latest commit, `head`.
+    Current { head: String },
+    /// The clone was fast-forwarded `commits` commits, to the repository's latest, `head`.
+    Moved { head: String, commits: u64 },
+    /// The clone was left at its commit `head`, because `why`.
+    Kept { head: String, why: String },
+}
+
 /// `(host, owner/repo)` from `owner/repo`, `host/owner/repo` or an https URL.
 pub fn parse_repo(input: &str, default_host: &str) -> Result<(String, String)> {
     let trimmed = input
@@ -212,6 +233,83 @@ impl GithubCredentials {
         self.git(dir, &["fetch", "-q", "origin", &repo.branch])
             .await?;
         Ok(true)
+    }
+
+    /// Brings `repo`'s clone up to the repository's latest commit on its branch before a
+    /// task starts in it: fetches the branch (unless the clone fetched it within
+    /// `max_age`) and fast-forwards the clone. The clone is kept as it is when the
+    /// repository can't be reached, it has another branch checked out, its branch has
+    /// commits the repository's hasn't, or the update would overwrite its local changes.
+    pub async fn update_clone(
+        &self,
+        repo: &Repo,
+        max_age: std::time::Duration,
+    ) -> Result<CloneUpdate> {
+        let _lock = UPDATE_LOCK.lock().await;
+        let dir = Some(repo.path.as_path());
+        let head = self.git(dir, &["rev-parse", "--short", "HEAD"]).await?;
+        let kept = |why: String| {
+            Ok(CloneUpdate::Kept {
+                head: head.clone(),
+                why,
+            })
+        };
+        if let Err(e) = self.refresh_base(repo, max_age).await {
+            return kept(format!(
+                "couldn't fetch the repository's {} ({})",
+                repo.branch,
+                first_line(&e)
+            ));
+        }
+        let branch = self
+            .git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await?;
+        if branch != repo.branch {
+            return kept(format!(
+                "it has branch {branch} checked out, not {}",
+                repo.branch
+            ));
+        }
+        let upstream = format!("origin/{}", repo.branch);
+        let ahead = self
+            .commits(&repo.path, &format!("{upstream}..HEAD"))
+            .await?;
+        if ahead > 0 {
+            return kept(format!(
+                "its {} has {ahead} commit{} the repository's hasn't",
+                repo.branch,
+                if ahead == 1 { "" } else { "s" }
+            ));
+        }
+        let behind = self
+            .commits(&repo.path, &format!("HEAD..{upstream}"))
+            .await?;
+        if behind == 0 {
+            return Ok(CloneUpdate::Current { head });
+        }
+        if let Err(e) = self
+            .git(dir, &["merge", "-q", "--ff-only", &upstream])
+            .await
+        {
+            let why = format!("{e:#}");
+            return kept(if why.contains("would be overwritten") {
+                "the update would overwrite its local changes".to_owned()
+            } else {
+                format!("it couldn't be fast-forwarded ({})", first_line(&e))
+            });
+        }
+        Ok(CloneUpdate::Moved {
+            head: self.git(dir, &["rev-parse", "--short", "HEAD"]).await?,
+            commits: behind,
+        })
+    }
+
+    /// How many commits `range` (`a..b`) has in the clone at `dir`.
+    async fn commits(&self, dir: &Path, range: &str) -> Result<u64> {
+        let count = self.git(Some(dir), &["rev-list", "--count", range]).await?;
+        count
+            .parse()
+            .with_context(|| format!("git counted {count:?} commits in {range}"))
     }
 
     /// Pushes local branch `branch` to the repository.
@@ -1000,6 +1098,17 @@ pub fn unlink(
 /// The default host for repositories (github.com).
 pub fn default_host() -> &'static str {
     DEFAULT_GITHUB_HOST
+}
+
+/// Why git failed, in a line: the first line of `e`, at most 200 characters.
+fn first_line(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    let line = text.lines().next().unwrap_or_default().trim();
+    let mut cut: String = line.chars().take(200).collect();
+    if line.chars().count() > 200 {
+        cut.push('…');
+    }
+    cut
 }
 
 /// Whether `login` can be a GitHub account's login: letters, digits and hyphens (not first

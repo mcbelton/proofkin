@@ -1888,6 +1888,119 @@ async fn worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch()
     assert!(!review_repo.path().join("feature.txt").exists());
 }
 
+#[tokio::test]
+async fn a_task_in_a_linked_repository_starts_from_its_latest_commit() {
+    // "GitHub" is a bare repository; the worker's folder is its clone, and someone pushed
+    // a commit after it was cloned.
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git").to_string_lossy().into_owned();
+    let clone = tmp.path().join("clone");
+    let commit = |dir: &std::path::Path, file: &str, text: &str| {
+        std::fs::write(dir.join(file), text).unwrap();
+        git(dir, &["add", "-A"]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                file,
+            ],
+        );
+    };
+    let seed = git_repo();
+    git(seed.path(), &["branch", "-q", "-M", "main"]);
+    git(
+        tmp.path(),
+        &["init", "-q", "--bare", "--initial-branch=main", &origin],
+    );
+    git(seed.path(), &["push", "-q", &origin, "main"]);
+    git(
+        tmp.path(),
+        &["clone", "-q", "--branch", "main", &origin, "clone"],
+    );
+    commit(seed.path(), "feature.txt", "new on main\n");
+    git(seed.path(), &["push", "-q", &origin, "main"]);
+
+    let pulls = Arc::new(FakePulls::default());
+    *pulls.linked.lock().unwrap() = Some(proofkin::github::Repo {
+        name: "app".into(),
+        slug: "acme/app".into(),
+        host: "github.com".into(),
+        path: clone.clone(),
+        branch: "main".into(),
+    });
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker
+        .shares
+        .add_with(
+            "app",
+            &clone,
+            Access::WorkspaceWrite,
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    worker.grant("boss", Access::WorkspaceWrite, &["app"]);
+    worker.pulls = Some(pulls.clone());
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let show = || LlmTask::new(Provider::Copilot, "show feature.txt").in_share("app");
+
+    // The clone is brought up to date first, so the task sees the commit pushed after it
+    // was cloned, and its requester is told.
+    let mut seen = Vec::new();
+    let done = boss
+        .send_task(worker.id(), show(), None)
+        .unwrap()
+        .finish(|p| seen.push(p.text))
+        .await
+        .unwrap();
+    assert!(
+        done.ok && done.output.contains("feature.txt says: new on main"),
+        "{}",
+        done.output
+    );
+    assert!(!done.output.contains("Note:"), "{}", done.output);
+    assert!(
+        seen.iter().any(|t| t
+            .starts_with("updated folder 'app' to its repository's latest commit ")
+            && t.ends_with(" (1 newer commit)")),
+        "{seen:?}"
+    );
+    assert!(
+        clone.join("feature.txt").is_file(),
+        "the clone itself was fast-forwarded"
+    );
+
+    // A clone whose branch has a commit the repository hasn't is left as it is: the task
+    // starts from it, and its result says so and why.
+    commit(&clone, "local.txt", "mine\n");
+    let kept = boss
+        .send_task(worker.id(), show(), None)
+        .unwrap()
+        .finish(|_| {})
+        .await
+        .unwrap();
+    assert!(
+        kept.ok
+            && kept.output.contains("feature.txt says: new on main")
+            && kept.output.contains(
+                "as it was, not brought up to date with its repository: its main has 1 commit the repository's hasn't."
+            ),
+        "{}",
+        kept.output
+    );
+}
+
 /// A call [`FakePulls`] answered: the folder, the ask as it came (with the sign-offs that
 /// checked out), the issues, and who asked and how.
 type OpenCall = (String, PullRequestAsk, Vec<String>, Asked);
@@ -1903,6 +2016,9 @@ struct FakePulls {
     states: Mutex<std::collections::BTreeMap<u64, String>>,
     /// The reviewers asked for: the pull request's number and the logins.
     reviews: Mutex<Vec<(u64, Vec<String>)>>,
+    /// The folder that is a linked repository's clone: tasks there bring it up to date
+    /// first, as with a real GitHub account (here a local "GitHub").
+    linked: Mutex<Option<proofkin::github::Repo>>,
 }
 
 #[async_trait]
@@ -1973,6 +2089,21 @@ impl PullRequests for FakePulls {
 
     fn poll(&self) -> Duration {
         Duration::from_millis(50)
+    }
+
+    async fn update(&self, share: &str) -> anyhow::Result<proofkin::github::CloneUpdate> {
+        let linked = self.linked.lock().unwrap().clone();
+        match linked {
+            Some(repo) if repo.name == share => {
+                let creds = proofkin::github::GithubCredentials {
+                    user: "worker-gh".into(),
+                    host: "github.com".into(),
+                    token: "t0k3n".into(),
+                };
+                creds.update_clone(&repo, proofkin::github::FETCH_AGE).await
+            }
+            _ => Ok(proofkin::github::CloneUpdate::NotLinked),
+        }
     }
 }
 

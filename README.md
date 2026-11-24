@@ -1279,6 +1279,15 @@ proofkin repo branches shop --profile alice            # p2p/... branches agents
 proofkin repo pr shop p2p/boss/12-1794781234 --title "Add CSV export" --profile alice
 ```
 
+Before a task starts in a linked repository's folder, its agent brings the clone up to date: it
+fetches the repository's branch (unless it did in the last minute) and fast-forwards the clone,
+so the task starts from the repository's latest commit, and its requester sees `updated folder
+'shop' to its repository's latest commit 1a2b3c4 (3 newer commits)`. The clone is left as it is
+when GitHub can't be reached, it has another branch checked out, its branch has commits the
+repository's hasn't, or the update would overwrite local changes: the task then starts from the
+clone's commit, and its result says which one and why. `repo sync` (**Sync** in the web UI)
+updates it by hand.
+
 `repo pr` pushes the task branch (only `p2p/...` branches) and opens a pull request into
 the repository's default branch with the profile's account. In the web UI the **GitHub**
 card does the same: **Sign in to GitHub** (pick a GitHub CLI account), **Link repo**

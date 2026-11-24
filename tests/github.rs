@@ -10,8 +10,8 @@ use std::process::Command;
 use proofkin::audit::{AuditEntry, AuditLog, Outcome};
 use proofkin::evidence::{Evidence, EvidenceKind};
 use proofkin::github::{
-    ClosingPr, FileChange, GithubCredentials, RepoStore, branch_changes, branch_states, link_url,
-    task_branches, unlink,
+    CloneUpdate, ClosingPr, FETCH_AGE, FileChange, GithubCredentials, RepoStore, branch_changes,
+    branch_states, link_url, task_branches, unlink,
 };
 use proofkin::worktree::Worktree;
 use proofkin::{Access, Profile, Provider, TrustStore, TrustedPeer};
@@ -512,6 +512,79 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
     let head = creds.sync(&repo).await.unwrap();
     assert_eq!(head, git(&seed, &["rev-parse", "--short", "HEAD"]));
     assert!(repo.path.join("CHANGELOG.md").is_file());
+
+    // Before a task starts in it, the clone gets the repository's latest commit, fetching
+    // it unless it fetched a moment ago (so tasks starting together fetch once)...
+    let now = std::time::Duration::ZERO;
+    let short = |dir: &Path| git(dir, &["rev-parse", "--short", "HEAD"]);
+    assert_eq!(
+        creds.update_clone(&repo, now).await.unwrap(),
+        CloneUpdate::Current {
+            head: short(&repo.path)
+        }
+    );
+    commit(&seed, "a.txt", "a\n", "a");
+    commit(&seed, "b.txt", "b\n", "b");
+    git(&seed, &["push", "-q", "origin", "main"]);
+    assert!(matches!(
+        creds.update_clone(&repo, FETCH_AGE).await.unwrap(),
+        CloneUpdate::Current { .. }
+    ));
+    assert_eq!(
+        creds.update_clone(&repo, now).await.unwrap(),
+        CloneUpdate::Moved {
+            head: short(&repo.path),
+            commits: 2
+        }
+    );
+    assert_eq!(
+        git(&repo.path, &["rev-parse", "HEAD"]),
+        git(&seed, &["rev-parse", "HEAD"])
+    );
+    // ...unless that would lose something, or it can't: then it is left as it is.
+    let kept = |why: &str| CloneUpdate::Kept {
+        head: short(&repo.path),
+        why: why.into(),
+    };
+    commit(&repo.path, "mine.txt", "mine\n", "my own commit");
+    assert_eq!(
+        creds.update_clone(&repo, now).await.unwrap(),
+        kept("its main has 1 commit the repository's hasn't")
+    );
+    git(&repo.path, &["reset", "-q", "--hard", "HEAD~1"]);
+    commit(&seed, "README.md", "app v3\n", "v3");
+    git(&seed, &["push", "-q", "origin", "main"]);
+    std::fs::write(repo.path.join("README.md"), "my edit\n").unwrap();
+    assert_eq!(
+        creds.update_clone(&repo, now).await.unwrap(),
+        kept("the update would overwrite its local changes")
+    );
+    git(&repo.path, &["checkout", "-q", "--", "README.md"]);
+    git(&repo.path, &["checkout", "-q", "-b", "wip"]);
+    assert_eq!(
+        creds.update_clone(&repo, now).await.unwrap(),
+        kept("it has branch wip checked out, not main")
+    );
+    git(&repo.path, &["checkout", "-q", "main"]);
+    git(
+        &repo.path,
+        &["remote", "set-url", "origin", "/no/such/repository.git"],
+    );
+    let CloneUpdate::Kept { why, .. } = creds.update_clone(&repo, now).await.unwrap() else {
+        panic!("GitHub can't be reached: the clone stays as it is")
+    };
+    assert!(
+        why.starts_with("couldn't fetch the repository's main (git fetch failed: "),
+        "{why}"
+    );
+    git(&repo.path, &["remote", "set-url", "origin", &url]);
+    assert_eq!(
+        creds.update_clone(&repo, now).await.unwrap(),
+        CloneUpdate::Moved {
+            head: short(&repo.path),
+            commits: 1
+        }
+    );
 
     // The pull request goes through gh with the profile's token in its environment.
     let fake = tmp.path().join(if cfg!(windows) { "gh.cmd" } else { "gh" });
