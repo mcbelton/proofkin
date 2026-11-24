@@ -39,6 +39,13 @@ pub struct Share {
     /// [`crate::team`]): plan text whose `{task}` is the task handed down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
+    /// Instead of `team`: this agent's model writes a team plan for each team step
+    /// peers hand this folder.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub team_model: bool,
+    /// With `team_model`: the owner approves each plan its model writes before it runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub team_approval: bool,
     /// Peers with edit access may end a plan with a pull request step here: this agent
     /// pushes the branch of their tasks' work and opens the pull request with the owner's
     /// GitHub account (a linked repository shared with worktrees; see [`crate::pulls`]).
@@ -66,8 +73,8 @@ pub struct ShareInfo {
     /// What each of those MCP servers is for, in its owner's words.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_about: BTreeMap<String, String>,
-    /// The folder has a team plan: team steps may be handed to it (its text stays
-    /// with its owner).
+    /// The folder takes team steps: its owner wrote a team plan for them, or its
+    /// agent's model writes one for each (peers learn neither which nor a plan's text).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub team: bool,
     /// The folder takes pull request steps (its owner allows them; older agents never
@@ -135,6 +142,8 @@ impl ShareStore {
                 worktrees: false,
                 mcp: BTreeMap::new(),
                 team: None,
+                team_model: false,
+                team_approval: false,
                 pull_requests: false,
                 pull_request_approval: false,
             }],
@@ -217,6 +226,8 @@ impl ShareStore {
         }
         let mcp = self.get(name).map(|s| s.mcp.clone()).unwrap_or_default();
         let team = self.get(name).and_then(|s| s.team.clone());
+        let team_model = self.get(name).is_some_and(|s| s.team_model);
+        let team_approval = team_model && self.get(name).is_some_and(|s| s.team_approval);
         let pull_requests = worktrees && self.get(name).is_some_and(|s| s.pull_requests);
         let pull_request_approval =
             pull_requests && self.get(name).is_some_and(|s| s.pull_request_approval);
@@ -229,6 +240,8 @@ impl ShareStore {
             worktrees,
             mcp,
             team,
+            team_model,
+            team_approval,
             pull_requests,
             pull_request_approval,
         });
@@ -259,8 +272,9 @@ impl ShareStore {
         Ok(())
     }
 
-    /// Sets (or with `None` removes) the team plan of share `share`; the plan must be
-    /// valid (see [`crate::team::validate_template`]).
+    /// Sets the team plan of share `share`, in place of team plans its model writes; the
+    /// plan must be valid (see [`crate::team::validate_template`]). `None` stops the
+    /// folder taking team steps (neither kind of plan).
     pub fn set_team(&mut self, share: &str, plan: Option<String>) -> Result<()> {
         if share == DATA_SHARE && plan.is_some() {
             bail!("the built-in '{DATA_SHARE}' share can't have a team plan; share a folder");
@@ -274,6 +288,26 @@ impl ShareStore {
             .find(|s| s.name == share)
             .with_context(|| format!("no share named '{share}'"))?;
         share.team = plan;
+        share.team_model = false;
+        share.team_approval = false;
+        Ok(())
+    }
+
+    /// Lets share `share` take team steps whose team plan this agent's model writes for
+    /// each one, in place of a written plan; with `approval` the owner approves each plan
+    /// before it runs.
+    pub fn set_team_model(&mut self, share: &str, approval: bool) -> Result<()> {
+        if share == DATA_SHARE {
+            bail!("the built-in '{DATA_SHARE}' share can't have a team plan; share a folder");
+        }
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|s| s.name == share)
+            .with_context(|| format!("no share named '{share}'"))?;
+        share.team = None;
+        share.team_model = true;
+        share.team_approval = approval;
         Ok(())
     }
 
@@ -390,7 +424,7 @@ impl ShareStore {
                         .filter(|(_, server)| !server.description.is_empty())
                         .map(|(name, server)| ((*name).clone(), server.description.clone()))
                         .collect(),
-                    team: s.team.is_some(),
+                    team: s.team.is_some() || s.team_model,
                     pull_requests: s.pull_requests && s.worktrees,
                     pull_request_approval: s.pull_requests
                         && s.worktrees
@@ -454,6 +488,63 @@ mod tests {
         store.set_pull_requests("repo", true, true).unwrap();
         store.set_pull_requests("repo", false, true).unwrap();
         assert!(!store.get("repo").unwrap().pull_request_approval);
+    }
+
+    #[test]
+    fn a_folder_takes_team_steps_with_its_owners_plan_or_its_models_but_not_both() {
+        fn takes_team_steps(store: &ShareStore) -> bool {
+            store.visible(&["repo".to_owned()], Access::Full)[0].team
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ShareStore::with_data(dir.path().join("data"));
+        store.add("repo", dir.path(), Access::Full).unwrap();
+        assert!(!takes_team_steps(&store));
+        store.set_team_model("repo", true).unwrap();
+        let repo = store.get("repo").unwrap();
+        assert!(repo.team_model && repo.team_approval && repo.team.is_none());
+        // Peers learn that it takes team steps, not who writes their plans.
+        assert_eq!(
+            store.visible(&["repo".to_owned()], Access::Full),
+            [ShareInfo {
+                name: "repo".into(),
+                access: Access::Full,
+                team: true,
+                ..Default::default()
+            }]
+        );
+        // Shared again (e.g. with other checks), it keeps the setting.
+        store
+            .add("repo", dir.path(), Access::WorkspaceWrite)
+            .unwrap();
+        let repo = store.get("repo").unwrap();
+        assert!(repo.team_model && repo.team_approval);
+        let file = dir.path().join("shares.json");
+        store.save(&file).unwrap();
+        assert_eq!(
+            ShareStore::load(&file, dir.path().join("data")).unwrap(),
+            store
+        );
+
+        // A written plan takes its place, and the other way round.
+        store
+            .set_team("repo", Some("dev @bob:app {task}".into()))
+            .unwrap();
+        let repo = store.get("repo").unwrap();
+        assert!(repo.team.is_some() && !repo.team_model && !repo.team_approval);
+        assert!(takes_team_steps(&store));
+        store.set_team_model("repo", false).unwrap();
+        let repo = store.get("repo").unwrap();
+        assert!(repo.team.is_none() && repo.team_model && !repo.team_approval);
+        // Clearing removes either kind, and the saved folder is as before.
+        store.set_team("repo", None).unwrap();
+        assert!(!takes_team_steps(&store));
+        store.save(&file).unwrap();
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("\"team"));
+
+        let refused = store.set_team_model(DATA_SHARE, false).unwrap_err();
+        assert!(refused.to_string().contains("can't have a team plan"));
+        let refused = store.set_team_model("gone", false).unwrap_err();
+        assert_eq!(refused.to_string(), "no share named 'gone'");
     }
 
     #[test]

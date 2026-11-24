@@ -3546,6 +3546,201 @@ async fn the_owner_sets_and_removes_a_folders_team_plan_through_the_api() {
     assert_eq!(plan_of(agent.shares().shares), None);
 }
 
+/// An owner has a shared folder's model write the team plan of each team step through
+/// the API, approved by them first if they like: the page's shares, the running agent
+/// and `shares.json` follow and the activity says so; a written plan replaces it (and it
+/// the plan), removing the team plan stops it, and a body that says neither, or both, is
+/// refused with what to send.
+#[tokio::test]
+async fn the_owner_lets_a_folders_model_write_its_team_plans_through_the_api() {
+    let home = tempfile::tempdir().unwrap();
+    let app = tempfile::tempdir().unwrap();
+    let profile = Profile::open_in(home.path(), "owner").unwrap();
+    let mut shares = profile.shares().unwrap();
+    shares.add("app", app.path(), Access::ReadOnly).unwrap();
+    shares.save(&profile.shares_path()).unwrap();
+    let mut config = AgentConfig::new("owner", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.shares = shares;
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: profile.clone(),
+        network: Network::Local,
+        serving: true,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let call = |method: &'static str, path: &'static str, body: Value| {
+        let (host, token) = (host.clone(), token.to_owned());
+        async move {
+            let body = (!body.is_null()).then(|| body.to_string());
+            request(port, method, path, &host, Some(&token), body.as_deref()).await
+        }
+    };
+    // What the folder does with team steps: its plan, whether its model writes them, and
+    // whether its owner approves each, as the page has it, with the activity's last line
+    // about it.
+    let in_state = || async {
+        let state = call("GET", "/api/state", Value::Null).await.json();
+        let app = state["me"]["shares"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "app")
+            .cloned()
+            .unwrap();
+        let said = state["feed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .filter_map(|f| f["text"].as_str())
+            .find(|t| t.starts_with("'app'"))
+            .unwrap_or_default()
+            .to_owned();
+        (
+            app["team"].clone(),
+            app["team_model"].clone(),
+            app["team_approval"].clone(),
+            said,
+        )
+    };
+    let kept = |shares: Vec<proofkin::shares::Share>| {
+        let app = shares.into_iter().find(|s| s.name == "app").unwrap();
+        (app.team, app.team_model, app.team_approval)
+    };
+    let team = "/api/shares/app/team";
+    let yes = Value::from(true);
+    let model_writes = "'app' takes team steps; its model writes the team plan for each one";
+    let approved = format!("{model_writes}, approved by you");
+
+    let set = call(
+        "PUT",
+        team,
+        serde_json::json!({ "model": true, "approve": true }),
+    )
+    .await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(
+        set.json(),
+        serde_json::json!({ "name": "app", "model": true, "approve": true })
+    );
+    assert_eq!(
+        in_state().await,
+        (Value::Null, yes.clone(), yes.clone(), approved.clone())
+    );
+    assert_eq!(kept(profile.shares().unwrap().shares), (None, true, true));
+    assert_eq!(kept(agent.shares().shares), (None, true, true));
+
+    let unapproved = call("PUT", team, serde_json::json!({ "model": true })).await;
+    assert_eq!(unapproved.status, 200, "{}", unapproved.body);
+    assert_eq!(unapproved.json()["approve"], false);
+    assert_eq!(
+        in_state().await,
+        (
+            Value::Null,
+            yes.clone(),
+            Value::Null,
+            model_writes.to_owned()
+        )
+    );
+    assert_eq!(kept(agent.shares().shares), (None, true, false));
+
+    // A written plan replaces it, and the model replaces the plan.
+    let plan = "build @bob {task}";
+    let written = call("PUT", team, serde_json::json!({ "plan": plan })).await;
+    assert_eq!(written.status, 200, "{}", written.body);
+    let (team_plan, team_model, team_approval, _) = in_state().await;
+    assert_eq!(
+        (team_plan, team_model, team_approval),
+        (Value::from(plan), Value::Null, Value::Null)
+    );
+    assert_eq!(
+        kept(profile.shares().unwrap().shares),
+        (Some(plan.to_owned()), false, false)
+    );
+    let again = call(
+        "PUT",
+        team,
+        serde_json::json!({ "model": true, "approve": true }),
+    )
+    .await;
+    assert_eq!(again.status, 200, "{}", again.body);
+    assert_eq!(kept(agent.shares().shares), (None, true, true));
+
+    // A body that says neither, or both, is refused with what to send, and changes nothing.
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({ "approve": true }),
+        serde_json::json!({ "plan": plan, "model": true }),
+        serde_json::json!({ "plan": plan, "approve": true }),
+    ] {
+        let refused = call("PUT", team, body.clone()).await;
+        assert_eq!(refused.status, 400, "{body}: {}", refused.body);
+        assert!(
+            refused.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("\"model\": true"),
+            "{body}: {}",
+            refused.body
+        );
+    }
+    assert_eq!(in_state().await, (Value::Null, yes.clone(), yes, approved));
+    assert_eq!(kept(profile.shares().unwrap().shares), (None, true, true));
+    let data = call(
+        "PUT",
+        "/api/shares/data/team",
+        serde_json::json!({ "model": true }),
+    )
+    .await;
+    assert_eq!(data.status, 400, "{}", data.body);
+    assert!(
+        data.json()["error"].as_str().unwrap().contains("data"),
+        "{}",
+        data.body
+    );
+    let unknown = call(
+        "PUT",
+        "/api/shares/nope/team",
+        serde_json::json!({ "model": true }),
+    )
+    .await;
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
+
+    // Removing the team plan stops its model writing them.
+    let removed = call("DELETE", team, Value::Null).await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert_eq!(
+        in_state().await,
+        (
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            "'app' no longer takes team steps".to_owned()
+        )
+    );
+    assert_eq!(kept(profile.shares().unwrap().shares), (None, false, false));
+    assert_eq!(kept(agent.shares().shares), (None, false, false));
+}
+
 /// A team step in the web UI: the boss's task shows the lead's team run and its
 /// steps (signed), the lead's page shows that team run as a plan of its own, marked
 /// for the boss, and the boss sees how busy the lead is.

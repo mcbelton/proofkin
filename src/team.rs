@@ -1,10 +1,14 @@
 //! Team runs: handing work down a level. A plan step `team @lead:folder` gives its
 //! task to a lead's agent, which runs its owner's team plan for that folder (plan
 //! text where `{task}` is the task handed down) on its own peers, digital workers
-//! and squads, under its own allowlist. The lead reports each step of its team run
-//! upward as it moves on, and signs its result with the team run inside: every
-//! step's own signed evidence, so whoever handed the work down (and anyone later,
-//! offline) can check the whole tree.
+//! and squads, under its own allowlist. Instead of writing that plan, the owner may
+//! let the agent's model write one for each team step (see [`plan_prompt`]): it is
+//! checked as an owner's plan is, and approved by the owner first if they ask for
+//! that (they may ask for changes, which the model makes). The team run's plan and
+//! the lead's answer say who wrote it (see [`written_by`]). The lead reports each step
+//! of its team run upward as it moves on, and signs its result with the team run
+//! inside: every step's own signed evidence, so whoever handed the work down (and
+//! anyone later, offline) can check the whole tree.
 //!
 //! Limits the requester sets travel with the work: how many levels it may go down
 //! (`levels=N`), how long it may take (`timeout=`, which cancels every level below
@@ -16,13 +20,15 @@ use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, PeerInfo};
 use crate::evidence::GitCommit;
+use crate::knowledge::KnowledgeBase;
 use crate::llm::LlmTask;
-use crate::plan::{Plan, RunContext, SquadStore, Step, StepState};
+use crate::plan::{Plan, Recipients, RunContext, SquadStore, Step, StepState};
 use crate::profile::Profile;
 use crate::protocol::{Phase, Progress, SubStep};
 use crate::runs::RunRecord;
+use crate::skills::{SkillInfo, Skills};
 
 /// The most levels work may go down from the step that hands it to a team.
 pub const MAX_LEVELS: u32 = 3;
@@ -30,6 +36,13 @@ pub const MAX_LEVELS: u32 = 3;
 pub const MAX_TEAM_STEPS: usize = 20;
 /// Where the handed-down task goes in a team plan.
 pub const TASK: &str = "{task}";
+/// How many times a lead's model may write the team plan of a team step: a plan that
+/// doesn't check out goes back to it with what is wrong, until one does or it wrote
+/// this many.
+pub const PLAN_TRIES: usize = 3;
+/// How many times the lead's owner may ask for changes to the team plan its model
+/// wrote, before they approve or reject it.
+pub const PLAN_CHANGE_ROUNDS: usize = 2;
 /// The most of each final step's result the lead's answer carries.
 const MAX_RESULT_CHARS: usize = 3_000;
 
@@ -70,12 +83,7 @@ pub fn validate_template(text: &str) -> Result<Plan> {
 /// Its team steps go down no more levels than the request allows.
 pub fn fill(template: &str, task: &LlmTask, request: &TeamRequest) -> Result<Plan> {
     let mut plan = validate_template(template)?;
-    let handed = task
-        .prompt
-        .strip_prefix(crate::boundary::DIRECTIVE)
-        .unwrap_or(&task.prompt)
-        .trim()
-        .to_owned();
+    let handed = handed_down(task);
     let brief = clip(&one_line(&request.brief), 200);
     for claim in &mut plan.claims {
         claim.text = claim.text.replace(TASK, &brief);
@@ -95,6 +103,223 @@ pub fn fill(template: &str, task: &LlmTask, request: &TeamRequest) -> Result<Pla
         }
     }
     Ok(plan)
+}
+
+/// Team step `task`'s task as handed down (with the earlier steps' results), without
+/// the rule for external content that the prompts made of it add again.
+fn handed_down(task: &LlmTask) -> String {
+    task.prompt
+        .strip_prefix(crate::boundary::DIRECTIVE)
+        .unwrap_or(&task.prompt)
+        .trim()
+        .to_owned()
+}
+
+/// The prompt that asks a lead's model for the team plan of team step `task`, which
+/// `requester` handed down: the task as handed down and its brief, how a team plan is
+/// written, and the team it may use: `peers` (but the requester and the agents the
+/// work came down from), `squads` and `skills`.
+pub fn plan_prompt(
+    task: &LlmTask,
+    request: &TeamRequest,
+    requester: EndpointId,
+    peers: &[PeerInfo],
+    squads: &SquadStore,
+    skills: &[SkillInfo],
+) -> String {
+    let mut text = format!(
+        "You lead a team of agents, and were handed a team step: write the team plan your \
+         team runs to do it. Don't do the task yourself: read the files in this folder if \
+         they help you plan it, and change nothing.\n\n\
+         ## The task handed down\n\n{}\n\nIn a line: {}\n\n",
+        handed_down(task),
+        clip(&one_line(&request.brief), 200)
+    );
+    text += "## How a team plan is written\n\n\
+             One claim or step per line:\n\
+             - `claim: ID text`: a claim the plan proves.\n\
+             - `id [after a,b] @peer:folder|#squad:folder [verify=c1,c2] [attempts=N] \
+             [apply=step] [skill=name] [claims=ID] task text`: a step. `after a,b` runs it \
+             once steps a and b are done, and gives it their results; `@peer:folder` runs it \
+             on that peer, in a folder it shares with you, and `#squad:folder` on the least \
+             busy member of the squad (with copilot, unless `using claude` or `using codex` \
+             comes after who runs it); `verify=` runs those checks of the folder after its \
+             model, as proof of the work; `attempts=N` lets its model try again while they \
+             fail; `apply=step` starts it from the work of an earlier step; `skill=` gives \
+             its model a skill to follow; `claims=` names the claims it proves.\n\
+             - `id after x approve @person text`: a sign-off: that person approves the work \
+             so far before the steps after it go on.\n";
+    if request.levels > 1 {
+        text += "- `id team @lead:folder text`: a team step: it hands its task down to that \
+                 lead, whose own team does it, in a folder that takes team steps.\n";
+    }
+    text += &format!(
+        "- `// comment`\n\n\
+         At most {MAX_TEAM_STEPS} steps. Write {TASK} where the task handed down goes, in the \
+         text of at least one step: that is how your team learns what to do. In a claim, \
+         {TASK} is the task in a line.\n\n\
+         ## Your team\n\n\
+         Your peers, the folders each shares with you and the access its tasks get there:\n"
+    );
+    let mut team = String::new();
+    for peer in peers
+        .iter()
+        .filter(|p| p.id != requester && !request.chain.contains(&p.id.to_string()))
+    {
+        let role = peer
+            .role
+            .as_deref()
+            .map(one_line)
+            .filter(|r| !r.is_empty())
+            .map(|r| format!(" ({})", clip(&r, 100)))
+            .unwrap_or_default();
+        let runs = if peer.capabilities.is_empty() {
+            "no models".to_owned()
+        } else {
+            let providers: Vec<String> = peer.capabilities.iter().map(|p| p.to_string()).collect();
+            providers.join(", ")
+        };
+        team += &format!("- @{}{role}: runs {runs}\n", peer.name);
+        for share in &peer.shares {
+            team += &format!("  - folder {}: {} access", share.name, share.access);
+            if !share.checks.is_empty() {
+                team += &format!("; checks {}", share.checks.join(", "));
+            }
+            if share.team {
+                team += "; takes team steps";
+            }
+            if share.pull_requests {
+                team += "; takes pull request steps";
+            }
+            team += "\n";
+        }
+    }
+    if team.is_empty() {
+        team = "- none: no peer you may hand this work to is connected\n".into();
+    }
+    text += &crate::boundary::wrap("your peers", &team);
+    text += "\n\nYour squads (a step for #squad runs on its least busy member):\n";
+    for squad in &squads.squads {
+        text += &format!("- #{}: {}\n", squad.name, squad.members.join(", "));
+    }
+    if squads.squads.is_empty() {
+        text += "- none\n";
+    }
+    text += "\nYour skills (skill=name):\n";
+    for skill in skills {
+        let about = clip(&one_line(&skill.description), 200);
+        text += &format!("- {}: {about}\n", skill.name);
+    }
+    if skills.is_empty() {
+        text += "- none\n";
+    }
+    text += "\nAnswer with the team plan alone, in one fenced block:\n\n\
+             ```plan\none claim or step per line\n```\n";
+    crate::boundary::guard(&text)
+}
+
+/// `prompt` (see [`plan_prompt`]) again, after the model answered it with `plan`, which
+/// doesn't check out: `problems` says why.
+pub fn plan_again_prompt(prompt: &str, plan: &str, problems: &str) -> String {
+    crate::boundary::guard(&format!(
+        "{prompt}\n\n## Your last team plan doesn't check out\n\n{}\n\n\
+         What is wrong with it: {problems}\n\n\
+         Write the whole team plan again, with that fixed, in one fenced block (```plan).",
+        crate::boundary::wrap("your last team plan", plan)
+    ))
+}
+
+/// `prompt` (see [`plan_prompt`]) again, after `by`, the lead's owner, read `plan`, the
+/// team plan the model wrote, and asked for changes to it: `note` says which.
+pub fn plan_changes_prompt(prompt: &str, plan: &str, by: &str, note: &str) -> String {
+    crate::boundary::guard(&format!(
+        "{prompt}\n\n## {by} asked for changes to your team plan\n\n{}\n\n\
+         {by} read this team plan before it ran, and asked for changes:\n\n{}\n\n\
+         Write the whole team plan again, with those changes, in one fenced block (```plan).",
+        crate::boundary::wrap("your last team plan", plan),
+        note.trim()
+    ))
+}
+
+/// The team plan in a model's `answer`: its first fenced block, else the whole answer.
+pub fn written_plan(answer: &str) -> String {
+    let lines: Vec<&str> = answer.lines().collect();
+    // The backticks the block's first line starts with: the line that closes it has as
+    // many or more, and nothing else.
+    let Some((start, open)) = lines.iter().enumerate().find_map(|(i, line)| {
+        let line = line.trim();
+        let ticks = line.len() - line.trim_start_matches('`').len();
+        (ticks >= 3).then_some((i, ticks))
+    }) else {
+        return answer.trim().to_owned();
+    };
+    let closes = |line: &&str| {
+        let line = line.trim();
+        line.len() >= open && line.chars().all(|c| c == '`')
+    };
+    lines[start + 1..]
+        .iter()
+        .copied()
+        .take_while(|line| !closes(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+
+/// What a lead's owner is asked to approve: `plan`, the team plan their agent's model
+/// wrote for the team step `from` handed to folder `folder`; `asked`, if the model wrote
+/// it again because they asked for changes: that round of changes and their note.
+pub fn approval_text(
+    from: &str,
+    folder: &str,
+    request: &TeamRequest,
+    plan: &str,
+    asked: Option<(usize, &str)>,
+) -> String {
+    let longest = plan.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let text = format!(
+        "{from} handed a team step to '{folder}': {}\n\n\
+         Your model wrote this team plan for it ({TASK} is the task as handed down):\n\n\
+         {fence}text\n{}\n{fence}\n\n\
+         Approving runs it on your team.",
+        clip(&one_line(&request.brief), 200),
+        plan.trim_end()
+    );
+    match asked {
+        None => text,
+        Some((round, note)) => format!(
+            "**Asked again** (round {round} of changes): you asked for changes, and your \
+             model wrote the team plan again with your note; the new plan is below.\n\n\
+             > {}\n\n---\n\n{text}",
+            note.trim().replace('\n', "\n> ")
+        ),
+    }
+}
+
+/// Who wrote the team plan of a team run, as its plan (in a comment) and its lead's
+/// answer say: `lead`'s model, with `provider` (on `model`, if it said which), for
+/// `from`'s team step; `approved`: how many rounds of changes `lead` asked for before
+/// approving it, if they were asked to.
+pub fn written_by(
+    lead: &str,
+    provider: crate::llm::Provider,
+    model: Option<&str>,
+    from: &str,
+    approved: Option<usize>,
+) -> String {
+    let model = model.map(|m| format!(", {m}")).unwrap_or_default();
+    let approved = match approved {
+        None => String::new(),
+        Some(0) => format!(", and approved by {lead}"),
+        Some(1) => format!(", and approved by {lead} after 1 round of changes"),
+        Some(n) => format!(", and approved by {lead} after {n} rounds of changes"),
+    };
+    format!(
+        "This team plan was written by {lead}'s model ({provider}{model}) for {from}'s team \
+         step{approved}"
+    )
 }
 
 /// A team run moving on, as [`TeamRunner::run`] reports it.
@@ -126,13 +351,96 @@ pub struct TeamRunner {
     profile: Profile,
 }
 
+/// What a lead's team plans run with: its profile's squads, knowledge and skills, and
+/// who may receive their steps' content.
+struct Kit {
+    squads: SquadStore,
+    kb: KnowledgeBase,
+    skills: Skills,
+    recipients: Recipients,
+}
+
+/// `text` (a team plan) filled in for team step `task` (see [`fill`]), if it can run
+/// now: [`crate::plan::preflight`] finds no error in it on `agent`'s peers with `kit`.
+fn checked(
+    agent: &Agent,
+    kit: &Kit,
+    text: &str,
+    task: &LlmTask,
+    request: &TeamRequest,
+) -> Result<Plan> {
+    let plan = fill(text, task, request)?;
+    let errors: Vec<String> = crate::plan::preflight(
+        &plan,
+        &agent.peers(),
+        &kit.squads,
+        &kit.kb,
+        &kit.skills,
+        &kit.recipients,
+    )
+    .into_iter()
+    .filter(|p| p.error)
+    .map(|p| match p.step {
+        Some(step) => format!("step {step}: {}", p.message),
+        None => p.message,
+    })
+    .collect();
+    if !errors.is_empty() {
+        bail!(
+            "{}'s team plan can't run now: {}",
+            agent.name(),
+            errors.join("; ")
+        );
+    }
+    Ok(plan)
+}
+
 impl TeamRunner {
     pub fn new(profile: Profile) -> Self {
         Self { profile }
     }
 
-    /// Runs `template` (a folder's team plan) for team step `task` from
-    /// `requester`, on `agent`'s peers, reporting each change to `observe`.
+    fn kit(&self, agent: &Agent) -> Kit {
+        Kit {
+            squads: SquadStore::load(&self.profile.squads_path()).unwrap_or_default(),
+            kb: self.profile.knowledge(),
+            skills: self.profile.skills(),
+            recipients: Recipients::of(agent, &self.profile),
+        }
+    }
+
+    /// The prompt that asks `agent`'s model for the team plan of team step `task` from
+    /// `requester` (see [`plan_prompt`]): its team is `agent`'s peers now and the
+    /// profile's squads and skills.
+    pub fn prompt(
+        &self,
+        agent: &Agent,
+        task: &LlmTask,
+        request: &TeamRequest,
+        requester: EndpointId,
+    ) -> String {
+        let squads = SquadStore::load(&self.profile.squads_path()).unwrap_or_default();
+        let skills = self.profile.skills().list();
+        plan_prompt(task, request, requester, &agent.peers(), &squads, &skills)
+    }
+
+    /// Checks `text` as the team plan of team step `task` as [`TeamRunner::run`] does
+    /// before it runs one: it fills in (see [`fill`]) and has no error
+    /// [`crate::plan::preflight`] finds on `agent`'s peers now, with the profile's
+    /// squads, knowledge and skills.
+    pub fn check(
+        &self,
+        agent: &Agent,
+        text: &str,
+        task: &LlmTask,
+        request: &TeamRequest,
+    ) -> Result<Plan> {
+        checked(agent, &self.kit(agent), text, task, request)
+    }
+
+    /// Runs `template` (a folder's team plan, or the one its model wrote) for team
+    /// step `task` from `requester`, on `agent`'s peers, reporting each change to
+    /// `observe`.
     pub async fn run(
         &self,
         agent: &Agent,
@@ -142,27 +450,14 @@ impl TeamRunner {
         requester: EndpointId,
         mut observe: impl FnMut(TeamUpdate<'_>),
     ) -> Result<TeamOutcome> {
-        let plan = fill(template, task, request)?;
-        let kb = self.profile.knowledge();
-        let skills = self.profile.skills();
-        let squads = SquadStore::load(&self.profile.squads_path()).unwrap_or_default();
-        let recipients = crate::plan::Recipients::of(agent, &self.profile);
-        let errors: Vec<String> =
-            crate::plan::preflight(&plan, &agent.peers(), &squads, &kb, &skills, &recipients)
-                .into_iter()
-                .filter(|p| p.error)
-                .map(|p| match p.step {
-                    Some(step) => format!("step {step}: {}", p.message),
-                    None => p.message,
-                })
-                .collect();
-        if !errors.is_empty() {
-            bail!(
-                "{}'s team plan can't run now: {}",
-                agent.name(),
-                errors.join("; ")
-            );
-        }
+        let kit = self.kit(agent);
+        let plan = checked(agent, &kit, template, task, request)?;
+        let Kit {
+            squads,
+            kb,
+            skills,
+            recipients,
+        } = kit;
         let ready = plan.prepare(&kb, &skills)?;
         let mut chain: Vec<EndpointId> = request
             .chain
@@ -473,6 +768,180 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("at most")
+        );
+    }
+
+    #[test]
+    fn a_leads_model_is_asked_for_a_plan_for_the_task_handed_down_with_the_team_it_may_use() {
+        use crate::llm::Access;
+        use crate::plan::Squad;
+        use crate::shares::ShareInfo;
+        let peer = |name: &str, role: Option<&str>, providers, shares| PeerInfo {
+            name: name.into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: providers,
+            shares,
+            owner: None,
+            role: role.map(Into::into),
+            load: None,
+            models: Default::default(),
+            offers: Default::default(),
+        };
+        let app = ShareInfo {
+            name: "app".into(),
+            access: Access::WorkspaceWrite,
+            checks: vec!["test".into(), "lint".into()],
+            team: true,
+            ..Default::default()
+        };
+        let docs = ShareInfo {
+            name: "docs".into(),
+            access: Access::ReadOnly,
+            pull_requests: true,
+            ..Default::default()
+        };
+        let peers = vec![
+            peer(
+                "alice",
+                Some("test\nengineer"),
+                vec![Provider::Copilot],
+                vec![app],
+            ),
+            peer(
+                "bob",
+                None,
+                vec![Provider::Claude, Provider::Codex],
+                vec![docs],
+            ),
+            peer("boss", None, vec![Provider::Copilot], Vec::new()),
+            peer("top", None, vec![Provider::Copilot], Vec::new()),
+        ];
+        let requester = peers[2].id;
+        let mut request = request(1);
+        request.chain = vec![peers[3].id.to_string(), requester.to_string()];
+        let squads = SquadStore {
+            squads: vec![Squad {
+                name: "devs".into(),
+                members: vec!["alice".into(), "bob".into()],
+            }],
+        };
+        let skills = [SkillInfo {
+            name: "review".into(),
+            description: "Reviews a\nchange".into(),
+            source: "profile",
+            plugin: None,
+        }];
+        let task = LlmTask::new(
+            Provider::Copilot,
+            crate::boundary::guard(&format!(
+                "Results of the earlier steps:\n{}\n---\nYour task:\nBuild the login page",
+                crate::boundary::wrap("step:design", "a form")
+            )),
+        );
+        let prompt = plan_prompt(&task, &request, requester, &peers, &squads, &skills);
+        // The task as handed down, once, with its own words in a line.
+        assert!(prompt.starts_with(crate::boundary::DIRECTIVE), "{prompt}");
+        assert_eq!(prompt.matches(crate::boundary::DIRECTIVE).count(), 1);
+        assert!(prompt.contains(
+            "## The task handed down\n\nResults of the earlier steps:\n\
+             <external_content source=\"step:design\">"
+        ));
+        let line = "Your task:\nBuild the login page\n\nIn a line: Build the login page\n";
+        assert!(prompt.contains(line));
+        // How a plan is written, without team steps when the work may go no further down.
+        for syntax in [
+            "`claim: ID text`",
+            "`id [after a,b] @peer:folder|#squad:folder [verify=c1,c2] [attempts=N] \
+             [apply=step] [skill=name] [claims=ID] task text`",
+            "`id after x approve @person text`",
+            "`// comment`",
+            "At most 20 steps. Write {task} where the task handed down goes",
+        ] {
+            assert!(prompt.contains(syntax), "{syntax}: {prompt}");
+        }
+        assert!(!prompt.contains("`id team @lead:folder text`"));
+        request.levels = 2;
+        let deeper = plan_prompt(&task, &request, requester, &peers, &squads, &skills);
+        assert!(deeper.contains("`id team @lead:folder text`"));
+        // Its team, with what its peers say of themselves as data, but not the agents the
+        // work came down from.
+        let team = "<external_content source=\"your peers\">\n\
+                    - @alice (test engineer): runs copilot\n  \
+                    - folder app: workspace-write access; checks test, lint; takes team steps\n\
+                    - @bob: runs claude, codex\n  \
+                    - folder docs: read-only access; takes pull request steps\n\
+                    </external_content>";
+        assert!(prompt.contains(team), "{prompt}");
+        assert!(!prompt.contains("@boss") && !prompt.contains("@top"));
+        assert!(prompt.contains("- #devs: alice, bob\n"));
+        assert!(prompt.contains("- review: Reviews a change\n"));
+        assert!(prompt.contains("in one fenced block:\n\n```plan\n"));
+
+        // Asked again, it is told what is wrong with the plan it wrote.
+        let again = plan_again_prompt(&prompt, "dev @nobody {task}", "step dev: no peer 'nobody'");
+        assert!(again.starts_with(&prompt));
+        assert!(again.contains(
+            "<external_content source=\"your last team plan\">\n\
+             dev @nobody {task}\n</external_content>"
+        ));
+        assert!(again.contains("What is wrong with it: step dev: no peer 'nobody'"));
+
+        // Its owner asked for changes: it is given their note with the plan they read.
+        let changes = plan_changes_prompt(&prompt, "dev @alice {task}", "lead", "Add a review\n");
+        assert!(changes.starts_with(&prompt));
+        assert!(
+            changes.contains(
+                "## lead asked for changes to your team plan\n\n\
+                 <external_content source=\"your last team plan\">\n\
+                 dev @alice {task}\n</external_content>\n\n\
+                 lead read this team plan before it ran, and asked for changes:\n\n\
+                 Add a review\n\n"
+            ),
+            "{changes}"
+        );
+    }
+
+    #[test]
+    fn the_plan_a_model_writes_is_its_answers_first_fenced_block_else_the_whole_answer() {
+        let answer = "Here it is:\n```plan\nclaim: T-1 {task} works\ndev @alice:app {task}\n```\n\
+                      And another:\n```\nother @bob {task}\n```";
+        assert_eq!(
+            written_plan(answer),
+            "claim: T-1 {task} works\ndev @alice:app {task}"
+        );
+        assert_eq!(written_plan("\n  dev @alice {task}\n"), "dev @alice {task}");
+        // A longer fence holds shorter ones, and one left open runs to the end.
+        assert_eq!(
+            written_plan("````\ndev @alice {task}\n```\n````\nafter"),
+            "dev @alice {task}\n```"
+        );
+        assert_eq!(
+            written_plan("```plan\ndev @alice {task}"),
+            "dev @alice {task}"
+        );
+        // Its owner sees it in a block the plan can't close.
+        let text = approval_text(
+            "boss",
+            "app",
+            &request(1),
+            "dev @alice {task} ```x```",
+            None,
+        );
+        assert!(text.starts_with("boss handed a team step to 'app': Build the login page\n"));
+        assert!(
+            text.contains("\n````text\ndev @alice {task} ```x```\n````\n"),
+            "{text}"
+        );
+        // Written again after they asked for changes, it comes after their note.
+        let asked = Some((2, "Add a\nreview "));
+        let again = approval_text("boss", "app", &request(1), "dev @alice {task}", asked);
+        assert!(
+            again.starts_with(
+                "**Asked again** (round 2 of changes): you asked for changes, and your model \
+                 wrote the team plan again with your note; the new plan is below.\n\n\
+                 > Add a\n> review\n\n---\n\nboss handed a team step to 'app': "
+            ),
+            "{again}"
         );
     }
 }

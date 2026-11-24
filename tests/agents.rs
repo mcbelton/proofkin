@@ -88,6 +88,45 @@ impl Executor for FakeExecutor {
 
 impl FakeExecutor {
     async fn answer(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
+        // A lead's model writing the team plan of a team step: only read-only and with no
+        // MCP servers, it has the member build the task, noting the model and effort it
+        // planned on, the notes it read in the folder and the changes its owner asked for.
+        // "plan-badly" in the task makes its first plan name a peer that isn't there, and
+        // "plan-badly-always" every one (the next one each time: nobody, nobody2, ...).
+        if task.prompt.contains("## How a team plan is written") {
+            if ctx.access != Access::ReadOnly || !ctx.mcp.is_empty() {
+                return Ok("I could change things here, so I won't plan".into());
+            }
+            let told = task
+                .prompt
+                .contains("## Your last team plan doesn't check out");
+            if task.prompt.contains("plan-badly-always")
+                || (task.prompt.contains("plan-badly") && !told)
+            {
+                let nobody = match task.prompt.split_once("@nobody") {
+                    None => "nobody".to_owned(),
+                    Some((_, after)) => {
+                        let n: u32 = after.split(':').next().unwrap().parse().unwrap_or(1);
+                        format!("nobody{}", n + 1)
+                    }
+                };
+                return Ok(format!("```plan\nwork @{nobody}:code {{task}}\n```"));
+            }
+            let notes = std::fs::read_to_string(ctx.workspace.join("notes.txt"))?;
+            let changed = task
+                .prompt
+                .split_once("and asked for changes:\n\n")
+                .map(|(_, note)| format!("// changed: {}\n", note.lines().next().unwrap()))
+                .unwrap_or_default();
+            return Ok(format!(
+                "Here is the plan:\n\n```plan\nclaim: T-1 {{task}} passes the member's check\n\
+                 // planned on {} at {}, with notes: {}\n\
+                 {changed}build @member:code verify=ok claims=T-1 {{task}}\n```\n\nThat's all.",
+                task.model.as_deref().unwrap_or("its default"),
+                task.effort.as_deref().unwrap_or("its effort"),
+                notes.trim()
+            ));
+        }
         // Its run stops before it finishes (as one that runs out of time does) unless it was
         // told its last run stopped: then it finds what that run changed, and finishes.
         if task.prompt.ends_with("stops-once") {
@@ -4718,5 +4757,228 @@ async fn team_steps_hand_work_down_a_level_and_prove_it_through_the_whole_tree()
     assert!(
         error.contains("boss handed this work down, so it isn't given back to it"),
         "{error}"
+    );
+}
+
+/// A lead whose folder leaves team plans to its model: for each team step the model
+/// writes the plan (read-only in the folder, on the owner's default model and effort),
+/// is told what is wrong with a plan that doesn't check out and writes it again, and the
+/// owner approves it before it runs, or asks for changes (twice at most), which the
+/// model makes. The team run's plan and the lead's answer say who wrote it. A plan the
+/// owner rejects, or that the model gets wrong three times, fails the step without a
+/// team run; a lead that runs no models refuses it.
+#[tokio::test]
+async fn a_leads_model_writes_the_team_plan_of_each_team_step_and_its_owner_approves_it() {
+    use proofkin::agent::Answer;
+    let home = tempfile::tempdir().unwrap();
+    let lead_profile = proofkin::Profile::open_in(home.path(), "lead").unwrap();
+    let solo_profile = proofkin::Profile::open_in(home.path(), "solo").unwrap();
+    let app = tempfile::tempdir().unwrap();
+    std::fs::write(app.path().join("notes.txt"), "the member builds it").unwrap();
+    let code = tempfile::tempdir().unwrap();
+    std::fs::write(code.path().join("ok.txt"), "ok").unwrap();
+    let mut boss = Node::new("boss").serving(vec![Provider::Copilot]);
+    let mut lead = Node::new("lead").serving(vec![Provider::Copilot]);
+    let mut solo = Node::new("solo");
+    let mut member = Node::new("member").serving(vec![Provider::Copilot]);
+    lead.models = [(
+        Provider::Copilot,
+        proofkin::models::ModelChoice {
+            default: Some("planner-1".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        },
+    )]
+    .into();
+    for (node, profile) in [(&mut lead, &lead_profile), (&mut solo, &solo_profile)] {
+        node.team = Some(Arc::new(proofkin::team::TeamRunner::new(profile.clone())));
+        node.shares.add("app", app.path(), Access::Full).unwrap();
+        node.shares.set_team_model("app", true).unwrap();
+        node.trusts(&boss, Some(100));
+        boss.trusts(node, Some(100));
+        node.grant("boss", Access::WorkspaceWrite, &["data", "app"]);
+    }
+    member
+        .shares
+        .add_with(
+            "code",
+            code.path(),
+            Access::Full,
+            parse_checks(&[format!("ok={}", exists_check("ok.txt"))]).unwrap(),
+            false,
+        )
+        .unwrap();
+    mutual(&mut lead, &mut member);
+    member.grant("lead", Access::Full, &["data", "code"]);
+    let (member, _me) = member.start().await;
+    let (lead, _le) = lead.start().await;
+    let (solo, _se) = solo.start().await;
+    let (boss, _be) = boss.start().await;
+    lead.connect(member.addr()).await.unwrap();
+    boss.connect(lead.addr()).await.unwrap();
+    boss.connect(solo.addr()).await.unwrap();
+    wait_for_peers(&lead, 2).await;
+    wait_for_peers(&boss, 2).await;
+    wait_until(|| {
+        boss.peers()
+            .iter()
+            .filter(|p| p.shares.iter().any(|s| s.name == "app" && s.team))
+            .count()
+            == 2
+    })
+    .await;
+    // The lead's owner answers the next requests to approve a team plan, in turn.
+    let answer = |answers: Vec<(Answer, &'static str)>| {
+        let lead = lead.clone();
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for (how, note) in answers {
+                let request = timeout(Duration::from_secs(30), async {
+                    loop {
+                        if let Some(a) = lead.approvals().pop() {
+                            return a;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("the lead's owner is asked");
+                lead.answer(request.id, how, note).await.unwrap();
+                seen.push(request);
+            }
+            seen
+        })
+    };
+
+    // Its first plan names a peer the lead doesn't have: told so, the model writes one
+    // that checks out. Its owner asks for changes twice, which it makes (each time
+    // after a plan that doesn't check out), and approves it once they may only approve
+    // or reject it.
+    let yes = answer(vec![
+        (Answer::Changes, "say who checks it"),
+        (Answer::Changes, "and when"),
+        (Answer::Approve, "go ahead"),
+    ]);
+    let plan = Plan::parse(
+        "claim: C-1 The team built it\n\
+         build team @lead:app claims=C-1 make the thing plan-badly",
+    )
+    .unwrap();
+    let ctx = RunContext {
+        run_id: Some("boss-run".into()),
+        ..RunContext::default()
+    };
+    let mut seen = Vec::new();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, s| {
+        if let StepState::Running {
+            progress: Some(p), ..
+        } = s
+        {
+            seen.push(p.text.clone());
+        }
+    })
+    .await;
+    let requests = yes.await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.title == "Run this team plan for boss?"),
+        "{requests:?}"
+    );
+    let offered: Vec<bool> = requests.iter().map(|r| r.changes).collect();
+    assert_eq!(offered, [true, true, false]);
+    assert!(
+        requests[0]
+            .text
+            .starts_with("boss handed a team step to 'app': make the thing plan-badly\n")
+            && requests[0]
+                .text
+                .contains("\nbuild @member:code verify=ok claims=T-1 {task}\n"),
+        "{}",
+        requests[0].text
+    );
+    for (round, (request, note)) in requests[1..]
+        .iter()
+        .zip(["say who checks it", "and when"])
+        .enumerate()
+    {
+        let text = &request.text;
+        assert!(
+            text.starts_with(&format!("**Asked again** (round {} of changes)", round + 1))
+                && text.contains(&format!("\n\n> {note}\n\n---\n\nboss handed a team step"))
+                && text.contains(&format!("\n// changed: {note}\nbuild @member:code")),
+            "{text}"
+        );
+    }
+    let StepState::Done {
+        peer,
+        output,
+        evidence: Some(e),
+        verified,
+        ..
+    } = &states["build"]
+    else {
+        panic!("{:?}", states["build"]);
+    };
+    assert_eq!(peer, "lead");
+    assert!(*verified, "the whole tree checks out");
+    let run = e.team.as_ref().expect("the team run comes with it");
+    assert!(run.passed(), "{}", run.verdict_line());
+    let by = "This team plan was written by lead's model (copilot, planner-1) for boss's \
+              team step, and approved by lead after 2 rounds of changes";
+    assert_eq!(
+        run.plan_text,
+        format!(
+            "// {by}\n\
+             claim: T-1 make the thing plan-badly passes the member's check\n\
+             // planned on planner-1 at high, with notes: the member builds it\n\
+             // changed: and when\n\
+             build @member:code verify=ok claims=T-1 make the thing plan-badly"
+        )
+    );
+    assert!(
+        output.trim_end().ends_with(&format!("\n\n{by}.")),
+        "{output}"
+    );
+    for text in [
+        "lead's model is writing the team plan",
+        "lead's model is writing the team plan again, told what was wrong with it",
+        "waiting for lead to approve the team plan",
+        "lead's model is writing the team plan again, with the changes lead asked for",
+    ] {
+        assert!(seen.iter().any(|s| s == text), "{text}: {seen:?}");
+    }
+
+    // A plan its owner rejects fails the step, saying why.
+    let no = answer(vec![(Answer::Reject, "not now")]);
+    let plan = Plan::parse("build team @lead:app make the thing").unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    no.await.unwrap();
+    assert!(
+        matches!(&states["build"], StepState::Failed { error, .. }
+            if error.contains("lead didn't approve the team plan: not now")),
+        "{:?}",
+        states["build"]
+    );
+    // So does one its model gets wrong three times, which its owner isn't asked about.
+    let plan = Plan::parse("build team @lead:app make the thing plan-badly-always").unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert!(
+        matches!(&states["build"], StepState::Failed { error, .. }
+            if error.contains("lead's model couldn't write a team plan that checks out")
+                && error.contains("step work: nobody3 is not connected")),
+        "{:?}",
+        states["build"]
+    );
+    assert!(lead.approvals().is_empty());
+    assert_eq!(RunRecord::list(&lead_profile.runs_dir()).unwrap().len(), 1);
+    // A lead that runs no models can't write one.
+    let plan = Plan::parse("build team @solo:app make the thing").unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert!(
+        matches!(&states["build"], StepState::Failed { error, .. }
+            if error.contains("solo runs no models, so it can't write a team plan for 'app'")),
+        "{:?}",
+        states["build"]
     );
 }

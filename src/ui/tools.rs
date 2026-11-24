@@ -577,7 +577,13 @@ pub(super) async fn offer_mcp(
 #[derive(Deserialize)]
 pub(super) struct TeamBody {
     #[serde(default)]
-    plan: String,
+    plan: Option<String>,
+    /// This agent's model writes the team plan for each team step, in place of a plan.
+    #[serde(default)]
+    model: bool,
+    /// With `model`: the owner approves each plan its model writes before it runs.
+    #[serde(default)]
+    approve: bool,
 }
 
 fn no_share(name: &str) -> ApiError {
@@ -587,16 +593,39 @@ fn no_share(name: &str) -> ApiError {
     )
 }
 
-/// Sets the team plan of a shared folder.
+/// Sets the team plan of a shared folder, or has this agent's model write one for each
+/// team step (`"model": true`), each approved by the owner first with `"approve": true`.
 pub(super) async fn set_team(
     State(s): State<AppState>,
     Path(name): Path<String>,
     Json(body): Json<TeamBody>,
 ) -> Result<Json<Value>, ApiError> {
+    if body.model {
+        if body
+            .plan
+            .as_deref()
+            .is_some_and(|plan| !plan.trim().is_empty())
+        {
+            return Err(bad_request(
+                "send either the team plan or \"model\": true (this agent's model writes one for each team step), not both",
+            ));
+        }
+        return set_team_model(&s, &name, body.approve);
+    }
+    if body.approve {
+        return Err(bad_request(
+            "\"approve\" is for the team plans this agent's model writes: send it with \"model\": true",
+        ));
+    }
+    let Some(plan) = body.plan else {
+        return Err(bad_request(
+            "send the team plan as {\"plan\": \"...\"}, or {\"model\": true} to have this agent's model write one for each team step (with \"approve\": true, you approve each plan before it runs)",
+        ));
+    };
     let steps = if name == DATA_SHARE {
         0
     } else {
-        crate::team::validate_template(&body.plan)
+        crate::team::validate_template(&plan)
             .map_err(err400)?
             .steps
             .len()
@@ -608,7 +637,7 @@ pub(super) async fn set_team(
             if name != DATA_SHARE && shares.get(&name).is_none() {
                 return Ok(false);
             }
-            shares.set_team(&name, Some(body.plan.clone()))?;
+            shares.set_team(&name, Some(plan.clone()))?;
             Ok(true)
         })
         .map_err(err400)?;
@@ -626,7 +655,37 @@ pub(super) async fn set_team(
     Ok(Json(json!({ "name": name, "steps": steps })))
 }
 
-/// Removes the team plan of a shared folder.
+/// Has this agent's model write the team plan for each team step shared folder `name`
+/// takes, in place of a written one; with `approve`, the owner approves each plan first.
+fn set_team_model(s: &Shared, name: &str, approve: bool) -> Result<Json<Value>, ApiError> {
+    let (found, shares) = s
+        .info
+        .profile
+        .update_shares(|shares| {
+            if name != DATA_SHARE && shares.get(name).is_none() {
+                return Ok(false);
+            }
+            shares.set_team_model(name, approve)?;
+            Ok(true)
+        })
+        .map_err(err400)?;
+    if !found {
+        return Err(no_share(name));
+    }
+    shares_changed(
+        s,
+        shares,
+        format!(
+            "'{name}' takes team steps; its model writes the team plan for each one{}",
+            if approve { ", approved by you" } else { "" }
+        ),
+    );
+    Ok(Json(
+        json!({ "name": name, "model": true, "approve": approve }),
+    ))
+}
+
+/// Removes the team plan of a shared folder, or stops its model writing them.
 pub(super) async fn remove_team(
     State(s): State<AppState>,
     Path(name): Path<String>,

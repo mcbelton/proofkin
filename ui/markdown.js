@@ -69,10 +69,14 @@ function renderMarkdown(text) {
       root.append(mdTable(rows));
       continue;
     }
-    if (/^\s*```/.test(line)) {
+    const fence = line.match(/^\s*(`{3,})/);
+    if (fence) {
       flushPara(); endList();
+      // Only a line of as many backticks or more closes it, so a longer fence holds
+      // shorter ones as text (e.g. a plan whose steps have code blocks of their own).
+      const closes = (l) => /^`+$/.test(l.trim()) && l.trim().length >= fence[1].length;
       const code = [];
-      for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
+      for (i++; i < lines.length && !closes(lines[i]); i++) code.push(lines[i]);
       root.append(mdEl("pre", {}, mdEl("code", { text: code.join("\n") })));
       continue;
     }

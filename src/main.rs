@@ -1031,7 +1031,8 @@ rights, so only peers with full access may request them.")]
         profile: ProfileArg,
     },
     /// Set (or clear) a folder's team plan: what this agent's team does with team steps
-    /// peers hand the folder (`name team @you:folder ...` in their plans).
+    /// peers hand the folder (`name team @you:folder ...` in their plans), or have this
+    /// agent's model write the team plan for each one.
     #[command(after_help = "\
 A team plan is plan text where {task} is the task handed down, e.g. team.plan:
   claim: T-1 {task} works
@@ -1040,14 +1041,25 @@ A team plan is plan text where {task} is the task handed down, e.g. team.plan:
 It runs on this agent's own peers, digital workers and squads, under its allowlist;
 each of its steps is reported to whoever handed the work down, and the result carries
 every step's signed evidence. At most 20 steps.
-example:
-  proofkin share team app team.plan --profile alice")]
+With --model, this agent's model writes the team plan for each team step instead, from
+the task and the peers, squads and skills it may use, reading the folder but changing
+nothing; it runs only if it checks out. With --approve too, you approve each plan before
+it runs (web UI: Approvals).
+examples:
+  proofkin share team app team.plan --profile alice
+  proofkin share team app --model --approve --profile alice")]
     Team {
         /// The shared folder.
         name: String,
         /// The team plan file (plan text with {task}).
         file: Option<PathBuf>,
-        /// Remove the folder's team plan.
+        /// This agent's model writes the team plan for each team step.
+        #[arg(long, conflicts_with_all = ["file", "clear"])]
+        model: bool,
+        /// You approve each team plan its model writes before it runs.
+        #[arg(long, requires = "model")]
+        approve: bool,
+        /// Remove the folder's team plan, or stop its model writing them.
         #[arg(long, conflicts_with = "file")]
         clear: bool,
         #[command(flatten)]
@@ -1869,6 +1881,12 @@ fn share_extras(share: &proofkin::shares::Share) -> String {
             "; team plan ({steps} step{}) for team steps",
             if steps == 1 { "" } else { "s" }
         );
+    } else if share.team_model {
+        extras += if share.team_approval {
+            "; team plans written by its model for team steps (you approve each)"
+        } else {
+            "; team plans written by its model for team steps"
+        };
     }
     extras
 }
@@ -3545,24 +3563,44 @@ fn run_share(command: ShareCommand) -> Result<()> {
         ShareCommand::Team {
             name,
             file,
+            model,
+            approve,
             clear,
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
+            let data = profile.data_folder();
+            if model {
+                proofkin::shares::ShareStore::update(&profile.shares_path(), data, |shares| {
+                    shares.set_team_model(&name, approve)
+                })?;
+                println!(
+                    "profile '{}': '{name}' takes team steps; its model writes the team plan for each one{}; peers hand them over with: name team @{}:{name} what to do",
+                    profile.name,
+                    if approve {
+                        ", and you approve each plan before it runs"
+                    } else {
+                        ""
+                    },
+                    profile.name
+                );
+                return Ok(());
+            }
             let plan = match (file, clear) {
                 (Some(file), _) => Some(
                     std::fs::read_to_string(&file)
                         .with_context(|| format!("reading {}", file.display()))?,
                 ),
                 (None, true) => None,
-                (None, false) => bail!("give the team plan file, or --clear to remove it"),
+                (None, false) => bail!(
+                    "give the team plan file, --model to have its model write each one, or --clear to remove it"
+                ),
             };
             let steps = plan
                 .as_deref()
                 .map(proofkin::team::validate_template)
                 .transpose()?
                 .map(|p| p.steps.len());
-            let data = profile.data_folder();
             proofkin::shares::ShareStore::update(&profile.shares_path(), data, |shares| {
                 shares.set_team(&name, plan)
             })?;
