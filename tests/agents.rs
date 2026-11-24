@@ -2195,7 +2195,8 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         refused.output
     );
 
-    // A sign-off whose record doesn't check out stays off it.
+    // A sign-off whose record doesn't check out stays off it. (Sent again as the step,
+    // as a run that goes on after a restart sends it.)
     let signed = ask.signoffs[0].clone();
     let forged = proofkin::pulls::SignOff {
         output: "Approved by boss: anything".into(),
@@ -2206,7 +2207,17 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         signoffs: vec![signed.clone(), forged],
         ..ask.clone()
     }));
-    let reopened = boss.delegate_verified(worker.id(), again).await.unwrap();
+    let step = proofkin::protocol::Origin {
+        run: Some("run-2".into()),
+        step: Some("ship".into()),
+        task: None,
+    };
+    let reopened = boss
+        .send_task(worker.id(), again, Some(step))
+        .unwrap()
+        .finish(|_| {})
+        .await
+        .unwrap();
     assert!(
         reopened.ok
             && reopened
@@ -2386,7 +2397,7 @@ async fn a_folder_owner_approves_each_pull_request_and_a_run_card_asks_for_one()
         again.ok
             && again
                 .output
-                .contains("an earlier try of this step opened it"),
+                .contains("it was opened before, from the same work"),
         "{}",
         again.output
     );

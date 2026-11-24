@@ -2310,7 +2310,14 @@ impl Inner {
                 ));
             }
             if opened.existed {
-                notes.push("an earlier try of this step opened it".to_owned());
+                notes.push(
+                    if asked.step.is_some() {
+                        "an earlier try of this step opened it"
+                    } else {
+                        "it was opened before, from the same work"
+                    }
+                    .to_owned(),
+                );
             }
             if let Some(approval) = &asked.approval {
                 notes.push(format!("{} approved opening it", approval.by));

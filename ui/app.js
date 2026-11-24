@@ -1507,9 +1507,10 @@ function openPullDialog(runId, work, opener) {
   pullAsk = { runId, work };
   $("#pull-form").reset();
   $("#pull-h").textContent = `Open a pull request of step ${work.step}`;
-  $("#pull-intro").textContent = `${work.peer}'s agent pushes branch ${work.branch} (commit ${work.commit}) of its clone of `
-    + `${work.folder} and opens the pull request with ${work.peer}'s GitHub account, listing the run's sign-offs on the work`
-    + `${work.approval ? `, once ${work.peer} approves it` : ""}. You follow it under Tasks until it is merged.`;
+  $("#pull-intro").replaceChildren(`${work.peer}'s agent pushes branch `, el("span", { class: "mono", text: work.branch }),
+    " (commit ", el("span", { class: "mono", text: work.commit }), ") of its clone of ", el("span", { class: "mono", text: work.folder }),
+    ` and opens the pull request with ${work.peer}'s GitHub account, with the run's sign-offs on the work`
+    + `${work.approval ? `, once ${work.peer} approves it` : ""}. You follow it under Tasks until it is merged.`);
   $("#pull-title").value = work.title;
   $("#pull-error").textContent = "";
   $("#pull-dialog").addEventListener("close", () => {
@@ -3613,7 +3614,7 @@ function init() {
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog",
-    "#branch-dialog"]) guardDialog($(id));
+    "#branch-dialog", "#pull-dialog"]) guardDialog($(id));
   initModelsDialog();
   initBranchReview();
   $("#provider").addEventListener("change", renderTaskOptions);
