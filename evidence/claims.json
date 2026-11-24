@@ -1441,6 +1441,16 @@
       ]
     },
     {
+      "id": "EDD-11",
+      "area": "evidence",
+      "claim": "A task that asks for its folder's checks gives its model (Copilot or Claude; not Codex, which takes no MCP servers) a run_check tool: the worker starts proofkin task-checks as the task's MCP server proofkin-checks, which runs one of the step's checks in the task's workspace and answers whether it passed, with its exit code, time and the end of its output (secrets redacted), at most 10 runs a task, each up to 10 minutes. A check the step doesn't name is refused, and so is an 11th run. The runtime still runs the checks after the model, and only those runs are evidence.",
+      "tests": [
+        "agents::a_tasks_model_runs_its_checks_while_it_works",
+        "lib::checks_mcp::the_model_runs_the_steps_checks_while_it_works_a_few_times",
+        "lib::checks_mcp::a_worker_starts_it_with_the_steps_checks_in_the_tasks_workspace"
+      ]
+    },
+    {
       "id": "TRK-6",
       "area": "tracking",
       "claim": "With a tracker linked, Plan mode and the plan editor offer Track on GitHub beside Run plan: a new issue (with a sub-issue per step), an existing issue it works on (by number) or don't track, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's). The line under it says what running the plan does there before it runs: the repository and the board (links that open a new tab), the account the issues are assigned to, the new issue's title when the plan names one, and that anyone can read them when the repository is public (the tracker reads its visibility; tracker status says it too), or that nothing goes to GitHub. An existing issue is looked up as its number is typed (GET /api/tracker/issues/N): its title, with a warning when it is closed (running reopens it), doesn't exist (the plan would run untracked) or can't be looked up; Run plan and Schedule… ask for the number when it is missing instead of opening a new issue.",

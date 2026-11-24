@@ -51,6 +51,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serves a task's checks to its model as an MCP tool, over stdio. A worker starts it
+    /// for a task that asks for its folder's checks; it isn't meant to be run by hand.
+    #[command(hide = true)]
+    TaskChecks {
+        /// The task's workspace, where the checks run.
+        #[arg(long)]
+        dir: PathBuf,
+        /// A check, as NAME=COMMAND.
+        #[arg(long = "check")]
+        checks: Vec<String>,
+    },
     /// Sign agent profiles in/out of Copilot, Claude and Codex (each profile has its own accounts).
     #[command(subcommand)]
     Auth(AuthCommand),
@@ -1571,6 +1582,9 @@ async fn main() -> Result<()> {
             limit,
             json,
         }) => run_audit(&profile.name, limit, json),
+        Some(Command::TaskChecks { dir, checks }) => {
+            proofkin::checks_mcp::serve(dir, proofkin::shares::parse_checks(&checks)?).await
+        }
         None => run_agent(cli.run).await,
     }
 }
@@ -4469,6 +4483,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             config.pulls = Some(Arc::new(proofkin::pulls::ProfilePulls::new(
                 profile.clone(),
             )));
+            // This program serves a task's checks to its model (proofkin task-checks).
+            config.task_checks = std::env::current_exe().ok();
         }
         Agent::bind(config).await?
     };

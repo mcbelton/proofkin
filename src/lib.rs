@@ -8,6 +8,7 @@ pub mod agent;
 pub mod audit;
 pub mod auth;
 pub mod boundary;
+pub mod checks_mcp;
 pub mod design;
 pub mod evidence;
 pub mod gh_auth;

@@ -1080,6 +1080,13 @@ review @alice:app verify=test Check the change:
 - **Retries**: when a task took more than one attempt, its output is the first attempt's
   report, then, for each later attempt, a line "Attempt 2 of 3, after these checks failed:
   fmt, clippy" and that attempt's report.
+- **Checks while it works**: a step's model (Copilot or Claude) can run the step's checks
+  itself while it works, with the `run_check` tool its worker gives it (MCP server
+  `proofkin-checks`). The tool runs one in the task's workspace, as the runtime will, and
+  says whether it passed, with the end of its output: at most 10 runs a task, each up to 10
+  minutes. They help the model find a mistake before it finishes, instead of in a failed
+  attempt; they aren't evidence. The runtime runs the checks again after the model, and
+  only those runs count.
 - **Approvals**: the approver sees the request in their web UI (**Waiting for your
   approval**) or terminal (`/approvals`, then `/approve <n> [note]` or `/reject <n> <why>`).
   The answer is signed with their key. Approvers only need to be allowlisted; they need no
