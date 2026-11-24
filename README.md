@@ -1129,7 +1129,7 @@ review @alice:app verify=test Check the change:
   itself while it works, with the `run_check` tool its worker gives it (MCP server
   `proofkin-checks`). The tool runs one in the task's workspace, as the runtime will
   (outside the model's sandbox, with your rights), and
-  says whether it passed, with the end of its output: at most 10 runs a task, each up to 10
+  says whether it passed, with the end of its output: at most 10 runs a task, each up to 20
   minutes. They help the model find a mistake before it finishes, instead of in a failed
   attempt; they aren't evidence. The runtime runs the checks again after the model, and
   only those runs count.
@@ -1191,7 +1191,7 @@ web UI lists runs under **Evidence runs** and opens each report with a fresh sig
 Checks run your folder's code (tests, builds) with **your** rights and without the OS
 sandbox, like a CI job on your machine. So only peers with `full` access to that folder may
 request them. Their environment has no inherited credential variables (`GH_TOKEN`,
-`ANTHROPIC_API_KEY`, ...). Each check may run for up to 15 minutes, and on a timeout or
+`ANTHROPIC_API_KEY`, ...). Each check may run for up to 30 minutes, and on a timeout or
 cancellation everything it started is killed.
 
 ### The lifecycle: from a fresh project to operations
