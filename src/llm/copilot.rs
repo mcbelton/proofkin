@@ -24,7 +24,9 @@ use crate::profile::{
     CopilotCredentials, DEFAULT_GITHUB_HOST, INHERITED_CREDENTIAL_VARS, github_login,
 };
 
-const TASK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// The longest one Copilot model run may take (a task with attempts left goes on in another
+/// attempt; a step's `timeout=` stops it sooner).
+const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Built-in Copilot CLI tools a session may use, per access level. Everything
 /// else (web_fetch, sub-agents, skills, MCP servers such as GitHub's) is not

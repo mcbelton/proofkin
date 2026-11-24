@@ -1636,11 +1636,12 @@ impl StepState {
     }
 
     /// The step's state from what `peer` sent back. Evidence that isn't signed by
-    /// `peer`, or missing evidence for requested checks, fails the step.
+    /// `peer`, or a result that says it succeeded without the evidence its requested
+    /// checks or sign-off need, fails the step.
     pub(crate) fn from_delivered(peer: String, step: &Step, d: Delivered) -> Self {
         let problem = match &d.evidence {
             Some(_) if !d.verified => Some(format!("the evidence isn't validly signed by {peer}")),
-            None if !step.checks.is_empty() || step.approve => {
+            None if d.ok && (!step.checks.is_empty() || step.approve) => {
                 Some(format!("{peer} sent no evidence (an older version?)"))
             }
             _ => None,
@@ -6446,5 +6447,37 @@ mod tests {
         let found = errors("a #mixed context=hr do");
         assert_eq!(found.len(), 1, "any member the squad may pick: {found:?}");
         assert!(found[0].contains("wide may not receive"), "{}", found[0]);
+    }
+
+    #[test]
+    fn a_failed_step_says_what_its_peer_said_and_only_a_success_needs_its_record() {
+        let step = Plan::parse("a @w verify=test Build it")
+            .unwrap()
+            .steps
+            .remove(0);
+        let delivered = |ok| Delivered {
+            ok,
+            output: "Copilot task failed: timed out after 3600s".into(),
+            evidence: None,
+            patch: None,
+            verified: false,
+            refused: false,
+            model: None,
+        };
+        let StepState::Failed { error, .. } =
+            StepState::from_delivered("w".into(), &step, delivered(false))
+        else {
+            panic!("failed")
+        };
+        assert_eq!(error, "Copilot task failed: timed out after 3600s");
+        let StepState::Failed { error, .. } =
+            StepState::from_delivered("w".into(), &step, delivered(true))
+        else {
+            panic!("a success without the record its checks need")
+        };
+        assert!(
+            error.starts_with("w sent no evidence (an older version?)"),
+            "{error}"
+        );
     }
 }

@@ -423,6 +423,20 @@ pub fn retry_prompt(task: &str, checks: &[CheckResult]) -> String {
     crate::boundary::guard(&(prompt + "\n---\nThe task:\n" + task))
 }
 
+/// The prompt for another attempt after the model's last run on the task stopped before it
+/// finished (`why`: it ran out of time, or its provider failed): go on from the work it left.
+pub fn resume_prompt(task: &str, why: &str) -> String {
+    let prompt = format!(
+        "Your previous attempt at this task stopped before you finished:\n{}\nWhat it changed is \
+         still in your folder: check it, finish the task, then stop.\n",
+        crate::boundary::wrap("why the run stopped", why.trim())
+    );
+    let task = task
+        .strip_prefix(crate::boundary::DIRECTIVE)
+        .unwrap_or(task);
+    crate::boundary::guard(&(prompt + "\n---\nThe task:\n" + task))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

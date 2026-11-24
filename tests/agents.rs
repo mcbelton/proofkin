@@ -88,6 +88,18 @@ impl Executor for FakeExecutor {
 
 impl FakeExecutor {
     async fn answer(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
+        // Its run stops before it finishes (as one that runs out of time does) unless it was
+        // told its last run stopped: then it finds what that run changed, and finishes.
+        if task.prompt.ends_with("stops-once") {
+            if task.prompt.contains("stopped before you finished") {
+                let earlier =
+                    std::fs::read_to_string(ctx.workspace.join("started.txt")).unwrap_or_default();
+                std::fs::write(ctx.workspace.join("finished.txt"), "finished\n")?;
+                return Ok(format!("finished it; the last run had left {earlier:?}"));
+            }
+            std::fs::write(ctx.workspace.join("started.txt"), "started\n")?;
+            anyhow::bail!("Copilot task failed: timed out after 1200s");
+        }
         // Done again for the changes a sign-off asked for: it says whether its earlier work
         // is there, and writes down what it was asked.
         if let Some((_, asked)) = task.prompt.split_once("## Changes asked for\n\n") {
@@ -336,7 +348,8 @@ async fn next_matching(
     events: &mut UnboundedReceiver<Event>,
     pred: impl Fn(&Event) -> bool,
 ) -> Event {
-    timeout(Duration::from_secs(10), async {
+    // Generous: with the whole suite running, a step's git work waits for other tests'.
+    timeout(Duration::from_secs(30), async {
         loop {
             let event = events.recv().await.expect("event channel closed");
             if pred(&event) {
@@ -1999,6 +2012,85 @@ async fn a_task_in_a_linked_repository_starts_from_its_latest_commit() {
         "{}",
         kept.output
     );
+}
+
+#[tokio::test]
+async fn a_model_run_that_stops_is_a_failed_attempt_and_keeps_its_work() {
+    let repo = git_repo();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker
+        .shares
+        .add_with(
+            "app",
+            repo.path(),
+            Access::WorkspaceWrite,
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    worker.grant("boss", Access::WorkspaceWrite, &["app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let task = |attempts| {
+        LlmTask::new(Provider::Copilot, "Build it stops-once")
+            .in_share("app")
+            .with_checks(Vec::new(), Some(attempts))
+    };
+
+    // With an attempt left, the next one goes on from what the stopped run changed.
+    let mut seen = Vec::new();
+    let done = boss
+        .send_task(worker.id(), task(2), None)
+        .unwrap()
+        .finish(|p| seen.push(p.text))
+        .await
+        .unwrap();
+    assert!(
+        done.ok
+            && done.output.starts_with(
+                "The model's run stopped before it finished: Copilot task failed: timed out after 1200s\n\n\
+                 Attempt 2 of 2, after the model's run stopped\n\n\
+                 finished it; the last run had left \"started\\n\""
+            ),
+        "{}",
+        done.output
+    );
+    assert!(
+        seen.iter().any(|t| t
+            == "attempt 2 of 2: the model is working, going on from where its last run stopped"),
+        "{seen:?}"
+    );
+    let evidence = done.evidence.unwrap();
+    assert_eq!(evidence.attempts, 2);
+    assert_eq!(evidence.git.unwrap().files, ["finished.txt", "started.txt"]);
+
+    // When its last attempt's run stops, the task fails, and what it changed stays on the
+    // task's branch.
+    let failed = boss
+        .send_task(worker.id(), task(1), None)
+        .unwrap()
+        .finish(|_| {})
+        .await
+        .unwrap();
+    let (why, kept) = failed
+        .output
+        .split_once(" (what it changed is on branch ")
+        .unwrap_or_else(|| panic!("{}", failed.output));
+    assert!(!failed.ok);
+    assert_eq!(why, "Copilot task failed: timed out after 1200s");
+    let branch = kept.split_once(", commit ").unwrap().0;
+    assert!(branch.starts_with("p2p/boss/"), "{branch}");
+    let shown = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["show", &format!("{branch}:started.txt")])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), "started\n");
 }
 
 /// A call [`FakePulls`] answered: the folder, the ask as it came (with the sign-offs that

@@ -753,6 +753,7 @@ Every peer working for you says what it is doing, and the UI and CLI show it as 
   tasks at a time and queues the rest.
 - **Working**: "the model is working", "attempt 2 of 3: the model is working, told what
   failed (fmt)", "attempt 1 of 3: running check test (3 of 4); fmt failed, clippy passed",
+  "attempt 2 of 3: the model is working, going on from where its last run stopped",
   "committing the work". The attempt comes first when a task has more than one.
 - **Team**: a team step's lead reports each step of its team run (below), with the same
   status for each one, nested level by level.
@@ -1011,7 +1012,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | Step option | What it does |
 | --- | --- |
 | `verify=a,b` | After the model finishes, the **worker's runtime** (not the model) runs those checks in the task's folder. It records exit codes, durations and the end of their output. The step fails if any check fails. |
-| `attempts=N` | While checks fail, the model tries again (up to 5 times), each time given the failing output. |
+| `attempts=N` | While checks fail, the model tries again (up to 5 times), each time given the failing output. A model run that stops before it finishes (a Copilot run may take up to an hour) also uses up an attempt: the next one goes on from what it changed. |
 | `claims=ID,...` | The claims this step's evidence counts towards. Claims must be defined with a `claim:` line first. |
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
 | `base=RUN:STEP` | Starts from the commit step STEP of an earlier evidence run RUN made, merged or not: its patch, from the run's signed record (which must check out), is applied in this step's worktree first. The plan check says when the run, its step or its patch isn't there. Not with `apply=`; needs edit access in a `--worktrees` folder. A run's card has **Build on it…**, which starts such a plan. |
@@ -1080,6 +1081,14 @@ review @alice:app verify=test Check the change:
 - **Retries**: when a task took more than one attempt, its output is the first attempt's
   report, then, for each later attempt, a line "Attempt 2 of 3, after these checks failed:
   fmt, clippy" and that attempt's report.
+- **A model run that stops**: a Copilot model run may take up to an hour (Claude and Codex
+  runs have no limit of their own; a step's `timeout=` stops any sooner). A run that stops
+  before the model finishes (it runs out of time, or its provider fails) is a failed attempt:
+  with attempts left, the next one goes on in the same worktree, told why the last run
+  stopped, and the output says "The model's run stopped before it finished: …" then
+  "Attempt 2 of 3, after the model's run stopped". If it was the last attempt, the task fails
+  with that error, and what the model changed is committed to the task's branch first; the
+  error names the branch and commit.
 - **Checks while it works**: a step's model (Copilot or Claude) can run the step's checks
   itself while it works, with the `run_check` tool its worker gives it (MCP server
   `proofkin-checks`). The tool runs one in the task's workspace, as the runtime will, and

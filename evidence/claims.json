@@ -1460,6 +1460,15 @@
       ]
     },
     {
+      "id": "EDD-12",
+      "area": "evidence",
+      "claim": "A model run that stops before it finishes (it runs out of time, a Copilot run being allowed up to an hour, or its provider fails) is a failed attempt: with attempts left, the next one goes on in the same worktree, told why the last run stopped, its progress saying it goes on from where the last run stopped and the result listing the stopped attempt; when it was the last attempt, what the model changed is committed to the task's branch before the error goes back, naming the branch and commit. A step whose task failed shows its peer's error alone: only a result that says it succeeded without the record its checks or sign-off need is suspect.",
+      "tests": [
+        "agents::a_model_run_that_stops_is_a_failed_attempt_and_keeps_its_work",
+        "lib::plan::a_failed_step_says_what_its_peer_said_and_only_a_success_needs_its_record"
+      ]
+    },
+    {
       "id": "TRK-6",
       "area": "tracking",
       "claim": "With a tracker linked, Plan mode and the plan editor offer Track on GitHub beside Run plan: a new issue (with a sub-issue per step), an existing issue it works on (by number) or don't track, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's). The line under it says what running the plan does there before it runs: the repository and the board (links that open a new tab), the account the issues are assigned to, the new issue's title when the plan names one, and that anyone can read them when the repository is public (the tracker reads its visibility; tracker status says it too), or that nothing goes to GitHub. An existing issue is looked up as its number is typed (GET /api/tracker/issues/N): its title, with a warning when it is closed (running reopens it), doesn't exist (the plan would run untracked) or can't be looked up; Run plan and Schedule… ask for the number when it is missing instead of opening a new issue.",
