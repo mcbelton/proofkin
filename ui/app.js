@@ -1498,20 +1498,43 @@ async function downloadRun(id, button) {
 }
 
 /** The work of run `runId` a pull request can be opened from (`works`, see
- * GET /api/runs/ID): a button for each, or why it can't be now. */
+ * GET /api/runs/ID): a button for each, or why it can't be now, and one to go on from it. */
 function renderRunPulls(runId, works) {
   const box = $("#run-pulls");
   box.hidden = !works.length;
-  box.replaceChildren(...(works.length ? [el("h3", { text: "Open a pull request" })] : []),
+  box.replaceChildren(...(works.length ? [el("h3", { text: "Its work" })] : []),
     ...works.map((w) => el("div", { class: "run-pull" },
       el("button", {
         type: "button", class: "btn small", disabled: Boolean(w.why),
+        "aria-label": `Open a pull request of step ${w.step}'s work`,
         onclick: (e) => openPullDialog(runId, w, e.currentTarget),
-      }, `Open pull request of ${w.step}…`),
-      el("span", { class: "muted small" }, w.why
-        ? `${w.why}.`
-        : [`From branch `, el("span", { class: "mono", text: w.branch }), ` of ${w.peer}'s clone of `,
-          el("span", { class: "mono", text: w.folder }), w.approval ? `; ${w.peer} approves it first.` : "."]))));
+      }, "Open pull request…"),
+      el("button", {
+        type: "button", class: "btn small",
+        "aria-label": `Plan new work that starts from step ${w.step}'s work`,
+        title: "A plan whose step starts from this work, merged or not (base=)",
+        onclick: () => planFromWork(runId, w),
+      }, "Build on it…"),
+      el("span", { class: "muted small" }, `Step ${w.step}: branch `, el("span", { class: "mono", text: w.branch }),
+        ` of ${w.peer}'s clone of `, el("span", { class: "mono", text: w.folder }),
+        w.why ? `; no pull request now: ${w.why}.` : w.approval ? `; ${w.peer} approves a pull request first.` : "."))));
+}
+
+/** A plan whose step starts from the work of step `work.step` of run `runId` (base=),
+ * merged or not: you say what to do. */
+function planFromWork(runId, work) {
+  const todo = "What to do";
+  const line = `next @${work.peer}:${work.folder} base=${runId}:${work.step} ${todo}`;
+  $("#run-dialog").close();
+  document.querySelector('[data-mode="plan"]')?.click();
+  const input = $("#composer-input");
+  input.value = line;
+  state.playbook = null;
+  renderPlanExplain();
+  schedulePlanCheck();
+  input.focus();
+  input.setSelectionRange(line.length - todo.length, line.length);
+  toast(`A plan that starts from step ${work.step}'s work: say what to do next, then run it`);
 }
 
 // The run and its work the pull request dialog asks to open, and what opened it.

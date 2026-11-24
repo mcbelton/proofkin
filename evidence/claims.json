@@ -1431,6 +1431,16 @@
       ]
     },
     {
+      "id": "EDD-10",
+      "area": "evidence",
+      "claim": "A plan's step can start from an earlier evidence run's work, merged or not (base=RUN:STEP; only on steps a model does in a folder, not with apply=): the commit step STEP of run RUN made, read from the run's signed record, which must check out (signatures and the patch's signed hash), is applied in its worktree first. The plan check says when the run, the step or its work isn't there, the step fails saying so if it is gone by then, and the run's report says which run's work the step started from. A run's card offers Build on it, which starts such a plan.",
+      "tests": [
+        "agents::a_step_starts_from_an_earlier_runs_unmerged_commit",
+        "lib::plan::a_step_starts_from_an_earlier_runs_work_as_its_record_has_it",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
       "id": "TRK-6",
       "area": "tracking",
       "claim": "With a tracker linked, Plan mode and the plan editor offer Track on GitHub beside Run plan: a new issue (with a sub-issue per step), an existing issue it works on (by number) or don't track, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's). The line under it says what running the plan does there before it runs: the repository and the board (links that open a new tab), the account the issues are assigned to, the new issue's title when the plan names one, and that anyone can read them when the repository is public (the tracker reads its visibility; tracker status says it too), or that nothing goes to GitHub. An existing issue is looked up as its number is typed (GET /api/tracker/issues/N): its title, with a warning when it is closed (running reopens it), doesn't exist (the plan would run untracked) or can't be looked up; Run plan and Schedule… ask for the number when it is missing instead of opening a new issue.",

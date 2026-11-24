@@ -119,6 +119,13 @@ impl FakeExecutor {
             std::fs::write(path, "made by the model\n")?;
             return Ok(format!("wrote {file}"));
         }
+        // "show <file>": what the file in its workspace says.
+        if let Some(file) = own.strip_prefix("show ") {
+            return Ok(match std::fs::read_to_string(ctx.workspace.join(file)) {
+                Ok(text) => format!("{file} says: {text}"),
+                Err(_) => format!("{file} is missing"),
+            });
+        }
         // Fails its checks the first time; the retry (which gets the failures) fixes it.
         if task.prompt.ends_with("fix-on-retry") {
             if task.prompt.contains("did not pass the checks") {
@@ -2535,6 +2542,104 @@ async fn a_sign_off_asks_for_changes_and_the_work_is_done_again_from_where_it_wa
         matches!(&states["ok"], StepState::Done { output, .. } if output == "Approved by boss: Good now"),
         "{:?}",
         states["ok"]
+    );
+}
+
+#[tokio::test]
+async fn a_step_starts_from_an_earlier_runs_unmerged_commit() {
+    let repo = git_repo();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker
+        .shares
+        .add_with(
+            "app",
+            repo.path(),
+            Access::WorkspaceWrite,
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    worker.grant("boss", Access::WorkspaceWrite, &["app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let squads = SquadStore::default();
+
+    // A run whose work isn't merged: its commit is on a task branch only.
+    let text = "impl @worker:app create feature.txt";
+    let first = Plan::parse(text).unwrap();
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan(&boss, &squads, &first, |_, _| {}),
+    )
+    .await
+    .unwrap();
+    let runs = tempfile::tempdir().unwrap();
+    let mut record = RunRecord::new("boss", &boss.id().to_string(), text, &first, &states, 0);
+    record.id = "run-1".into();
+    record
+        .peer_ids
+        .insert("worker".into(), worker.id().to_string());
+    record.save(runs.path()).unwrap();
+    assert!(!repo.path().join("feature.txt").exists(), "it isn't merged");
+
+    // A new plan's step starts from it, and its report says so.
+    let recipients = proofkin::plan::Recipients {
+        runs_dir: Some(runs.path().to_path_buf()),
+        ..Default::default()
+    };
+    let ctx = RunContext {
+        recipients: recipients.clone(),
+        ..Default::default()
+    };
+    let text = "next @worker:app base=run-1:impl show feature.txt";
+    let next = Plan::parse(text).unwrap();
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan_with(&boss, &squads, &next, &ctx, |_, _| {}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&states["next"], StepState::Done { output, .. } if output.starts_with("feature.txt says: made by the model")),
+        "{:?}",
+        states["next"]
+    );
+    let report = RunRecord::new("boss", "id", text, &next, &states, 0).render_markdown();
+    assert!(
+        report.contains("- Started from the commit of step impl of evidence run run-1\n"),
+        "{report}"
+    );
+
+    // Work that isn't there fails the step, and the plan check says so first.
+    let missing = Plan::parse("next @worker:app base=run-1:nope show feature.txt").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let problems = proofkin::plan::preflight(
+        &missing,
+        &boss.peers(),
+        &squads,
+        &proofkin::knowledge::KnowledgeBase::new(dir.path().join("kb")),
+        &proofkin::skills::Skills::new(dir.path().join("skills")),
+        &recipients,
+    );
+    assert!(
+        problems.iter().any(|p| p.error
+            && p.message == "base=run-1:nope: evidence run run-1 has no step nope"),
+        "{problems:?}"
+    );
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan_with(&boss, &squads, &missing, &ctx, |_, _| {}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&states["next"], StepState::Failed { error, .. } if error == "base=run-1:nope: evidence run run-1 has no step nope"),
+        "{:?}",
+        states["next"]
     );
 }
 

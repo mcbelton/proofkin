@@ -11,18 +11,18 @@ const planText = (() => {
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
     ["context", "context"], ["claims", "claims"], ["claim", "claims"], ["workiq", "workiq"],
     ["reviewers", "reviewers"], ["reviewer", "reviewers"]]);
-  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue", "model", "effort", "changes"]);
+  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout", "issue", "model", "effort", "changes", "base"]);
   // A sign-off is a person's decision: no checks, retries, patches, saved result, agent, model, effort or search.
-  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq", "model", "effort"]);
+  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels", "workiq", "model", "effort", "base"]);
   // A team step is done and proven by the lead's team plan.
-  const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent", "model", "effort"]);
+  const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent", "model", "effort", "base"]);
   // A pull request step opens the pull request with the work before it: only a time limit, an
   // issue and who reviews it (an option only it has).
   const IN_PR = new Set(["timeout", "issue", "reviewers"]);
   // A @workiq step asks Microsoft 365 for an answer: context, never proof. Its agent= is a Work IQ
   // agent id; it has no skills, MCP servers, checks, claims, patches, folder, model or search of its own.
   const WORKIQ = "@workiq";
-  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq", "model", "effort"]);
+  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq", "model", "effort", "base"]);
   /// What a new step does until you say: selected, so typing replaces it (the plan
   /// check refuses to run it as is, see src/plan.rs).
   const TODO = "What to do";

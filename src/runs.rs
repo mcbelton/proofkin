@@ -372,6 +372,7 @@ impl RunRecord {
             pr: false,
             reviewers: None,
             changes: None,
+            base: None,
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims
@@ -618,6 +619,9 @@ impl RunRecord {
         }
         if let Some(apply) = &step.apply {
             md += &format!("- Applied the commit of step {apply}\n");
+        }
+        if let Some((run, from)) = step.base.as_deref().and_then(|b| b.split_once(':')) {
+            md += &format!("- Started from the commit of step {from} of evidence run {run}\n");
         }
         md += &format!("- Task: {}\n", step.prompt);
         if let Some(model) = s.state.model() {
