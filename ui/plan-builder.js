@@ -236,7 +236,7 @@ const planBuilder = (() => {
       : s.approve
       ? [field(`${k}-target`, "Who signs off", who, "Their answer is signed evidence"),
         field(`${k}-todo`, "What to check", todo, "The approver sees this and the results of the steps it waits for"),
-        provesField(s, k, true), waitsField(s, k)]
+        changesField(s, k), provesField(s, k, true), waitsField(s, k)]
       : [field(`${k}-target`, "Who does it", who, "A peer and one of the folders it shares with you, or any member of a squad"),
         field(`${k}-todo`, "What to do", todo),
         agentField(s, k),
@@ -244,6 +244,17 @@ const planBuilder = (() => {
         waitsField(s, k), moreOptions(s, k)];
     return el("li", { class: `pb-step${s.approve ? " signoff" : ""}${s.team ? " team" : ""}${s.pr ? " pr" : ""}`, "data-card": k }, head, ...body,
       el("div", { class: "pb-marks", "data-marks": k }));
+  }
+
+  /// How often a sign-off's approver may ask for changes (changes=; default 2): the steps
+  /// it waits for are done again with their note, then they are asked again.
+  function changesField(s, k) {
+    const rounds = el("select", {}, ...[[0, "Never: they approve or reject"], [1, "Once"], [2, "Up to twice"],
+      [3, "Up to 3 times"], [4, "Up to 4 times"], [5, "Up to 5 times"]].map(([n, text]) => el("option", { value: String(n), text })));
+    rounds.value = planText.valuesOf(s, "changes")[0] ?? "2";
+    rounds.addEventListener("change", () => { planText.setValues(s, "changes", rounds.value === "2" ? null : rounds.value); changed(); });
+    return field(`${k}-changes`, "May ask for changes", rounds,
+      "The steps it waits for are done again with the approver's note, from their earlier work; then they are asked again");
   }
 
   /// Who a pull request step asks to review it (reviewers=): without any, those who
@@ -537,8 +548,9 @@ const planBuilder = (() => {
     s.approve = kind === "signoff";
     s.team = kind === "team";
     s.pr = kind === "pr";
-    // Only a pull request step asks for reviews.
+    // Only a pull request step asks for reviews, and only a sign-off for changes.
     if (kind !== "pr") planText.setValues(s, "reviewers", null);
+    if (kind !== "signoff") planText.setValues(s, "changes", null);
     if (kind === "pr") {
       // Opened from the work before it: only a time limit, an issue and its reviewers.
       s.target = null;

@@ -1420,6 +1420,17 @@
       ]
     },
     {
+      "id": "EDD-9",
+      "area": "evidence",
+      "claim": "A sign-off's approver can ask for changes instead of approving or rejecting (web UI Ask for changes, terminal /changes N WHAT, POST /api/approvals/ID with changes and a note; signed as not approved, saying so) while the sign-off allows another round (changes=N on it, 0 to 5, default 2; only sign-offs take it): the steps a model did that it waits for directly are done again, each from its own earlier commit with the note, their cards saying so, then the sign-off asks again with the new results and the note it answered. A request that doesn't offer it refuses it, and asking for changes needs a note.",
+      "tests": [
+        "agents::a_sign_off_asks_for_changes_and_the_work_is_done_again_from_where_it_was",
+        "lib::plan::sign_offs_say_how_often_their_approver_may_ask_for_changes",
+        "ui::ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
       "id": "TRK-6",
       "area": "tracking",
       "claim": "With a tracker linked, Plan mode and the plan editor offer Track on GitHub beside Run plan: a new issue (with a sub-issue per step), an existing issue it works on (by number) or don't track, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's). The line under it says what running the plan does there before it runs: the repository and the board (links that open a new tab), the account the issues are assigned to, the new issue's title when the plan names one, and that anyone can read them when the repository is public (the tracker reads its visibility; tracker status says it too), or that nothing goes to GitHub. An existing issue is looked up as its number is typed (GET /api/tracker/issues/N): its title, with a warning when it is closed (running reopens it), doesn't exist (the plan would run untracked) or can't be looked up; Run plan and Schedule… ask for the number when it is missing instead of opening a new issue.",

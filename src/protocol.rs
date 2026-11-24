@@ -104,6 +104,10 @@ pub enum Message {
         /// The same for a UX prototype only, by path under `prototype/` (v0.5.0 peers).
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         prototype: std::collections::BTreeMap<String, String>,
+        /// The approver may also ask for changes: the work is done again with their note,
+        /// then they are asked again (older approvers only approve or reject).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        changes: bool,
     },
     /// The requester no longer wants the result of `task_id`; the worker stops it.
     TaskCancel {

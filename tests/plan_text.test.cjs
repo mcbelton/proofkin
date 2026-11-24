@@ -200,6 +200,11 @@ cases.push(
   ["only a pull request step asks for reviews", part("build @alice:app Build| it", "reviewers=me"), `error: ${ERRORS.reviewersOption}`],
   ["reviewers typed on another step", needs(planText.parsePlan("build @alice:app reviewers=me Build it")),
     `step0.target: ${ERRORS.reviewersOption}`],
+  ["a sign-off says how often changes may be asked for", part("ok after build approve @me Ship| it?", "changes=1"),
+    "ok after build approve @me changes=1 Ship it?[]"],
+  ["only a sign-off takes changes=", part("build @alice:app Build| it", "changes=1"), `error: ${ERRORS.changesOption}`],
+  ["changes= typed on another step", needs(planText.parsePlan("build @alice:app changes=1 Build it")),
+    `step0.target: ${ERRORS.changesOption}`],
   // model= names the model a step runs on; a sign-off, team step or @workiq step has none.
   ["a step's model", part("a @x Do| it", "model=gpt-5.5"), "a @x model=gpt-5.5 Do it[]"],
   ["a step's model replaces its model", part("a @x model=gpt-5.5 Do| it", "model=claude-sonnet-5.5"), "a @x model=claude-sonnet-5.5 Do it[]"],

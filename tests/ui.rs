@@ -2638,7 +2638,71 @@ async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
     )
     .await;
     assert_eq!(page.body, "<h1>Proto</h1>");
-    waiting.abort();
+    // This request can only be approved or rejected; asking for changes is refused.
+    let answer = |id: &Value, body: &'static str| {
+        let (host, token, path) = (
+            host.clone(),
+            token.to_owned(),
+            format!("/api/approvals/{id}"),
+        );
+        async move { request(port, "POST", &path, &host, Some(&token), Some(body)).await }
+    };
+    let refused = answer(
+        &approval["id"],
+        r#"{"approved":false,"changes":true,"note":"Bigger"}"#,
+    )
+    .await;
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(refused.body.contains("can only be approved or rejected"));
+    assert_eq!(
+        answer(&approval["id"], r#"{"approved":true}"#).await.status,
+        200
+    );
+    assert!(waiting.await.unwrap().unwrap().ok);
+
+    // One that offers it: asking for changes needs a note, and is signed as not approved.
+    let asker = agent.clone();
+    let waiting = tokio::spawn(async move {
+        let ask = proofkin::agent::ApprovalAsk {
+            title: "Plan step ok".into(),
+            text: "Ship it?".into(),
+            changes: true,
+            ..Default::default()
+        };
+        let id = asker.new_task_id();
+        asker.request_approval_as(None, id, &ask).await
+    });
+    let approval = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            if let Some(a) = state["approvals"].as_array().and_then(|a| a.first()) {
+                return a.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(approval["changes"], true);
+    let bare = answer(&approval["id"], r#"{"approved":false,"changes":true}"#).await;
+    assert_eq!(bare.status, 400);
+    assert!(bare.body.contains("say what to change"), "{}", bare.body);
+    let asked = answer(
+        &approval["id"],
+        r#"{"approved":false,"changes":true,"note":"Make it bigger"}"#,
+    )
+    .await;
+    assert_eq!(asked.status, 200, "{}", asked.body);
+    let answered = waiting.await.unwrap().unwrap();
+    assert!(!answered.ok && answered.verified);
+    assert!(
+        answered.output.ends_with(" Make it bigger")
+            && answered.output.starts_with(proofkin::agent::CHANGES_ASKED),
+        "{}",
+        answered.output
+    );
     agent.shutdown().await;
 }
 

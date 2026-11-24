@@ -559,7 +559,7 @@ In terminal 2, once `+ worker` appears:
 | `/squads` | List your squads and which members are online |
 | `/runs` | List saved evidence runs ([EDD with agents](#evidence-driven-development-with-agents)) |
 | `/approvals` | Show approval requests waiting for you |
-| `/approve <n> [note]`, `/reject <n> <why>` | Answer approval request `n` (signed with your key) |
+| `/approve <n> [note]`, `/reject <n> <why>`, `/changes <n> <what>` | Answer approval request `n` (signed with your key); `/changes` asks for changes, where the request offers it |
 | `/tasks` | List your running tasks with their numbers |
 | `/cancel <n>` | Cancel your running task `n`; the peer stops the model run and frees the slot |
 | `/peers` | List connected peers and the providers they serve |
@@ -1020,7 +1020,8 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `effort=level` | The reasoning effort its model works at: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (default: the peer's default; a model that supports fewer takes the nearest below, see [Models](#models)). The peer refuses an effort its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it. Not on sign-offs, team steps or `@workiq` steps. |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
-| `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
+| `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results, or asks for changes: the steps it waits for are done again with their note, then they are asked again. |
+| `changes=N` | On a sign-off: how many times its approver may ask for changes (0 to 5, default 2). |
 | `team @lead:folder`, `levels=N` | Instead of a model, the lead's team does it, with the folder's team plan ([team steps](#team-steps-handing-work-down-a-level)). `levels=` (1 to 3, default 1) is how many levels down it may go. |
 | `pr @peer:folder` | Instead of a model, the folder's agent opens the pull request with the work of the steps before it there, then waits until it is merged ([pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan)). Takes only `timeout=`, `issue=` and `reviewers=`. |
 | `reviewers=me,carol,octocat` | On a `pr` step: who is asked to review the pull request, by GitHub account (`me`, a peer on your allowlist, or a GitHub login; `none` asks no one). Without it, those who signed off before it are asked. |
@@ -1082,6 +1083,15 @@ review @alice:app verify=test Check the change:
   approval**) or terminal (`/approvals`, then `/approve <n> [note]` or `/reject <n> <why>`).
   The answer is signed with their key. Approvers only need to be allowlisted; they need no
   providers and no delegation rights.
+- **Asking for changes**: an approver can also answer **Ask for changes** (terminal:
+  `/changes <n> <what>`) with what to change. The steps a model did that the sign-off waits
+  for directly are then done again: each starts from its own earlier work (its commit,
+  applied in its new worktree) and gets the note, and its card says it is done again. Then
+  the sign-off asks again, showing the new results and the note it answered. A sign-off
+  allows 2 rounds of changes unless it says otherwise (`changes=N`, 0 to 5; `changes=0`:
+  approve or reject only); once they are used, the approver can only approve or reject. A
+  pull request step after the sign-off opens the reworked branch. Approvers on agents
+  older than 0.25 only approve or reject.
 
 **4. Every run is saved with a verdict per claim.**
 
@@ -1873,7 +1883,8 @@ proofkin --name me --providers copilot --serve --ui
   **takes no steps**. A squad whose members all take none isn't saved.
   Digital workers show their owner and role in the peer list.
 - **Waiting for your approval**: approval requests from plans (yours or teammates'), with
-  what you're approving and Approve / Reject (a rejection needs a reason).
+  what you're approving and Approve / Reject (a rejection needs a reason), and **Ask for
+  changes** where the sign-off allows another round (it needs a note saying what to change).
 - **Evidence runs**: every plan run, and every task kept as evidence, with what it was
   about and its verdict. Open one to read its report (claims, checks, commits, signatures)
   and a fresh signature check, or **Download** its `run.json` for anyone to verify

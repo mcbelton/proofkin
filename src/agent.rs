@@ -248,6 +248,35 @@ pub struct ApprovalInfo {
     /// [`Agent::approval_preview`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<&'static str>,
+    /// It may also be answered by asking for changes (see [`Answer::Changes`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub changes: bool,
+}
+
+/// How a person answers an approval request (see [`Agent::answer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Approve,
+    Reject,
+    /// Not yet: the work is done again with their note, then they are asked again. Only
+    /// for a request that offers it ([`ApprovalInfo::changes`]).
+    Changes,
+}
+
+/// How the signed answer to an approval request that asks for changes starts; the
+/// approver's name and note follow (see [`Agent::answer`]).
+pub const CHANGES_ASKED: &str = "Changes asked for by ";
+
+/// An approval request: what the approver sees, and how they may answer it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApprovalAsk {
+    pub title: String,
+    pub text: String,
+    /// What they can look at before answering, by path in the project: the UX prototype,
+    /// review decks and design documents (see [`crate::preview`]).
+    pub preview: BTreeMap<String, String>,
+    /// They may also ask for changes (see [`Answer::Changes`]).
+    pub changes: bool,
 }
 
 struct IncomingApproval {
@@ -1060,23 +1089,25 @@ impl Agent {
         preview: BTreeMap<String, String>,
     ) -> Result<Delivered> {
         let task_id = self.inner.new_task_id();
-        self.request_approval_as(peer, task_id, title, text, preview)
-            .await
+        let ask = ApprovalAsk {
+            title: title.to_owned(),
+            text: text.to_owned(),
+            preview,
+            changes: false,
+        };
+        self.request_approval_as(peer, task_id, &ask).await
     }
 
-    /// [`Agent::request_approval_with`] as request `task_id` (see [`Agent::new_task_id`]):
-    /// a plan run keeps it, to wait for the same request again after a restart (the
-    /// approver keeps one request per id, so it isn't asked twice).
+    /// Asks for approval `ask` as request `task_id` (see [`Agent::new_task_id`]): a plan
+    /// run keeps it, to wait for the same request again after a restart (the approver
+    /// keeps one request per id, so it isn't asked twice).
     pub async fn request_approval_as(
         &self,
         peer: Option<EndpointId>,
         task_id: u64,
-        title: &str,
-        text: &str,
-        preview: BTreeMap<String, String>,
+        ask: &ApprovalAsk,
     ) -> Result<Delivered> {
-        self.ask_approval(peer, task_id, title, text, preview, false)
-            .await
+        self.ask_approval(peer, task_id, ask, false).await
     }
 
     /// Waits again for approval request `task_id`, which a plan run of this agent sent
@@ -1087,20 +1118,16 @@ impl Agent {
         &self,
         peer: Option<EndpointId>,
         task_id: u64,
-        title: &str,
-        text: &str,
+        ask: &ApprovalAsk,
     ) -> Result<Delivered> {
-        self.ask_approval(peer, task_id, title, text, BTreeMap::new(), true)
-            .await
+        self.ask_approval(peer, task_id, ask, true).await
     }
 
     async fn ask_approval(
         &self,
         peer: Option<EndpointId>,
         task_id: u64,
-        title: &str,
-        text: &str,
-        preview: BTreeMap<String, String>,
+        ask: &ApprovalAsk,
         rejoin: bool,
     ) -> Result<Delivered> {
         self.inner.reserve_task_id(task_id);
@@ -1109,10 +1136,11 @@ impl Agent {
         let target = peer.unwrap_or(me);
         let request = (target != me).then(|| Message::ApprovalRequest {
             task_id,
-            title: title.to_owned(),
-            text: text.to_owned(),
-            preview: preview.clone(),
+            title: ask.title.clone(),
+            text: ask.text.clone(),
+            preview: ask.preview.clone(),
             prototype: BTreeMap::new(),
+            changes: ask.changes,
         });
         self.inner.pending.lock().unwrap().insert(
             task_id,
@@ -1125,7 +1153,7 @@ impl Agent {
         );
         if target == me {
             self.inner
-                .add_approval(me, self.inner.name.clone(), task_id, title, text, preview);
+                .add_approval(me, self.inner.name.clone(), task_id, ask.clone());
         } else {
             let sent = self
                 .inner
@@ -1228,6 +1256,34 @@ impl Agent {
 
     /// Approves or rejects request `id`; the answer is signed with this agent's key.
     pub async fn answer_approval(&self, id: u64, approved: bool, note: &str) -> Result<()> {
+        let answer = if approved {
+            Answer::Approve
+        } else {
+            Answer::Reject
+        };
+        self.answer(id, answer, note).await
+    }
+
+    /// Answers approval request `id` (see [`Answer`]); the answer is signed with this
+    /// agent's key. Asking for changes needs a note saying what to change, and a request
+    /// that offers it.
+    pub async fn answer(&self, id: u64, answer: Answer, note: &str) -> Result<()> {
+        let note = note.trim();
+        if answer == Answer::Changes {
+            let offered = self
+                .inner
+                .approvals
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|a| a.info.changes);
+            match offered {
+                None => bail!("there is no open approval request {id}"),
+                Some(false) => bail!("request {id} can only be approved or rejected"),
+                Some(true) if note.is_empty() => bail!("say what to change"),
+                Some(true) => {}
+            }
+        }
         let request = self
             .inner
             .approvals
@@ -1236,10 +1292,14 @@ impl Agent {
             .remove(&id)
             .ok_or_else(|| anyhow!("there is no open approval request {id}"))?;
         let _ = self.inner.events.send(Event::ApprovalClosed { id });
-        let note = note.trim();
+        let approved = answer == Answer::Approve;
         let output = format!(
-            "{} by {}{}",
-            if approved { "Approved" } else { "Rejected" },
+            "{}{}{}",
+            match answer {
+                Answer::Approve => "Approved by ",
+                Answer::Reject => "Rejected by ",
+                Answer::Changes => CHANGES_ASKED,
+            },
             self.inner.name,
             if note.is_empty() {
                 String::new()
@@ -1691,18 +1751,22 @@ impl Inner {
         }
     }
 
-    /// Queues an approval request for this agent's user; false if `requester` has
-    /// too many open requests. A preview over the limits, or of files that aren't
+    /// Queues approval request `ask` for this agent's user; false if `requester` has too
+    /// many open requests. A preview over the limits, or of files that aren't
     /// previewable, is left out.
     fn add_approval(
         &self,
         requester: EndpointId,
         from: String,
         task_id: u64,
-        title: &str,
-        text: &str,
-        preview: BTreeMap<String, String>,
+        ask: ApprovalAsk,
     ) -> bool {
+        let ApprovalAsk {
+            title,
+            text,
+            preview,
+            changes,
+        } = ask;
         let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
         let size: usize = preview.iter().map(|(k, v)| k.len() + v.len()).sum();
         let preview: crate::preview::Sources =
@@ -1741,6 +1805,7 @@ impl Inner {
                         title: title.chars().take(200).collect(),
                         text: text.chars().take(20_000).collect(),
                         preview: crate::preview::label(&preview),
+                        changes,
                     },
                     requester,
                     task_id,
@@ -2076,7 +2141,12 @@ impl Inner {
                 progress: None,
             },
         );
-        self.add_approval(me, self.name.clone(), task_id, title, text, BTreeMap::new());
+        let ask = ApprovalAsk {
+            title: title.to_owned(),
+            text: text.to_owned(),
+            ..ApprovalAsk::default()
+        };
+        self.add_approval(me, self.name.clone(), task_id, ask);
         let mut guard = CancelOnDrop {
             inner: self.clone(),
             peer: me,
@@ -3014,6 +3084,7 @@ async fn run_connection(
                     text,
                     mut preview,
                     prototype,
+                    changes,
                 } => {
                     if preview.is_empty() {
                         preview = prototype
@@ -3023,7 +3094,13 @@ async fn run_connection(
                             })
                             .collect();
                     }
-                    if !inner.add_approval(peer_id, name.clone(), task_id, &title, &text, preview) {
+                    let ask = ApprovalAsk {
+                        title,
+                        text,
+                        preview,
+                        changes,
+                    };
+                    if !inner.add_approval(peer_id, name.clone(), task_id, ask) {
                         let msg = Message::TaskResult {
                             task_id,
                             ok: false,
