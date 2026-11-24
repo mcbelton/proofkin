@@ -126,6 +126,34 @@ impl FakeExecutor {
                 Err(_) => format!("{file} is missing"),
             });
         }
+        // Runs the step's check "test" through the tool its worker gave it, as a model
+        // would: it starts the MCP server it was given and calls the tool.
+        if own == "use the checks tool" {
+            let Some(server) = ctx.mcp.get(proofkin::checks_mcp::SERVER) else {
+                return Ok("no checks tool".into());
+            };
+            let mut child = tokio::process::Command::new(server.command.as_deref().unwrap())
+                .args(&server.args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let call = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": proofkin::checks_mcp::TOOL, "arguments": { "name": "test" } } });
+            {
+                use tokio::io::AsyncWriteExt;
+                let mut stdin = child.stdin.take().unwrap();
+                stdin.write_all(format!("{call}\n").as_bytes()).await?;
+            }
+            let out = child.wait_with_output().await?;
+            let line = String::from_utf8_lossy(&out.stdout);
+            let reply: serde_json::Value =
+                serde_json::from_str(line.lines().next().unwrap_or("{}"))?;
+            return Ok(reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("no answer")
+                .to_owned());
+        }
         // Fails its checks the first time; the retry (which gets the failures) fixes it.
         if task.prompt.ends_with("fix-on-retry") {
             if task.prompt.contains("did not pass the checks") {
@@ -236,6 +264,8 @@ impl Node {
         config.task_grace = self.grace;
         config.team = self.team;
         config.pulls = self.pulls;
+        // The real program serves a task's checks to its model.
+        config.task_checks = Some(env!("CARGO_BIN_EXE_proofkin").into());
         config.worktrees_dir = std::env::temp_dir()
             .join("p2p-test-worktrees")
             .join(format!("{}-{}", self.name, self.key.public().fmt_short()));
@@ -2640,6 +2670,70 @@ async fn a_step_starts_from_an_earlier_runs_unmerged_commit() {
         "{:?}",
         states["next"]
     );
+}
+
+#[tokio::test]
+async fn a_tasks_model_runs_its_checks_while_it_works() {
+    let repo = git_repo();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot, Provider::Codex]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker
+        .shares
+        .add_with(
+            "app",
+            repo.path(),
+            Access::Full,
+            [("test".to_owned(), "echo checked here".to_owned())].into(),
+            true,
+        )
+        .unwrap();
+    worker.grant("boss", Access::Full, &["app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    // Asked for the folder's check, its model gets a tool that runs it in its workspace;
+    // the runtime still runs it after the model, and only that run is evidence.
+    let task = |provider| {
+        LlmTask::new(provider, "use the checks tool")
+            .in_share("app")
+            .with_checks(vec!["test".into()], None)
+    };
+    let done = boss
+        .delegate_verified(worker.id(), task(Provider::Copilot))
+        .await
+        .unwrap();
+    assert!(done.ok && done.verified, "{}", done.output);
+    assert!(
+        done.output.starts_with("check test passed (exit code 0, ")
+            && done.output.contains("; 9 of 10 runs left\n\nchecked here"),
+        "{}",
+        done.output
+    );
+    let evidence = done.evidence.unwrap();
+    assert_eq!(evidence.checks.len(), 1);
+    assert!(evidence.checks[0].passed);
+    // Codex takes no MCP servers: its model works without the tool.
+    let codex = boss
+        .delegate_verified(worker.id(), task(Provider::Codex))
+        .await
+        .unwrap();
+    assert!(
+        codex.output.starts_with("no checks tool"),
+        "{}",
+        codex.output
+    );
+    // Without checks, there is nothing to run.
+    let plain = boss
+        .delegate(
+            worker.id(),
+            LlmTask::new(Provider::Copilot, "use the checks tool").in_share("app"),
+        )
+        .await
+        .unwrap();
+    assert!(plain.starts_with("no checks tool"), "{plain}");
 }
 
 #[tokio::test]

@@ -73,6 +73,9 @@ pub struct AgentConfig {
     /// Opens and follows the pull requests of peers' pull request steps, in folders whose
     /// owner allows them (none: it refuses them; see [`crate::pulls`]).
     pub pulls: Option<Arc<dyn crate::pulls::PullRequests>>,
+    /// The program that serves a task's checks to its model while it works (this program;
+    /// see [`crate::checks_mcp`]). None: the model gets no such tool.
+    pub task_checks: Option<PathBuf>,
     /// How long tasks wait for a dropped peer to come back (see [`TASK_GRACE`]).
     pub task_grace: Duration,
     /// Where the next id for the tasks it gives peers is kept, so ids go on after a
@@ -98,6 +101,7 @@ impl AgentConfig {
             worktrees_dir: std::env::temp_dir().join("proofkin-worktrees"),
             team: None,
             pulls: None,
+            task_checks: None,
             task_grace: TASK_GRACE,
             task_ids: None,
         }
@@ -512,6 +516,7 @@ struct Inner {
     last_progress: Mutex<HashMap<(EndpointId, u64), Progress>>,
     team: Option<Arc<crate::team::TeamRunner>>,
     pulls: Option<Arc<dyn crate::pulls::PullRequests>>,
+    task_checks: Option<PathBuf>,
     task_grace: Duration,
     /// When peers that dropped were last seen, until they come back or are given up.
     left: Mutex<HashMap<EndpointId, Instant>>,
@@ -575,6 +580,7 @@ impl Agent {
             last_progress: Mutex::new(HashMap::new()),
             team: config.team,
             pulls: config.pulls,
+            task_checks: config.task_checks,
             task_grace: config.task_grace,
             left: Mutex::new(HashMap::new()),
         });
@@ -2640,6 +2646,21 @@ impl Inner {
                 }
             })
             .collect();
+        // The model may run those checks itself while it works; they run again after it,
+        // and only those runs count (see crate::checks_mcp).
+        let commands: Vec<(String, String)> = checks
+            .iter()
+            .filter_map(|(name, command)| command.map(|c| ((*name).clone(), c.clone())))
+            .collect();
+        if let Some(program) = &self.task_checks
+            && !commands.is_empty()
+            && task.provider != Provider::Codex
+        {
+            ctx.mcp.insert(
+                crate::checks_mcp::SERVER.to_owned(),
+                crate::checks_mcp::server(program, &ctx.workspace, &commands),
+            );
+        }
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();
         // The model it asked for (allowed: checked when it was admitted), else the
