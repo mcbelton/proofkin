@@ -21,8 +21,9 @@ use crate::profile::INHERITED_CREDENTIAL_VARS;
 
 /// Most model attempts a task may ask for (each failed check run starts another).
 pub const MAX_ATTEMPTS: u32 = 5;
-/// How long one check may run.
-pub const CHECK_TIMEOUT: Duration = Duration::from_secs(900);
+/// How long one check may run: long enough for a whole test suite on a slow machine; it only
+/// stops a check that hangs.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Characters of a check's output kept (its end, where failures are reported).
 const OUTPUT_TAIL: usize = 4_000;
 const DOMAIN: &[u8] = b"p2pagents-evidence-v1\n";

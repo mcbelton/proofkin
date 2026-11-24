@@ -1472,7 +1472,7 @@
     {
       "id": "EDD-11",
       "area": "evidence",
-      "claim": "A task that asks for its folder's checks gives its model (Copilot or Claude; not Codex, which takes no MCP servers) a run_check tool: the worker starts proofkin task-checks as the task's MCP server proofkin-checks, which runs one of the step's checks in the task's workspace, outside the model's sandbox as the runtime does, and answers whether it passed, with its exit code, time and the end of its output (secrets redacted), at most 10 runs a task, each up to 10 minutes. A check the step doesn't name is refused, and so is an 11th run. The runtime still runs the checks after the model, and only those runs are evidence.",
+      "claim": "A task that asks for its folder's checks gives its model (Copilot or Claude; not Codex, which takes no MCP servers) a run_check tool: the worker starts proofkin task-checks as the task's MCP server proofkin-checks, which runs one of the step's checks in the task's workspace, outside the model's sandbox as the runtime does, and answers whether it passed, with its exit code, time and the end of its output (secrets redacted), at most 10 runs a task, each up to 20 minutes. A check the step doesn't name is refused, and so is an 11th run. The runtime still runs the checks after the model, and only those runs are evidence.",
       "tests": [
         "agents::a_tasks_model_runs_its_checks_while_it_works",
         "lib::checks_mcp::the_model_runs_the_steps_checks_while_it_works_a_few_times",

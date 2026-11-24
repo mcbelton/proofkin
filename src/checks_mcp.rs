@@ -21,8 +21,8 @@ pub const SERVER: &str = "proofkin-checks";
 pub const TOOL: &str = "run_check";
 /// The most times a task's model may run checks.
 pub const MAX_RUNS: u32 = 10;
-/// The longest one run may take.
-pub const RUN_TIMEOUT: Duration = Duration::from_secs(600);
+/// The longest one run may take: long enough for a whole test suite.
+pub const RUN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// The MCP versions it speaks, newest first.
 const VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
