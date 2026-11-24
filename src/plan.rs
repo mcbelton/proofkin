@@ -3757,6 +3757,12 @@ pub async fn run_plan_with(
                     task.model = step.model.clone();
                     task.effort = step.effort.clone();
                     task.title = Some(crate::llm::title_of(step.own_text()));
+                    // A step working on an issue commits with the issue's title.
+                    task.subject = ctx
+                        .issue_texts
+                        .get(&step.id)
+                        .and_then(|text| crate::tracker::issue_title(text))
+                        .map(crate::llm::title_of);
                     task.issues = ctx.issues.get(&step.id).cloned().unwrap_or_default();
                     if let Some(share) = &step.share {
                         task = task.in_share(share.clone());

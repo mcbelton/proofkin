@@ -2924,9 +2924,10 @@ impl Inner {
                     let mut why = format!("{e:#}");
                     // What the model changed stays on the task's branch, to look at or go on from.
                     if let Some(wt) = &worktree {
+                        let (subject, own) = commit_subject(task);
                         let message = format!(
-                            "{} (unfinished)\n\nTask {task_id} from {from}: the model's run stopped before it finished. Kept by {} with Proofkin.",
-                            commit_subject(task),
+                            "{subject} (unfinished)\n\n{}Task {task_id} from {from}: the model's run stopped before it finished. Kept by {} with Proofkin.",
+                            own.map(|o| format!("{o}\n\n")).unwrap_or_default(),
                             self.name
                         );
                         if let Ok((record, _)) = wt.commit(&message).await
@@ -3035,9 +3036,13 @@ impl Inner {
                 task_id,
                 Progress::new(Phase::Committing, "committing the work"),
             );
-            let subject = commit_subject(task);
-            let mut message = format!(
-                "{subject}\n\nTask {task_id} from {from}, done by {} with Proofkin.",
+            let (subject, own) = commit_subject(task);
+            let mut message = subject;
+            if let Some(own) = own {
+                message += &format!("\n\n{own}");
+            }
+            message += &format!(
+                "\n\nTask {task_id} from {from}, done by {} with Proofkin.",
                 self.name
             );
             // The issues it is for (checked: they come from the peer), as trailers a
@@ -3099,14 +3104,26 @@ impl Inner {
     }
 }
 
-/// The subject of the commit of `task`'s work: its title, else its first line's.
-fn commit_subject(task: &LlmTask) -> String {
+/// The subject of the commit of `task`'s work, and the line under it, if any: the title of
+/// the issue it works on with its own title under it, else its own title (else its first
+/// line's).
+fn commit_subject(task: &LlmTask) -> (String, Option<String>) {
     let first = task.prompt.lines().next().unwrap_or_default();
-    task.title
+    let own = task
+        .title
         .as_deref()
         .map(crate::llm::title_of)
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| crate::llm::title_of(first))
+        .unwrap_or_else(|| crate::llm::title_of(first));
+    match task
+        .subject
+        .as_deref()
+        .map(crate::llm::title_of)
+        .filter(|s| !s.is_empty() && *s != own)
+    {
+        Some(subject) => (subject, Some(own).filter(|o| !o.is_empty())),
+        None => (own, None),
+    }
 }
 
 /// A peer's models as its hello says, kept only as far as they make sense: well-formed

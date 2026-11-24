@@ -1065,7 +1065,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `reviewers=me,carol,octocat` | On a `pr` step: who is asked to review the pull request, by GitHub account (`me`, a peer on your allowlist, or a GitHub login; `none` asks no one). Without it, those who signed off before it are asked. |
 | `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
 | `workiq=all` / `workiq=email,files` | Searches your Microsoft 365 (Work IQ) for the step's own words when the step is sent, and puts what it finds in the prompt before `Your task:`. `all` searches everything; a list names sources: `email`, `meetings`, `files`, `teams`, `people`, `connectors`. Not on sign-offs. See [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq). |
-| `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue, and its task gets the issue's title and body in front of it (as external content, secrets redacted, cut at 20,000 characters, saying how much was left out), so the plan needn't repeat them. |
+| `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue, and its task gets the issue's title and body in front of it (as external content, secrets redacted, cut at 20,000 characters, saying how much was left out), so the plan needn't repeat them. Its commit is titled with the issue's title. |
 
 A step line is `name [after steps] [team|pr] @peer[:folder] or #squad [options] what to do`: options
 go before the task text (the plan check warns about one typed after it, but not text in
@@ -1108,6 +1108,8 @@ review @alice:app verify=test Check the change:
   tasks never collide. Review or merge the branch (`git log p2p/boss/...`) when you're
   happy. Removed worktrees keep their branch. The commit's subject is the task's title (the
   first line of its own words, at most 100 characters), followed by who asked and who did it.
+  A plan step that works on an issue (`issue=#N`) is committed with the issue's title as the
+  subject instead, its own title under it.
   The task's report names the files the commit has (the first 20, then how many more).
   New files of build and tool caches the model made while trying things stay out of it
   (`__pycache__/`, `*.pyc`, `node_modules/`, `.pytest_cache/`, `.venv/`, a top-level

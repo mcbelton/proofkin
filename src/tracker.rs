@@ -1867,6 +1867,14 @@ fn issue_text(repo: &str, issue: &Issue) -> String {
     }
 }
 
+/// The title of the issue in `text`, as [`issue_text`] wrote it (`owner/repo#N Title` on
+/// its first line), if it has one.
+pub fn issue_title(text: &str) -> Option<&str> {
+    let (reference, title) = text.lines().next()?.split_once(' ')?;
+    let title = title.trim();
+    (valid_ref(reference) && !title.is_empty()).then_some(title)
+}
+
 /// The marker in a step issue's body, so a later run on the same issue finds it.
 fn step_marker(step: &str) -> String {
     format!("<!-- proofkin:step={step} -->")
@@ -4391,5 +4399,35 @@ mod tests {
             cut,
             "19 more characters; the whole issue is https://github.com/acme/app/issues/160]"
         );
+    }
+
+    #[test]
+    fn an_issue_steps_title_is_read_back_from_its_text() {
+        let issue = Issue {
+            id: "I_13".into(),
+            number: 13,
+            title: " Add the orders API ".into(),
+            url: "https://github.com/acme/app/issues/13".into(),
+            open: true,
+            body: "GET /orders".into(),
+            parent: None,
+            item: None,
+            status: None,
+            subs: Vec::new(),
+            summary: (0, 0),
+        };
+        assert_eq!(
+            issue_title(&issue_text("acme/app", &issue)),
+            Some("Add the orders API")
+        );
+        for other in [
+            "",
+            "Add the orders API",
+            "#13 Add it",
+            "acme/app#13 ",
+            "acme/app#x Add it",
+        ] {
+            assert_eq!(issue_title(other), None, "{other:?}");
+        }
     }
 }

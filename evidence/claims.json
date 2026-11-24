@@ -1046,7 +1046,7 @@
     {
       "id": "TRK-3",
       "area": "tracking",
-      "claim": "A tracked step's task carries its issue and those of the steps whose work it applies. The worker's commit references them in Refs: trailers (only well-formed owner/repo#N references, since they come from a peer), its task branch lists them, and a pull request opened from the branch (repo pr or the web UI) closes them, so GitHub links the pull request to the issues and closes them when it merges.",
+      "claim": "A tracked step's task carries its issue and those of the steps whose work it applies. The worker's commit references them in Refs: trailers (only well-formed owner/repo#N references, since they come from a peer, as is the subject a step that works on an issue asks for, of which only the first line is used), its task branch lists them, and a pull request opened from the branch (repo pr or the web UI) closes them, so GitHub links the pull request to the issues and closes them when it merges.",
       "tests": [
         "agents::a_task_with_skills_commits_with_its_title_as_the_subject",
         "lib::tracker::a_tracked_run_has_an_issue_with_a_sub_issue_per_step_and_the_board_follows_it",
@@ -1544,11 +1544,12 @@
     {
       "id": "TRK-7",
       "area": "tracking",
-      "claim": "A step that names an issue (issue=#N) on a tracked run gets the issue's title and body, as its tracker has them, in front of its task as external content (Proofkin's own markers left out, secrets redacted, cut at 20,000 characters saying how much was left out and where the whole issue is; after the earlier steps' results), so the plan needn't repeat them and the model needn't look them up; a sign-off shows them to the person. Steps that name no issue get none.",
+      "claim": "A step that names an issue (issue=#N) on a tracked run gets the issue's title and body, as its tracker has them, in front of its task as external content (Proofkin's own markers left out, secrets redacted, cut at 20,000 characters saying how much was left out and where the whole issue is; after the earlier steps' results), so the plan needn't repeat them and the model needn't look them up; a sign-off shows them to the person. Its commit is titled with the issue's title, the step's own first line under it. Steps that name no issue get none.",
       "tests": [
         "lib::tracker::a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do",
         "lib::plan::a_step_working_on_an_issue_gets_its_text_as_external_content",
         "agents::a_step_gets_the_text_of_the_issue_it_works_on",
+        "lib::tracker::an_issue_steps_title_is_read_back_from_its_text",
         "lib::tracker::a_long_issue_comes_whole_and_one_past_the_limit_says_what_was_cut"
       ]
     },
