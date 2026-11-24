@@ -1029,7 +1029,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `reviewers=me,carol,octocat` | On a `pr` step: who is asked to review the pull request, by GitHub account (`me`, a peer on your allowlist, or a GitHub login; `none` asks no one). Without it, those who signed off before it are asked. |
 | `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
 | `workiq=all` / `workiq=email,files` | Searches your Microsoft 365 (Work IQ) for the step's own words when the step is sent, and puts what it finds in the prompt before `Your task:`. `all` searches everything; a list names sources: `email`, `meetings`, `files`, `teams`, `people`, `connectors`. Not on sign-offs. See [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq). |
-| `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue, and its task gets the issue's title and body in front of it (as external content, secrets redacted, cut at 4,000 characters), so the plan needn't repeat them. |
+| `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue, and its task gets the issue's title and body in front of it (as external content, secrets redacted, cut at 20,000 characters, saying how much was left out), so the plan needn't repeat them. |
 
 A step line is `name [after steps] [team|pr] @peer[:folder] or #squad [options] what to do`: options
 go before the task text (the plan check warns about one typed after it, but not text in
@@ -1091,7 +1091,8 @@ review @alice:app verify=test Check the change:
   error names the branch and commit.
 - **Checks while it works**: a step's model (Copilot or Claude) can run the step's checks
   itself while it works, with the `run_check` tool its worker gives it (MCP server
-  `proofkin-checks`). The tool runs one in the task's workspace, as the runtime will, and
+  `proofkin-checks`). The tool runs one in the task's workspace, as the runtime will
+  (outside the model's sandbox, with your rights), and
   says whether it passed, with the end of its output: at most 10 runs a task, each up to 10
   minutes. They help the model find a mistake before it finishes, instead of in a failed
   attempt; they aren't evidence. The runtime runs the checks again after the model, and
@@ -2251,6 +2252,10 @@ Claude's sandbox runtime (on Windows a separate low-rights user) for Claude:
 - **Fails closed**: if a host has no sandbox, Copilot tasks drop the shell tool (printed
   as `copilot: no OS sandbox on this host`) and Claude tasks fail rather than run
   unsandboxed. Run `copilot update` so Proofkin can check sandbox support at startup.
+- **Only the model's commands**: the MCP servers a task may use (its folder owner's, and
+  the one that runs its checks while it works) run outside the sandbox, with your rights,
+  as the checks after the model do; so a check that builds into a folder outside the
+  workspace (a shared `CARGO_TARGET_DIR`, say) works while the model works too.
 
 On top of the sandbox, commands that name a URL, a path outside the workspace, the home
 folder (`~`, `$HOME`, `$env:USERPROFILE`, `%APPDATA%`, ...) or a credential file are refused

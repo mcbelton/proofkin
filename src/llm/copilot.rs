@@ -85,6 +85,9 @@ impl SandboxSupport {
 /// Linux Bubblewrap or macOS Seatbelt. Commands may write only in the workspace
 /// (plus temp and tool caches), have no network, can't ask to run outside it, and
 /// (where the backend enforces it) can't read the home folder's credential stores.
+/// The MCP servers a task may use (its folder owner's, and the one that runs the
+/// task's checks) run outside it, with the owner's rights, as at the other access
+/// levels and as the checks after the model do.
 pub(crate) fn sandbox_config(deny_secrets: bool) -> SandboxConfig {
     let mut policy = json!({
         "network": { "allowOutbound": false, "allowLocalNetwork": false },
@@ -96,6 +99,7 @@ pub(crate) fn sandbox_config(deny_secrets: bool) -> SandboxConfig {
         "enabled": true,
         "allowBypass": false,
         "addCurrentWorkingDirectory": true,
+        "sandboxMcpServers": false,
         "userPolicy": policy,
     }))
     .expect("valid sandbox config")
@@ -1212,6 +1216,10 @@ mod tests {
         let config = serde_json::to_value(sandbox_config(true)).unwrap();
         assert_eq!(config["enabled"], true);
         assert_eq!(config["allowBypass"], false);
+        assert_eq!(
+            config["sandboxMcpServers"], false,
+            "MCP servers (the owner's, and the task's checks) run with the owner's rights"
+        );
         assert_eq!(config["userPolicy"]["network"]["allowOutbound"], false);
         assert_eq!(config["userPolicy"]["network"]["allowLocalNetwork"], false);
         assert!(config["userPolicy"]["filesystem"]["deniedPaths"].is_array());
