@@ -11,7 +11,7 @@ use proofkin::audit::{AuditLog, Outcome};
 use proofkin::mcp::McpServer;
 use proofkin::plan::{Plan, RunContext, SquadStore, StepState, run_plan, run_plan_with};
 use proofkin::protocol::Phase;
-use proofkin::pulls::{Opened, PullRequestAsk, PullRequests};
+use proofkin::pulls::{Opened, PullRequestAsk, PullRequests, Review};
 use proofkin::runs::{RunRecord, Verdict};
 use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
 use proofkin::{
@@ -203,6 +203,7 @@ impl Node {
             access: Access::ReadOnly,
             shares: vec![DATA_SHARE.to_owned()],
             m365: None,
+            github: None,
         });
     }
 
@@ -1855,6 +1856,8 @@ struct FakePulls {
     opened: Mutex<Vec<(String, String)>>,
     /// Each one's state, by number.
     states: Mutex<std::collections::BTreeMap<u64, String>>,
+    /// The reviewers asked for: the pull request's number and the logins.
+    reviews: Mutex<Vec<(u64, Vec<String>)>>,
 }
 
 #[async_trait]
@@ -1896,6 +1899,18 @@ impl PullRequests for FakePulls {
 
     async fn state(&self, _share: &str, number: u64) -> anyhow::Result<String> {
         Ok(self.states.lock().unwrap()[&number].clone())
+    }
+
+    async fn request_reviews(&self, _share: &str, number: u64, logins: &[String]) -> Vec<Review> {
+        self.reviews.lock().unwrap().push((number, logins.to_vec()));
+        // As GitHub does, it can't ask an account that isn't the repository's collaborator.
+        logins
+            .iter()
+            .map(|l| match l.as_str() {
+                "stranger" => Review::not_asked(l, "not a collaborator of acme/app"),
+                _ => Review::asked(l),
+            })
+            .collect()
     }
 
     fn poll(&self) -> Duration {
@@ -1947,13 +1962,10 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     eve.connect(worker.addr()).await.unwrap();
     wait_for_peers(&boss, 1).await;
     wait_for_peers(&eve, 1).await;
-    let plan = Plan::parse(
-        "impl @worker:app create feature.txt\n\
+    let steps = "impl @worker:app create feature.txt\n\
          check after impl @worker:app apply=impl Check the feature\n\
-         ok after check approve @me Ship it?\n\
-         ship after ok pr @worker:app",
-    )
-    .unwrap();
+         ok after check approve @me Ship it?\n";
+    let plan = Plan::parse(&format!("{steps}ship after ok pr @worker:app")).unwrap();
     let squads = SquadStore::default();
     // You sign off on each run's work as it comes.
     let signer = {
@@ -1987,7 +1999,8 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     assert!(pulls.calls.lock().unwrap().is_empty());
 
     // Allowed: it opens the pull request from check's branch (it has impl's work too),
-    // named after the work, and waits until it is merged.
+    // named after the work, asks the reviewers the step names (you are boss-gh on GitHub)
+    // and waits until it is merged.
     worker.set_shares(allowed);
     timeout(Duration::from_secs(10), async {
         while !boss.peers()[0].shares.iter().any(|s| s.pull_requests) {
@@ -2001,15 +2014,24 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         tokio::spawn(async move { pulls.when_opened(1, "MERGED").await })
     };
     let said = Arc::new(Mutex::new(Vec::<String>::new()));
-    let ctx = RunContext {
-        run_id: Some("run-2".into()),
+    let recipients = proofkin::plan::Recipients {
+        github: Some("boss-gh".into()),
         ..Default::default()
     };
+    let ctx = RunContext {
+        run_id: Some("run-2".into()),
+        recipients: recipients.clone(),
+        ..Default::default()
+    };
+    let named = Plan::parse(&format!(
+        "{steps}ship after ok pr @worker:app reviewers=me,carol-gh,stranger"
+    ))
+    .unwrap();
     let states = {
         let said = said.clone();
         timeout(
             Duration::from_secs(60),
-            run_plan_with(&boss, &squads, &plan, &ctx, move |id, state| {
+            run_plan_with(&boss, &squads, &named, &ctx, move |id, state| {
                 if let (
                     "ship",
                     StepState::Running {
@@ -2056,6 +2078,7 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
             .collect::<Vec<_>>(),
         [("ok", "Approved by boss: Looks good", "boss")]
     );
+    assert_eq!(ask.reviewers, ["boss-gh", "carol-gh", "stranger"]);
     let shown = std::process::Command::new("git")
         .arg("-C")
         .arg(repo.path())
@@ -2076,7 +2099,10 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
             assert!(
                 output.starts_with(
                     "Pull request #1 was merged: https://github.com/acme/app/pull/1\n"
-                ) && output.contains("with its signed proof and 1 sign-off."),
+                ) && output.contains("with its signed proof and 1 sign-off.")
+                    && output.ends_with(
+                        " Asked to review: boss-gh, carol-gh. Not asked to review: stranger (not a collaborator of acme/app)."
+                    ),
                 "{output}"
             );
             assert!(
@@ -2086,22 +2112,27 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         }
         other => panic!("{other:?}"),
     }
+    let said = said.lock().unwrap().clone();
     assert!(
-        said.lock()
-            .unwrap()
-            .iter()
-            .any(|t| t.contains("pull request #1 is open: waiting for it to be merged")),
+        said.iter().any(|t| t.contains(
+            "pull request #1 is open, with a review asked of boss-gh, carol-gh: waiting for it to be merged"
+        )),
         "{said:?}"
     );
 
-    // A pull request closed without being merged fails the step.
+    // A pull request closed without being merged fails the step. Naming no one, it asks
+    // those who signed off: you.
     let close = {
         let pulls = pulls.clone();
         tokio::spawn(async move { pulls.when_opened(2, "CLOSED").await })
     };
+    let ctx = RunContext {
+        recipients,
+        ..Default::default()
+    };
     let states = timeout(
         Duration::from_secs(60),
-        run_plan(&boss, &squads, &plan, |_, _| {}),
+        run_plan_with(&boss, &squads, &plan, &ctx, |_, _| {}),
     )
     .await
     .unwrap();
@@ -2110,6 +2141,16 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         matches!(&states["ship"], StepState::Failed { error, .. } if error.contains("#2 was closed without being merged: https://github.com/acme/app/pull/2")),
         "{:?}",
         states["ship"]
+    );
+    assert_eq!(
+        *pulls.reviews.lock().unwrap(),
+        [
+            (
+                1,
+                vec!["boss-gh".into(), "carol-gh".into(), "stranger".into()]
+            ),
+            (2, vec!["boss-gh".to_owned()])
+        ]
     );
 
     // Only the peer the work was done for opens it, and only as it was done.
@@ -2158,6 +2199,8 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     let call = pulls.calls.lock().unwrap().last().unwrap().1.clone();
     assert_eq!(call.signoffs, [signed]);
     assert_eq!(pulls.opened.lock().unwrap().len(), 2);
+    // An earlier try opened it: its reviewers aren't asked again.
+    assert_eq!(pulls.reviews.lock().unwrap().len(), 2);
     signer.abort();
 }
 
@@ -2473,6 +2516,7 @@ async fn a_step_with_microsoft_365_content_is_checked_again_when_its_task_is_sen
         access: Access::ReadOnly,
         shares: vec![DATA_SHARE.to_owned()],
         m365: grant(&["General"]),
+        github: None,
     });
     let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
     let expected = Recipients::new(boss.trusted(), Vec::new())

@@ -1292,9 +1292,35 @@ agent's own --access.")]
         /// Also let this peer's tasks use this agent's Work IQ (read only).
         #[arg(long, requires = "m365")]
         m365_tools: bool,
+        /// The peer's GitHub account (its login): pull request steps ask it to review
+        /// when it signed off on the work, or is named in `reviewers=`. Without it, an
+        /// account already set is kept.
+        #[arg(long, value_name = "LOGIN", conflicts_with = "no_github")]
+        github: Option<String>,
+        /// Forget the peer's GitHub account.
+        #[arg(long)]
+        no_github: bool,
     },
     /// List allowlisted peers.
     List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Set (or forget, with --off) an allowlisted peer's GitHub account: pull request
+    /// steps ask it to review when it signed off on the work, or is named in reviewers=.
+    #[command(after_help = "\
+examples:
+  proofkin peers github carol octocat --profile boss
+  proofkin peers github carol --off --profile boss")]
+    Github {
+        /// Peer name or endpoint id.
+        peer: String,
+        /// The peer's GitHub login.
+        #[arg(required_unless_present = "off", conflicts_with = "off")]
+        login: Option<String>,
+        /// Forget the peer's GitHub account.
+        #[arg(long)]
+        off: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -4070,11 +4096,23 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             share,
             m365,
             m365_tools,
+            github,
+            no_github,
         } => {
             let profile = Profile::open(&profile.name)?;
             let grant = m365
                 .as_deref()
                 .map(|spec| proofkin::M365Grant::parse(spec, m365_tools))
+                .transpose()?;
+            let github = github
+                .map(|login| {
+                    let login = login.trim().trim_start_matches('@').to_owned();
+                    if proofkin::github::login_ok(&login) {
+                        Ok(login)
+                    } else {
+                        Err(anyhow::anyhow!("{login:?} isn't a GitHub login"))
+                    }
+                })
                 .transpose()?;
             let ticket = Ticket::parse(&target)?;
             let name = name
@@ -4101,6 +4139,15 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 .as_ref()
                 .map(|g| format!("; Microsoft 365 {}", g.describe()))
                 .unwrap_or_default();
+            let github = match github {
+                Some(login) => Some(login),
+                None if no_github => None,
+                None => trust.github_of(&ticket.addr.id, &name),
+            };
+            let github_note = github
+                .as_deref()
+                .map(|g| format!("; GitHub account {g}"))
+                .unwrap_or_default();
             trust.allow(TrustedPeer {
                 name: name.clone(),
                 id: ticket.addr.id,
@@ -4110,6 +4157,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 access,
                 shares: share.clone(),
                 m365,
+                github,
             });
             trust.save(&profile.trust_path())?;
             let rights = if delegate {
@@ -4121,7 +4169,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 "chat only, may not delegate".into()
             };
             println!(
-                "profile '{}': allowed {name} ({}), {rights}{m365_note}",
+                "profile '{}': allowed {name} ({}), {rights}{m365_note}{github_note}",
                 profile.name,
                 ticket.addr.id.fmt_short()
             );
@@ -4147,8 +4195,51 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                     Some(g) => format!("; Microsoft 365 {}", g.describe()),
                     None => String::new(),
                 };
-                println!("  {:<16} {}  {rights}{m365}", p.name, p.id);
+                let github = match &p.github {
+                    Some(g) => format!("; GitHub {g}"),
+                    None => String::new(),
+                };
+                println!("  {:<16} {}  {rights}{m365}{github}", p.name, p.id);
             }
+        }
+        PeersCommand::Github {
+            peer,
+            login,
+            off: _,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let account = login
+                .map(|login| {
+                    let login = login.trim().trim_start_matches('@').to_owned();
+                    if proofkin::github::login_ok(&login) {
+                        Ok(login)
+                    } else {
+                        Err(anyhow::anyhow!("{login:?} isn't a GitHub login"))
+                    }
+                })
+                .transpose()?;
+            let mut trust = profile.trust()?;
+            let Some(entry) = trust
+                .peers
+                .iter_mut()
+                .find(|p| p.name == peer || p.id.to_string() == peer)
+            else {
+                bail!("no allowlisted peer {peer} in profile '{}'", profile.name);
+            };
+            entry.github = account.clone();
+            let name = entry.name.clone();
+            trust.save(&profile.trust_path())?;
+            match account {
+                Some(login) => println!(
+                    "profile '{}': {name}'s GitHub account is {login}",
+                    profile.name
+                ),
+                None => println!("profile '{}': forgot {name}'s GitHub account", profile.name),
+            }
+            println!(
+                "A running agent uses it once it restarts (the web UI's Change… sets it at once)."
+            );
         }
         PeersCommand::Remove { peer, profile } => {
             let profile = Profile::open(&profile.name)?;

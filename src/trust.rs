@@ -43,6 +43,10 @@ pub struct TrustedPeer {
     /// What this peer may have of this agent's Microsoft 365 data. Absent: nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m365: Option<M365Grant>,
+    /// The peer's GitHub account, as this agent's owner knows it: pull request steps ask it
+    /// to review (see [`crate::pulls`]). Absent: not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<String>,
 }
 
 /// A peer's grant to Microsoft 365 (Work IQ) content.
@@ -138,11 +142,21 @@ impl TrustStore {
     /// The grant of the entry that `allow` would replace (same id or name), so re-allowing a
     /// peer without mentioning Microsoft 365 keeps it.
     pub fn m365_of(&self, id: &EndpointId, name: &str) -> Option<M365Grant> {
+        self.replaced(id, name).and_then(|p| p.m365.clone())
+    }
+
+    /// The GitHub account of the entry that `allow` would replace, so re-allowing a peer
+    /// without naming one keeps it.
+    pub fn github_of(&self, id: &EndpointId, name: &str) -> Option<String> {
+        self.replaced(id, name).and_then(|p| p.github.clone())
+    }
+
+    /// The entry `allow` would replace: the one with id `id`, else the one named `name`.
+    fn replaced(&self, id: &EndpointId, name: &str) -> Option<&TrustedPeer> {
         self.peers
             .iter()
             .find(|p| &p.id == id)
             .or_else(|| self.get_by_name(name))
-            .and_then(|p| p.m365.clone())
     }
 
     /// Who work context may go to when it is sent to `id`: `Local` for the owner's own
@@ -227,6 +241,7 @@ mod tests {
             access: Access::ReadOnly,
             shares: default_shares(),
             m365: None,
+            github: None,
         }
     }
 
@@ -256,6 +271,7 @@ mod tests {
         let mut store = TrustStore::default();
         let bob = TrustedPeer {
             m365: Some(grant.clone()),
+            github: None,
             ..peer("bob")
         };
         store.allow(bob.clone());
@@ -283,6 +299,7 @@ mod tests {
         let grant = M365Grant::parse("Public", false).unwrap();
         let bob = TrustedPeer {
             m365: grant.clone(),
+            github: None,
             ..peer("bob")
         };
         let mut store = TrustStore::default();
@@ -300,6 +317,7 @@ mod tests {
         assert_eq!(store.get(&bob.id).unwrap().m365, grant);
         store.allow(TrustedPeer {
             m365: None,
+            github: None,
             ..bob.clone()
         });
         assert_eq!(store.get(&bob.id).unwrap().m365, None);

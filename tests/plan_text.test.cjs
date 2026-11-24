@@ -195,6 +195,11 @@ cases.push(
   ["no checks on a pull request step", part("ship pr @alice:app Add| it", "verify=test"), `error: ${ERRORS.prOption}`],
   ["no squad opens a pull request", part("ship pr |", "#devs:app"), `error: ${ERRORS.prTarget}`],
   ["a pull request step's issue", part("ship pr @alice:app Add| it", "issue=#7"), "ship pr @alice:app issue=#7 Add it[]"],
+  ["a pull request step's reviewers add up", part("ship pr @alice:app reviewers=me Add| it", "reviewers=carol,me"),
+    "ship pr @alice:app reviewers=me,carol Add it[]"],
+  ["only a pull request step asks for reviews", part("build @alice:app Build| it", "reviewers=me"), `error: ${ERRORS.reviewersOption}`],
+  ["reviewers typed on another step", needs(planText.parsePlan("build @alice:app reviewers=me Build it")),
+    `step0.target: ${ERRORS.reviewersOption}`],
   // model= names the model a step runs on; a sign-off, team step or @workiq step has none.
   ["a step's model", part("a @x Do| it", "model=gpt-5.5"), "a @x model=gpt-5.5 Do it[]"],
   ["a step's model replaces its model", part("a @x model=gpt-5.5 Do| it", "model=claude-sonnet-5.5"), "a @x model=claude-sonnet-5.5 Do it[]"],

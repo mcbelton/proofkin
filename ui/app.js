@@ -395,7 +395,10 @@ function renderPeers() {
             ? [el("span", { class: "badge ok", title: "The access its tasks get here, and how many it may run an hour", text: `Tasks: ${ACCESS_SHORT[t.access] ?? "Read only"} · ${t.tasks_per_hour}/h` }),
               // The folders as text: in the pill they wrap into a blob in a narrow column.
               el("span", { class: "trust-shares", text: `in ${(t.shares ?? []).join(", ") || "no folder"}` })]
-            : el("span", { class: "badge neutral", title: "It can connect and chat, but can't run tasks on this agent's accounts", text: "Chat only" }))),
+            : el("span", { class: "badge neutral", title: "It can connect and chat, but can't run tasks on this agent's accounts", text: "Chat only" }),
+          t.github
+            ? el("span", { class: "trust-github", title: "Its GitHub account: pull request steps ask it to review", text: `GitHub ${t.github}` })
+            : null)),
       el("div", { class: "row-actions" },
         el("button", {
           type: "button", class: "btn small", "aria-label": `Change what ${t.name} may do`,
@@ -3256,6 +3259,7 @@ function openGrantDialog(peer, opener) {
   $("#add-delegate").checked = !!peer.can_delegate;
   $("#add-rate").value = peer.tasks_per_hour ?? 20;
   $("#add-access").value = peer.can_delegate ? peer.access ?? "read-only" : "read-only";
+  $("#add-github").value = peer.github ?? "";
   syncDelegateFields();
   $("#add-error").textContent = "";
   $("#add-dialog").showModal();
@@ -3272,10 +3276,12 @@ async function submitAdd(e) {
     access: delegate ? $("#add-access").value : "read-only",
     shares: delegate ? [...document.querySelectorAll("#add-shares input:checked")].map((i) => i.value) : null,
   };
+  // Empty forgets a peer's account when changing it; adding a peer again keeps the one it had.
+  const github = $("#add-github").value.trim().replace(/^@/, "");
   if (grantPeer) {
     const peer = grantPeer;
     try {
-      await api(`/api/trust/${encodeURIComponent(peer.id)}`, { method: "PUT", body: JSON.stringify(grant) });
+      await api(`/api/trust/${encodeURIComponent(peer.id)}`, { method: "PUT", body: JSON.stringify({ ...grant, github }) });
       $("#add-dialog").close();
       toast(`Saved what ${peer.name} may do`);
     } catch (err) {
@@ -3292,7 +3298,7 @@ async function submitAdd(e) {
   try {
     const res = await api("/api/trust", {
       method: "POST",
-      body: JSON.stringify({ ticket, name: $("#add-name").value.trim() || null, ...grant }),
+      body: JSON.stringify({ ticket, name: $("#add-name").value.trim() || null, github: github || null, ...grant }),
     });
     $("#add-dialog").close();
     toast(`${res.name} added to the allowlist`);

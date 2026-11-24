@@ -745,6 +745,18 @@ impl Profile {
         }
     }
 
+    /// The login of [`Profile::github`]'s account, without fetching its token. `None`:
+    /// the profile isn't signed in to GitHub.
+    pub fn github_user(&self) -> Option<String> {
+        if self.config.owner.is_some() {
+            return self.account_profile().ok()?.github_user();
+        }
+        self.config
+            .github
+            .as_ref()
+            .map(|GithubAuth::Gh { user, .. }| user.clone())
+    }
+
     /// Where per-task git worktrees are created: outside the profiles folder (like
     /// the data folder), since providers deny tasks access to profiles.
     pub fn worktrees_dir(&self) -> PathBuf {

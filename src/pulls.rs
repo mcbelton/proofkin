@@ -1,7 +1,8 @@
 //! Pull request steps: `pr @peer:folder` in a plan (see [`crate::plan`]). The agent that
 //! holds a linked repository's clone opens the pull request from the branch the steps
 //! before it committed to, with the commit's signed proof, the plan's sign-offs before it
-//! and the issues the work is for, and follows it until it is merged or closed. Its owner
+//! and the issues the work is for, asks its reviewers (those who signed off, or those the
+//! step names) to review it, and follows it until it is merged or closed. Its owner
 //! allows this per folder (`proofkin share pull-requests`): the branch is pushed and the
 //! pull request opened with the owner's GitHub account, and only from a task branch whose
 //! signed record this agent made for the peer that asks.
@@ -37,6 +38,84 @@ pub struct PullRequestAsk {
     /// lists those that check out (see [`SignOff::checks_out`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signoffs: Vec<SignOff>,
+    /// The GitHub accounts asked to review it when it is opened (see
+    /// [`crate::plan::Step::reviewers`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<String>,
+}
+
+/// A reviewer a pull request step asked for, and whether GitHub was asked to request its
+/// review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    pub login: String,
+    /// Why its review wasn't requested (none: it was).
+    pub not_asked: Option<String>,
+}
+
+impl Review {
+    pub fn asked(login: &str) -> Self {
+        Self {
+            login: login.to_owned(),
+            not_asked: None,
+        }
+    }
+
+    pub fn not_asked(login: &str, why: impl Into<String>) -> Self {
+        Self {
+            login: login.to_owned(),
+            not_asked: Some(why.into()),
+        }
+    }
+}
+
+/// The reviewers of `ask` that can be asked (GitHub logins, each once, at most
+/// [`crate::plan::MAX_REVIEWERS`]), and the others with why they aren't.
+pub fn reviewers_to_ask(ask: &PullRequestAsk) -> (Vec<String>, Vec<Review>) {
+    let (mut ok, mut not): (Vec<String>, Vec<Review>) = (Vec::new(), Vec::new());
+    for login in &ask.reviewers {
+        if ok.iter().any(|l| l.eq_ignore_ascii_case(login)) {
+            continue;
+        }
+        let clean: String = login.chars().filter(|c| !c.is_control()).take(40).collect();
+        if !crate::github::login_ok(login) {
+            not.push(Review::not_asked(&clean, "not a GitHub login"));
+        } else if ok.len() == crate::plan::MAX_REVIEWERS {
+            not.push(Review::not_asked(
+                &clean,
+                format!("more than {} reviewers", crate::plan::MAX_REVIEWERS),
+            ));
+        } else {
+            ok.push(login.clone());
+        }
+    }
+    (ok, not)
+}
+
+/// What a pull request step's output says about its reviewers: who was asked to review,
+/// and who wasn't and why. Logins go without `@`, so quoting it mentions no one.
+pub fn reviews_text(reviews: &[Review]) -> String {
+    let asked: Vec<&str> = reviews
+        .iter()
+        .filter(|r| r.not_asked.is_none())
+        .map(|r| r.login.as_str())
+        .collect();
+    let not: Vec<String> = reviews
+        .iter()
+        .filter_map(|r| {
+            r.not_asked
+                .as_ref()
+                .map(|why| format!("{} ({why})", r.login))
+        })
+        .collect();
+    let mut text = String::new();
+    if !asked.is_empty() {
+        text += &format!(" Asked to review: {}.", asked.join(", "));
+    }
+    if !not.is_empty() {
+        text += &format!(" Not asked to review: {}.", not.join("; "));
+    }
+    text
 }
 
 /// A sign-off of the plan (an approval step it comes after), as its approver signed it.
@@ -94,6 +173,12 @@ pub trait PullRequests: Send + Sync {
     /// Where pull request `number` of folder `share`'s repository is: `OPEN`, `MERGED` or
     /// `CLOSED`.
     async fn state(&self, share: &str, number: u64) -> Result<String>;
+
+    /// Asks GitHub accounts `logins` to review pull request `number` of folder `share`'s
+    /// repository (one it just opened), one at a time, since GitHub refuses the whole
+    /// request for one it can't ask. Its own account, the pull request's author, isn't
+    /// asked.
+    async fn request_reviews(&self, share: &str, number: u64, logins: &[String]) -> Vec<Review>;
 
     /// How long to wait before asking again about an open pull request.
     fn poll(&self) -> Duration {
@@ -330,6 +415,28 @@ impl PullRequests for ProfilePulls {
                     })
             })
     }
+
+    async fn request_reviews(&self, share: &str, number: u64, logins: &[String]) -> Vec<Review> {
+        let (repo, creds) = match self.linked(share) {
+            Ok(linked) => linked,
+            Err(e) => {
+                let why = format!("{e:#}");
+                return logins.iter().map(|l| Review::not_asked(l, &why)).collect();
+            }
+        };
+        let mut reviews = Vec::new();
+        for login in logins {
+            reviews.push(if login.eq_ignore_ascii_case(&creds.user) {
+                Review::not_asked(login, "the pull request's author")
+            } else {
+                match creds.request_reviewer(&repo, number, login).await {
+                    Ok(()) => Review::asked(login),
+                    Err(e) => Review::not_asked(login, format!("{e:#}")),
+                }
+            });
+        }
+        reviews
+    }
 }
 
 /// The newest pull request from `ask.branch` whose head is `ask.commit`, if there is one:
@@ -392,6 +499,47 @@ mod tests {
         ] {
             assert!(!task_branch_ok(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn reviewers_are_asked_once_each_and_the_output_says_who_was_not() {
+        let ask = PullRequestAsk {
+            branch: "p2p/boss/1".into(),
+            commit: "c".into(),
+            title: "t".into(),
+            signoffs: Vec::new(),
+            reviewers: ["carol", "Carol", "bad login", "-x", "dave"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        let (ok, not) = reviewers_to_ask(&ask);
+        assert_eq!(ok, ["carol", "dave"]);
+        assert_eq!(
+            not,
+            [
+                Review::not_asked("bad login", "not a GitHub login"),
+                Review::not_asked("-x", "not a GitHub login")
+            ]
+        );
+        let many = PullRequestAsk {
+            reviewers: (0..12).map(|n| format!("r{n}")).collect(),
+            ..ask
+        };
+        let (ok, not) = reviewers_to_ask(&many);
+        assert_eq!((ok.len(), not.len()), (10, 2));
+        assert_eq!(not[0], Review::not_asked("r10", "more than 10 reviewers"));
+
+        assert_eq!(
+            reviews_text(&[
+                Review::asked("carol"),
+                Review::not_asked("erin", "not a collaborator of acme/app"),
+                Review::asked("dave"),
+                Review::not_asked("boss", "the pull request's author"),
+            ]),
+            " Asked to review: carol, dave. Not asked to review: erin (not a collaborator of acme/app); boss (the pull request's author)."
+        );
+        assert_eq!(reviews_text(&[]), "");
     }
 
     #[test]

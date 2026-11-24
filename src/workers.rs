@@ -186,6 +186,7 @@ fn finish(
             .unwrap_or(Access::ReadOnly),
         shares: granted,
         m365: None,
+        github: None,
     });
     trust.save(&worker.trust_path())?;
     let entry = TrustedPeer {
@@ -197,6 +198,7 @@ fn finish(
         access: Access::ReadOnly,
         shares: vec![DATA_SHARE.to_owned()],
         m365: None,
+        github: None,
     };
     Ok(Created { worker, id, entry })
 }
@@ -612,6 +614,7 @@ mod tests {
             access: Access::ReadOnly,
             shares: Vec::new(),
             m365: None,
+            github: None,
         });
         assert!(refused(spec("alice"), &allowlist).contains("already on your allowlist"));
         let copilot = WorkerSpec {
