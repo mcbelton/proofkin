@@ -1048,14 +1048,19 @@ Your agent then pushes the branch their earlier steps committed to and opens the
 request with your GitHub account, closing the issues the work is for and carrying its
 signed proof, and follows it until it is merged or closed. It opens only work it did for
 the peer that asks, as it was done. Branch protection still decides what merging needs.
-example:
-  proofkin share pull-requests app --profile alice")]
+With --approve, it opens each one only once you approve it (web UI: Approvals).
+examples:
+  proofkin share pull-requests app --profile alice
+  proofkin share pull-requests app --approve --profile alice")]
     PullRequests {
         /// The shared folder (a repository linked with `repo link`).
         name: String,
         /// Stop taking pull request steps.
         #[arg(long)]
         off: bool,
+        /// You approve each pull request before it is opened.
+        #[arg(long, conflicts_with = "off")]
+        approve: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1831,7 +1836,11 @@ fn share_extras(share: &proofkin::shares::Share) -> String {
         extras += "; a git worktree per editing task";
     }
     if share.pull_requests {
-        extras += "; takes pull request steps";
+        extras += if share.pull_request_approval {
+            "; takes pull request steps, each once you approve it"
+        } else {
+            "; takes pull request steps"
+        };
     }
     if !share.mcp.is_empty() {
         extras += &format!(
@@ -3555,7 +3564,12 @@ fn run_share(command: ShareCommand) -> Result<()> {
                 ),
             }
         }
-        ShareCommand::PullRequests { name, off, profile } => {
+        ShareCommand::PullRequests {
+            name,
+            off,
+            approve,
+            profile,
+        } => {
             let profile = Profile::open(&profile.name)?;
             if !off {
                 proofkin::github::RepoStore::load(&profile.repos_path())?
@@ -3568,7 +3582,7 @@ fn run_share(command: ShareCommand) -> Result<()> {
             }
             let data = profile.data_folder();
             proofkin::shares::ShareStore::update(&profile.shares_path(), data, |shares| {
-                shares.set_pull_requests(&name, !off)
+                shares.set_pull_requests(&name, !off, approve)
             })?;
             if off {
                 println!(
@@ -3577,8 +3591,14 @@ fn run_share(command: ShareCommand) -> Result<()> {
                 );
             } else {
                 println!(
-                    "profile '{}': '{name}' takes pull request steps from peers with edit access; they end a plan with: ship after <steps> pr @{}:{name} <title>",
-                    profile.name, profile.name
+                    "profile '{}': '{name}' takes pull request steps from peers with edit access{}; they end a plan with: ship after <steps> pr @{}:{name} <title>",
+                    profile.name,
+                    if approve {
+                        ", each opened once you approve it (web UI: Approvals)"
+                    } else {
+                        ""
+                    },
+                    profile.name
                 );
             }
         }

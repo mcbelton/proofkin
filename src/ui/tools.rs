@@ -652,10 +652,13 @@ pub(super) async fn remove_team(
 #[derive(Deserialize)]
 pub(super) struct PullRequestsBody {
     on: bool,
+    /// You approve each one before it is opened; absent keeps how it is.
+    approval: Option<bool>,
 }
 
 /// Lets peers with edit access end their plans with pull request steps in a shared
-/// folder (a linked repository shared with worktrees), or stops letting them.
+/// folder (a linked repository shared with worktrees), each opened once you approve it if
+/// you like, or stops letting them.
 pub(super) async fn set_pull_requests(
     State(s): State<AppState>,
     Path(name): Path<String>,
@@ -671,30 +674,39 @@ pub(super) async fn set_pull_requests(
                 ))
             })?;
     }
+    let mut approval = false;
     let (found, shares) = s
         .info
         .profile
         .update_shares(|shares| {
-            if shares.get(&name).is_none() {
+            let Some(share) = shares.get(&name) else {
                 return Ok(false);
-            }
-            shares.set_pull_requests(&name, body.on)?;
+            };
+            approval = body.approval.unwrap_or(share.pull_request_approval);
+            shares.set_pull_requests(&name, body.on, approval)?;
             Ok(true)
         })
         .map_err(err400)?;
     if !found {
         return Err(no_share(&name));
     }
+    let approval = body.on && approval;
     shares_changed(
         &s,
         shares,
-        if body.on {
+        if approval {
+            format!(
+                "'{name}' takes pull request steps from peers with edit access, each once you approve it"
+            )
+        } else if body.on {
             format!("'{name}' takes pull request steps from peers with edit access")
         } else {
             format!("'{name}' no longer takes pull request steps")
         },
     );
-    Ok(Json(json!({ "name": name, "on": body.on })))
+    Ok(Json(
+        json!({ "name": name, "on": body.on, "approval": approval }),
+    ))
 }
 
 #[derive(Deserialize)]

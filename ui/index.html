@@ -614,8 +614,30 @@
       <p id="run-tracked" class="small" hidden></p>
       <ul id="run-signatures" class="signature-list"></ul>
       <div id="run-prototypes" class="task-actions"></div>
+      <div id="run-pulls" class="run-pulls" hidden></div>
       <div id="run-report" class="result" tabindex="0"></div>
     </div>
+  </dialog>
+
+  <dialog id="pull-dialog" aria-labelledby="pull-h">
+    <form method="dialog" id="pull-form" novalidate>
+      <h2 id="pull-h">Open a pull request</h2>
+      <p class="muted small" id="pull-intro"></p>
+      <label class="field">
+        <span>Title</span>
+        <input id="pull-title" type="text" maxlength="200" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>Who reviews it <span class="muted">(optional)</span></span>
+        <input id="pull-reviewers" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="me, carol, octocat…" aria-describedby="pull-reviewers-hint">
+        <span class="muted small" id="pull-reviewers-hint">me, peers of your allowlist (the GitHub account it has for them) or GitHub logins; none asks no one. Empty: those who signed off on the work.</span>
+      </label>
+      <p class="form-error" id="pull-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="pull-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="pull-submit">Ask to open it</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog id="playbook-dialog" class="wide" aria-labelledby="playbook-h">
