@@ -5072,7 +5072,7 @@ mod tests {
         );
         assert!(check(&format!("{three} reviewers=none"), &signed_out).is_empty());
         let found = check(
-            "a @bob:app do\np after a pr @bob:app reviewers=me,carol,dave,octocat,x_y Go",
+            "a @bob:app do\np after a pr @bob:app reviewers=me,carol,dave,octocat,x.y Go",
             &signed_out,
         );
         let errors: Vec<bool> = found.iter().map(|(error, _)| *error).collect();
@@ -5087,7 +5087,7 @@ mod tests {
         ));
         assert_eq!(
             found[2].1,
-            "reviewers= names \"x_y\", who isn't on the allowlist and can't be a GitHub login"
+            "reviewers= names \"x.y\", who isn't on the allowlist and can't be a GitHub login"
         );
     }
 

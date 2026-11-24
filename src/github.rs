@@ -1002,13 +1002,22 @@ pub fn default_host() -> &'static str {
     DEFAULT_GITHUB_HOST
 }
 
-/// Whether `login` can be a GitHub account's login: 1 to 39 letters, digits and hyphens,
-/// not starting or ending with a hyphen.
+/// Whether `login` can be a GitHub account's login: letters, digits and hyphens (not first
+/// or last), then for a managed user (Enterprise Managed Users) an underscore and its
+/// enterprise's short code; at most 39 characters.
 pub fn login_ok(login: &str) -> bool {
-    (1..=39).contains(&login.len())
-        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        && !login.starts_with('-')
-        && !login.ends_with('-')
+    let (handle, code) = match login.split_once('_') {
+        Some((handle, code)) => (handle, Some(code)),
+        None => (login, None),
+    };
+    login.len() <= 39
+        && !handle.is_empty()
+        && handle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !handle.starts_with('-')
+        && !handle.ends_with('-')
+        && code.is_none_or(|c| !c.is_empty() && c.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 /// Why GitHub didn't ask a reviewer, in a few words: GitHub's message `said`, shortened when
@@ -1289,11 +1298,31 @@ mod tests {
 
     #[test]
     fn reviewers_are_github_logins_and_a_refusal_says_why_in_a_few_words() {
-        for ok in ["octocat", "a", "mc-belton", "A1-b2"] {
+        for ok in [
+            "octocat",
+            "a",
+            "mc-belton",
+            "A1-b2",
+            "mona-cat_octo",
+            "beltoalb_microsoft",
+        ] {
             assert!(login_ok(ok), "{ok}");
         }
         let long = "a".repeat(40);
-        for bad in ["", "-x", "x-", "a_b", "a.b", "a b", "@x", long.as_str()] {
+        for bad in [
+            "",
+            "-x",
+            "x-",
+            "_x",
+            "x_",
+            "a_b_c",
+            "a-_b",
+            "a_b-c",
+            "a.b",
+            "a b",
+            "@x",
+            long.as_str(),
+        ] {
             assert!(!login_ok(bad), "{bad}");
         }
         assert_eq!(
