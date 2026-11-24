@@ -974,6 +974,7 @@ pub async fn start_with_work(
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/file", get(run_file))
+        .route("/api/runs/{id}/pull-request", post(open_run_pull_request))
         .route("/api/previews", post(create_preview))
         .route("/api/approvals/{id}", post(answer_approval))
         .route("/api/ops", get(ops_state))
@@ -1607,24 +1608,7 @@ fn start_task(
                 settle(&shared, &name, &task, delivered, started)
             }
         };
-        shared.running.lock().unwrap().remove(&id);
-        shared.update_task(id, |t| {
-            t.finished_ms = Some(now_ms());
-            t.evidence = settled.evidence;
-            t.run = settled.run;
-            t.progress = None;
-            t.model = settled.model;
-            match settled.result {
-                Ok(out) => {
-                    t.status = "done";
-                    t.output = Some(out);
-                }
-                Err(e) => {
-                    t.status = "failed";
-                    t.output = Some(format!("{e:#}"));
-                }
-            }
-        });
+        finish_task(&shared, id, settled);
     });
     {
         // The task removes itself when done; insert only if it's still running.
@@ -1634,6 +1618,28 @@ fn start_task(
         }
     }
     Ok(view)
+}
+
+/// Page task `id` ended as `settled`: its card says how.
+fn finish_task(shared: &Shared, id: u64, settled: Settled) {
+    shared.running.lock().unwrap().remove(&id);
+    shared.update_task(id, |t| {
+        t.finished_ms = Some(now_ms());
+        t.evidence = settled.evidence;
+        t.run = settled.run;
+        t.progress = None;
+        t.model = settled.model;
+        match settled.result {
+            Ok(out) => {
+                t.status = "done";
+                t.output = Some(out);
+            }
+            Err(e) => {
+                t.status = "failed";
+                t.output = Some(format!("{e:#}"));
+            }
+        }
+    });
 }
 
 /// How a task ended, for its card: its output (or why it failed), the model that did
@@ -1668,6 +1674,17 @@ async fn deliver(
         task: Some(id),
         ..Default::default()
     };
+    deliver_with(shared, id, peer, task, origin).await
+}
+
+/// [`deliver`], saying the task is part of `origin`.
+async fn deliver_with(
+    shared: &AppState,
+    id: u64,
+    peer: iroh::EndpointId,
+    task: &LlmTask,
+    origin: crate::protocol::Origin,
+) -> anyhow::Result<crate::agent::Delivered> {
     let delegation = shared.agent.send_task(peer, task.clone(), Some(origin))?;
     let progress = shared.clone();
     delegation
@@ -3847,7 +3864,179 @@ fn run_details(s: &Shared, id: &str) -> Result<Value> {
         "signatures": checks,
         "previews": previews,
         "tracked": run.tracked,
+        "pull_requests": run_pulls_json(s, &run),
     }))
+}
+
+/// The work of `run` a pull request can be opened from (see [`crate::plan::run_work`]),
+/// each with why it can't be now (its peer is offline, or its folder doesn't take pull
+/// requests from you) and whether the folder's owner approves each one first.
+fn run_pulls_json(s: &Shared, run: &RunRecord) -> Vec<Value> {
+    let peers = s.agent.peers();
+    crate::plan::run_work(run)
+        .into_iter()
+        .map(|w| {
+            let peer = peers.iter().find(|p| p.name == w.peer);
+            let why = match peer {
+                None => Some(format!("{} isn't connected", w.peer)),
+                Some(p) => crate::plan::pull_request_refusal(p, &w.folder),
+            };
+            let approval = peer
+                .and_then(|p| p.shares.iter().find(|f| f.name == w.folder))
+                .is_some_and(|f| f.pull_request_approval);
+            json!({
+                "step": w.step,
+                "peer": w.peer,
+                "folder": w.folder,
+                "branch": w.branch,
+                "commit": w.commit.chars().take(12).collect::<String>(),
+                "title": w.title,
+                "why": why,
+                "approval": approval,
+            })
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct RunPullBody {
+    /// The step whose work it opens (see [`crate::plan::run_work`]).
+    step: String,
+    /// Its title (default: that of the work).
+    #[serde(default)]
+    title: Option<String>,
+    /// Who is asked to review it, as `reviewers=` names them (default: those who signed
+    /// off on the work).
+    #[serde(default)]
+    reviewers: Option<String>,
+}
+
+/// Asks the agent that holds the clone to open a pull request with the work of a step of
+/// finished run `id` (see [`crate::plan::run_pull_request`]): it shows up as a task,
+/// followed until the pull request is merged or closed.
+async fn open_run_pull_request(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RunPullBody>,
+) -> Result<Json<Value>, ApiError> {
+    let missing = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("there is no run {id}") })),
+        )
+    };
+    crate::profile::validate_name(&id).map_err(|_| missing())?;
+    let dir = s.info.profile.runs_dir();
+    let run = RunRecord::load(&dir, &id).map_err(|_| missing())?;
+    // Only work whose records still check out, as the run's card lists it.
+    let (run, _) = run.reverified(Some(&dir.join(&run.id)));
+    let reviewers = body
+        .reviewers
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(crate::plan::parse_reviewers)
+        .transpose()
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let recipients = crate::plan::Recipients::of(&s.agent, &s.info.profile);
+    let (work, ask) = crate::plan::run_pull_request(
+        &run,
+        &body.step,
+        body.title.as_deref(),
+        reviewers.as_deref(),
+        &s.agent.id(),
+        &recipients,
+    )
+    .map_err(|e| bad_request(format!("{e:#}")))?;
+    let peer = s
+        .agent
+        .peers()
+        .into_iter()
+        .find(|p| p.name == work.peer)
+        .ok_or_else(|| {
+            bad_request(format!(
+                "{} isn't connected: its agent holds the clone of '{}' with the work",
+                work.peer, work.folder
+            ))
+        })?;
+    if let Some(why) = crate::plan::pull_request_refusal(&peer, &work.folder) {
+        return Err(bad_request(why));
+    }
+    let approval = peer
+        .shares
+        .iter()
+        .any(|f| f.name == work.folder && f.pull_request_approval);
+    let prompt = format!("Open a pull request from {}: {}", ask.branch, ask.title);
+    let mut task = LlmTask::new(Provider::Copilot, prompt.clone()).in_share(work.folder.clone());
+    task.title = Some(ask.title.clone());
+    let reviewers = ask.reviewers.clone();
+    task.pull_request = Some(Box::new(ask));
+    let task_id = s.next_task_id.fetch_add(1, Ordering::Relaxed);
+    let view = TaskView {
+        id: task_id,
+        provider: Provider::Copilot,
+        model: None,
+        prompt,
+        target: peer.name.clone(),
+        status: "running",
+        output: None,
+        started_ms: now_ms(),
+        finished_ms: None,
+        plan: None,
+        step: None,
+        after: Vec::new(),
+        approval: false,
+        team_step: false,
+        pull_request: true,
+        evidence: None,
+        preview: None,
+        preview_label: None,
+        via: None,
+        run: None,
+        progress: None,
+        team: None,
+        for_peer: None,
+        issue: None,
+        plan_issue: None,
+        squad: None,
+    };
+    s.add_task(view.clone());
+    s.send(json!({ "type": "task", "task": view }));
+    s.system(
+        "info",
+        format!(
+            "Asked {} to open a pull request with the work of step {} of run {}{}",
+            peer.name,
+            work.step,
+            run.id,
+            if approval {
+                ", once its owner approves it"
+            } else {
+                ""
+            }
+        ),
+    );
+    let origin = crate::protocol::Origin {
+        run: Some(run.id.clone()),
+        step: None,
+        task: Some(task_id),
+    };
+    let shared = s.clone();
+    let handle = tokio::spawn(async move {
+        let started = crate::runs::unix_now();
+        let delivered = deliver_with(&shared, task_id, peer.id, &task, origin).await;
+        let settled = settle(&shared, &peer.name, &task, delivered, started);
+        finish_task(&shared, task_id, settled);
+    });
+    {
+        let mut running = s.running.lock().unwrap();
+        if !handle.is_finished() {
+            running.insert(task_id, handle.abort_handle());
+        }
+    }
+    Ok(Json(
+        json!({ "task": view, "reviewers": reviewers, "approval": approval }),
+    ))
 }
 
 fn approvals_json(s: &Shared) -> Value {

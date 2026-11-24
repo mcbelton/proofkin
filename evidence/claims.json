@@ -1408,6 +1408,18 @@
       ]
     },
     {
+      "id": "GH-8",
+      "area": "github",
+      "claim": "A folder that takes pull request steps can have its owner approve each one (share pull-requests --approve, or Ask me to approve each one in the web UI; peers learn that it does): the request waits in the owner's approvals saying who asks, the title, branch and commit, the sign-offs, reviewers and issues; nothing is pushed or opened until they approve, a rejection fails the step with their reason, the pull request says they approved it with their note, and one an earlier try opened isn't asked about again. A finished run's card lists the work a pull request can be opened from (each signed commit a model's step made in a peer's folder that no other step of the run builds on, unless a pull request step of the run saw it merged) and why it can't be now; Open pull request (POST /api/runs/ID/pull-request with a title and reviewers) sends the folder's agent the ask with the run's sign-offs on that work and the reviewers resolved as reviewers= does, and the pull request says who asked for it from which evidence run.",
+      "tests": [
+        "agents::a_folder_owner_approves_each_pull_request_and_a_run_card_asks_for_one",
+        "lib::plan::a_finished_runs_work_opens_with_the_sign_offs_on_it",
+        "lib::pulls::a_description_closes_the_issues_and_names_who_asked",
+        "lib::shares::only_folders_with_worktrees_take_pull_request_steps",
+        "ui::a_run_card_offers_its_work_for_a_pull_request_and_says_why_it_cannot_now"
+      ]
+    },
+    {
       "id": "TRK-6",
       "area": "tracking",
       "claim": "With a tracker linked, Plan mode and the plan editor offer Track on GitHub beside Run plan: a new issue (with a sub-issue per step), an existing issue it works on (by number) or don't track, which reads and writes the plan's track: line (a title, #N or N, off in any case; a track: line in a step's text isn't the plan's). The line under it says what running the plan does there before it runs: the repository and the board (links that open a new tab), the account the issues are assigned to, the new issue's title when the plan names one, and that anyone can read them when the repository is public (the tracker reads its visibility; tracker status says it too), or that nothing goes to GitHub. An existing issue is looked up as its number is typed (GET /api/tracker/issues/N): its title, with a warning when it is closed (running reopens it), doesn't exist (the plan would run untracked) or can't be looked up; Run plan and Schedule… ask for the number when it is missing instead of opening a new issue.",

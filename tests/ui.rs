@@ -406,6 +406,135 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
 }
 
 #[tokio::test]
+async fn a_run_card_offers_its_work_for_a_pull_request_and_says_why_it_cannot_now() {
+    use proofkin::evidence::{Evidence, EvidenceKind, GitCommit};
+    use proofkin::plan::StepState;
+    let home = tempfile::tempdir().unwrap();
+    let profile = Profile::open_in(home.path(), "boss").unwrap();
+    let (boss, alice) = (SecretKey::generate(), SecretKey::generate());
+    // A run whose step committed work in alice's folder shop, as alice's agent signed it.
+    let text = "impl @alice:shop Add CSV export to the report page";
+    let plan = proofkin::plan::Plan::parse(text).unwrap();
+    let mut evidence = Evidence::new(
+        EvidenceKind::Task,
+        "alice",
+        alice.public(),
+        boss.public(),
+        1,
+    );
+    evidence.share = Some("shop".into());
+    evidence.git = Some(GitCommit {
+        branch: "p2p/boss/1-1".into(),
+        base: "base".into(),
+        commit: Some("c0ffee".repeat(7)),
+        files: vec!["report.rs".into()],
+        patch_sha256: None,
+        left_out: Vec::new(),
+    });
+    let states: std::collections::BTreeMap<String, StepState> = [(
+        "impl".to_owned(),
+        StepState::Done {
+            peer: "alice".into(),
+            output: "did it".into(),
+            evidence: Some(evidence.sign("did it", &alice)),
+            verified: true,
+            patch: None,
+            model: None,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let started = proofkin::runs::unix_now() - 60;
+    let mut run = proofkin::runs::RunRecord::new(
+        "boss",
+        &boss.public().to_string(),
+        text,
+        &plan,
+        &states,
+        started,
+    );
+    run.id = "run-1".into();
+    run.peer_ids
+        .insert("alice".into(), alice.public().to_string());
+    run.save(&profile.runs_dir()).unwrap();
+
+    let mut config = AgentConfig::new("boss", boss);
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile,
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+
+    let details = request(port, "GET", "/api/runs/run-1", &host, Some(token), None)
+        .await
+        .json();
+    assert_eq!(
+        details["pull_requests"],
+        serde_json::json!([{
+            "step": "impl",
+            "peer": "alice",
+            "folder": "shop",
+            "branch": "p2p/boss/1-1",
+            "commit": "c0ffeec0ffee",
+            "title": "Add CSV export to the report page",
+            "why": "alice isn't connected",
+            "approval": false,
+        }])
+    );
+    let post = |path: &'static str, body: &'static str| {
+        let (host, token) = (host.clone(), token.to_owned());
+        async move { request(port, "POST", path, &host, Some(&token), Some(body)).await }
+    };
+    for (body, why) in [
+        (
+            r#"{"step":"impl"}"#,
+            "alice isn't connected: its agent holds the clone of 'shop' with the work",
+        ),
+        (
+            r#"{"step":"nope"}"#,
+            "step nope of run run-1 has no work to open a pull request with",
+        ),
+        (
+            r#"{"step":"impl","reviewers":"me none"}"#,
+            "reviewers=none asks no one",
+        ),
+    ] {
+        let refused = post("/api/runs/run-1/pull-request", body).await;
+        assert_eq!(refused.status, 400, "{body}: {}", refused.body);
+        assert!(refused.body.contains(why), "{body}: {}", refused.body);
+    }
+    assert_eq!(
+        post("/api/runs/missing/pull-request", r#"{"step":"impl"}"#)
+            .await
+            .status,
+        404
+    );
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn ui_cancels_running_tasks_and_shows_the_audit_log() {
     let home = tempfile::tempdir().unwrap();
     let profile = Profile::open_in(home.path(), "solo").unwrap();

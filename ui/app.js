@@ -870,27 +870,44 @@ function openTeamDialog(share, opener) {
 }
 
 /** Whether peers may end a plan with a pull request step in shared folder `s`: this agent
- * then pushes their tasks' branch and opens the pull request with its GitHub account. */
+ * then pushes their tasks' branch and opens the pull request with its GitHub account,
+ * each one once you approve it if you tick that too. */
 function pullRequestsToggle(s) {
-  const input = el("input", { type: "checkbox", checked: Boolean(s.pull_requests) });
-  input.addEventListener("change", async () => {
-    const on = input.checked;
-    input.disabled = true;
+  const save = async (body, done, inputs) => {
+    for (const i of inputs) i.disabled = true;
     try {
-      await api(`/api/shares/${encodeURIComponent(s.name)}/pull-requests`, { method: "PUT", body: JSON.stringify({ on }) });
-      toast(on ? `${s.name} takes pull request steps` : `${s.name} no longer takes pull request steps`);
+      await api(`/api/shares/${encodeURIComponent(s.name)}/pull-requests`, { method: "PUT", body: JSON.stringify(body) });
+      toast(done);
       await loadState();
     } catch (err) {
-      input.checked = !on;
       toast(err.message, "error");
+      await loadState();
     } finally {
-      input.disabled = false;
+      for (const i of inputs) i.disabled = false;
     }
+  };
+  const input = el("input", { type: "checkbox", checked: Boolean(s.pull_requests) });
+  const approve = el("input", { type: "checkbox", checked: Boolean(s.pull_request_approval) });
+  input.addEventListener("change", () => {
+    const on = input.checked;
+    save({ on }, on ? `${s.name} takes pull request steps` : `${s.name} no longer takes pull request steps`, [input, approve]);
   });
-  return el("label", {
-    class: "check small",
-    title: "Peers with edit access may end a plan with a pull request step here: this agent pushes the branch of their tasks' work and opens the pull request with your GitHub account, then follows it until it is merged",
-  }, input, el("span", { text: "Takes pull request steps" }));
+  approve.addEventListener("change", () => {
+    const approval = approve.checked;
+    save({ on: true, approval }, approval ? `You approve each pull request in ${s.name} before it is opened`
+      : `${s.name} opens pull requests without asking you`, [input, approve]);
+  });
+  return el("span", { class: "pr-toggles" },
+    el("label", {
+      class: "check small",
+      title: "Peers with edit access may end a plan with a pull request step here: this agent pushes the branch of their tasks' work and opens the pull request with your GitHub account, then follows it until it is merged",
+    }, input, el("span", { text: "Takes pull request steps" })),
+    s.pull_requests
+      ? el("label", {
+        class: "check small",
+        title: "Each request waits under Approvals until you approve it; the pull request says you did",
+      }, approve, el("span", { text: "Ask me to approve each one" }))
+      : null);
 }
 
 /// Runs a team plan request with `button` disabled and saying `busy`; on success closes
@@ -1432,6 +1449,7 @@ async function openRun(id) {
     $("#run-prototypes").replaceChildren(...(run.previews ?? []).map((p) =>
       el("button", { type: "button", class: "btn small", onclick: (e) => openPreview({ run: id, step: p.step }, e.currentTarget) },
         `${previewText(p.label)} of step ${p.step}`)));
+    renderRunPulls(id, run.pull_requests ?? []);
     $("#run-report").replaceChildren(renderMarkdown(run.report));
     $("#run-dialog").showModal();
     $("#run-close").focus();
@@ -1460,6 +1478,71 @@ async function downloadRun(id, button) {
     toast(`Saved ${id}.json; anyone can check it with: proofkin runs verify --file ${id}.json`);
   } catch (err) {
     toast(err.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/** The work of run `runId` a pull request can be opened from (`works`, see
+ * GET /api/runs/ID): a button for each, or why it can't be now. */
+function renderRunPulls(runId, works) {
+  const box = $("#run-pulls");
+  box.hidden = !works.length;
+  box.replaceChildren(...(works.length ? [el("h3", { text: "Open a pull request" })] : []),
+    ...works.map((w) => el("div", { class: "run-pull" },
+      el("button", {
+        type: "button", class: "btn small", disabled: Boolean(w.why),
+        onclick: (e) => openPullDialog(runId, w, e.currentTarget),
+      }, `Open pull request of ${w.step}…`),
+      el("span", { class: "muted small" }, w.why
+        ? `${w.why}.`
+        : [`From branch `, el("span", { class: "mono", text: w.branch }), ` of ${w.peer}'s clone of `,
+          el("span", { class: "mono", text: w.folder }), w.approval ? `; ${w.peer} approves it first.` : "."]))));
+}
+
+// The run and its work the pull request dialog asks to open, and what opened it.
+let pullAsk = null;
+
+function openPullDialog(runId, work, opener) {
+  pullAsk = { runId, work };
+  $("#pull-form").reset();
+  $("#pull-h").textContent = `Open a pull request of step ${work.step}`;
+  $("#pull-intro").replaceChildren(`${work.peer}'s agent pushes branch `, el("span", { class: "mono", text: work.branch }),
+    " (commit ", el("span", { class: "mono", text: work.commit }), ") of its clone of ", el("span", { class: "mono", text: work.folder }),
+    ` and opens the pull request with ${work.peer}'s GitHub account, with the run's sign-offs on the work`
+    + `${work.approval ? `, once ${work.peer} approves it` : ""}. You follow it under Tasks until it is merged.`);
+  $("#pull-title").value = work.title;
+  $("#pull-error").textContent = "";
+  $("#pull-dialog").addEventListener("close", () => {
+    if (opener.isConnected) opener.focus();
+  }, { once: true });
+  $("#pull-dialog").showModal();
+  $("#pull-title").focus();
+}
+
+async function submitPull(e) {
+  e.preventDefault();
+  if (!pullAsk) return;
+  const { runId, work } = pullAsk;
+  const title = $("#pull-title").value.trim();
+  if (!title) {
+    $("#pull-error").textContent = "Give the pull request a title.";
+    $("#pull-title").focus();
+    return;
+  }
+  const button = $("#pull-submit");
+  button.disabled = true;
+  try {
+    const res = await api(`/api/runs/${encodeURIComponent(runId)}/pull-request`, {
+      method: "POST",
+      body: JSON.stringify({ step: work.step, title, reviewers: $("#pull-reviewers").value.trim() || null }),
+    });
+    $("#pull-dialog").close();
+    $("#run-dialog").close();
+    const asked = res.reviewers?.length ? `; it asks ${res.reviewers.join(", ")} to review it` : "";
+    toast(`Asked ${work.peer} to open the pull request${res.approval ? ` once ${work.peer} approves it` : ""}${asked}. Follow it under Tasks.`);
+  } catch (err) {
+    $("#pull-error").textContent = err.message;
   } finally {
     button.disabled = false;
   }
@@ -3467,6 +3550,8 @@ function init() {
   // Monitors run in the background: refresh the health panel now and then.
   setInterval(() => { if (!document.hidden) loadOps().catch(() => {}); }, 20000);
   $("#run-close").addEventListener("click", () => $("#run-dialog").close());
+  $("#pull-cancel").addEventListener("click", () => $("#pull-dialog").close());
+  $("#pull-form").addEventListener("submit", submitPull);
   $("#squad-cancel").addEventListener("click", () => $("#squad-dialog").close());
   // Back to the button that opened it (a squad's own, if it is still there).
   $("#squad-dialog").addEventListener("close", () => {
@@ -3529,7 +3614,7 @@ function init() {
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog",
-    "#branch-dialog"]) guardDialog($(id));
+    "#branch-dialog", "#pull-dialog"]) guardDialog($(id));
   initModelsDialog();
   initBranchReview();
   $("#provider").addEventListener("change", renderTaskOptions);

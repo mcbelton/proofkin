@@ -44,6 +44,10 @@ pub struct Share {
     /// GitHub account (a linked repository shared with worktrees; see [`crate::pulls`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pull_requests: bool,
+    /// With `pull_requests`: the owner approves each pull request a peer asks for before
+    /// this agent opens it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pull_request_approval: bool,
 }
 
 /// What a peer learns about a share: its name, the access it would get and the
@@ -70,6 +74,9 @@ pub struct ShareInfo {
     /// say so, so they are never sent one).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pull_requests: bool,
+    /// Its owner approves each pull request before it is opened.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pull_request_approval: bool,
 }
 
 /// How an owner offers an MCP server in a shared folder (see [`ShareStore::offer_mcp`]).
@@ -129,6 +136,7 @@ impl ShareStore {
                 mcp: BTreeMap::new(),
                 team: None,
                 pull_requests: false,
+                pull_request_approval: false,
             }],
         }
     }
@@ -210,6 +218,8 @@ impl ShareStore {
         let mcp = self.get(name).map(|s| s.mcp.clone()).unwrap_or_default();
         let team = self.get(name).and_then(|s| s.team.clone());
         let pull_requests = worktrees && self.get(name).is_some_and(|s| s.pull_requests);
+        let pull_request_approval =
+            pull_requests && self.get(name).is_some_and(|s| s.pull_request_approval);
         self.shares.retain(|s| s.name != name);
         self.shares.push(Share {
             name: name.to_owned(),
@@ -220,14 +230,16 @@ impl ShareStore {
             mcp,
             team,
             pull_requests,
+            pull_request_approval,
         });
         Ok(self.shares.last().expect("just pushed"))
     }
 
     /// Lets peers with edit access end their plans with pull request steps in share
-    /// `share` (`on`), or stops letting them. The folder must be shared with worktrees,
-    /// as pull requests come from its tasks' branches.
-    pub fn set_pull_requests(&mut self, share: &str, on: bool) -> Result<()> {
+    /// `share` (`on`), each one opened only once the owner approves it (`approval`), or
+    /// stops letting them. The folder must be shared with worktrees, as pull requests come
+    /// from its tasks' branches.
+    pub fn set_pull_requests(&mut self, share: &str, on: bool, approval: bool) -> Result<()> {
         if share == DATA_SHARE && on {
             bail!("the built-in '{DATA_SHARE}' share has no branches to open pull requests from");
         }
@@ -243,6 +255,7 @@ impl ShareStore {
             );
         }
         share.pull_requests = on;
+        share.pull_request_approval = on && approval;
         Ok(())
     }
 
@@ -379,6 +392,9 @@ impl ShareStore {
                         .collect(),
                     team: s.team.is_some(),
                     pull_requests: s.pull_requests && s.worktrees,
+                    pull_request_approval: s.pull_requests
+                        && s.worktrees
+                        && s.pull_request_approval,
                 }
             })
             .collect()
@@ -408,24 +424,36 @@ mod tests {
             .add_with("repo", &repo, Access::WorkspaceWrite, BTreeMap::new(), true)
             .unwrap();
         store.add("plain", &plain, Access::WorkspaceWrite).unwrap();
-        let refused = store.set_pull_requests("plain", true).unwrap_err();
+        let refused = store.set_pull_requests("plain", true, false).unwrap_err();
         assert!(
             refused
                 .to_string()
                 .contains("isn't shared with --worktrees")
         );
-        assert!(store.set_pull_requests(DATA_SHARE, true).is_err());
-        store.set_pull_requests("repo", true).unwrap();
-        assert!(store.visible(&["repo".to_owned()], Access::Full)[0].pull_requests);
+        assert!(store.set_pull_requests(DATA_SHARE, true, false).is_err());
+        store.set_pull_requests("repo", true, false).unwrap();
+        let seen = &store.visible(&["repo".to_owned()], Access::Full)[0];
+        assert!(seen.pull_requests && !seen.pull_request_approval);
+        // Its owner may approve each one first; stopping them stops that too.
+        store.set_pull_requests("repo", true, true).unwrap();
+        assert!(store.visible(&["repo".to_owned()], Access::Full)[0].pull_request_approval);
         // Shared again, it keeps taking them, unless it no longer has worktrees.
         store
             .add_with("repo", &repo, Access::Full, BTreeMap::new(), true)
             .unwrap();
-        assert!(store.get("repo").unwrap().pull_requests);
+        let kept = store.get("repo").unwrap();
+        assert!(kept.pull_requests && kept.pull_request_approval);
         store
             .add_with("repo", &repo, Access::Full, BTreeMap::new(), false)
             .unwrap();
-        assert!(!store.get("repo").unwrap().pull_requests);
+        let plain = store.get("repo").unwrap();
+        assert!(!plain.pull_requests && !plain.pull_request_approval);
+        store
+            .add_with("repo", &repo, Access::Full, BTreeMap::new(), true)
+            .unwrap();
+        store.set_pull_requests("repo", true, true).unwrap();
+        store.set_pull_requests("repo", false, true).unwrap();
+        assert!(!store.get("repo").unwrap().pull_request_approval);
     }
 
     #[test]

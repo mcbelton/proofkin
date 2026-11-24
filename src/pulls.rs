@@ -153,22 +153,46 @@ pub struct Opened {
     pub proof: bool,
 }
 
+/// Who asks for a pull request, as its description names them (see [`description`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Asked {
+    /// The peer that asks (by its name on this agent's allowlist).
+    pub by: String,
+    /// The evidence run it is part of.
+    pub run: Option<String>,
+    /// Its plan step; none when it was asked for from a finished run's card.
+    pub step: Option<String>,
+    /// This agent's owner approved opening it (the folder has them approve each one).
+    pub approval: Option<OwnerApproval>,
+}
+
+/// A folder owner's answer approving a pull request, before it is opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnerApproval {
+    /// Who approved it: this agent's name.
+    pub by: String,
+    /// What they noted (may be empty).
+    pub note: String,
+}
+
 /// Opens and follows the pull requests of peers' pull request steps. The host sets it
 /// (see [`crate::agent::AgentConfig::pulls`]); tests use a fake.
 #[async_trait]
 pub trait PullRequests: Send + Sync {
     /// Opens a pull request from `ask.branch` of folder `share`'s repository into its
     /// branch, closing `issues` and the issues its commit is for, with the commit's proof,
-    /// who asked for it (`by`, as part of evidence run `run`) and `ask`'s sign-offs (checked
-    /// already). If one was opened from the branch as it is, that one.
+    /// who asked for it and how (`asked`) and `ask`'s sign-offs (checked already). If one
+    /// was opened from the branch as it is, that one.
     async fn open(
         &self,
         share: &str,
         ask: &PullRequestAsk,
         issues: &[String],
-        by: &str,
-        run: Option<&str>,
+        asked: &Asked,
     ) -> Result<Opened>;
+
+    /// The pull request an earlier try opened from `ask`'s branch as it is, if there is one.
+    async fn find(&self, share: &str, ask: &PullRequestAsk) -> Result<Option<Opened>>;
 
     /// Where pull request `number` of folder `share`'s repository is: `OPEN`, `MERGED` or
     /// `CLOSED`.
@@ -269,22 +293,46 @@ pub fn number_of(url: &str) -> Option<u64> {
 }
 
 /// The description of a pull request a step opens: the lines closing `issues` (those of
-/// `slug` by number), who asked for it (`by`), and the plan's sign-offs before it, with the
-/// evidence run (`run`) that has their records.
-pub fn description(
-    issues: &[String],
-    slug: &str,
-    by: &str,
-    run: Option<&str>,
-    signoffs: &[SignOff],
-) -> String {
+/// `slug` by number), who asked for it and how (`asked`, with the owner's approval if the
+/// folder asks for one), and the plan's sign-offs before it, with the evidence run that has
+/// their records.
+pub fn description(issues: &[String], slug: &str, asked: &Asked, signoffs: &[SignOff]) -> String {
     let clean = |text: &str| text.replace(['`', '*', '_', '[', ']', '\r', '\n'], "");
+    // Words as code: they mention no one and link nothing.
+    let code = |text: &str| {
+        let text = crate::redact::redact(text).0;
+        let text = text.replace('`', "'").replace(['\r', '\n'], " ");
+        text.trim().chars().take(300).collect::<String>()
+    };
     let mut body = crate::tracker::closing_lines(issues, slug);
     if !body.is_empty() {
         body.push('\n');
     }
-    let by = clean(by);
-    body += &format!("Opened by Proofkin for **{by}**, as a pull request step of their plan.\n");
+    let by = clean(&asked.by);
+    let run = asked.run.as_deref().map(clean);
+    body += &match (&asked.step, &run) {
+        (Some(_), _) => {
+            format!("Opened by Proofkin for **{by}**, as a pull request step of their plan.\n")
+        }
+        (None, Some(run)) => {
+            format!(
+                "Opened by Proofkin for **{by}**, who asked for it from their evidence run `{run}`.\n"
+            )
+        }
+        (None, None) => format!("Opened by Proofkin for **{by}**, who asked for it.\n"),
+    };
+    if let Some(approval) = &asked.approval {
+        let note = code(&approval.note);
+        body += &format!(
+            "\n**{}** approved opening it with their GitHub account{}.\n",
+            clean(&approval.by),
+            if note.is_empty() {
+                String::new()
+            } else {
+                format!(", noting `{note}`")
+            }
+        );
+    }
     if signoffs.is_empty() {
         return body;
     }
@@ -292,13 +340,10 @@ pub fn description(
     for s in signoffs {
         let e = &s.evidence;
         let key: String = e.signer_id.chars().take(10).collect();
-        // The approver's words, as code: they mention no one and link nothing.
         let note = s
             .output
             .split_once(": ")
-            .map(|(_, note)| crate::redact::redact(note).0)
-            .map(|note| note.replace('`', "'").replace(['\r', '\n'], " "))
-            .map(|note| note.trim().chars().take(300).collect::<String>())
+            .map(|(_, note)| code(note))
             .filter(|note| !note.is_empty());
         body += &format!(
             "- `{}`: approved by **{}** (key `{key}`) on {} UTC{}\n",
@@ -311,8 +356,7 @@ pub fn description(
     body += &format!(
         "\n<sub>Each is a record its approver's agent signed (Ed25519), checked before it was added{}.</sub>\n",
         run.map(|r| format!(
-            "; they are in {by}'s evidence run `{}`, which `proofkin runs verify` checks again",
-            clean(r)
+            "; they are in {by}'s evidence run `{r}`, which `proofkin runs verify` checks again"
         ))
         .unwrap_or_default()
     );
@@ -347,8 +391,7 @@ impl PullRequests for ProfilePulls {
         share: &str,
         ask: &PullRequestAsk,
         issues: &[String],
-        by: &str,
-        run: Option<&str>,
+        asked: &Asked,
     ) -> Result<Opened> {
         let (repo, creds) = self.linked(share)?;
         let api = crate::tracker::GhApi::new(creds.clone());
@@ -366,7 +409,7 @@ impl PullRequests for ProfilePulls {
                 refs.push(issue.clone());
             }
         }
-        let mut body = description(&refs, &repo.slug, by, run, &ask.signoffs);
+        let mut body = description(&refs, &repo.slug, asked, &ask.signoffs);
         creds.push(&repo, &ask.branch).await?;
         let profile = self.profile.reload()?;
         let proof = match creds.pr_proof(&repo, &ask.branch, &profile).await {
@@ -388,6 +431,11 @@ impl PullRequests for ProfilePulls {
             existed: false,
             proof,
         })
+    }
+
+    async fn find(&self, share: &str, ask: &PullRequestAsk) -> Result<Option<Opened>> {
+        let (repo, creds) = self.linked(share)?;
+        opened_from(&crate::tracker::GhApi::new(creds), &repo, ask).await
     }
 
     async fn state(&self, share: &str, number: u64) -> Result<String> {
@@ -544,11 +592,15 @@ mod tests {
 
     #[test]
     fn a_description_closes_the_issues_and_names_who_asked() {
+        let step = |by: &str| Asked {
+            by: by.into(),
+            step: Some("ship".into()),
+            ..Default::default()
+        };
         let body = description(
             &["acme/app#3".into(), "other/lib#9".into(), "bad".into()],
             "acme/app",
-            "bo*ss_`x`",
-            None,
+            &step("bo*ss_`x`"),
             &[],
         );
         assert_eq!(
@@ -556,8 +608,22 @@ mod tests {
             "Closes #3\nCloses other/lib#9\n\nOpened by Proofkin for **bossx**, as a pull request step of their plan.\n"
         );
         assert_eq!(
-            description(&[], "acme/app", "boss", None, &[]),
+            description(&[], "acme/app", &step("boss"), &[]),
             "Opened by Proofkin for **boss**, as a pull request step of their plan.\n"
+        );
+        // Asked for from a finished run's card, and approved by the clone's owner.
+        let from_run = Asked {
+            by: "boss".into(),
+            run: Some("20261123-064022-169d7".into()),
+            step: None,
+            approval: Some(OwnerApproval {
+                by: "alice".into(),
+                note: "fine, @team see `x`".into(),
+            }),
+        };
+        assert_eq!(
+            description(&[], "acme/app", &from_run, &[]),
+            "Opened by Proofkin for **boss**, who asked for it from their evidence run `20261123-064022-169d7`.\n\n**alice** approved opening it with their GitHub account, noting `fine, @team see 'x'`.\n"
         );
         assert_eq!(number_of("https://github.com/acme/app/pull/12"), Some(12));
         assert_eq!(number_of("https://github.com/acme/app/pull/12/"), Some(12));
@@ -598,8 +664,12 @@ mod tests {
         let body = description(
             &[],
             "acme/app",
-            "boss",
-            Some("20261123-064022-169d7"),
+            &Asked {
+                by: "boss".into(),
+                run: Some("20261123-064022-169d7".into()),
+                step: Some("ship".into()),
+                approval: None,
+            },
             &[good],
         );
         assert!(

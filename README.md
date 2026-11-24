@@ -875,10 +875,11 @@ folder, in a repository linked to its profile:
 
 ```powershell
 proofkin share pull-requests shop --profile alice   # --off stops it; share list shows it
+proofkin share pull-requests shop --approve --profile alice   # you approve each one first
 ```
 
-or in the web UI, under **This agent > Shared folders > Takes pull request steps**. The
-boss then ends its plan with one:
+or in the web UI, under **This agent > Shared folders > Takes pull request steps** (and
+**Ask me to approve each one**). The boss then ends its plan with one:
 
 ```text
 claim: F-1 Reports can be exported as CSV
@@ -899,6 +900,13 @@ ship after ok pr @alice:shop
   request with its owner's GitHub account. The pull request closes the issues the work is
   for (`Closes #N`, on a [tracked run](#tracked-work)), carries the commit's
   [proof](#pull-request-proof), and says who asked for it.
+- With `--approve` (**Ask me to approve each one**), the folder's owner approves each pull
+  request before anything is pushed: the request waits under their **Waiting for your
+  approval**, saying who asks, the title, the branch and commit (the GitHub card's task
+  branches show its changes), the sign-offs, the reviewers and the issues it closes. The
+  pull request says they approved it, with their note; a rejection fails the step with
+  their reason. A pull request an earlier try opened isn't asked about again. Peers see
+  that the folder asks (the run's card says so).
 - The pull request lists the plan's **sign-offs** before it: for each sign-off step it
   comes after, who approved it, with their agent's key, when, and their note. Each comes
   from the record the approver's agent signed. The folder's agent lists only approvals
@@ -925,6 +933,16 @@ ship after ok pr @alice:shop
 - It takes no options for a model, only `timeout=`, `issue=` and `reviewers=`. It needs
   edit access (`workspace-write` or `full`) in the folder, and the folder must take pull
   request steps. An older agent never says that its folder does, so it is never sent one.
+
+**After the run.** A plan without a `pr` step can still have its work opened: in the web
+UI, a finished run's card (under **Evidence runs**) has **Open pull request of `step`…**
+for each signed commit a step made in a peer's folder that no other step builds on (and
+that a `pr` step of the run didn't see merged). Give it a title and, if you like, who
+reviews it (as `reviewers=`); the folder's agent opens it as it would a `pr` step, with the
+run's sign-offs on that work, the run named as where their records are, and its owner's
+approval first if the folder asks for that. It shows under **Tasks**, followed until it is
+merged (API: `POST /api/runs/<id>/pull-request` with
+`{"step": "...", "title": "...", "reviewers": "me, carol"}`).
 
 ### Scheduled plans
 
@@ -1859,8 +1877,9 @@ proofkin --name me --providers copilot --serve --ui
 - **Evidence runs**: every plan run, and every task kept as evidence, with what it was
   about and its verdict. Open one to read its report (claims, checks, commits, signatures)
   and a fresh signature check, or **Download** its `run.json` for anyone to verify
-  (`proofkin runs verify --file`). Results that carry valid signed evidence show
-  **Signed ✓**.
+  (`proofkin runs verify --file`). Its work can go in a pull request from there
+  ([after the run](#pull-request-steps-opening-the-pull-request-from-the-plan)). Results
+  that carry valid signed evidence show **Signed ✓**.
 - **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
 - **Get started**: a new agent (nobody on its allowlist yet) shows its first steps in
   place of the empty conversation: share your ticket, add a teammate's, or create a
@@ -2029,9 +2048,10 @@ A worker decides exactly what each peer can see:
   a [pull request step](#pull-request-steps-opening-the-pull-request-from-the-plan) in a
   linked repository's folder: your agent pushes the branch of work it did for them and
   opens the pull request with your GitHub account, never for another peer's work or a
-  branch moved on since. `--off` stops it; in the web UI it is **Takes pull request steps**
-  under **This agent > Shared folders** (API: `PUT /api/shares/<folder>/pull-requests`
-  with `{"on": true}`).
+  branch moved on since. `--approve` has you approve each one first; `--off` stops it. In
+  the web UI it is **Takes pull request steps** and **Ask me to approve each one** under
+  **This agent > Shared folders** (API: `PUT /api/shares/<folder>/pull-requests` with
+  `{"on": true, "approval": true}`; without `approval` it stays as it is).
 
 | | `data` (built in) | A folder you add |
 | --- | --- | --- |

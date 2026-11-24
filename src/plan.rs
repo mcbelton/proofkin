@@ -1295,19 +1295,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                         })?);
                     }
                     "reviewers" | "reviewer" => {
-                        let list = reviewers.get_or_insert_with(Vec::new);
-                        add(list, value);
-                        if list.is_empty() {
-                            bail!("reviewers= needs GitHub logins, peer names, me or none");
-                        }
-                        if let Some(bad) = list
-                            .iter()
-                            .find(|r| validate_name(r).is_err() && !crate::github::login_ok(r))
-                        {
-                            bail!(
-                                "reviewers= needs GitHub logins, peer names, me or none, got {bad:?}"
-                            );
-                        }
+                        add(reviewers.get_or_insert_with(Vec::new), value);
                     }
                     _ => break,
                 }
@@ -1360,15 +1348,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         if !pr {
             bail!("reviewers= is for pull request steps (name after steps pr @peer:folder)");
         }
-        if list.iter().any(|r| r.eq_ignore_ascii_case("none")) {
-            if list.len() > 1 {
-                bail!("reviewers=none asks no one; don't name reviewers with it");
-            }
-            list.clear();
-        }
-        if list.len() > MAX_REVIEWERS {
-            bail!("reviewers= names at most {MAX_REVIEWERS} reviewers");
-        }
+        check_reviewers(list)?;
     }
     if levels.is_some() && target == Target::Workiq {
         bail!(
@@ -1423,6 +1403,41 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
         bail!("{why}");
     }
     Ok(step)
+}
+
+/// Checks the reviewers a step names (see [`Step::reviewers`]): GitHub logins, peer names
+/// or `me`, at most [`MAX_REVIEWERS`], or `none` alone, which leaves `list` empty.
+fn check_reviewers(list: &mut Vec<String>) -> Result<()> {
+    if list.is_empty() {
+        bail!("reviewers= needs GitHub logins, peer names, me or none");
+    }
+    if let Some(bad) = list
+        .iter()
+        .find(|r| validate_name(r).is_err() && !crate::github::login_ok(r))
+    {
+        bail!("reviewers= needs GitHub logins, peer names, me or none, got {bad:?}");
+    }
+    if list.iter().any(|r| r.eq_ignore_ascii_case("none")) {
+        if list.len() > 1 {
+            bail!("reviewers=none asks no one; don't name reviewers with it");
+        }
+        list.clear();
+    }
+    if list.len() > MAX_REVIEWERS {
+        bail!("reviewers= names at most {MAX_REVIEWERS} reviewers");
+    }
+    Ok(())
+}
+
+/// The reviewers `value` names as `reviewers=` does (commas or spaces between them, a
+/// leading `@` left off), checked; empty for `none`.
+pub fn parse_reviewers(value: &str) -> Result<Vec<String>> {
+    let mut list = Vec::new();
+    for name in value.split(|c: char| c == ',' || c.is_whitespace()) {
+        add(&mut list, name.trim_start_matches('@'));
+    }
+    check_reviewers(&mut list)?;
+    Ok(list)
 }
 
 /// Adds the sources of a `workiq=` value to `list`: `all`, or names from
@@ -1733,26 +1748,32 @@ fn unproven_fixes(plan: &Plan, claim: &ClaimDef) -> Vec<Fix> {
     fixes
 }
 
+/// Why `peer` can't open a pull request in its folder `folder` for you, if it can't: it
+/// doesn't share it, the folder doesn't take pull request steps, or you lack edit access.
+pub fn pull_request_refusal(peer: &PeerInfo, folder: &str) -> Option<String> {
+    use crate::llm::Access;
+    match peer.shares.iter().find(|s| s.name == folder) {
+        None => Some(format!(
+            "{} shares no folder '{folder}' with you, so it can't open its pull request",
+            peer.name
+        )),
+        Some(share) if !share.pull_requests => Some(format!(
+            "folder '{folder}' on {} doesn't take pull request steps (its owner allows them with: proofkin share pull-requests {folder}), or its agent is older",
+            peer.name
+        )),
+        Some(share) if share.access < Access::WorkspaceWrite => Some(format!(
+            "a pull request step needs edit access in '{folder}' on {}; you have {}",
+            peer.name, share.access
+        )),
+        Some(_) => None,
+    }
+}
+
 /// Why `peer` can't run `step`, if it can't: provider, folder, checks, access.
 fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
     use crate::llm::Access;
     if step.pr {
-        let folder = step.share.as_deref().unwrap_or_default();
-        return match peer.shares.iter().find(|s| s.name == folder) {
-            None => Some(format!(
-                "{} shares no folder '{folder}' with you, so it can't open its pull request",
-                peer.name
-            )),
-            Some(share) if !share.pull_requests => Some(format!(
-                "folder '{folder}' on {} doesn't take pull request steps (its owner allows them with: proofkin share pull-requests {folder}), or its agent is older",
-                peer.name
-            )),
-            Some(share) if share.access < Access::WorkspaceWrite => Some(format!(
-                "a pull request step needs edit access in '{folder}' on {}; you have {}",
-                peer.name, share.access
-            )),
-            Some(_) => None,
-        };
+        return pull_request_refusal(peer, step.share.as_deref().unwrap_or_default());
     }
     if step.team.is_some() {
         let folder = step.share.as_deref().unwrap_or(crate::shares::DATA_SHARE);
@@ -2521,12 +2542,12 @@ fn pr_ask(
     })
 }
 
-/// The GitHub accounts pull request step `step` asks to review (see [`Step::reviewers`]):
-/// those it names, else those of the people whose sign-offs it carries (`signoffs`), as
-/// this agent (`own`) and its allowlist know them. A name without a known account is left
+/// The GitHub accounts a pull request asks to review (see [`Step::reviewers`]): those
+/// `names` says, else those of the people whose sign-offs it carries (`signoffs`), as this
+/// agent (`own`) and its allowlist know them. A name without a known account is left
 /// out; the plan check warned about it.
 fn reviewers_for(
-    step: &Step,
+    names: Option<&[String]>,
     signoffs: &[crate::pulls::SignOff],
     own: &EndpointId,
     recipients: &Recipients,
@@ -2538,7 +2559,7 @@ fn reviewers_for(
             recipients.trust.get(id).and_then(|p| p.github.clone())
         }
     };
-    let found: Vec<Option<String>> = match &step.reviewers {
+    let found: Vec<Option<String>> = match names {
         Some(names) => names
             .iter()
             .map(|name| {
@@ -2647,6 +2668,159 @@ fn reviewer_problems(plan: &Plan, step: &Step, recipients: &Recipients) -> Vec<(
         }
     }
     problems
+}
+
+/// Work of a finished run that a pull request can be opened from, as [`run_work`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunWork {
+    /// The step whose branch has the work: no other step of the run builds on it.
+    pub step: String,
+    /// The peer that holds the clone, by its name on the allowlist, and the folder.
+    pub peer: String,
+    pub folder: String,
+    pub branch: String,
+    pub commit: String,
+    /// The pull request's title unless you give one: that of the step that started the work.
+    pub title: String,
+}
+
+/// The run's steps as a plan, to follow their `after` and `apply=` links.
+fn plan_of(run: &crate::runs::RunRecord) -> Plan {
+    Plan {
+        claims: Vec::new(),
+        steps: run.steps.iter().map(|s| s.step.clone()).collect(),
+        track: None,
+    }
+}
+
+/// The work of finished run `run` a pull request can be opened from: each signed commit a
+/// model's step made in a peer's folder that no other step of the run builds on (through
+/// `apply=`), unless a pull request step of the run saw it merged.
+pub fn run_work(run: &crate::runs::RunRecord) -> Vec<RunWork> {
+    let plan = plan_of(run);
+    let made: Vec<(&Step, &str, &str, &crate::evidence::GitCommit)> = run
+        .steps
+        .iter()
+        .filter(|r| !r.step.pr && !r.step.approve && r.step.team.is_none())
+        .filter_map(|r| match &r.state {
+            StepState::Done {
+                peer,
+                evidence: Some(e),
+                verified: true,
+                ..
+            } => {
+                let git = e.git.as_ref().filter(|g| g.commit.is_some())?;
+                Some((&r.step, peer.as_str(), e.share.as_deref()?, git))
+            }
+            _ => None,
+        })
+        .collect();
+    let steps: Vec<&Step> = made.iter().map(|m| m.0).collect();
+    let ends = chain_ends(&plan, &steps);
+    let merged: HashSet<String> = run
+        .steps
+        .iter()
+        .filter(|r| r.step.pr && matches!(r.state, StepState::Done { .. }))
+        .flat_map(|r| pr_sources(&plan, &r.step))
+        .map(|s| s.id.clone())
+        .collect();
+    made.into_iter()
+        .filter(|(step, ..)| ends.iter().any(|e| e.id == step.id) && !merged.contains(&step.id))
+        .map(|(step, peer, folder, git)| {
+            let first = std::iter::successors(Some(step), |s| {
+                s.apply
+                    .as_ref()
+                    .and_then(|a| plan.steps.iter().find(|x| &x.id == a))
+            })
+            .take(plan.steps.len())
+            .last()
+            .unwrap_or(step);
+            RunWork {
+                step: step.id.clone(),
+                peer: peer.to_owned(),
+                folder: folder.to_owned(),
+                branch: git.branch.clone(),
+                commit: git.commit.clone().unwrap_or_default(),
+                title: crate::llm::title_of(first.own_text()),
+            }
+        })
+        .collect()
+}
+
+/// What to ask the agent that holds the clone, to open a pull request with the work of
+/// step `step` of finished run `run` (see [`run_work`]): its branch and commit, titled
+/// `title` (else as the work), with the run's sign-offs that came after any of that work,
+/// asking `reviewers` (as `reviewers=` names them; else those who signed off) to review it.
+pub fn run_pull_request(
+    run: &crate::runs::RunRecord,
+    step: &str,
+    title: Option<&str>,
+    reviewers: Option<&[String]>,
+    own: &EndpointId,
+    recipients: &Recipients,
+) -> Result<(RunWork, crate::pulls::PullRequestAsk)> {
+    let work = run_work(run)
+        .into_iter()
+        .find(|w| w.step == step)
+        .with_context(|| {
+            format!(
+                "step {step} of run {} has no work to open a pull request with: it committed nothing in a peer's folder, another step builds on its work, or a pull request step of the run merged it",
+                run.id
+            )
+        })?;
+    let plan = plan_of(run);
+    // Its work: the step and those whose work it starts from.
+    let mut chain: HashSet<&str> = HashSet::new();
+    let mut at = plan.steps.iter().find(|s| s.id == step);
+    while let Some(s) = at {
+        if !chain.insert(s.id.as_str()) {
+            break;
+        }
+        at = s
+            .apply
+            .as_ref()
+            .and_then(|a| plan.steps.iter().find(|x| &x.id == a));
+    }
+    let signoffs: Vec<crate::pulls::SignOff> = run
+        .steps
+        .iter()
+        .filter(|r| r.step.approve)
+        .filter(|r| {
+            let before = ancestors(&plan, &r.step.id);
+            chain.iter().any(|c| before.contains(*c))
+        })
+        .filter_map(|r| match &r.state {
+            StepState::Done {
+                output,
+                evidence: Some(evidence),
+                verified: true,
+                ..
+            } if evidence.kind == crate::evidence::EvidenceKind::Approval
+                && evidence.approved == Some(true) =>
+            {
+                Some(crate::pulls::SignOff {
+                    step: r.step.id.clone(),
+                    output: output.clone(),
+                    evidence: evidence.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    let title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(crate::llm::title_of)
+        .unwrap_or_else(|| work.title.clone());
+    let reviewers = reviewers_for(reviewers, &signoffs, own, recipients);
+    let ask = crate::pulls::PullRequestAsk {
+        branch: work.branch.clone(),
+        commit: work.commit.clone(),
+        title,
+        signoffs,
+        reviewers,
+    };
+    Ok((work, ask))
 }
 
 /// A plan checked and ready to run as `profile`'s agent (see [`start`]).
@@ -3445,7 +3619,7 @@ pub async fn run_plan_with(
                         match pr_ask(plan, step, &states) {
                             Ok(mut ask) => {
                                 ask.reviewers = reviewers_for(
-                                    step,
+                                    step.reviewers.as_deref(),
                                     &ask.signoffs,
                                     &agent.id(),
                                     &fresh_recipients(agent, ctx),
@@ -4288,6 +4462,7 @@ mod tests {
             mcp_about: Default::default(),
             team: false,
             pull_requests: false,
+            pull_request_approval: false,
         };
         let peer = |name: &str, shares: Vec<ShareInfo>| PeerInfo {
             name: name.into(),
@@ -4850,19 +5025,26 @@ mod tests {
         };
         // Naming no one, it asks those who signed off whose accounts are known, each once.
         let signoffs = [signed(carol), signed(own), signed(dave), signed(carol)];
-        let plan = pr("");
+        let asks = |plan: &Plan| {
+            reviewers_for(
+                plan.steps[3].reviewers.as_deref(),
+                &signoffs,
+                &own,
+                &recipients,
+            )
+        };
+        assert_eq!(asks(&pr("")), ["carol-gh", "me-gh"]);
         assert_eq!(
-            reviewers_for(&plan.steps[3], &signoffs, &own, &recipients),
-            ["carol-gh", "me-gh"]
-        );
-        let named = pr("reviewers=me,carol,dave,octocat,ME-GH");
-        assert_eq!(
-            reviewers_for(&named.steps[3], &signoffs, &own, &recipients),
+            asks(&pr("reviewers=me,carol,dave,octocat,ME-GH")),
             ["me-gh", "carol-gh", "octocat"]
         );
-        assert!(
-            reviewers_for(&pr("reviewers=none").steps[3], &signoffs, &own, &recipients).is_empty()
+        assert!(asks(&pr("reviewers=none")).is_empty());
+        assert_eq!(
+            parse_reviewers("@me, carol octocat").unwrap(),
+            ["me", "carol", "octocat"]
         );
+        assert!(parse_reviewers(" none ").unwrap().is_empty());
+        assert!(parse_reviewers("me,none").is_err() && parse_reviewers("a/b").is_err());
 
         // The plan check says who isn't asked, and why.
         let check = |text: &str, recipients: &Recipients| {
@@ -4890,7 +5072,7 @@ mod tests {
         );
         assert!(check(&format!("{three} reviewers=none"), &signed_out).is_empty());
         let found = check(
-            "a @bob:app do\np after a pr @bob:app reviewers=me,carol,dave,octocat,x_y Go",
+            "a @bob:app do\np after a pr @bob:app reviewers=me,carol,dave,octocat,x.y Go",
             &signed_out,
         );
         let errors: Vec<bool> = found.iter().map(|(error, _)| *error).collect();
@@ -4905,8 +5087,165 @@ mod tests {
         ));
         assert_eq!(
             found[2].1,
-            "reviewers= names \"x_y\", who isn't on the allowlist and can't be a GitHub login"
+            "reviewers= names \"x.y\", who isn't on the allowlist and can't be a GitHub login"
         );
+    }
+
+    #[test]
+    fn a_finished_runs_work_opens_with_the_sign_offs_on_it() {
+        use crate::evidence::{EvidenceKind, GitCommit};
+        let text = "impl @bob:app Write the parser\n\
+                    check after impl @carol:app apply=impl verify=test Check it\n\
+                    docs @bob:docs Write the docs\n\
+                    ok after check approve @carol Ship it?\n\
+                    early after impl approve @me Looks right?\n\
+                    late after docs approve @me Docs fine?";
+        let plan = Plan::parse(text).unwrap();
+        let key = || iroh::SecretKey::generate();
+        let (own, bob, carol) = (key(), key(), key());
+        let made = |by: &iroh::SecretKey, peer: &str, folder: &str, branch: &str| {
+            let mut e = Evidence::new(EvidenceKind::Task, peer, by.public(), own.public(), 1);
+            e.share = Some(folder.into());
+            e.git = Some(GitCommit {
+                branch: branch.into(),
+                base: "base".into(),
+                commit: Some(format!("{branch}-commit")),
+                files: vec!["x".into()],
+                patch_sha256: None,
+                left_out: Vec::new(),
+            });
+            StepState::Done {
+                peer: peer.into(),
+                output: "did it".into(),
+                evidence: Some(e.sign("did it", by)),
+                verified: true,
+                patch: None,
+                model: None,
+            }
+        };
+        let approved = |by: &iroh::SecretKey, name: &str| {
+            let output = format!("Approved by {name}: fine");
+            let mut e = Evidence::new(EvidenceKind::Approval, name, by.public(), own.public(), 2);
+            e.approved = Some(true);
+            StepState::Done {
+                peer: name.into(),
+                output: output.clone(),
+                evidence: Some(e.sign(&output, by)),
+                verified: true,
+                patch: None,
+                model: None,
+            }
+        };
+        let states: BTreeMap<String, StepState> = [
+            ("impl", made(&bob, "bob", "app", "p2p/boss/1")),
+            ("check", made(&carol, "carol", "app", "p2p/boss/2")),
+            ("docs", made(&bob, "bob", "docs", "p2p/boss/3")),
+            ("ok", approved(&carol, "carol")),
+            ("early", approved(&own, "you")),
+            ("late", approved(&own, "you")),
+        ]
+        .into_iter()
+        .map(|(id, s)| (id.to_owned(), s))
+        .collect();
+        let run =
+            crate::runs::RunRecord::new("boss", &own.public().to_string(), text, &plan, &states, 0);
+        // check's branch has impl's work too: it, and docs, can be opened.
+        let work = run_work(&run);
+        assert_eq!(
+            work.iter()
+                .map(|w| (
+                    w.step.as_str(),
+                    w.peer.as_str(),
+                    w.folder.as_str(),
+                    w.title.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("check", "carol", "app", "Write the parser"),
+                ("docs", "bob", "docs", "Write the docs")
+            ]
+        );
+        assert!(
+            run_pull_request(
+                &run,
+                "impl",
+                None,
+                None,
+                &own.public(),
+                &Recipients::default()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("another step builds on its work")
+        );
+        // It carries the sign-offs on any of its work, and asks those who gave them.
+        let mut trust = TrustStore::default();
+        trust.allow(crate::trust::TrustedPeer {
+            name: "carol".into(),
+            id: carol.public(),
+            addrs: Default::default(),
+            can_delegate: false,
+            tasks_per_hour: 5,
+            access: Access::ReadOnly,
+            shares: Vec::new(),
+            m365: None,
+            github: Some("carol-gh".into()),
+        });
+        let mut recipients = Recipients::new(trust, Vec::new());
+        recipients.github = Some("me-gh".into());
+        let (w, ask) =
+            run_pull_request(&run, "check", Some("  "), None, &own.public(), &recipients).unwrap();
+        assert_eq!(
+            (w.branch.as_str(), ask.commit.as_str(), ask.title.as_str()),
+            ("p2p/boss/2", "p2p/boss/2-commit", "Write the parser")
+        );
+        let signed: Vec<&str> = ask.signoffs.iter().map(|s| s.step.as_str()).collect();
+        assert_eq!(signed, ["ok", "early"]);
+        assert_eq!(ask.reviewers, ["carol-gh", "me-gh"]);
+        let named = ["octocat".to_owned()];
+        let (_, docs) = run_pull_request(
+            &run,
+            "docs",
+            Some("Docs"),
+            Some(&named),
+            &own.public(),
+            &recipients,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                docs.title.as_str(),
+                docs.signoffs.len(),
+                docs.reviewers.as_slice()
+            ),
+            ("Docs", 1, ["octocat".to_owned()].as_slice())
+        );
+
+        // Work a pull request step of the run saw merged is in already.
+        let shipped = format!("{text}\nship after ok pr @carol:app");
+        let plan = Plan::parse(&shipped).unwrap();
+        let mut states = states;
+        states.insert(
+            "ship".into(),
+            StepState::Done {
+                peer: "carol".into(),
+                output: "Pull request #1 was merged".into(),
+                evidence: None,
+                verified: false,
+                patch: None,
+                model: None,
+            },
+        );
+        let run = crate::runs::RunRecord::new(
+            "boss",
+            &own.public().to_string(),
+            &shipped,
+            &plan,
+            &states,
+            0,
+        );
+        let steps: Vec<String> = run_work(&run).into_iter().map(|w| w.step).collect();
+        assert_eq!(steps, ["docs"]);
     }
 
     #[test]
@@ -5266,6 +5605,7 @@ mod tests {
                 mcp_about: Default::default(),
                 team: false,
                 pull_requests: false,
+                pull_request_approval: false,
             }],
             owner: None,
             role: None,
@@ -5424,6 +5764,7 @@ mod tests {
                 mcp_about: Default::default(),
                 team: false,
                 pull_requests: false,
+                pull_request_approval: false,
             }],
             owner: None,
             role: None,
@@ -5549,6 +5890,7 @@ mod tests {
                 mcp_about: Default::default(),
                 team: false,
                 pull_requests: false,
+                pull_request_approval: false,
             }],
             owner: None,
             role: None,

@@ -2061,6 +2061,33 @@ impl Inner {
         }
     }
 
+    /// Asks this agent's own user to approve `title` (`text` says what it is) and waits for
+    /// the signed answer (`ok` = approved). Dropping the wait withdraws the request.
+    async fn ask_own_user(self: &Arc<Self>, title: &str, text: &str) -> Result<Delivered> {
+        let task_id = self.new_task_id();
+        let me = self.endpoint.id();
+        let (reply, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(
+            task_id,
+            PendingTask {
+                peer: me,
+                reply,
+                request: None,
+                progress: None,
+            },
+        );
+        self.add_approval(me, self.name.clone(), task_id, title, text, BTreeMap::new());
+        let mut guard = CancelOnDrop {
+            inner: self.clone(),
+            peer: me,
+            task_id,
+            armed: true,
+        };
+        let result = rx.await;
+        guard.armed = false;
+        reply_result(result)
+    }
+
     /// Runs pull request step `task` from `from` (see [`crate::pulls`]): opens the pull
     /// request from the branch an earlier task of `from`'s committed to in this folder (or
     /// finds the one opened for it before), asks the step's reviewers to review one it
@@ -2116,6 +2143,81 @@ impl Inner {
             team: false,
         });
         let work = async {
+            // Only the sign-offs that check out go on the pull request.
+            let mut checked = ask.clone();
+            checked.signoffs.retain(|s| s.checks_out(&id.to_string()));
+            let left_out = ask.signoffs.len() - checked.signoffs.len();
+            let mut asked = crate::pulls::Asked {
+                by: from.to_owned(),
+                run: origin.and_then(|o| o.run.clone()),
+                step: origin.and_then(|o| o.step.clone()),
+                approval: None,
+            };
+            // Its owner approves each one first, unless an earlier try opened it already.
+            if share.pull_request_approval && pulls.find(&share.name, &checked).await?.is_none() {
+                self.send_progress(
+                    id,
+                    task_id,
+                    Progress::new(
+                        Phase::PullRequest,
+                        format!(
+                            "waiting for {} to approve opening the pull request from {}",
+                            self.name, ask.branch
+                        ),
+                    ),
+                );
+                let mut text = format!(
+                    "{from} asks you to open a pull request in '{}' with your GitHub account, with work this agent did for them:\n\n- Title: {}\n- Branch: `{}` (commit `{}`): the GitHub card's task branches can show its changes\n",
+                    share.name,
+                    checked.title,
+                    checked.branch,
+                    checked.commit.chars().take(12).collect::<String>()
+                );
+                if !checked.signoffs.is_empty() {
+                    text += &format!(
+                        "- Sign-offs it lists: {}\n",
+                        checked
+                            .signoffs
+                            .iter()
+                            .map(|s| format!("{} ({})", s.evidence.signer, s.step))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                if !checked.reviewers.is_empty() {
+                    text += &format!("- Asked to review: {}\n", checked.reviewers.join(", "));
+                }
+                if !task.issues.is_empty() {
+                    text += &format!("- It closes: {}\n", task.issues.join(", "));
+                }
+                text += "\nApproving pushes the branch and opens the pull request, which says you approved it.";
+                let answer = self
+                    .ask_own_user(
+                        &format!("Open a pull request in {} for {from}?", share.name),
+                        &text,
+                    )
+                    .await?;
+                let note = answer
+                    .output
+                    .split_once(": ")
+                    .map(|(_, note)| note.trim().to_owned())
+                    .unwrap_or_default();
+                if !answer.ok {
+                    bail!(
+                        "{} didn't approve opening the pull request{}",
+                        self.name,
+                        if note.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {note}")
+                        }
+                    );
+                }
+                asked.approval = Some(crate::pulls::OwnerApproval {
+                    by: self.name.clone(),
+                    note,
+                });
+            }
             self.send_progress(
                 id,
                 task_id,
@@ -2124,13 +2226,8 @@ impl Inner {
                     format!("opening the pull request from {}", ask.branch),
                 ),
             );
-            // Only the sign-offs that check out go on the pull request.
-            let mut checked = ask.clone();
-            checked.signoffs.retain(|s| s.checks_out(&id.to_string()));
-            let left_out = ask.signoffs.len() - checked.signoffs.len();
-            let run = origin.and_then(|o| o.run.as_deref());
             let opened = pulls
-                .open(&share.name, &checked, &task.issues, from, run)
+                .open(&share.name, &checked, &task.issues, &asked)
                 .await?;
             // Reviewers are asked once, when it is opened: asking again would ask those who
             // reviewed it already to review it again.
@@ -2156,7 +2253,7 @@ impl Inner {
                 }
                 reviews.extend(not);
             }
-            let asked: Vec<&str> = reviews
+            let reviewing: Vec<&str> = reviews
                 .iter()
                 .filter(|r| r.not_asked.is_none())
                 .map(|r| r.login.as_str())
@@ -2173,10 +2270,10 @@ impl Inner {
                             format!(
                                 "pull request #{} is open{}: waiting for it to be merged ({})",
                                 opened.number,
-                                if asked.is_empty() {
+                                if reviewing.is_empty() {
                                     String::new()
                                 } else {
-                                    format!(", with a review asked of {}", asked.join(", "))
+                                    format!(", with a review asked of {}", reviewing.join(", "))
                                 },
                                 opened.url
                             ),
@@ -2213,7 +2310,17 @@ impl Inner {
                 ));
             }
             if opened.existed {
-                notes.push("an earlier try of this step opened it".to_owned());
+                notes.push(
+                    if asked.step.is_some() {
+                        "an earlier try of this step opened it"
+                    } else {
+                        "it was opened before, from the same work"
+                    }
+                    .to_owned(),
+                );
+            }
+            if let Some(approval) = &asked.approval {
+                notes.push(format!("{} approved opening it", approval.by));
             }
             let output = format!(
                 "Pull request #{} {}: {}\n\nIt has the work of branch `{}` (commit `{}`){}{}.{}",

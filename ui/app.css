@@ -335,6 +335,11 @@ textarea { resize: vertical; }
 .worker .sub { margin-top: 2px; }
 .worker-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-top: 8px; }
 .check.small { font-size: 12.5px; align-items: center; color: var(--muted); }
+.pr-toggles { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.run-pulls { display: grid; gap: 6px; margin: 10px 0; }
+.run-pulls h3 { font-size: 13px; margin: 0; }
+.run-pull { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.run-pull .mono { overflow-wrap: anywhere; }
 .worker-log { margin-top: 6px; }
 .worker-log > summary { cursor: pointer; font-size: 12.5px; color: var(--accent); width: fit-content; }
 .worker-log pre {

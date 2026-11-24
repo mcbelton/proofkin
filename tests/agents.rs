@@ -11,7 +11,7 @@ use proofkin::audit::{AuditLog, Outcome};
 use proofkin::mcp::McpServer;
 use proofkin::plan::{Plan, RunContext, SquadStore, StepState, run_plan, run_plan_with};
 use proofkin::protocol::Phase;
-use proofkin::pulls::{Opened, PullRequestAsk, PullRequests, Review};
+use proofkin::pulls::{Asked, Opened, PullRequestAsk, PullRequests, Review};
 use proofkin::runs::{RunRecord, Verdict};
 use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
 use proofkin::{
@@ -1844,8 +1844,8 @@ async fn worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch()
 }
 
 /// A call [`FakePulls`] answered: the folder, the ask as it came (with the sign-offs that
-/// checked out), the issues, who asked and the run it is part of.
-type OpenCall = (String, PullRequestAsk, Vec<String>, String, Option<String>);
+/// checked out), the issues, and who asked and how.
+type OpenCall = (String, PullRequestAsk, Vec<String>, Asked);
 
 /// Pull requests kept in memory: each one opened is open until the test merges or closes
 /// it, and opening the same work again finds it.
@@ -1867,15 +1867,13 @@ impl PullRequests for FakePulls {
         share: &str,
         ask: &PullRequestAsk,
         issues: &[String],
-        by: &str,
-        run: Option<&str>,
+        asked: &Asked,
     ) -> anyhow::Result<Opened> {
         self.calls.lock().unwrap().push((
             share.into(),
             ask.clone(),
             issues.to_vec(),
-            by.into(),
-            run.map(Into::into),
+            asked.clone(),
         ));
         let mut opened = self.opened.lock().unwrap();
         let mut states = self.states.lock().unwrap();
@@ -1895,6 +1893,21 @@ impl PullRequests for FakePulls {
             existed,
             proof: true,
         })
+    }
+
+    async fn find(&self, _share: &str, ask: &PullRequestAsk) -> anyhow::Result<Option<Opened>> {
+        let opened = self.opened.lock().unwrap();
+        let work = (ask.branch.clone(), ask.commit.clone());
+        Ok(opened.iter().position(|w| *w == work).map(|i| {
+            let number = i as u64 + 1;
+            Opened {
+                number,
+                url: format!("https://github.com/acme/app/pull/{number}"),
+                state: self.states.lock().unwrap()[&number].clone(),
+                existed: true,
+                proof: false,
+            }
+        }))
     }
 
     async fn state(&self, _share: &str, number: u64) -> anyhow::Result<String> {
@@ -1954,7 +1967,7 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     worker.grant("eve", Access::WorkspaceWrite, &["app"]);
     worker.pulls = Some(pulls.clone());
     let mut allowed = worker.shares.clone();
-    allowed.set_pull_requests("app", true).unwrap();
+    allowed.set_pull_requests("app", true, false).unwrap();
     let (worker, _we) = worker.start().await;
     let (boss, _be) = boss.start().await;
     let (eve, _ee) = eve.start().await;
@@ -2055,10 +2068,16 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         panic!("{:?}", states["check"]);
     };
     let branch = checked.git.clone().unwrap();
-    let (share, ask, issues, by, run) = pulls.calls.lock().unwrap()[0].clone();
+    let (share, ask, issues, asked) = pulls.calls.lock().unwrap()[0].clone();
     assert_eq!(
-        (share.as_str(), by.as_str(), run.as_deref()),
-        ("app", "boss", Some("run-2"))
+        (
+            share.as_str(),
+            asked.by.as_str(),
+            asked.run.as_deref(),
+            asked.step.as_deref(),
+            asked.approval
+        ),
+        ("app", "boss", Some("run-2"), Some("ship"), None)
     );
     assert!(issues.is_empty(), "{issues:?}");
     assert_eq!(
@@ -2176,7 +2195,8 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         refused.output
     );
 
-    // A sign-off whose record doesn't check out stays off it.
+    // A sign-off whose record doesn't check out stays off it. (Sent again as the step,
+    // as a run that goes on after a restart sends it.)
     let signed = ask.signoffs[0].clone();
     let forged = proofkin::pulls::SignOff {
         output: "Approved by boss: anything".into(),
@@ -2187,7 +2207,17 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         signoffs: vec![signed.clone(), forged],
         ..ask.clone()
     }));
-    let reopened = boss.delegate_verified(worker.id(), again).await.unwrap();
+    let step = proofkin::protocol::Origin {
+        run: Some("run-2".into()),
+        step: Some("ship".into()),
+        task: None,
+    };
+    let reopened = boss
+        .send_task(worker.id(), again, Some(step))
+        .unwrap()
+        .finish(|_| {})
+        .await
+        .unwrap();
     assert!(
         reopened.ok
             && reopened
@@ -2202,6 +2232,177 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     // An earlier try opened it: its reviewers aren't asked again.
     assert_eq!(pulls.reviews.lock().unwrap().len(), 2);
     signer.abort();
+}
+
+#[tokio::test]
+async fn a_folder_owner_approves_each_pull_request_and_a_run_card_asks_for_one() {
+    let repo = git_repo();
+    let pulls = Arc::new(FakePulls::default());
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker
+        .shares
+        .add_with(
+            "app",
+            repo.path(),
+            Access::WorkspaceWrite,
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    worker.shares.set_pull_requests("app", true, true).unwrap();
+    worker.grant("boss", Access::WorkspaceWrite, &["app"]);
+    worker.pulls = Some(pulls.clone());
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    assert!(
+        boss.peers()[0]
+            .shares
+            .iter()
+            .any(|s| s.pull_requests && s.pull_request_approval),
+        "boss learns the folder's owner approves each one"
+    );
+    // The folder's owner answers the next request it gets.
+    let answer = |approve: bool, note: &'static str| {
+        let worker = worker.clone();
+        tokio::spawn(async move {
+            let request = timeout(Duration::from_secs(30), async {
+                loop {
+                    if let Some(a) = worker.approvals().pop() {
+                        return a;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the folder's owner is asked");
+            worker
+                .answer_approval(request.id, approve, note)
+                .await
+                .unwrap();
+            request
+        })
+    };
+
+    // Not approved: nothing is pushed or opened, and the step says why.
+    let text = "impl @worker:app create feature.txt\nship after impl pr @worker:app";
+    let plan = Plan::parse(text).unwrap();
+    let no = answer(false, "not yet");
+    let ctx = RunContext {
+        run_id: Some("run-1".into()),
+        ..Default::default()
+    };
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}),
+    )
+    .await
+    .unwrap();
+    let request = no.await.unwrap();
+    assert_eq!(request.title, "Open a pull request in app for boss?");
+    assert!(
+        request
+            .text
+            .starts_with("boss asks you to open a pull request in 'app' with your GitHub account")
+            && request.text.contains("- Branch: `p2p/boss/"),
+        "{}",
+        request.text
+    );
+    assert!(
+        matches!(&states["ship"], StepState::Failed { error, .. } if error.contains("worker didn't approve opening the pull request: not yet")),
+        "{:?}",
+        states["ship"]
+    );
+    assert!(pulls.calls.lock().unwrap().is_empty());
+
+    // From the run's card: the work of step impl, which no pull request has yet.
+    let record = RunRecord::new("boss", &boss.id().to_string(), text, &plan, &states, 0);
+    let work = proofkin::plan::run_work(&record);
+    assert_eq!(
+        work.iter()
+            .map(|w| (
+                w.step.as_str(),
+                w.peer.as_str(),
+                w.folder.as_str(),
+                w.title.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [("impl", "worker", "app", "create feature.txt")]
+    );
+    let (_, ask) = proofkin::plan::run_pull_request(
+        &record,
+        "impl",
+        Some("Add the feature"),
+        None,
+        &boss.id(),
+        &proofkin::plan::Recipients::default(),
+    )
+    .unwrap();
+    let mut task = LlmTask::new(Provider::Copilot, "open it").in_share("app");
+    task.pull_request = Some(Box::new(ask));
+    let origin = proofkin::protocol::Origin {
+        run: Some("run-1".into()),
+        task: Some(1),
+        step: None,
+    };
+    let yes = answer(true, "fine");
+    let merge = {
+        let pulls = pulls.clone();
+        tokio::spawn(async move { pulls.when_opened(1, "MERGED").await })
+    };
+    let done = timeout(
+        Duration::from_secs(60),
+        boss.send_task(worker.id(), task.clone(), Some(origin.clone()))
+            .unwrap()
+            .finish(|_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    yes.await.unwrap();
+    merge.await.unwrap();
+    assert!(
+        done.ok && done.output.contains("; worker approved opening it."),
+        "{}",
+        done.output
+    );
+    let (_, opened, _, asked) = pulls.calls.lock().unwrap()[0].clone();
+    assert_eq!(opened.title, "Add the feature");
+    assert_eq!(
+        (asked.run.as_deref(), asked.step, asked.approval),
+        (
+            Some("run-1"),
+            None,
+            Some(proofkin::pulls::OwnerApproval {
+                by: "worker".into(),
+                note: "fine".into()
+            })
+        )
+    );
+
+    // Asked again (say after a restart), it follows the one it opened: no new request.
+    let again = timeout(
+        Duration::from_secs(60),
+        boss.send_task(worker.id(), task, Some(origin))
+            .unwrap()
+            .finish(|_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        again.ok
+            && again
+                .output
+                .contains("it was opened before, from the same work"),
+        "{}",
+        again.output
+    );
+    assert!(worker.approvals().is_empty());
+    assert_eq!(pulls.opened.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
