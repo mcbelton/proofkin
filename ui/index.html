@@ -531,7 +531,26 @@
     <form method="dialog" id="team-form" novalidate>
       <h2 id="team-h">Team plan</h2>
       <p class="muted small" id="team-intro"></p>
-      <label class="field">
+      <fieldset class="field team-by" id="team-who">
+        <legend>Who writes the team plan</legend>
+        <label class="check">
+          <input type="radio" name="team-by" id="team-by-owner" value="owner" checked>
+          <span>I do</span>
+        </label>
+        <label class="check">
+          <input type="radio" name="team-by" id="team-by-model" value="model" aria-describedby="team-model-hint">
+          <span>My model writes one for each team step</span>
+        </label>
+        <span class="muted small team-sub" id="team-model-hint">This agent's default model writes it from the step's task and the peers, squads and skills it may use, reading the folder but changing nothing. A plan runs only once it checks out.</span>
+        <div class="team-sub" id="team-approve-field" hidden>
+          <label class="check">
+            <input type="checkbox" id="team-approve" aria-describedby="team-approve-hint">
+            <span>Ask me to approve each plan before it runs</span>
+          </label>
+          <span class="muted small" id="team-approve-hint">Each plan waits for you under Waiting for your approval. Ask for changes and your model writes it again with your note (at most twice); reject it and the step fails.</span>
+        </div>
+      </fieldset>
+      <label class="field" id="team-plan-field">
         <span>Team plan</span>
         <textarea id="team-plan" class="mono" rows="8" spellcheck="false" aria-describedby="team-hint"></textarea>
         <span class="muted small" id="team-hint">One claim or step per line. <span class="mono">{task}</span> is where the task of the peer's step goes (in claims, a one-line brief of it).</span>

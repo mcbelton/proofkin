@@ -2132,9 +2132,9 @@ impl Inner {
         }
     }
 
-    /// Asks this agent's own user to approve `title` (`text` says what it is) and waits for
-    /// the signed answer (`ok` = approved). Dropping the wait withdraws the request.
-    async fn ask_own_user(self: &Arc<Self>, title: &str, text: &str) -> Result<Delivered> {
+    /// Asks this agent's own user to approve `ask` and waits for the signed answer (`ok` =
+    /// approved). Dropping the wait withdraws the request.
+    async fn ask_own_user(self: &Arc<Self>, ask: ApprovalAsk) -> Result<Delivered> {
         let task_id = self.new_task_id();
         let me = self.endpoint.id();
         let (reply, rx) = oneshot::channel();
@@ -2147,11 +2147,6 @@ impl Inner {
                 progress: None,
             },
         );
-        let ask = ApprovalAsk {
-            title: title.to_owned(),
-            text: text.to_owned(),
-            ..ApprovalAsk::default()
-        };
         self.add_approval(me, self.name.clone(), task_id, ask);
         let mut guard = CancelOnDrop {
             inner: self.clone(),
@@ -2268,10 +2263,11 @@ impl Inner {
                 }
                 text += "\nApproving pushes the branch and opens the pull request, which says you approved it.";
                 let answer = self
-                    .ask_own_user(
-                        &format!("Open a pull request in {} for {from}?", share.name),
-                        &text,
-                    )
+                    .ask_own_user(ApprovalAsk {
+                        title: format!("Open a pull request in {} for {from}?", share.name),
+                        text,
+                        ..ApprovalAsk::default()
+                    })
                     .await?;
                 let note = answer
                     .output
@@ -2444,8 +2440,9 @@ impl Inner {
         }
     }
 
-    /// Runs team step `task` from `from`: its folder's team plan, on this agent's own
-    /// peers (never one the work came down from), reporting each of its steps upward.
+    /// Runs team step `task` from `from`: its folder's team plan, or one this agent's
+    /// model writes for it (see [`Inner::write_team_plan`]), on this agent's own peers
+    /// (never one the work came down from), reporting each of its steps upward.
     /// The signed evidence holds the team run with every step's own signed evidence,
     /// so the requester (and anyone later) can check the whole tree.
     #[allow(clippy::too_many_arguments)]
@@ -2466,13 +2463,30 @@ impl Inner {
             .clone()
             .ok_or_else(|| anyhow!("{} doesn't run team plans", self.name))?;
         let (ctx, share) = self.admit_task(id, task)?;
-        let template = share.team.clone().ok_or_else(|| {
-            anyhow!(
+        // The folder's own team plan, else one its model writes, with this agent's first
+        // provider.
+        let writer = if share.team.is_some() {
+            None
+        } else if share.team_model {
+            let provider = self
+                .executor
+                .as_ref()
+                .and_then(|e| e.providers().first().copied());
+            let writer = self.executor.clone().zip(provider).ok_or_else(|| {
+                anyhow!(
+                    "{} runs no models, so it can't write a team plan for '{}'",
+                    self.name,
+                    share.name
+                )
+            })?;
+            Some(writer)
+        } else {
+            bail!(
                 "folder '{}' on {} has no team plan for team steps",
                 share.name,
                 self.name
-            )
-        })?;
+            );
+        };
         if ctx.access < Access::WorkspaceWrite {
             bail!(
                 "a team step needs edit access in '{}' on {}; {from} has {}",
@@ -2520,7 +2534,32 @@ impl Inner {
             let _ = self.events.send(event);
             self.send_progress(id, task_id, crate::team::progress(&update));
         };
-        let work = runner.run(&agent, &template, task, request, *id, observe);
+        let work = async {
+            let (template, notes) = match &writer {
+                Some((executor, provider)) => {
+                    self.write_team_plan(
+                        executor.as_ref(),
+                        *provider,
+                        &runner,
+                        id,
+                        from,
+                        task_id,
+                        task,
+                        request,
+                        &share,
+                    )
+                    .await?
+                }
+                None => (share.team.clone().unwrap_or_default(), Vec::new()),
+            };
+            let mut outcome = runner
+                .run(&agent, &template, task, request, *id, observe)
+                .await?;
+            for note in notes {
+                outcome.output = format!("{}\n\n{note}", outcome.output.trim_end());
+            }
+            anyhow::Ok(outcome)
+        };
         let outcome = tokio::select! {
             outcome = work => outcome?,
             _ = cancel => {
@@ -2547,6 +2586,137 @@ impl Inner {
             ok: outcome.ok,
             model: None,
         })
+    }
+
+    /// Has `executor`'s model write the team plan for team step `task` from `from` in
+    /// folder `share`, whose owner leaves team plans to it: with `provider` and the
+    /// owner's default model and reasoning effort for it, read-only in the folder, in one
+    /// of this agent's task slots while it writes. A plan that doesn't check out as
+    /// [`crate::team::TeamRunner::run`] checks one goes back to it with what is wrong, up
+    /// to [`crate::team::PLAN_TRIES`] tries in all; then this agent's own user approves
+    /// it first if the owner asked for that, and may ask for changes instead, up to
+    /// [`crate::team::PLAN_CHANGE_ROUNDS`] times: the model writes it again with their
+    /// note (with as many tries), and they are asked again. Returns the plan to run,
+    /// which says first (in a comment) who wrote it, and what the lead's answer adds: who
+    /// wrote it, and a note if the folder couldn't be brought up to date first.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_team_plan(
+        self: &Arc<Self>,
+        executor: &dyn Executor,
+        provider: Provider,
+        runner: &crate::team::TeamRunner,
+        id: &EndpointId,
+        from: &str,
+        task_id: u64,
+        task: &LlmTask,
+        request: &crate::team::TeamRequest,
+        share: &Share,
+    ) -> Result<(String, Vec<String>)> {
+        let agent = Agent {
+            inner: self.clone(),
+        };
+        // A linked repository's clone first gets the repository's latest commit.
+        let kept = self.update_folder(id, task_id, share).await;
+        let prompt = runner.prompt(&agent, task, request, *id);
+        let mut ask = LlmTask::new(provider, prompt.clone());
+        let choice = crate::models::choice(&self.models.lock().unwrap(), provider);
+        ask.model = choice.pick(None)?;
+        ask.effort = choice.pick_effort(None)?;
+        let ctx = TaskContext::new(Access::ReadOnly, &share.path);
+        // What the model is asked: the prompt, with the changes its owner last asked for
+        // (`asked`, in round `rounds` of changes).
+        let (mut base, mut asked, mut rounds) = (prompt.clone(), None::<String>, 0);
+        let (plan, model, approved) = loop {
+            ask.prompt = base.clone();
+            let mut tries = 0;
+            let (plan, model) = loop {
+                tries += 1;
+                let text = match (tries, &asked) {
+                    (1, None) => format!("{}'s model is writing the team plan", self.name),
+                    (1, Some(_)) => format!(
+                        "{0}'s model is writing the team plan again, with the changes {0} \
+                         asked for",
+                        self.name
+                    ),
+                    _ => format!(
+                        "{}'s model is writing the team plan again, told what was wrong with it",
+                        self.name
+                    ),
+                };
+                self.send_progress(id, task_id, Progress::new(Phase::Running, text));
+                let ran = {
+                    let _slot = self.take_slot(id, task_id).await?;
+                    executor.execute(&ask, &ctx).await.with_context(|| {
+                        format!("{}'s model couldn't write the team plan", self.name)
+                    })?
+                };
+                let plan = crate::team::written_plan(&ran.output);
+                match runner.check(&agent, &plan, task, request) {
+                    Ok(_) => break (plan, ran.model.or_else(|| ask.model.clone())),
+                    Err(e) if tries < crate::team::PLAN_TRIES => {
+                        let problems = format!("{e:#}");
+                        ask.prompt = crate::team::plan_again_prompt(&base, &plan, &problems);
+                    }
+                    Err(e) => bail!(
+                        "{}'s model couldn't write a team plan that checks out: {e:#}",
+                        self.name
+                    ),
+                }
+            };
+            if !share.team_approval {
+                break (plan, model, None);
+            }
+            self.send_progress(
+                id,
+                task_id,
+                Progress::new(
+                    Phase::Team,
+                    format!("waiting for {} to approve the team plan", self.name),
+                ),
+            );
+            let changes = rounds < crate::team::PLAN_CHANGE_ROUNDS;
+            let text = crate::team::approval_text(
+                from,
+                &share.name,
+                request,
+                &plan,
+                asked.as_deref().map(|note| (rounds, note)),
+            );
+            let answer = self
+                .ask_own_user(ApprovalAsk {
+                    title: format!("Run this team plan for {from}?"),
+                    text,
+                    changes,
+                    ..ApprovalAsk::default()
+                })
+                .await?;
+            if answer.ok {
+                break (plan, model, Some(rounds));
+            }
+            let note = answer
+                .output
+                .split_once(": ")
+                .map(|(_, note)| note.trim().to_owned())
+                .unwrap_or_default();
+            if changes && answer.output.starts_with(CHANGES_ASKED) {
+                rounds += 1;
+                base = crate::team::plan_changes_prompt(&prompt, &plan, &self.name, &note);
+                asked = Some(note);
+                continue;
+            }
+            bail!(
+                "{} didn't approve the team plan{}",
+                self.name,
+                if note.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {note}")
+                }
+            );
+        };
+        let by = crate::team::written_by(&self.name, provider, model.as_deref(), from, approved);
+        let notes = std::iter::once(format!("{by}.")).chain(kept).collect();
+        Ok((format!("// {by}\n{plan}"), notes))
     }
 
     /// Waits for a task slot for `peer`'s task `task_id`, telling it its place in the

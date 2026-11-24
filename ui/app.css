@@ -597,6 +597,10 @@ dialog h2 { font-size: 16px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .dialog-actions .btn.danger:first-child { margin-right: auto; }
 .share-team { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; }
+/* Who writes a team plan: the options read as text, and what goes with the model's sits under it. */
+.team-by .check { font-weight: 400; }
+.team-sub { margin-left: 28px; }
+div.team-sub { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
 /* The error and buttons stay in view while a long dialog scrolls (e.g. on a phone). */
 dialog form > .dialog-footer {
   position: sticky; bottom: 0; z-index: 1; display: flex; flex-direction: column; gap: 12px;

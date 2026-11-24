@@ -843,6 +843,42 @@ proofkin share team app team.plan --profile alice   # --clear removes it; share 
 
 The owner can also set or remove a folder's team plan in the web UI (This agent > Shared
 folders > Team plan…).
+
+Instead of writing one, the owner can let the lead's model write the team plan for each
+team step the folder is handed:
+
+```powershell
+proofkin share team app --model --approve --profile alice   # --approve: you approve each plan first
+```
+
+In the web UI, the **Team plan…** dialog asks **Who writes the team plan**: **I do** (the
+plan, as above) or **My model writes one for each team step**, with **Ask me to approve
+each plan before it runs**; the folder's line then says *Takes team steps (its model writes
+the plan)*. A written plan and the model replace each other, and `--clear` (**Remove team
+plan**) removes either. Peers see only that the folder takes team steps.
+
+- The model is the owner's default model and reasoning effort for the lead's first
+  provider. It works read-only in the folder, holding one of the lead's task slots only
+  while it writes. It is given the task as handed down (and a one-line brief of it), how a
+  team plan is written, and the team it may use: the connected peers (except the agents the
+  work came down from) with their roles, providers and the folders each shares with the
+  lead (access, checks, whether they take team or pull request steps), the lead's squads
+  and its skills. Team steps of its own are offered only when `levels=` lets the work go
+  further down.
+- Its plan (the answer's first fenced block) is checked as an owner's plan is before it
+  runs. One that doesn't check out goes back to the model with its problems, at most 3
+  tries in all; then the step fails with them.
+- With `--approve`, each plan waits under **Waiting for your approval** (*Run this team plan
+  for boss?*, with the plan) until the owner answers: **Approve** runs it, **Ask for
+  changes** has the model write it again with the owner's note before they are asked again
+  (at most 2 rounds; then only approve or reject), and **Reject** fails the step with their
+  note.
+- The team run's plan starts with a comment saying who wrote it, and the lead's answer
+  says so too, e.g. *This team plan was written by alice's model (copilot,
+  claude-opus-5.5) for boss's team step, and approved by alice after 1 round of changes.*
+- A lead that runs no models (an agent that only delegates) refuses team steps in such a
+  folder.
+
 The boss gives a step to the lead with `team`:
 
 ```text
@@ -1806,7 +1842,8 @@ proofkin --name me --providers copilot --serve --ui
   its [models](#models) with **Models…** to choose the ones peers may pick,
   access level and workspace, and its shared folders, each with a **Team plan…** button (for
   folders with edit or full access) to set or remove the folder's
-  [team plan](#team-steps-handing-work-down-a-level).
+  [team plan](#team-steps-handing-work-down-a-level), or have its model write one for each
+  team step, approved by you first if you like.
 - **GitHub**: **Sign in to GitHub** with a GitHub CLI account; once signed in, **Change
   account** next to "Signed in as …" switches to another one (the account in use is
   preselected), or **Sign in another account** with a code entered on GitHub. The card
@@ -2078,10 +2115,13 @@ A worker decides exactly what each peer can see:
 - A task naming a folder that isn't shared with that peer is refused (and audited).
 - `proofkin share team <folder> <file>` gives a folder a **team plan**, so peers with edit
   access can hand it [team steps](#team-steps-handing-work-down-a-level) that your agent
-  runs with your own team. Peers see only that the folder takes team steps, not the plan.
+  runs with your own team; `--model` has your agent's model write one for each team step
+  instead (read-only in the folder, checked before it runs), and `--approve` has you
+  approve each first. Peers see only that the folder takes team steps, not the plan.
   The web UI sets and removes it too, under **This agent > Shared folders > Team plan…**
   (and through its API: `PUT /api/shares/<folder>/team` with
-  `{"plan": "..."}` and `DELETE /api/shares/<folder>/team`).
+  `{"plan": "..."}` or `{"model": true, "approve": true}`, and
+  `DELETE /api/shares/<folder>/team`).
 - `proofkin share pull-requests <folder>` lets peers with edit access end their plans with
   a [pull request step](#pull-request-steps-opening-the-pull-request-from-the-plan) in a
   linked repository's folder: your agent pushes the branch of work it did for them and

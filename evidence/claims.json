@@ -453,7 +453,7 @@
     {
       "id": "UI-4",
       "area": "ui",
-      "claim": "The web UI shows a task's prompt and a team step's text as Markdown (code spans, bold, lists, rules and paragraphs; a line of ---, *** or ___ after a blank line is a rule, so a signed result's summary shows under one; built as DOM nodes so markup in the text stays text), compactly; a long prompt is cut at about four lines with a fade until Show all.",
+      "claim": "The web UI shows a task's prompt and a team step's text as Markdown (code spans, bold, lists, rules, code blocks and paragraphs; a line of ---, *** or ___ after a blank line is a rule, so a signed result's summary shows under one; a code block ends only at a fence at least as long as its own, so one in a longer fence stays inside it; built as DOM nodes so markup in the text stays text), compactly; a long prompt is cut at about four lines with a fade until Show all.",
       "tests": ["ui::task_text_shows_as_markdown_and_markup_stays_text"]
     },
     {
@@ -999,6 +999,26 @@
         "ui::team_runs_show_on_the_bosss_step_and_the_leads_page",
         "ui::the_plan_editor_keeps_plans_valid",
         "ui::the_owner_sets_and_removes_a_folders_team_plan_through_the_api"
+      ]
+    },
+    {
+      "id": "TEAM-3",
+      "area": "squads",
+      "claim": "A folder's owner can leave its team plans to their agent's model instead of writing one (proofkin share team NAME --model, optionally --approve; a written plan and the model exclude each other, and peers see either as a folder that takes team steps). For each team step it is handed, the lead's model writes the team plan with the owner's default model and effort for its first provider, read-only in the folder, holding a task slot only while it writes, from a prompt with the task as handed down, how a team plan is written and the team it may use (its peers except the agents the work came from, its squads and skills).       The plan is the answer's first fenced block, checked as an owner's plan is before it runs; one that doesn't check out goes back to the model with what is wrong, up to 3 tries in all, and then fails the step. With --approve the owner approves each plan first: they may ask for changes, at most twice, which the model makes before they are asked again, and a plan they reject fails the step. The team run's plan (in a comment) and the lead's answer say whose model wrote it for whose step, and whether the owner approved it and after how many rounds of changes. A lead that runs no models refuses such team steps.",
+      "tests": [
+        "agents::a_leads_model_writes_the_team_plan_of_each_team_step_and_its_owner_approves_it",
+        "lib::team::a_leads_model_is_asked_for_a_plan_for_the_task_handed_down_with_the_team_it_may_use",
+        "lib::team::the_plan_a_model_writes_is_its_answers_first_fenced_block_else_the_whole_answer",
+        "lib::shares::a_folder_takes_team_steps_with_its_owners_plan_or_its_models_but_not_both"
+      ]
+    },
+    {
+      "id": "TEAM-4",
+      "area": "web ui",
+      "claim": "The web UI lets an owner have a folder's model write its team plans (Team plan…: who writes it, I do or My model writes one for each team step, with Ask me to approve each plan before it runs): PUT /api/shares/NAME/team with {\"model\": true, \"approve\": bool} saves it for the running agent and in shares.json, and the reply, the activity and the page's shares (team_model, team_approval) say what the folder does now. A written plan and the model replace each other, DELETE removes either, and a body that says neither or both is refused with what to send, as the data share and a folder it doesn't share are.",
+      "tests": [
+        "ui::the_owner_lets_a_folders_model_write_its_team_plans_through_the_api",
+        "ui::the_page_follows_the_ux_guidelines"
       ]
     },
     {

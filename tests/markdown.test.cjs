@@ -56,4 +56,13 @@ const under = renderMarkdown("Title\n---\nbody");
 assert.deepStrictEqual(tags(under), ["p"]);
 assert.strictEqual(under.textContent, "Title --- body");
 
-console.log("ok: task text becomes code, list items, rules and paragraphs, and markup stays text");
+// A fenced block ends at a line of as many backticks or more: a team plan to approve,
+// in a longer fence, keeps the code blocks of its steps' text inside it.
+const fenced = renderMarkdown("Plan:\n\n````text\ndev @alice {task}\n  ```sh\n  make\n  ```\n````\n\nApprove it.");
+assert.deepStrictEqual(tags(fenced), ["p", "pre", "p"]);
+assert.strictEqual(fenced.children[1].textContent, "dev @alice {task}\n  ```sh\n  make\n  ```");
+const plain = renderMarkdown("```js\nlet a = 1;\n```  \nafter");
+assert.deepStrictEqual(tags(plain), ["pre", "p"]);
+assert.strictEqual(plain.children[0].textContent, "let a = 1;");
+
+console.log("ok: task text becomes code, list items, rules, code blocks and paragraphs, and markup stays text");

@@ -324,7 +324,7 @@ function renderMe() {
               title: "Set what this agent's team does when a peer hands this folder a team step",
               onclick: (e) => openTeamDialog(s, e.currentTarget),
             }, "Team plan…"),
-            s.team ? el("span", { class: "small muted", text: `Takes team steps (${teamStepCount(s.team)} ${teamStepCount(s.team) === 1 ? "step" : "steps"})` }) : null),
+            teamLine(s) ? el("span", { class: "small muted", text: teamLine(s) }) : null),
           s.worktrees && ["workspace-write", "full"].includes(s.max_access) ? el("div", { class: "share-team" }, pullRequestsToggle(s)) : null))));
     }
   } else {
@@ -860,13 +860,36 @@ function openTeamDialog(share, opener) {
   const plan = $("#team-plan");
   plan.value = share.team ?? "";
   plan.placeholder = `claim: T-1 {task} passes the tests\nbuild @alice:${share.name} verify=test claims=T-1 {task}`;
+  // It opens on what the folder does now: its plan, or its model writing one.
+  const byModel = Boolean(share.team_model);
+  $("#team-by-owner").checked = !byModel;
+  $("#team-by-model").checked = byModel;
+  $("#team-approve").checked = Boolean(share.team_approval);
+  showTeamBy();
   $("#team-error").textContent = "";
-  $("#team-remove").hidden = !share.team;
+  $("#team-remove").hidden = !share.team && !byModel;
   $("#team-dialog").addEventListener("close", () => {
     if (opener.isConnected) opener.focus();
   }, { once: true });
   $("#team-dialog").showModal();
-  plan.focus();
+  (share.team ? plan : $(byModel ? "#team-by-model" : "#team-by-owner")).focus();
+}
+
+/** Shows only the fields of who writes the team plan: the plan for "I do", the approval for the model. */
+function showTeamBy() {
+  const byModel = $("#team-by-model").checked;
+  $("#team-plan-field").hidden = byModel;
+  $("#team-approve-field").hidden = !byModel;
+}
+
+/** What shared folder `s` does with team steps, for its line in the shares list (none: nothing). */
+function teamLine(s) {
+  if (s.team_model) {
+    return s.team_approval ? "Takes team steps (its model writes the plan, you approve each)" : "Takes team steps (its model writes the plan)";
+  }
+  if (!s.team) return null;
+  const n = teamStepCount(s.team);
+  return `Takes team steps (${n} ${n === 1 ? "step" : "steps"})`;
 }
 
 /** Whether peers may end a plan with a pull request step in shared folder `s`: this agent
@@ -937,9 +960,12 @@ async function sendTeamPlan(button, busy, request, done) {
 
 function submitTeamPlan(e) {
   e.preventDefault();
+  const byModel = $("#team-by-model").checked;
+  const approve = $("#team-approve").checked;
   return sendTeamPlan($("#team-save"), "Saving…",
-    (url) => api(url, { method: "PUT", body: JSON.stringify({ plan: $("#team-plan").value }) }),
-    (folder) => `Saved the team plan for ${folder}`);
+    (url) => api(url, { method: "PUT", body: JSON.stringify(byModel ? { model: true, approve } : { plan: $("#team-plan").value }) }),
+    (folder) => (byModel ? `Your model writes the team plans for ${folder}${approve ? "; you approve each before it runs" : ""}`
+      : `Saved the team plan for ${folder}`));
 }
 
 async function removeTeamPlan() {
@@ -3600,6 +3626,7 @@ function init() {
   $("#team-cancel").addEventListener("click", () => $("#team-dialog").close());
   $("#team-form").addEventListener("submit", submitTeamPlan);
   $("#team-remove").addEventListener("click", removeTeamPlan);
+  $("#team-who").addEventListener("change", showTeamBy);
   $("#clear-tasks-btn").addEventListener("click", clearTasks);
   $("#add-monitor-btn").addEventListener("click", openMonitorDialog);
   $("#monitor-cancel").addEventListener("click", () => $("#monitor-dialog").close());
