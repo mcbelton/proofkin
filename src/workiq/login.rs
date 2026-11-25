@@ -3,6 +3,7 @@
 //! docs/work-iq.md, section 1).
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,13 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use super::account::{DEFAULT_AUTHORITY, HostedTokens, SCOPE, encode, logout};
+use super::account::{CLI_USER, DEFAULT_AUTHORITY, HostedTokens, SCOPE, encode, logout};
 use super::client::{Client, DEFAULT_URL, http_client};
-use super::stdio::{NoToken, StdioTransport};
+use super::stdio::{NoToken, StdioTransport, find_cli};
 use crate::profile::{Profile, WorkIqAccount, WorkIqConnection};
-
-/// Shown as the user of a CLI account when the CLI doesn't say who it is.
-const CLI_USER: &str = "Work IQ CLI";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the browser has to come back to the loopback address.
@@ -89,43 +87,67 @@ fn browser_command(url: &str) -> std::process::Command {
 /// A Work IQ sign-in through Microsoft's Work IQ CLI: no token is kept, because the CLI signs
 /// in by itself with its own app, which the tenant's admin has approved.
 pub struct CliLogin {
-    tenant: Option<String>,
+    account: Option<String>,
+    cli_path: Option<PathBuf>,
     command: Option<(OsString, Vec<String>)>,
 }
 
 impl CliLogin {
-    pub fn new(tenant: Option<&str>) -> Self {
+    /// Signs in with `account` (the email of an account the CLI has signed in), else the
+    /// CLI's own default account.
+    pub fn new(account: Option<&str>) -> Self {
         CliLogin {
-            tenant: tenant.map(str::to_string),
+            account: account.map(str::to_string),
+            cli_path: None,
             command: None,
         }
     }
 
-    /// Starts `program` with `args` instead of the CLI, for tests.
+    /// Uses the Work IQ CLI at `path` instead of looking for it.
+    pub fn with_cli_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cli_path = Some(path.into());
+        self
+    }
+
+    /// Starts `program` with `args` instead of the CLI, for tests (see
+    /// [`StdioTransport::with_command`]); it isn't saved with the account.
     pub fn with_command(mut self, program: impl Into<OsString>, args: &[&str]) -> Self {
         let args = args.iter().map(|arg| arg.to_string()).collect();
         self.command = Some((program.into(), args));
         self
     }
 
-    /// Saves the account, and checks it with `tools/list` through the CLI; if that fails, the
-    /// profile is signed out again. Returns who signed in: the user the CLI reports, else
-    /// `Work IQ CLI`.
+    /// Finds the CLI (`--cli-path`, else on the PATH, else in npm's global folder) and saves
+    /// the account with where it is, so an agent whose PATH doesn't have it starts the same
+    /// one. Then checks it with `tools/list` through the CLI; if that fails, the profile is
+    /// signed out again. Returns who signed in: the account given, else the user the CLI
+    /// reports, else its default account (`workiq config show`), else `Work IQ CLI`.
     pub async fn run(&self, profile: &mut Profile) -> Result<String> {
+        let program = match (&self.command, &self.cli_path) {
+            (Some(_), _) => None,
+            (None, Some(path)) => {
+                if !path.is_file() {
+                    bail!("there is no Work IQ CLI at {}", path.display());
+                }
+                Some(std::path::absolute(path).unwrap_or_else(|_| path.clone()))
+            }
+            (None, None) => find_cli().await,
+        };
         let transport = Arc::new(match &self.command {
             Some((program, args)) => {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                StdioTransport::with_command(program, &args, self.tenant.as_deref())
+                StdioTransport::with_command(program, &args, self.account.as_deref())
             }
-            None => StdioTransport::new(self.tenant.as_deref()),
+            None => StdioTransport::new(program.as_deref(), self.account.as_deref()),
         });
         let mut account = WorkIqAccount {
             connection: WorkIqConnection::Cli {
-                tenant: self.tenant.clone(),
+                account: self.account.clone(),
+                program,
             },
             display_name: CLI_USER.to_string(),
             upn: CLI_USER.to_string(),
-            tenant_id: self.tenant.clone().unwrap_or_else(|| "unknown".into()),
+            tenant_id: "unknown".into(),
             added: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -143,10 +165,14 @@ impl CliLogin {
                  again: {error:#}"
             );
         }
-        let who = transport
-            .reported_user()
-            .await
-            .unwrap_or_else(|| CLI_USER.to_string());
+        let who = match &self.account {
+            Some(account) => Some(account.clone()),
+            None => match transport.reported_user().await {
+                Some(user) => Some(user),
+                None => transport.default_account().await,
+            },
+        };
+        let who = who.unwrap_or_else(|| CLI_USER.to_string());
         if who != CLI_USER {
             account.display_name = who.clone();
             account.upn = who.clone();

@@ -335,11 +335,7 @@ impl<'a> Doctor<'a> {
                 "check the message; if it looks right, give it to support",
             )
         })?;
-        let how = if hosted { "hosted" } else { "Work IQ CLI" };
-        let detail = format!(
-            "{} ({}), tenant {}, {how}",
-            account.display_name, account.upn, account.tenant_id
-        );
+        let detail = super::account::account_line(&account);
         Ok((
             Check::ok(name, detail),
             SignedIn {

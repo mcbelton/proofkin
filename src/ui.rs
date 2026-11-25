@@ -391,6 +391,15 @@ impl Shared {
         let _ = self.tx.send(msg.to_string());
     }
 
+    /// The profile as its files say now: sign-ins made while the agent runs (Work IQ, GitHub)
+    /// included. Its folders are the same; when its settings can't be read, as it started.
+    fn profile_now(&self) -> crate::profile::Profile {
+        self.info
+            .profile
+            .reload()
+            .unwrap_or_else(|_| self.info.profile.clone())
+    }
+
     fn push_feed(&self, mut item: Value) {
         item["id"] = json!(self.next_feed_id.fetch_add(1, Ordering::Relaxed));
         item["ts"] = json!(now_ms());
@@ -2012,10 +2021,11 @@ fn start_plan(
     via: Option<&'static str>,
 ) -> Result<StartedPlan, String> {
     let plan = Plan::parse(&text).map_err(|e| format!("{e:#}"))?;
-    let kb = s.info.profile.knowledge();
-    let skills = s.info.profile.skills();
+    let profile = s.profile_now();
+    let kb = profile.knowledge();
+    let skills = profile.skills();
     let squads_now = s.squads.lock().unwrap().clone();
-    let recipients = crate::plan::Recipients::of(&s.agent, &s.info.profile);
+    let recipients = crate::plan::Recipients::of(&s.agent, &profile);
     let errors: Vec<String> = crate::plan::preflight(
         &plan,
         &s.agent.peers(),
@@ -2035,7 +2045,7 @@ fn start_plan(
         return Err(format!("the plan was not started:\n{}", errors.join("\n")));
     }
     let ready = plan.prepare(&kb, &skills).map_err(|e| format!("{e:#}"))?;
-    let work = crate::plan::work_context(&s.info.profile, &plan).map_err(|e| format!("{e:#}"))?;
+    let work = crate::plan::work_context(&profile, &plan).map_err(|e| format!("{e:#}"))?;
     let plan_id = s.next_task_id.fetch_add(1, Ordering::Relaxed);
     let mut ids = HashMap::new();
     for step in &plan.steps {
@@ -2970,13 +2980,14 @@ fn plan_check(s: &Shared, text: &str) -> Value {
         }
     };
     let squads = s.squads.lock().unwrap().clone();
-    let recipients = crate::plan::Recipients::of(&s.agent, &s.info.profile);
+    let profile = s.profile_now();
+    let recipients = crate::plan::Recipients::of(&s.agent, &profile);
     let problems = crate::plan::preflight(
         &plan,
         &s.agent.peers(),
         &squads,
-        &s.info.profile.knowledge(),
-        &s.info.profile.skills(),
+        &profile.knowledge(),
+        &profile.skills(),
         &recipients,
     );
     json!({
@@ -3739,7 +3750,7 @@ async fn import_workiq(
     let work: Arc<dyn crate::workiq::context::WorkContext> = match &s.work {
         Some(work) => work.clone(),
         None => Arc::new(
-            crate::workiq::context::ClientWork::for_profile(&s.info.profile)
+            crate::workiq::context::ClientWork::for_profile(&s.profile_now())
                 .map_err(|e| bad_request(format!("{e:#}")))?,
         ),
     };

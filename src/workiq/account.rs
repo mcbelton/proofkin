@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use super::client::{
     Class, Fix, RequestIds, TokenSource, Who, WorkIqError, WorkIqErrorKind, http_client,
 };
-use crate::profile::{Profile, WorkIqConnection};
+use crate::profile::{Profile, WorkIqAccount, WorkIqConnection};
 
 /// The Entra authority; the tenant and `/oauth2/v2.0/token` follow.
 pub const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com";
@@ -277,6 +277,24 @@ pub(crate) fn encode(value: &str) -> String {
     out
 }
 
+/// Who a CLI account is when neither the owner nor the CLI said.
+pub const CLI_USER: &str = "Work IQ CLI";
+
+/// Who `account` is and how it connects: `Ada (ada@contoso.com), tenant T, hosted`, or
+/// `ada@contoso.com through the Work IQ CLI` (the CLI picks the tenant from the account).
+pub fn account_line(account: &WorkIqAccount) -> String {
+    match &account.connection {
+        WorkIqConnection::Hosted { .. } => format!(
+            "{} ({}), tenant {}, hosted",
+            account.display_name, account.upn, account.tenant_id
+        ),
+        WorkIqConnection::Cli { .. } if account.upn == CLI_USER => {
+            "through the Work IQ CLI, as its default account".to_string()
+        }
+        WorkIqConnection::Cli { .. } => format!("{} through the Work IQ CLI", account.upn),
+    }
+}
+
 /// One line for `proofkin auth status`: who the Work IQ account is, or why there is none.
 pub fn describe(profile: &Profile) -> String {
     let Ok(holder) = profile.workiq_profile() else {
@@ -285,14 +303,7 @@ pub fn describe(profile: &Profile) -> String {
     let Some(account) = &holder.config.workiq else {
         return format!("not signed in  ({})", holder.workiq_login_hint());
     };
-    let connection = match &account.connection {
-        WorkIqConnection::Hosted { .. } => "hosted",
-        WorkIqConnection::Cli { .. } => "Work IQ CLI",
-    };
-    let mut text = format!(
-        "signed in: {} ({}), tenant {}, {connection}",
-        account.display_name, account.upn, account.tenant_id
-    );
+    let mut text = format!("signed in: {}", account_line(account));
     if holder.name != profile.name {
         text.push_str(&format!(", the account of '{}'", holder.name));
     }
