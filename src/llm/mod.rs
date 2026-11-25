@@ -133,6 +133,11 @@ pub struct LlmTask {
     /// under it, in the commit's body. Older workers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// Work context the requester put in the prompt (Microsoft 365 through Work IQ): where
+    /// it is and what it held. The worker records its hash in the signed evidence, never its
+    /// content (see [`crate::evidence::ContextUse`]). Older workers ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<crate::evidence::ContextRef>,
     /// Issues the work is for (`owner/repo#N`, see [`crate::tracker`]): the worker's
     /// commit references them, and a pull request from its branch closes them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -197,6 +202,7 @@ impl LlmTask {
             team: None,
             title: None,
             subject: None,
+            context: Vec::new(),
             issues: Vec::new(),
             pull_request: None,
         }

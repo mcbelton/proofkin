@@ -484,10 +484,32 @@ impl RunRecord {
                             Err(anyhow::anyhow!("the same evidence is used by another step"))
                         }
                     })
+                    .and_then(|()| self.context_recorded(s, evidence))
                     .and_then(|()| verify_step(evidence, output, &s.step.id, dir));
                 Some((s.step.id.clone(), check))
             })
             .collect()
+    }
+
+    /// A step that was sent Work IQ context: its signed evidence records the hash of the
+    /// context this run kept for it, which the kept text has. Content never enters evidence,
+    /// so this is how a record says which context the work was done with.
+    fn context_recorded(&self, s: &StepRecord, e: &Evidence) -> Result<()> {
+        let Some(work) = self.workiq.get(&s.step.id).filter(|w| !w.sha256.is_empty()) else {
+            return Ok(());
+        };
+        if !work.text.is_empty() && crate::evidence::sha256_hex(work.text.as_bytes()) != work.sha256
+        {
+            bail!("the Work IQ context this run kept for it doesn't have the hash it records");
+        }
+        if !e
+            .context
+            .iter()
+            .any(|c| c.source == "workiq" && c.sha256 == work.sha256)
+        {
+            bail!("its signed evidence doesn't record the Work IQ context it was sent");
+        }
+        Ok(())
     }
 
     fn belongs(&self, s: &StepRecord, e: &Evidence, peer: Option<&String>) -> Result<()> {
