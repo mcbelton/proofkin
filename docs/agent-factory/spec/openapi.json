@@ -2163,6 +2163,10 @@
           "capabilities": {
             "$ref": "#/components/schemas/Capabilities"
           },
+          "team": {
+            "type": "string",
+            "maxLength": 16384
+          },
           "model": {
             "$ref": "#/components/schemas/ModelPolicy"
           },

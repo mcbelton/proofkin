@@ -85,6 +85,12 @@ pub struct AgentConfig {
     /// restart (none: they start at 1). A peer still running a task from before must
     /// never take a new task for it, nor a plan resumed after a restart a new one's.
     pub task_ids: Option<PathBuf>,
+    /// What it remembers when it serves tasks: the knowledge put in front of each, and
+    /// the lessons its verified tasks teach it (see [`crate::factory::memory`]).
+    pub memory: Option<Arc<crate::factory::memory::WorkerMemory>>,
+    /// For a digital worker: its owner's endpoint id. Its owner's tasks may have all its
+    /// memory knows; names on its allowlist can change, so they never decide that.
+    pub owner_id: Option<EndpointId>,
 }
 
 impl AgentConfig {
@@ -108,6 +114,8 @@ impl AgentConfig {
             workiq_gateway: None,
             task_grace: TASK_GRACE,
             task_ids: None,
+            memory: None,
+            owner_id: None,
         }
     }
 }
@@ -529,6 +537,8 @@ struct Inner {
     task_grace: Duration,
     /// When peers that dropped were last seen, until they come back or are given up.
     left: Mutex<HashMap<EndpointId, Instant>>,
+    memory: Option<Arc<crate::factory::memory::WorkerMemory>>,
+    owner_id: Option<EndpointId>,
 }
 
 /// A peer-to-peer agent on an iroh QUIC endpoint. Cheap to clone; all clones
@@ -593,6 +603,8 @@ impl Agent {
             workiq_gateway: config.workiq_gateway,
             task_grace: config.task_grace,
             left: Mutex::new(HashMap::new()),
+            memory: config.memory,
+            owner_id: config.owner_id,
         });
         tokio::spawn(accept_loop(inner.clone()));
         Ok((Self { inner }, rx))
@@ -1035,7 +1047,7 @@ impl Agent {
         }
         let request = Message::TaskRequest {
             task_id,
-            task,
+            task: Box::new(task),
             origin,
         };
         self.inner.pending.lock().unwrap().insert(
@@ -1206,7 +1218,7 @@ impl Agent {
         let (progress_tx, progress) = mpsc::unbounded_channel();
         let request = Message::TaskRequest {
             task_id,
-            task,
+            task: Box::new(task),
             origin,
         };
         self.inner.pending.lock().unwrap().insert(
@@ -1986,6 +1998,9 @@ impl Inner {
         if let Err(e) = crate::evidence::context_uses(&task.prompt, &task.context) {
             bail!("{} refused the task: {e:#}", self.name);
         }
+        if let Err(e) = crate::evidence::marked_use(&task.prompt, &task.m365) {
+            bail!("{} refused the task: {e:#}", self.name);
+        }
         let mut mcp = BTreeMap::new();
         for server in &task.mcp {
             let Some(def) = share.mcp.get(server) else {
@@ -2629,6 +2644,28 @@ impl Inner {
                 bail!("task cancelled by {from}");
             }
         };
+        // What its team's results hold goes back only to a requester who may have it.
+        if !outcome.labels.is_empty() && !self.may_have(id, &outcome.labels) {
+            let recipients = runner.recipients(&agent);
+            let granted = recipients
+                .trust
+                .get(id)
+                .and_then(|p| p.m365.as_ref())
+                .map(|g| g.labels.clone())
+                .unwrap_or_default();
+            bail!(
+                "the team's results hold Microsoft 365 content (labels: {}) that {from} may not \
+                 receive; they stay with {} (team run {}). Grant it with: {}",
+                outcome.labels.join(", "),
+                self.name,
+                outcome.record.id,
+                recipients.grant_command(
+                    id,
+                    from,
+                    &crate::knowledge::union_labels(&granted, &outcome.labels)
+                )
+            );
+        }
         let output = crate::redact::redact_with_note(&outcome.output, &self.name);
         let mut evidence = Evidence::new(
             EvidenceKind::Task,
@@ -2642,6 +2679,18 @@ impl Inner {
         // Checked when the team step was admitted.
         evidence.context =
             crate::evidence::context_uses(&task.prompt, &task.context).unwrap_or_default();
+        evidence
+            .context
+            .extend(crate::evidence::marked_use(&task.prompt, &task.m365).unwrap_or_default());
+        // What its team's results hold, so the requester marks what it does with them.
+        if !outcome.labels.is_empty() {
+            evidence.context.push(crate::evidence::ContextUse {
+                source: "team".to_owned(),
+                sha256: sha256_hex(output.as_bytes()),
+                results: outcome.marked,
+                labels: outcome.labels.clone(),
+            });
+        }
         evidence.git = outcome.git;
         evidence.team = Some(Box::new(outcome.record));
         Ok(Served {
@@ -2873,6 +2922,28 @@ impl Inner {
         note
     }
 
+    /// Whether peer `id` may have Microsoft 365 content with `labels`: a digital worker's
+    /// owner (by endpoint id) may have all of it, another peer what its grant here names.
+    fn may_have(&self, id: &EndpointId, labels: &[String]) -> bool {
+        if self.owner_id.as_ref() == Some(id) {
+            return true;
+        }
+        let trust = self.trust.lock().unwrap();
+        trust
+            .get(id)
+            .and_then(|p| p.m365.as_ref())
+            .is_some_and(|g| crate::factory::memory::may_have(&g.labels, labels))
+    }
+
+    /// What this agent's memory gives a task from peer `id`: the topics it may have (see
+    /// [`Inner::may_have`]).
+    fn recall(&self, id: &EndpointId) -> crate::factory::memory::Recall {
+        let Some(memory) = &self.memory else {
+            return crate::factory::memory::Recall::default();
+        };
+        memory.recall(|labels| self.may_have(id, labels))
+    }
+
     /// Runs an admitted task: in its own worktree if the folder uses them, applying
     /// the requester's patch, then the model and the requested checks, retrying
     /// with the failures while attempts are left. Returns the signed evidence.
@@ -2952,6 +3023,11 @@ impl Inner {
         }
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();
+        // What its memory knows goes in front of the task, for a requester who may have
+        // it; every attempt gets it.
+        let recall = self.recall(id);
+        let asked = recall.prompt(&task.prompt);
+        prompt.prompt = asked.clone();
         // The model it asked for (allowed: checked when it was admitted), else the
         // default; the same for its reasoning effort. Settings changed since it was
         // admitted apply: it fails if they no longer allow what it asks for.
@@ -3000,7 +3076,7 @@ impl Inner {
                         used + 1
                     ));
                     stopped_before = true;
-                    prompt.prompt = crate::evidence::resume_prompt(&task.prompt, &why);
+                    prompt.prompt = crate::evidence::resume_prompt(&asked, &why);
                     continue;
                 }
                 Err(e) => {
@@ -3079,7 +3155,37 @@ impl Inner {
                     failed_before.join(", ")
                 ));
             }
-            prompt.prompt = retry_prompt(&task.prompt, &results);
+            prompt.prompt = retry_prompt(&asked, &results);
+        }
+        // Checks verified it: what it did is a lesson, with the labels of what it was given.
+        if !results.is_empty()
+            && results.iter().all(|r| r.passed)
+            && let Some(memory) = &self.memory
+        {
+            use crate::knowledge::union_labels;
+            let mut labels = union_labels(&recall.labels, &task.m365);
+            for part in &task.context {
+                labels = union_labels(&labels, &part.labels);
+            }
+            // What its model read through Work IQ has labels nobody here learned: a lesson
+            // made from it is kept from every peer.
+            if !workiq_sessions.is_empty() {
+                let unknown = [crate::workiq::content::UNKNOWN.to_owned()];
+                labels = union_labels(&labels, &unknown);
+            }
+            let lesson = crate::factory::memory::Lesson {
+                title: task
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| crate::llm::title_of(&task.prompt)),
+                from: from.to_owned(),
+                checks: results.iter().map(|r| r.name.clone()).collect(),
+                output: crate::redact::redact(reports.last().map_or("", String::as_str)).0,
+                labels,
+            };
+            if let Err(e) = memory.learn(&lesson) {
+                eprintln!("{}: {e:#}", self.name);
+            }
         }
         // Each later attempt's report follows a line saying why it was made.
         let mut output = String::new();
@@ -3114,6 +3220,18 @@ impl Inner {
         // Checked when the task was admitted.
         evidence.context =
             crate::evidence::context_uses(&task.prompt, &task.context).unwrap_or_default();
+        evidence
+            .context
+            .extend(crate::evidence::marked_use(&task.prompt, &task.m365).unwrap_or_default());
+        // The knowledge its memory gave it, by hash: with Microsoft 365 labels, in the signed
+        // record, so its requester marks what it does with the result; without, only in the
+        // output's summary, which requesters from before work context verify as before.
+        let (labeled, plain): (Vec<_>, Vec<_>) = recall
+            .used
+            .iter()
+            .cloned()
+            .partition(|used| !used.labels.is_empty());
+        evidence.context.extend(labeled);
         evidence.attempts = used;
         evidence.checks = results;
         let mut patch = None;
@@ -3167,6 +3285,9 @@ impl Inner {
             })
             .unwrap_or_default();
         summary += &evidence.summary();
+        for used in &plain {
+            summary += &crate::evidence::context_line(&self.name, used);
+        }
         if !summary.is_empty() {
             output = format!("{}\n\n---\n{summary}", output.trim_end());
         }
@@ -3392,6 +3513,7 @@ async fn run_connection(
                     task,
                     origin,
                 } => {
+                    let task = *task;
                     let key = (peer_id, task_id);
                     // A re-sent request: it's running (its requester hears where it is
                     // again), or its result is sent again.

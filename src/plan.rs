@@ -43,7 +43,7 @@ use tokio::task::JoinSet;
 
 use crate::agent::{Agent, Delivered, PeerInfo};
 use crate::evidence::Evidence;
-use crate::knowledge::{KnowledgeBase, check_topics, union_labels, with_mark};
+use crate::knowledge::{KnowledgeBase, check_topics, labels_of_mark, union_labels, with_mark};
 use crate::llm::{LlmTask, Provider};
 use crate::profile::validate_name;
 use crate::protocol::{Origin, Phase, Progress};
@@ -935,6 +935,18 @@ impl Recipients {
             }
             None => (Vec::new(), "it has no Microsoft 365 grant".to_owned()),
         };
+        let command = self.grant_command(id, name, &union_labels(&granted, &needed));
+        Some(format!(
+            "step '{}' gets Microsoft 365 content (labels: {}) that {name} may not receive: {why}. \
+             Grant it with: {command}",
+            step.id,
+            needed.join(", ")
+        ))
+    }
+
+    /// The command that grants the peer `name` (`id`) Microsoft 365 content with `labels`,
+    /// keeping the rest of its allowlist entry (`peers allow` replaces it).
+    pub fn grant_command(&self, id: &EndpointId, name: &str, labels: &[String]) -> String {
         let mut command = format!("proofkin peers allow {id} --name {name}");
         if let Some(profile) = &self.profile {
             command += &format!(" --profile {profile}");
@@ -948,23 +960,19 @@ impl Recipients {
                 peer.shares.join(",")
             );
         }
-        command += &format!(" --m365 {}", union_labels(&granted, &needed).join(","));
+        command += &format!(" --m365 {}", labels.join(","));
         if entry.and_then(|p| p.m365.as_ref()).is_some_and(|g| g.tools) {
             command += " --m365-tools";
         }
-        Some(format!(
-            "step '{}' gets Microsoft 365 content (labels: {}) that {name} may not receive: {why}. \
-             Grant it with: {command}",
-            step.id,
-            needed.join(", ")
-        ))
+        command
     }
 }
 
 /// Saves the result of every finished step with `save=` into `kb`, if its evidence
 /// was verified (or it ran locally); returns the topics written. A step with Microsoft 365
-/// content saves its topic marked as such, with the step's labels. A `@workiq` step's
-/// answer has no evidence to verify: it is saved as an answer from Work IQ, marked.
+/// content (its own, the steps' before it, or what its peer's evidence says its result
+/// holds) saves its topic marked as such, with those labels. A `@workiq` step's answer has
+/// no evidence to verify: it is saved as an answer from Work IQ, marked.
 pub fn save_knowledge(
     kb: &KnowledgeBase,
     plan: &Plan,
@@ -972,7 +980,7 @@ pub fn save_knowledge(
     run_id: &str,
 ) -> Vec<String> {
     let mut saved = Vec::new();
-    let plan = plan.marked(kb);
+    let plan = with_result_labels(plan, states).marked(kb);
     for step in &plan.steps {
         let (
             Some(topic),
@@ -3360,36 +3368,100 @@ fn fresh_recipients(agent: &Agent, ctx: &RunContext) -> Recipients {
 }
 
 /// Why `step`'s Microsoft 365 content may not be sent to `name` (`id`) now, if it may not:
-/// the plan check's test again, against the allowlist as it is at this moment. A step that
-/// gets content from `workiq=` steps (its own, or those it waits for) is checked against the
-/// labels those found in this run, joined with the labels it was marked with.
+/// the plan check's test again, against the allowlist as it is at this moment, for the
+/// labels [`sent_labels`] says the content has (`also`: those of the step's own earlier work
+/// it is sent again, see [`Rework`]).
+#[allow(clippy::too_many_arguments)]
 fn m365_refusal(
     agent: &Agent,
     ctx: &RunContext,
     plan: &Plan,
+    states: &BTreeMap<String, StepState>,
     step: &Step,
+    also: &[String],
     name: &str,
     id: &EndpointId,
 ) -> Option<String> {
-    let recipients = fresh_recipients(agent, ctx);
+    let labels = sent_labels(ctx, plan, states, step, also)?;
+    fresh_recipients(agent, ctx).refusal_for_labels(step, &labels, name, id)
+}
+
+/// The Microsoft 365 labels of what `step`'s task holds when it is sent now, if it holds any
+/// such content: those it is marked with (a mark without labels is `unlabeled`), those the
+/// results of the steps it waits for hold as their peers' signed evidence says (a worker's
+/// labeled knowledge), and `also`. A step that gets content from `workiq=` steps (its own,
+/// or those it waits for) has the labels those found in this run instead of its own mark's
+/// (empty while none are known: then a grant is all its peer needs).
+fn sent_labels(
+    ctx: &RunContext,
+    plan: &Plan,
+    states: &BTreeMap<String, StepState>,
+    step: &Step,
+    also: &[String],
+) -> Option<Vec<String>> {
     let earlier = ancestors(plan, &step.id);
+    let mut delivered: Vec<String> = also.to_vec();
+    for before in &earlier {
+        if let Some(labels) = states.get(before).and_then(result_labels) {
+            delivered = union_labels(&delivered, &labels);
+        }
+    }
     let via_workiq = step.brings_m365()
         || plan
             .steps
             .iter()
             .any(|s| s.brings_m365() && earlier.contains(&s.id));
     if !via_workiq {
-        step.m365.as_ref()?;
-        return recipients.refusal(step, name, id);
+        let own = step.m365.as_deref().map(labels_of_mark);
+        if own.is_none() && delivered.is_empty() {
+            return None;
+        }
+        return Some(union_labels(&own.unwrap_or_default(), &delivered));
     }
     let found = ctx.work_log.records();
-    let mut labels = step.m365.clone().unwrap_or_default();
+    let mut labels = union_labels(step.m365.as_deref().unwrap_or_default(), &delivered);
     for before in &earlier {
         if let Some(record) = found.get(before) {
             labels = union_labels(&labels, &record.labels);
         }
     }
-    recipients.refusal_for_labels(step, &labels, name, id)
+    Some(labels)
+}
+
+/// The Microsoft 365 labels a step's result holds, as its peer's signed evidence says: those
+/// of the work context it was sent and that its requester marked it with, and of the
+/// knowledge its worker's own memory put in its task (see [`crate::factory::memory`]). A
+/// failed step's output counts too. None if it names none.
+pub fn result_labels(state: &StepState) -> Option<Vec<String>> {
+    let (StepState::Done {
+        evidence: Some(evidence),
+        ..
+    }
+    | StepState::Failed {
+        evidence: Some(evidence),
+        ..
+    }) = state
+    else {
+        return None;
+    };
+    let mut labels: Vec<String> = Vec::new();
+    for part in &evidence.context {
+        labels = union_labels(&labels, &part.labels);
+    }
+    (!labels.is_empty()).then_some(labels)
+}
+
+/// `plan` with each finished step marked with the labels its result holds (see
+/// [`result_labels`]), so the steps after it and what it saves as knowledge are marked too.
+pub fn with_result_labels(plan: &Plan, states: &BTreeMap<String, StepState>) -> Plan {
+    let mut plan = plan.clone();
+    for step in &mut plan.steps {
+        if let Some(labels) = states.get(&step.id).and_then(result_labels) {
+            let own = step.m365.as_deref().map(labels_of_mark).unwrap_or_default();
+            step.m365 = Some(union_labels(&own, &labels));
+        }
+    }
+    plan
 }
 
 /// Searches Work IQ for `step` (which goes to `peer`) and returns the prompt section for
@@ -3685,8 +3757,9 @@ pub async fn run_plan_with(
                     .collect();
                     match choose_approver(step, &agent.peers()) {
                         Ok((approver, name)) => {
-                            let refused = approver
-                                .and_then(|id| m365_refusal(agent, ctx, plan, step, &name, &id));
+                            let refused = approver.and_then(|id| {
+                                m365_refusal(agent, ctx, plan, &states, step, &[], &name, &id)
+                            });
                             if let Some(why) = refused {
                                 let state = fail(why);
                                 on_update(&step.id, &state);
@@ -3764,7 +3837,21 @@ pub async fn run_plan_with(
                             continue;
                         }
                     };
-                    if let Some(why) = m365_refusal(agent, ctx, plan, step, &peer.name, &peer.id) {
+                    // Done again for a sign-off: its earlier work goes with it, with its labels.
+                    let again_labels = reworks
+                        .get(&step.id)
+                        .map(|r| r.labels.clone())
+                        .unwrap_or_default();
+                    if let Some(why) = m365_refusal(
+                        agent,
+                        ctx,
+                        plan,
+                        &states,
+                        step,
+                        &again_labels,
+                        &peer.name,
+                        &peer.id,
+                    ) {
                         let state = StepState::failed(Some(peer.name), why);
                         on_update(&step.id, &state);
                         states.insert(step.id.clone(), state);
@@ -3804,6 +3891,9 @@ pub async fn run_plan_with(
                     let mut task = LlmTask::new(step.provider, prompt.clone())
                         .with_checks(step.checks.clone(), step.attempts);
                     task.context = context.into_iter().collect();
+                    // What it holds, so its worker marks what it learns from it.
+                    task.m365 =
+                        sent_labels(ctx, plan, &states, step, &again_labels).unwrap_or_default();
                     task.mcp = step.mcp.clone();
                     task.model = step.model.clone();
                     task.effort = step.effort.clone();
@@ -3997,9 +4087,12 @@ pub async fn run_plan_with(
                                 )),
                             };
                             for s in redo {
-                                let patch = match &states[&s] {
-                                    StepState::Done { patch, .. } => patch.clone(),
-                                    _ => None,
+                                let (patch, labels) = match &states[&s] {
+                                    StepState::Done { patch, .. } => (
+                                        patch.clone(),
+                                        result_labels(&states[&s]).unwrap_or_default(),
+                                    ),
+                                    _ => (None, Vec::new()),
                                 };
                                 reworks.insert(
                                     s.clone(),
@@ -4008,6 +4101,7 @@ pub async fn run_plan_with(
                                         by: by.clone(),
                                         note: note.clone(),
                                         patch,
+                                        labels,
                                     },
                                 );
                                 on_update(&s, &StepState::Waiting);
@@ -4057,6 +4151,9 @@ struct Rework {
     /// The step's earlier work, applied first so its model changes it rather than starting
     /// over (none: it changed no files).
     patch: Option<String>,
+    /// The Microsoft 365 labels that work held (see [`result_labels`]): it goes to the peer
+    /// that does the step again, so that peer must be allowed them.
+    labels: Vec<String>,
 }
 
 /// What the model doing a step again is told about the changes asked for.
@@ -5965,6 +6062,68 @@ mod tests {
             .with_knowledge(&kb)
             .unwrap();
         assert_eq!(step_labels(&ready, "b"), list(&["HR"]));
+    }
+
+    #[test]
+    fn what_a_result_holds_marks_what_is_sent_after_it_and_a_mark_without_labels_stays() {
+        let list = |names: &[&str]| -> Option<Vec<String>> {
+            Some(names.iter().map(|n| n.to_string()).collect())
+        };
+        let key = iroh::SecretKey::generate().public();
+        let mut e = Evidence::new(crate::evidence::EvidenceKind::Task, "w", key, key, 1);
+        e.context = vec![crate::evidence::ContextUse {
+            source: "knowledge".into(),
+            sha256: String::new(),
+            results: 1,
+            labels: list(&["Confidential"]).unwrap(),
+        }];
+        let done = StepState::Done {
+            peer: "w".into(),
+            output: "Revenue was 12.".into(),
+            evidence: Some(e.clone()),
+            verified: true,
+            patch: None,
+            model: None,
+        };
+        // A failed step's output holds what its evidence names too.
+        let failed = StepState::Failed {
+            peer: Some("w".into()),
+            error: "Revenue was 12.".into(),
+            evidence: Some(e),
+            verified: true,
+            model: None,
+        };
+        assert_eq!(result_labels(&failed), list(&["Confidential"]));
+        assert_eq!(result_labels(&StepState::failed(None, "x".into())), None);
+
+        // A step marked without labels holds unlabeled content: it still needs `unlabeled`
+        // once its result names other labels, and so does what is sent after it.
+        let mut plan = Plan::parse("a @w do\nb after a @w do\nc @w do").unwrap();
+        plan.steps[0].m365 = Some(Vec::new());
+        plan.steps[1].m365 = Some(Vec::new());
+        let states: BTreeMap<String, StepState> = [("a".to_owned(), done)].into();
+        let marked = with_result_labels(&plan, &states);
+        assert_eq!(
+            step_labels(&marked, "a"),
+            list(&["unlabeled", "Confidential"])
+        );
+        let ctx = RunContext::default();
+        assert_eq!(
+            sent_labels(&ctx, &plan, &states, &plan.steps[1], &[]),
+            list(&["unlabeled", "Confidential"])
+        );
+        // Nothing marked holds no such content, unless its earlier work it is sent again does.
+        assert_eq!(sent_labels(&ctx, &plan, &states, &plan.steps[2], &[]), None);
+        assert_eq!(
+            sent_labels(
+                &ctx,
+                &plan,
+                &states,
+                &plan.steps[2],
+                &list(&["HR"]).unwrap()
+            ),
+            list(&["HR"])
+        );
     }
 
     #[test]

@@ -180,6 +180,12 @@ local.
 - **Checked twice**: the plan check fails a step that would send marked content to a peer
   without a grant, or above its labels, naming the step, the peer and the grant to add. The
   runner checks again when it sends each task, and filters by labels then.
+- **Results that hold it**: a worker's own memory can put a marked topic in a task (see
+  [Digital workers](../README.md#digital-workers)). Its signed evidence then names the
+  labels, and the runner marks that step's result with them: later steps go only to peers
+  granted them, `save=` marks the topic, and a lead's team results go back only to a
+  requester granted what any of its steps held. Each task the runner sends names the labels
+  of what it holds (`LlmTask.m365`), so a worker marks the lessons it learns from it.
 
 ### 5. Work context in plans
 

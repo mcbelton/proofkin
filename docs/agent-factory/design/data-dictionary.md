@@ -35,6 +35,7 @@ Rules that apply to every field:
 | Blueprint | instructions | string (Markdown), at most 32 KB | Yes | Confidential | Tell the model how to work | As long as the agent; every released version keeps its own | The agent file's body; may hold the owner's procedures |
 | Blueprint | skills | array of skill names | No | Internal | Reuse procedures | As long as the agent | Built-in, profile or plugin skills, and skills the blueprint brings |
 | Blueprint | capabilities | Capabilities | Yes | Internal | Ask for what the agent needs, never grant it | As long as the agent | Access, MCP servers and tools, checks, Work IQ sources, delegation |
+| Blueprint | team | string, a team plan, at most 16 KB | No | Internal | Lead a team: the plan its team steps run | As long as the agent; every released version keeps its own | Checked as a team plan, needs delegate; built as team.plan |
 | Blueprint | model | ModelPolicy | Yes | Internal | Choose and constrain models | As long as the agent | Providers, candidates and constraints |
 | Blueprint | memory | object {context, lessons, retention_days} | No | Internal | Say which knowledge it reads and keeps | As long as the agent | Knowledge topics put in its prompts, the topic its lessons go to, how long lessons are kept |
 | Blueprint | evals | object {repetitions, thresholds, cases} | Yes | Confidential | Prove the requirements before release | As long as the agent | The eval suite; cases may hold example business data |
@@ -210,4 +211,6 @@ erDiagram
 | `factory/agents/<name>/state.json` | Lifecycle state, active version, deployments, history | As long as the agent |
 | `factory/imported/<publisher>/<name>/<version>/` | Imported bundles | Until removed |
 | `knowledge/<lessons topic>.md` | Lessons from verified results, with labels | The blueprint's retention (90 days by default) |
+| `knowledge/<context topic>.md` of a digital worker | Copies of its owner's topics it reads, with their Microsoft 365 marks | Until removed |
+| `profile.json` (`memory`) of a digital worker | Its memory: context topics, lessons topic, retention | Until changed |
 | `audit.jsonl` | Tasks with `agent@version` and usage, no text | 90 days |

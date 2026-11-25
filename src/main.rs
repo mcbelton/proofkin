@@ -297,6 +297,38 @@ stops and deletes it too.")]
         /// Name of the worker.
         name: String,
     },
+    /// Show or set a digital worker's memory: the knowledge put in front of every task it
+    /// serves, and where what its verified work teaches it goes.
+    #[command(after_help = "\
+examples:
+  proofkin worker memory analyst                    (show it)
+  proofkin worker memory analyst --context glossary,q3-results --lessons analyst-lessons
+  proofkin worker memory analyst --retention-days 30
+  proofkin worker memory analyst --off
+The --context topics are copied from its owner's knowledge into the worker's, with their
+Microsoft 365 marks. A marked topic goes only into the tasks of requesters who may have its
+labels (its owner, or a peer whose grant names them), and the task's signed evidence then
+carries the labels, so its result is marked with them. A task whose checks passed adds a
+lesson to the --lessons topic; lessons older than --retention-days are removed. Changes
+take effect when the worker next starts.")]
+    Memory {
+        /// Name of the worker.
+        name: String,
+        /// Its owner's knowledge topics put in front of every task it serves
+        /// (comma-separated; replaces the list; \"\" for none).
+        #[arg(long, value_delimiter = ',')]
+        context: Option<Vec<String>>,
+        /// The topic its lessons go to (\"\" for none).
+        #[arg(long)]
+        lessons: Option<String>,
+        /// How many days lessons are kept (default 90).
+        #[arg(long)]
+        retention_days: Option<u32>,
+        /// It remembers nothing: no topics in front of its tasks, no lessons (its
+        /// knowledge stays).
+        #[arg(long, conflicts_with_all = ["context", "lessons", "retention_days"])]
+        off: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1849,6 +1881,66 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
             }
         }
         WorkerCommand::Remove { name } => remove_worker(&name)?,
+        WorkerCommand::Memory {
+            name,
+            context,
+            lessons,
+            retention_days,
+            off,
+        } => {
+            use proofkin::factory::memory;
+            let mut worker = Profile::open(&name)?;
+            let mut settings = worker.config.memory.clone();
+            let changed = off || context.is_some() || lessons.is_some() || retention_days.is_some();
+            if off {
+                settings = memory::Memory::default();
+            }
+            if let Some(context) = context {
+                settings.context = context
+                    .into_iter()
+                    .map(|t| t.trim().to_owned())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+            }
+            if let Some(lessons) = lessons {
+                settings.lessons = Some(lessons.trim().to_owned()).filter(|t| !t.is_empty());
+            }
+            if retention_days.is_some() {
+                settings.retention_days = retention_days;
+            }
+            if changed {
+                let copied = memory::configure(&mut worker, settings)?;
+                if !copied.is_empty() {
+                    println!(
+                        "copied from '{}''s knowledge, with their marks: {}",
+                        worker.config.owner.as_deref().unwrap_or_default(),
+                        copied.join(", ")
+                    );
+                }
+            }
+            let settings = &worker.config.memory;
+            println!("memory of '{name}':");
+            println!(
+                "  in front of every task: {}",
+                if settings.context.is_empty() {
+                    "no knowledge".to_owned()
+                } else {
+                    settings.context.join(", ")
+                }
+            );
+            match &settings.lessons {
+                Some(topic) => println!(
+                    "  lessons: topic '{topic}', kept {} days",
+                    settings
+                        .retention_days
+                        .unwrap_or(memory::DEFAULT_RETENTION_DAYS)
+                ),
+                None => println!("  lessons: none"),
+            }
+            if changed {
+                println!("it takes effect when '{name}' next starts");
+            }
+        }
     }
     Ok(())
 }
@@ -4569,6 +4661,10 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.bind = args.listen;
         config.trust = profile.trust()?;
         config.owner = profile.config.owner.clone();
+        // A digital worker knows its owner by key: names on its allowlist can change.
+        if profile.config.owner.is_some() {
+            config.owner_id = Some(profile.account_profile()?.identity()?.public());
+        }
         config.role = profile.config.role.clone();
         config.models = profile.models();
         config.worktrees_dir = profile.worktrees_dir();
@@ -4588,6 +4684,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             config.executor = executor.clone().map(|e| e as Arc<dyn Executor>);
             config.audit = Some(Arc::new(AuditLog::new(profile.audit_path())));
             config.team = Some(Arc::new(proofkin::team::TeamRunner::new(profile.clone())));
+            config.memory = proofkin::factory::memory::WorkerMemory::of(&profile);
             config.pulls = Some(Arc::new(proofkin::pulls::ProfilePulls::new(
                 profile.clone(),
             )));

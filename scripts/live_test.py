@@ -220,6 +220,13 @@ try:
     ids["helper"] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
     allow("helper", "boss", delegate=True)
     allow("boss", "helper")
+    # What helper knows: a topic of its owner's, put in front of every task it serves.
+    knowledge1 = os.path.join(HOME, "profiles", "worker1", "knowledge")
+    os.makedirs(knowledge1, exist_ok=True)
+    with open(os.path.join(knowledge1, "glossary.md"), "w") as f:
+        f.write("# Glossary\nThe project code word is periwinkle-4412.\n")
+    _, memory_out = cli("worker", "memory", "helper", "--context", "glossary")
+    print(f"  {memory_out.strip()}")
     # Something worker1's owner chose to share with peers, in its data folder (.proofkin-data).
     data1 = os.path.join(HOME, ".proofkin-data", "worker1")
     os.makedirs(data1, exist_ok=True)
@@ -271,6 +278,12 @@ try:
     boss.send("/delegate copilot@helper Reply with exactly: HELPER-OK")
     check("digital worker ran boss's task on its owner's account",
           helper_acct and boss.wait_for(r"HELPER-OK", 300) and boss.wait_for(rf"=== copilot on helper{MODEL} ===", 5))
+    boss.cursor = len(boss.lines)
+    boss.send("/delegate copilot@helper What is the project code word in the knowledge you were given? "
+              "Reply with only the code word.")
+    check("helper's memory put its owner's knowledge in front of boss's task, and its signed evidence says so",
+          "copied from 'worker1''s knowledge" in memory_out and boss.wait_for(r"periwinkle-4412", 300)
+          and boss.wait_for(r"\*\*Knowledge\*\* from helper's memory: 1 topic", 10), memory_out)
 
     print("== intruder (worker1 never allowlisted it) tries to connect")
     intruder = Agent("intruder", [])
@@ -708,6 +721,15 @@ try:
     check("worker1's model drafted an agent from a description that passes the factory check",
           drafted.returncode == 0 and "drafted by copilot's model" in drafted.stdout and checked == 0
           and "written: by copilot's model" in shown, shown + check_out)
+
+    print("== the drafted agent builds into the same files twice, kept by their hash")
+    builds = [cli("factory", "build", "fin-analyst", "--profile", "worker1") for _ in range(2)]
+    hashes = [re.search(r"^hash: ([0-9a-f]{64})$", out, re.M) for _, out in builds]
+    _, shown = cli("factory", "show", "fin-analyst", "--profile", "worker1")
+    check("worker1 built the drafted agent into the same files twice, kept by their hash",
+          all(code == 0 for code, _ in builds) and all(hashes) and hashes[0].group(1) == hashes[1].group(1)
+          and f"builds: {hashes[0].group(1)[:12]}" in shown and "evaluated on: copilot" in shown,
+          builds[0][1] + shown)
 finally:
     for a in reversed(agents):
         a.stop()

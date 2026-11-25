@@ -138,6 +138,13 @@ pub struct LlmTask {
     /// content (see [`crate::evidence::ContextUse`]). Older workers ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<crate::evidence::ContextRef>,
+    /// The Microsoft 365 labels of what the task holds, as its requester's plan marks it
+    /// (`unlabeled` for such content without a label, `unknown` for content whose labels
+    /// aren't known): marked topics, `@workiq` answers and results that held such content.
+    /// The worker's signed evidence repeats them, and its memory marks what it learns from
+    /// the task with them. Older workers ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub m365: Vec<String>,
     /// Issues the work is for (`owner/repo#N`, see [`crate::tracker`]): the worker's
     /// commit references them, and a pull request from its branch closes them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -203,6 +210,7 @@ impl LlmTask {
             title: None,
             subject: None,
             context: Vec::new(),
+            m365: Vec::new(),
             issues: Vec::new(),
             pull_request: None,
         }

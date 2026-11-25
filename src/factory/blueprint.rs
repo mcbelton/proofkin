@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::factory::evals::Suite;
+use crate::knowledge::labels_of_mark;
 use crate::llm::{Access, Provider};
 use crate::models::Models;
 use crate::profile::{Profile, name_ok};
@@ -44,6 +45,8 @@ pub const MAX_TASKS_PER_DAY: u32 = 10_000;
 pub const MIN_TIMEOUT_SECS: u64 = 60;
 /// The longest task timeout a budget may set, in seconds (a week).
 pub const MAX_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
+/// The largest team plan, in bytes.
+pub const MAX_TEAM_PLAN: usize = 16 * 1024;
 /// Names no agent may take: plan steps and approvals give them other meanings.
 const RESERVED: &[&str] = &["me", crate::plan::WORKIQ_TARGET];
 
@@ -65,6 +68,11 @@ pub struct Blueprint {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
     pub capabilities: Capabilities,
+    /// A team plan for the team steps handed to it, as a folder's team plan is written
+    /// (plan text whose `{task}` is the task handed down; see `proofkin share team`). It
+    /// hands work to other agents, so it needs `delegate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
     pub model: ModelPolicy,
     #[serde(default, skip_serializing_if = "Memory::is_empty")]
     pub memory: Memory,
@@ -287,6 +295,9 @@ pub struct Catalog {
     pub skills: BTreeMap<String, String>,
     /// Knowledge topics.
     pub topics: BTreeSet<String>,
+    /// The topics made from Microsoft 365 content, with their labels (`unlabeled` for
+    /// such content without a label).
+    pub marked: BTreeMap<String, Vec<String>>,
     /// Shared folders, the built-in data folder too.
     pub folders: BTreeMap<String, Folder>,
     /// Providers its accounts are signed in to.
@@ -305,12 +316,39 @@ pub struct Catalog {
     pub factory: BTreeSet<String>,
 }
 
-/// A shared folder: the most access it gives, its checks and its MCP servers.
+/// A shared folder: where it is, the most access it gives, its checks, the MCP servers it
+/// offers tasks and whether each editing task gets a worktree of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Folder {
+    pub path: std::path::PathBuf,
     pub access: Access,
     pub checks: BTreeSet<String>,
-    pub mcp: BTreeSet<String>,
+    pub mcp: BTreeMap<String, Offer>,
+    pub worktrees: bool,
+}
+
+/// An MCP server a folder offers tasks: the least access they need, the tools they may
+/// call (none listed: all of them), and why it isn't offered now, if it isn't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    pub access: Access,
+    pub tools: Vec<String>,
+    /// Its owner paused it.
+    pub paused: bool,
+    /// The plugin it comes with, when that plugin is turned off.
+    pub plugin_off: Option<String>,
+}
+
+impl Offer {
+    /// Whether tasks are offered it now (not paused, its plugin on).
+    pub fn live(&self) -> bool {
+        !self.paused && self.plugin_off.is_none()
+    }
+
+    /// Whether tasks may call `tool`.
+    pub fn allows_tool(&self, tool: &str) -> bool {
+        self.tools.is_empty() || self.tools.iter().any(|t| t == tool)
+    }
 }
 
 impl Catalog {
@@ -319,6 +357,7 @@ impl Catalog {
         let skills = profile.skills();
         let accounts = profile.account_profile()?;
         let shares = profile.shares()?;
+        let topics = profile.knowledge().list();
         Ok(Self {
             profile: profile.name.clone(),
             skills: skills
@@ -326,20 +365,39 @@ impl Catalog {
                 .into_iter()
                 .map(|s| (s.name, s.description))
                 .collect(),
-            topics: profile
-                .knowledge()
-                .list()
-                .into_iter()
-                .map(|t| t.name)
+            marked: topics
+                .iter()
+                .filter_map(|t| Some((t.name.clone(), labels_of_mark(t.workiq.as_deref()?))))
                 .collect(),
+            topics: topics.into_iter().map(|t| t.name).collect(),
             folders: shares
                 .shares
                 .iter()
                 .map(|s| {
+                    let mcp = s
+                        .mcp
+                        .iter()
+                        .map(|(name, server)| {
+                            let offer = Offer {
+                                access: server.access,
+                                tools: server.tools.clone(),
+                                paused: server.paused,
+                                plugin_off: server.plugin_off.then(|| {
+                                    server.from.as_ref().map_or_else(
+                                        || "its plugin".to_owned(),
+                                        |o| o.plugin.clone(),
+                                    )
+                                }),
+                            };
+                            (name.clone(), offer)
+                        })
+                        .collect();
                     let folder = Folder {
+                        path: s.path.clone(),
                         access: s.max_access,
                         checks: s.checks.keys().cloned().collect(),
-                        mcp: s.mcp.keys().cloned().collect(),
+                        mcp,
+                        worktrees: s.worktrees,
                     };
                     (s.name.clone(), folder)
                 })
@@ -422,6 +480,7 @@ pub fn validate(blueprint: &Blueprint, catalog: &Catalog) -> Vec<Problem> {
     check_requirements(blueprint, &mut found);
     check_skills(blueprint, catalog, &mut found);
     check_capabilities(blueprint, catalog, &mut found);
+    check_team(blueprint, &mut found);
     check_model(blueprint, catalog, &mut found);
     check_memory(blueprint, catalog, &mut found);
     check_budgets(blueprint, &mut found);
@@ -601,19 +660,58 @@ fn check_requirements(bp: &Blueprint, found: &mut Vec<Problem>) {
 
 fn check_skills(bp: &Blueprint, catalog: &Catalog, found: &mut Vec<Problem>) {
     for (i, skill) in bp.skills.iter().enumerate() {
+        let at = format!("/skills/{i}");
         if !catalog.skills.contains_key(skill) {
             found.push(
+                Problem::error("unknown_skill", &at, format!("there is no skill '{skill}'")).fix(
+                    format!(
+                        "proofkin skill list --profile {} shows the skills there are",
+                        catalog.profile
+                    ),
+                ),
+            );
+        } else if name_ok(&bp.name) && !name_ok(&crate::factory::build::skill_name(&bp.name, skill))
+        {
+            found.push(
                 Problem::error(
-                    "unknown_skill",
-                    &format!("/skills/{i}"),
-                    format!("there is no skill '{skill}'"),
+                    "skill_name_too_long",
+                    &at,
+                    format!(
+                        "its builds keep skill '{skill}' as '{}', which is over 64 characters",
+                        crate::factory::build::skill_name(&bp.name, skill)
+                    ),
                 )
-                .fix(format!(
-                    "proofkin skill list --profile {} shows the skills there are",
-                    catalog.profile
-                )),
+                .fix("give the agent a shorter name"),
             );
         }
+    }
+}
+
+fn check_team(bp: &Blueprint, found: &mut Vec<Problem>) {
+    let Some(plan) = &bp.team else {
+        return;
+    };
+    if plan.len() > MAX_TEAM_PLAN {
+        found.push(Problem::error(
+            "too_long",
+            "/team",
+            "its team plan is over 16 KB",
+        ));
+    } else if let Err(e) = crate::team::validate_template(plan) {
+        found.push(
+            Problem::error("invalid_team_plan", "/team", format!("{e:#}"))
+                .fix("write it as `proofkin share team` takes a team plan (see proofkin share team --help)"),
+        );
+    }
+    if !bp.capabilities.delegate {
+        found.push(
+            Problem::error(
+                "team_needs_delegate",
+                "/capabilities/delegate",
+                "its team plan hands work to other agents, and it doesn't ask to delegate",
+            )
+            .fix("set delegate to true, or remove the team plan"),
+        );
     }
 }
 
@@ -1092,10 +1190,18 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn catalog() -> Catalog {
+        let pdf = Offer {
+            access: Access::ReadOnly,
+            tools: vec!["read_pdf".into(), "search_pdf".into()],
+            paused: false,
+            plugin_off: None,
+        };
         let folder = |access| Folder {
+            path: std::path::PathBuf::from("/srv/reports"),
             access,
             checks: ["test".to_owned()].into(),
-            mcp: ["pdf".to_owned()].into(),
+            mcp: [("pdf".to_owned(), pdf.clone())].into(),
+            worktrees: false,
         };
         let mut models = Models::new();
         models.insert(
@@ -1113,6 +1219,7 @@ pub(crate) mod tests {
                 .map(|s| (s.to_owned(), format!("The {s} procedure")))
                 .into(),
             topics: ["finance-glossary".to_owned()].into(),
+            marked: BTreeMap::new(),
             folders: [
                 ("data".to_owned(), folder(Access::ReadOnly)),
                 ("reports".to_owned(), folder(Access::Full)),
@@ -1391,5 +1498,49 @@ pub(crate) mod tests {
         );
         assert!(has_errors(&found));
         assert_eq!(summary(&found), "1 error, 1 warning");
+    }
+
+    #[test]
+    fn a_team_plan_is_a_valid_team_plan_and_needs_delegation() {
+        let lead = |plan: &str, delegate: bool| {
+            let found = problems_of(|v| {
+                v["team"] = json!(plan);
+                v["capabilities"]["delegate"] = json!(delegate);
+            });
+            codes(&found)
+        };
+        assert_eq!(
+            lead("review @carol {task}", true),
+            [("least_privilege", false, "/capabilities/delegate".into())],
+            "a team plan with {{task}} is fine; delegation is still linted"
+        );
+        assert!(lead("review @carol Check it", true).contains(&(
+            "invalid_team_plan",
+            true,
+            "/team".into()
+        )));
+        assert!(lead("review @carol {task}", false).contains(&(
+            "team_needs_delegate",
+            true,
+            "/capabilities/delegate".into()
+        )));
+        let blueprint = from_value(&{
+            let mut v = sample();
+            v["team"] = json!("review @carol {task}");
+            v
+        })
+        .unwrap();
+        assert_eq!(blueprint.team.as_deref(), Some("review @carol {task}"));
+    }
+
+    #[test]
+    fn a_skill_kept_under_the_agents_name_must_fit_a_name() {
+        let long = "a".repeat(60);
+        let found = problems_of(|v| v["name"] = json!(long));
+        assert_eq!(
+            codes(&found),
+            [("skill_name_too_long", true, "/skills/0".into())]
+        );
+        assert!(found[0].message.contains(&format!("'{long}.risk-review'")));
     }
 }

@@ -5,9 +5,10 @@
 //!   drafts/<name>.json          an agent's draft: its blueprint, as written or edited, and how it was first written
 //!   agents/<name>/state.json    its lifecycle: state, active version, deployments, and the history of every change
 //!   agents/<name>/fixtures/     files its eval cases work on
+//!   agents/<name>/builds/<hash>/  its builds, by hash (see crate::factory::build)
 //! ```
 //!
-//! Builds, evaluations and releases go next to the state as the factory grows
+//! Evaluations and releases go next to the state as the factory grows
 //! (docs/agent-factory/design/data-dictionary.md). Files are written atomically, and
 //! changes to an agent hold its lock ([`crate::store`]), so the CLI, the web UI and an
 //! agent can work at once without losing a change. A file that can't be read is
@@ -20,6 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::factory::build::Build;
 use crate::llm::Provider;
 use crate::profile::{Profile, validate_name};
 use crate::store::{FileLock, write_atomic};
@@ -189,6 +191,87 @@ impl FactoryStore {
         self.agent_dir(name).join("fixtures")
     }
 
+    /// Where agent `name`'s build `hash` is kept.
+    pub fn build_dir(&self, name: &str, hash: &str) -> PathBuf {
+        self.agent_dir(name).join("builds").join(hash)
+    }
+
+    /// Keeps `build` by its hash and returns its folder. A build kept already is left as it
+    /// is once it checks out against its hash; one that doesn't is an error naming it.
+    pub fn save_build(&self, build: &Build) -> Result<PathBuf> {
+        validate_agent_name(&build.agent)?;
+        self.prepare()?;
+        let _lock = FileLock::acquire(&self.state_path(&build.agent))?;
+        let dir = self.build_dir(&build.agent, &build.hash);
+        if dir.exists() {
+            self.build(&build.agent, &build.hash)?;
+            return Ok(dir);
+        }
+        let builds = dir.parent().expect("a build's folder is in builds/");
+        std::fs::create_dir_all(builds)
+            .with_context(|| format!("creating {}", builds.display()))?;
+        // Written whole, then renamed into place: a build is there complete, or not at all.
+        let partial = builds.join(format!(".partial-{}", uuid::Uuid::new_v4().simple()));
+        let written = (|| -> Result<()> {
+            for (path, text) in &build.files {
+                let file = partial.join(path);
+                if let Some(parent) = file.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&file, text)?;
+            }
+            rename_dir(&partial, &dir)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_dir_all(&partial);
+        }
+        written.with_context(|| {
+            format!(
+                "keeping build {} of {} in {}",
+                build.short_hash(),
+                build.agent,
+                builds.display()
+            )
+        })?;
+        Ok(dir)
+    }
+
+    /// Agent `name`'s build `hash`, if it is kept, checked against its hash: one changed
+    /// since it was built is an error naming its folder.
+    pub fn build(&self, name: &str, hash: &str) -> Result<Option<Build>> {
+        validate_agent_name(name)?;
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("{hash:?} isn't a build's hash");
+        }
+        let dir = self.build_dir(name, hash);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        let mut files = std::collections::BTreeMap::new();
+        read_tree(&dir, "", &mut files)?;
+        let build = Build::of(name, files);
+        if build.hash != hash {
+            bail!(
+                "{} doesn't match its hash: it was changed after it was built; remove it to build it again",
+                dir.display()
+            );
+        }
+        Ok(Some(build))
+    }
+
+    /// The hashes of agent `name`'s builds, sorted.
+    pub fn builds(&self, name: &str) -> Result<Vec<String>> {
+        validate_agent_name(name)?;
+        let mut hashes: Vec<String> = read_dir(&self.agent_dir(name).join("builds"))?
+            .into_iter()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect();
+        hashes.sort();
+        Ok(hashes)
+    }
+
     /// Agent `name`'s draft, if it has one.
     pub fn draft(&self, name: &str) -> Result<Option<Draft>> {
         validate_agent_name(name)?;
@@ -353,6 +436,43 @@ fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
     }
 }
 
+/// The text files under `dir`, by their `/`-separated paths below it (after `prefix`).
+fn read_tree(
+    dir: &Path,
+    prefix: &str,
+    files: &mut std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    for entry in read_dir(dir)? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let relative = format!("{prefix}{name}");
+        if entry.file_type()?.is_dir() {
+            read_tree(&path, &format!("{relative}/"), files)?;
+        } else {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            files.insert(relative, text);
+        }
+    }
+    Ok(())
+}
+
+/// Renames folder `from` to `to`, trying again for a moment while Windows still holds the
+/// files just written in it.
+fn rename_dir(from: &Path, to: &Path) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if tries < 20 && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// The JSON file at `path` (`None` if there is none). One that can't be read or
 /// parsed is an error naming it, so it is never written over by mistake.
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -476,6 +596,46 @@ mod tests {
         std::fs::write(store.draft_path("fin"), "[").unwrap();
         let err = store.draft("fin").unwrap_err();
         assert!(err.to_string().contains("fin.json"), "{err}");
+    }
+
+    #[test]
+    fn builds_are_kept_by_hash_and_checked_when_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FactoryStore::new(dir.path().join("factory"));
+        let files = [
+            (
+                "agent.md".to_owned(),
+                "---\nname: fin\n---\nDo it.\n".to_owned(),
+            ),
+            ("skills/fin.x.md".to_owned(), "x\n".to_owned()),
+        ]
+        .into();
+        let build = Build::of("fin", files);
+        let kept = store.save_build(&build).unwrap();
+        assert_eq!(kept, store.build_dir("fin", &build.hash));
+        assert_eq!(store.save_build(&build).unwrap(), kept, "kept once");
+        assert_eq!(
+            store.build("fin", &build.hash).unwrap(),
+            Some(build.clone())
+        );
+        assert_eq!(
+            store.builds("fin").unwrap(),
+            std::slice::from_ref(&build.hash)
+        );
+        assert_eq!(store.build("fin", &"0".repeat(64)).unwrap(), None);
+        assert!(store.build("fin", "../x").is_err());
+
+        std::fs::write(kept.join("skills").join("fin.x.md"), "changed\n").unwrap();
+        let error = store.build("fin", &build.hash).unwrap_err().to_string();
+        assert!(error.contains("doesn't match its hash"), "{error}");
+        assert!(
+            store.save_build(&build).is_err(),
+            "a changed build is reported, never written over"
+        );
+        assert_eq!(
+            std::fs::read_to_string(kept.join("skills").join("fin.x.md")).unwrap(),
+            "changed\n"
+        );
     }
 
     #[test]

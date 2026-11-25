@@ -123,6 +123,17 @@ pub fn union_labels(labels: &[String], more: &[String]) -> Vec<String> {
     all
 }
 
+/// The labels of a Microsoft 365 mark as audiences are checked against: its labels, or
+/// `unlabeled` for content without one. Marks are joined after this, so a mark without
+/// labels still needs `unlabeled` when another one names some.
+pub fn labels_of_mark(labels: &[String]) -> Vec<String> {
+    if labels.iter().all(|l| l.trim().is_empty()) {
+        vec![crate::workiq::content::UNLABELED.to_owned()]
+    } else {
+        union_labels(&[], labels)
+    }
+}
+
 /// The Microsoft 365 mark in a topic's front matter (`origin: workiq`): its labels
 /// (`labels: a, b`, none if the line is missing), or `None` if the topic isn't marked.
 pub fn parse_mark(text: &str) -> Option<Vec<String>> {
