@@ -370,6 +370,14 @@ pub(crate) fn schema_mismatches(value: &Value, schema: &Value) -> Vec<String> {
     out
 }
 
+/// [`schema_mismatches`] for a schema whose `$ref`s point into the OpenAPI document `root`:
+/// an API's answer against its contract (contract tests).
+pub fn contract_mismatches(value: &Value, schema: &Value, root: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    mismatches(value, schema, root, "$", 0, &mut out);
+    out
+}
+
 /// Where `value` doesn't match `schema` (types, required properties, enums).
 fn mismatches(
     value: &Value,

@@ -3194,6 +3194,7 @@ async fn the_page_follows_the_ux_guidelines() {
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     assert!(page.contains(r#"<script src="/workers.js" defer>"#));
+    assert!(page.contains(r#"<script src="/factory.js" defer>"#));
     assert!(page.contains(r#"<script src="/connect.js" defer>"#));
     for id in [
         "confirm-dialog",
@@ -3207,6 +3208,9 @@ async fn the_page_follows_the_ux_guidelines() {
         "plan-builder",
         "worker-list",
         "worker-dialog",
+        "factory-list",
+        "factory-new-dialog",
+        "factory-agent-dialog",
         "connect",
         "connect-toggle",
         "check-options",
@@ -3263,6 +3267,7 @@ async fn the_page_follows_the_ux_guidelines() {
         "/plan-text.js",
         "/plan-builder.js",
         "/workers.js",
+        "/factory.js",
         "/connect.js",
     ] {
         let js = request(port, "GET", script, &host, None, None).await;
@@ -4664,5 +4669,393 @@ async fn the_allowlist_dialog_offers_the_microsoft_365_grant_after_the_folders()
             "#{id} isn't in the grant's fields"
         );
     }
+    agent.shutdown().await;
+}
+
+/// The agent factory's API (docs/agent-factory/spec/openapi.json): each operation answers
+/// with the status codes its contract lists and a body that fits its schema, and nothing
+/// works without the web UI's token (TM-11).
+#[tokio::test]
+async fn the_factory_api_answers_as_its_contract_says() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("solo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("profile.json"),
+        r#"{"codex": {"source": "login"}}"#,
+    )
+    .unwrap();
+    let mut config = AgentConfig::new("solo", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(home.path(), "solo").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let contract: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("docs/agent-factory/spec/openapi.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Calls `method path` with `body`; asserts its status is `code`, one its contract
+    // (operation `op` at `template`) lists, with a body that fits that response's schema.
+    let call = |method: &'static str,
+                path: String,
+                template: &'static str,
+                body: Option<Value>,
+                code: u16| {
+        let (host, contract) = (host.clone(), contract.clone());
+        async move {
+            let sent = body.map(|b| b.to_string());
+            let got = request(port, method, &path, &host, Some(token), sent.as_deref()).await;
+            assert_eq!(got.status, code, "{method} {path}: {}", got.body);
+            let value = got.json();
+            let response = &contract["paths"][template][method.to_ascii_lowercase()]["responses"]
+                [code.to_string()];
+            assert!(!response.is_null(), "{method} {template} lists no {code}");
+            let response = match response["$ref"].as_str() {
+                Some(r) => contract.pointer(r.strip_prefix('#').unwrap()).unwrap(),
+                None => response,
+            };
+            let schema = &response["content"]["application/json"]["schema"];
+            let wrong = proofkin::spec::contract_mismatches(&value, schema, &contract);
+            assert!(
+                wrong.is_empty(),
+                "{method} {path} {code}: {wrong:?}\n{value:#}"
+            );
+            value
+        }
+    };
+
+    // Nothing without the web UI's token.
+    for (method, path) in [
+        ("GET", "/api/factory/templates"),
+        ("POST", "/api/factory/drafts"),
+        ("GET", "/api/factory/drafts/x"),
+        ("GET", "/api/factory/agents"),
+        ("POST", "/api/factory/agents/x/evaluations"),
+        ("GET", "/api/factory/evaluations/ev-20261124-091500-x"),
+        ("DELETE", "/api/factory/evaluations/ev-20261124-091500-x"),
+    ] {
+        let got = request(port, method, path, &host, None, Some("{}")).await;
+        assert_eq!(got.status, 401, "{method} {path}");
+    }
+
+    let templates = call(
+        "GET",
+        "/api/factory/templates".into(),
+        "/api/factory/templates",
+        None,
+        200,
+    )
+    .await;
+    assert!(
+        templates["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "researcher")
+    );
+
+    // Drafts: from a template (no model), refused when they can't be one.
+    let drafts = "/api/factory/drafts";
+    let draft = call(
+        "POST",
+        drafts.into(),
+        drafts,
+        Some(serde_json::json!({ "template": "researcher", "name": "ask" })),
+        201,
+    )
+    .await;
+    assert_eq!(draft["provenance"]["source"], "template");
+    assert_eq!(
+        draft["blueprint"]["model"]["providers"],
+        serde_json::json!(["codex"])
+    );
+    assert_eq!(draft["problems"], serde_json::json!([]));
+    let taken = call(
+        "POST",
+        drafts.into(),
+        drafts,
+        Some(serde_json::json!({ "template": "researcher", "name": "ask" })),
+        409,
+    )
+    .await;
+    assert!(
+        taken["error"]
+            .as_str()
+            .unwrap()
+            .contains("'ask' is already"),
+        "{taken}"
+    );
+    for (body, why) in [
+        (
+            serde_json::json!({ "name": "x", "description": "   " }),
+            "the description is empty",
+        ),
+        (
+            serde_json::json!({ "name": "x", "template": "nope" }),
+            "there is no template 'nope'",
+        ),
+        (
+            serde_json::json!({ "name": "x" }),
+            "describe what the agent should do, or start from a template",
+        ),
+        (
+            serde_json::json!({ "name": "../x", "template": "researcher" }),
+            "can't name an agent",
+        ),
+    ] {
+        let refused = call("POST", drafts.into(), drafts, Some(body), 400).await;
+        assert!(
+            refused["error"].as_str().unwrap().contains(why),
+            "{refused}"
+        );
+    }
+
+    let one = "/api/factory/drafts/{name}";
+    let got = call("GET", "/api/factory/drafts/ask".into(), one, None, 200).await;
+    assert_eq!(got["blueprint"], draft["blueprint"]);
+    call("GET", "/api/factory/drafts/nope".into(), one, None, 404).await;
+    let mut blueprint = draft["blueprint"].clone();
+    blueprint["title"] = "Asker".into();
+    let saved = call(
+        "PUT",
+        "/api/factory/drafts/ask".into(),
+        one,
+        Some(blueprint.clone()),
+        200,
+    )
+    .await;
+    assert_eq!(
+        (saved["passed"].clone(), saved["increases"].clone()),
+        (true.into(), serde_json::json!([]))
+    );
+    let mut renamed = blueprint.clone();
+    renamed["name"] = "other".into();
+    call(
+        "PUT",
+        "/api/factory/drafts/ask".into(),
+        one,
+        Some(renamed),
+        400,
+    )
+    .await;
+    call(
+        "PUT",
+        "/api/factory/drafts/ask".into(),
+        one,
+        Some(serde_json::json!({ "name": "ask" })),
+        400,
+    )
+    .await;
+    let checked = call(
+        "POST",
+        "/api/factory/drafts/ask/check".into(),
+        "/api/factory/drafts/{name}/check",
+        Some(serde_json::json!({ "folders": ["nowhere"] })),
+        200,
+    )
+    .await;
+    assert_eq!(checked["passed"], false);
+    assert!(
+        checked["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["code"] == "unknown_folder"),
+        "{checked}"
+    );
+
+    let agents = call(
+        "GET",
+        "/api/factory/agents".into(),
+        "/api/factory/agents",
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(agents["agents"][0]["name"], "ask");
+    assert_eq!(agents["agents"][0]["title"], "Asker");
+    let shown = call(
+        "GET",
+        "/api/factory/agents/ask".into(),
+        "/api/factory/agents/{name}",
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(shown["state"], "draft");
+    assert_eq!(shown["candidates"][0]["provider"], "codex");
+    call(
+        "GET",
+        "/api/factory/agents/nope".into(),
+        "/api/factory/agents/{name}",
+        None,
+        404,
+    )
+    .await;
+
+    // An evaluation: its estimate first, and nothing runs.
+    let evaluations = "/api/factory/agents/{name}/evaluations";
+    let estimate = call(
+        "POST",
+        "/api/factory/agents/ask/evaluations".into(),
+        evaluations,
+        Some(serde_json::json!({ "confirm": false })),
+        200,
+    )
+    .await;
+    assert_eq!(
+        (
+            estimate["cases"].clone(),
+            estimate["repetitions"].clone(),
+            estimate["candidates"].clone(),
+            estimate["runs"].clone()
+        ),
+        (10.into(), 3.into(), 1.into(), 30.into())
+    );
+    let fewer = call("POST", "/api/factory/agents/ask/evaluations".into(), evaluations,
+        Some(serde_json::json!({ "confirm": false, "repetitions": 1, "candidates": [{ "provider": "codex", "model": "gpt-5", "effort": "high" }] })), 200).await;
+    assert_eq!(
+        (
+            fewer["runs"].clone(),
+            fewer["candidate_routes"][0]["model"].clone()
+        ),
+        (10.into(), "gpt-5".into())
+    );
+    assert!(
+        !home.path().join("solo-eval").exists(),
+        "nothing ran: no evaluation worker"
+    );
+    call(
+        "POST",
+        "/api/factory/agents/ask/evaluations".into(),
+        evaluations,
+        Some(serde_json::json!({ "confirm": false, "peer": "someone" })),
+        400,
+    )
+    .await;
+    call(
+        "POST",
+        "/api/factory/agents/nope/evaluations".into(),
+        evaluations,
+        Some(serde_json::json!({ "confirm": false })),
+        404,
+    )
+    .await;
+    // Without a way to run its evaluation worker, it can't be confirmed.
+    let refused = call(
+        "POST",
+        "/api/factory/agents/ask/evaluations".into(),
+        evaluations,
+        Some(serde_json::json!({ "confirm": true })),
+        409,
+    )
+    .await;
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("can't run your evaluation worker"),
+        "{refused}"
+    );
+    // A suite that doesn't prove R2 is the request's problem; other errors the draft's.
+    let mut unproven = blueprint.clone();
+    unproven["evals"]["cases"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c["requirement"] != "R2");
+    call(
+        "PUT",
+        "/api/factory/drafts/ask".into(),
+        one,
+        Some(unproven),
+        200,
+    )
+    .await;
+    let invalid = call(
+        "POST",
+        "/api/factory/agents/ask/evaluations".into(),
+        evaluations,
+        Some(serde_json::json!({ "confirm": false })),
+        400,
+    )
+    .await;
+    assert!(
+        invalid["error"].as_str().unwrap().contains("R2"),
+        "{invalid}"
+    );
+    let mut broken = blueprint.clone();
+    broken["skills"] = serde_json::json!(["no-such-skill"]);
+    call(
+        "PUT",
+        "/api/factory/drafts/ask".into(),
+        one,
+        Some(broken),
+        200,
+    )
+    .await;
+    let errors = call(
+        "POST",
+        "/api/factory/agents/ask/evaluations".into(),
+        evaluations,
+        Some(serde_json::json!({ "confirm": false })),
+        409,
+    )
+    .await;
+    assert_eq!(
+        errors["error"],
+        "the draft has 1 error: fix it, then evaluate"
+    );
+
+    let id = "/api/factory/evaluations/{id}";
+    call(
+        "GET",
+        "/api/factory/evaluations/ev-20261124-091500-ask".into(),
+        id,
+        None,
+        404,
+    )
+    .await;
+    call(
+        "GET",
+        "/api/factory/evaluations/not-an-id".into(),
+        id,
+        None,
+        404,
+    )
+    .await;
+    call(
+        "DELETE",
+        "/api/factory/evaluations/ev-20261124-091500-ask".into(),
+        id,
+        None,
+        404,
+    )
+    .await;
     agent.shutdown().await;
 }

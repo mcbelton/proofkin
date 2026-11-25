@@ -225,10 +225,29 @@ pub fn plan(
     let problems = draft_problems(&store, name, &draft.blueprint, &catalog);
     if has_errors(&problems) {
         let errors = problems.iter().filter(|p| p.error).count();
+        // Only its suite is wrong: the evaluation asked for is what isn't valid.
+        let suite: Vec<&Problem> = match from_value(&draft.blueprint) {
+            Ok(bp) => {
+                let own = crate::factory::evals::check(&bp);
+                problems
+                    .iter()
+                    .filter(|p| p.error && (own.contains(p) || p.code == "missing_fixture"))
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        if suite.len() == errors {
+            let said: Vec<&str> = suite.iter().map(|p| p.message.as_str()).collect();
+            return Err(Refused {
+                conflict: false,
+                message: format!("its eval suite isn't valid: {}", said.join("; ")),
+                problems,
+            });
+        }
         return Err(Refused {
             conflict: true,
             message: format!(
-                "{name}'s draft has {errors} error{}: fix {} before it is evaluated",
+                "the draft has {errors} error{}: fix {}, then evaluate",
                 if errors == 1 { "" } else { "s" },
                 if errors == 1 { "it" } else { "them" }
             ),

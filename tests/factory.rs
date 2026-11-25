@@ -765,13 +765,28 @@ fn an_evaluation_shows_its_estimate_and_runs_nothing_until_it_is_confirmed() {
         assert!(out.contains(why), "{why:?} isn't in:\n{out}");
     }
     // A draft with an error isn't evaluated.
-    let mut blueprint = home.blueprint("rev");
+    let original = home.blueprint("rev");
+    let mut blueprint = original.clone();
     blueprint["skills"] = json!(["no-such-skill"]);
     let edit = ["edit", "rev", "--from", "-", "--profile", "alice"];
     assert!(home.run_with_stdin(&edit, &blueprint.to_string()).ok);
     let out = home.fails(&["evaluate", "rev", "--profile", "alice"]);
     assert!(
-        out.contains("rev's draft has 1 error: fix it before it is evaluated"),
+        out.contains("the draft has 1 error: fix it, then evaluate"),
+        "{out}"
+    );
+    // A suite that doesn't prove a requirement is what's wrong with the request.
+    let mut blueprint = original;
+    blueprint["evals"]["cases"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c["requirement"] != "R2");
+    assert!(home.run_with_stdin(&edit, &blueprint.to_string()).ok);
+    let out = home.fails(&["evaluate", "rev", "--profile", "alice"]);
+    assert!(
+        out.contains(
+            "its eval suite isn't valid: no case proves R2 with a deterministic expectation"
+        ),
         "{out}"
     );
     let out = home.fails(&["report", "ev-20261124-091500-rev", "--profile", "alice"]);

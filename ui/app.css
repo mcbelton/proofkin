@@ -330,6 +330,38 @@ textarea { resize: vertical; }
 .squad { align-items: flex-start; }
 .row-actions { display: flex; align-items: center; gap: 4px; flex: none; }
 .list li.worker { align-items: flex-start; }
+.list li.factory-agent { align-items: flex-start; }
+.factory-agent .sub { margin-top: 2px; }
+.factory-templates { display: grid; gap: 6px; max-height: 280px; overflow-y: auto; overscroll-behavior: contain; padding: 2px; }
+.factory-template { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); font-weight: 400; cursor: pointer; }
+.factory-template:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.factory-template input { margin-top: 3px; accent-color: var(--accent); min-width: 16px; min-height: 16px; }
+.factory-template > span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.factory-template .t-title { font-weight: 600; }
+.factory-template .t-purpose { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.factory-panel h3 { font-size: 13px; margin: 0; }
+.factory-panel .card-head { margin: 0; }
+.factory-requirements { margin: 0; padding-left: 20px; font-size: 13px; display: grid; gap: 4px; }
+.factory-problems, .factory-failing, .factory-grants { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; font-size: 13px; }
+.factory-problems li { display: flex; gap: 8px; align-items: flex-start; }
+.factory-problems .status { flex: none; }
+.factory-problems .p-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.factory-problems .p-fix { color: var(--muted); }
+.factory-failing > li { padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+.factory-failing ul { margin: 4px 0; padding-left: 18px; }
+.factory-failing summary { cursor: pointer; font-size: 12.5px; color: var(--accent); width: fit-content; }
+.factory-output {
+  margin: 6px 0 0; padding: 8px 10px; max-height: 220px; overflow: auto; overscroll-behavior: contain;
+  white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11.5px; font-family: var(--mono);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.factory-json { width: 100%; min-height: 320px; flex: 1; font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+.factory-matrix-wrap { overflow-x: auto; overscroll-behavior: contain; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.factory-matrix { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.factory-matrix th, .factory-matrix td { padding: 5px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border); }
+.factory-matrix thead th { color: var(--muted); font-weight: 600; background: var(--surface-2); }
+.factory-matrix tbody tr:last-child > * { border-bottom: none; }
+.factory-panel progress { width: 100%; height: 10px; accent-color: var(--accent); }
 .worker-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
 .worker-head .name { min-width: 0; }
 .worker .sub { margin-top: 2px; }
