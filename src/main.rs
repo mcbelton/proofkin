@@ -4410,7 +4410,10 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
                 } else {
                     proofkin::workiq::login::Flow::Browser
                 };
+                let endpoints = proofkin::workiq::Endpoints::configured()?;
                 let who = proofkin::workiq::login::Login::new(&tenant, &client_id)
+                    .with_authority(&endpoints.authority)
+                    .with_mcp_url(&endpoints.mcp_url)
                     .run(&mut profile, flow)
                     .await?;
                 println!("profile '{}': Work IQ signed in as {who}", profile.name);

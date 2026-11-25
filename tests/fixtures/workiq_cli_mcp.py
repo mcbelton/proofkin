@@ -1,4 +1,5 @@
-"""A fake Work IQ CLI (`workiq mcp`: stdio, newline-delimited JSON-RPC) for tests/workiq_cli.rs.
+"""A fake Work IQ CLI (`workiq mcp`: stdio, newline-delimited JSON-RPC) for tests/workiq_cli.rs
+and tests/workiq_e2e.rs.
 
 Usage: workiq_cli_mcp.py <state dir> <mode> mcp [--account <email>]
        workiq_cli_mcp.py <state dir> <mode> config show
@@ -9,6 +10,10 @@ the default account (none in mode `bare`).
 
 Modes:
   ok            answers everything
+  full          like ok, but offers the tools Proofkin's commands use, answering as the
+                content policy reads them: `retrieve` (one General file and one blocked one in
+                structuredContent), `ask` (an answer citing a General file), `list_agents`
+                (one agent)
   bare          like ok, but `config show` names no default account
   user          like ok, and says who is signed in in the initialize reply
   crash         exits without answering on the first tools/call of the whole test (a marker
@@ -66,12 +71,53 @@ if MODE == "eula":
 
 TOOLS = [
     {"name": name, "description": name, "inputSchema": {"type": "object", "properties": {}}}
-    for name in ("retrieve", "send_mail", "inspect")
+    for name in (
+        ("retrieve", "ask", "list_agents") if MODE == "full" else ("retrieve", "send_mail", "inspect")
+    )
 ]
 
 
 def text_result(text):
     return {"content": [{"type": "text", "text": text}]}
+
+
+def cli_file(fid, protection, text):
+    return {
+        "id": fid,
+        "markdown": text,
+        "webUrl": "https://contoso.example/files/%s" % fid,
+        "entityType": "file",
+        "contentProtection": protection,
+        "sensitivityLabel": {"displayName": "General"},
+        "resourceMetadata": {"document": {"title": "CLI file %s" % fid}},
+        "relevanceScore": 0.9,
+    }
+
+
+def full_result(name, arguments):
+    """What the `full` mode answers: the text, and the structuredContent Proofkin reads."""
+    if name == "retrieve":
+        files = [
+            cli_file("c1", "allowed", "Launch budget notes from the CLI."),
+            cli_file("c2", "blocked", "A file the CLI may not hand out."),
+        ]
+        structured = {
+            "application/vnd.ms-workiq.retrieval": {
+                "results": files,
+                "resultCount": len(files),
+                "stoppedReason": "completed",
+            }
+        }
+    elif name == "ask":
+        structured = {
+            "answer": "The CLI says the launch moved to May.",
+            "citations": [{"title": "Launch plan", "sensitivityLabel": {"displayName": "General"}}],
+        }
+    else:
+        structured = {"agents": [{"id": "sales:1", "name": "Sales"}]}
+    result = text_result("%s: %s" % (name, arguments.get("query", "")))
+    result["structuredContent"] = structured
+    return result
 
 
 for line in sys.stdin:
@@ -104,7 +150,9 @@ for line in sys.stdin:
         result = {"tools": TOOLS}
     elif method == "tools/call":
         arguments = params.get("arguments") or {}
-        if params.get("name") == "inspect":
+        if MODE == "full":
+            result = full_result(params.get("name"), arguments)
+        elif params.get("name") == "inspect":
             names = arguments.get("names", [])
             result = text_result(
                 json.dumps({"argv": ARGV, "set": [n for n in names if n in os.environ]})
