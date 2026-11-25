@@ -216,6 +216,9 @@ token:
 - Only read tools by default (`retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
   `list_agents`). Every result goes through the content policy for the task's audience;
   every call is audited and metered; sizes are capped.
+- The server is called `workiq`, so a plan knows a step with `mcp=workiq` reads Microsoft
+  365 content whose labels it never learns: the step is marked `unknown`, and nothing made
+  from it goes to a peer.
 - Peers' tasks get it only with the `--m365-tools` grant, within that peer's labels. Codex
   tasks can't use MCP servers, so they can't use it either.
 

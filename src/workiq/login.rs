@@ -595,7 +595,7 @@ fn form(fields: &[(&str, &str)]) -> String {
 }
 
 /// `bytes` random bytes as URL-safe text.
-fn random_token(bytes: usize) -> String {
+pub(crate) fn random_token(bytes: usize) -> String {
     let mut random = Vec::new();
     while random.len() < bytes {
         random.extend_from_slice(&iroh::SecretKey::generate().to_bytes());
