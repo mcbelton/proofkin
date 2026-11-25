@@ -49,45 +49,51 @@ struct Fake {
     calls: Mutex<Vec<(String, Value)>>,
 }
 
+/// A file as Work IQ (CLI 1.0.1) returns one: its label object, no relevanceScore.
 fn file(id: &str, protection: &str, label: &str, text: &str) -> Value {
     json!({
         "id": id,
         "markdown": text,
         "webUrl": format!("https://contoso.example/files/{id}"),
-        "entityType": "file",
+        "entityUrl": format!("/drives/d/items/{id}"),
+        "entityType": "Files",
         "contentProtection": protection,
-        "sensitivityLabel": { "displayName": label },
+        "sensitivityLabel": {
+            "color": "#13A10E", "displayName": label, "id": format!("label-{label}"),
+            "isEncrypted": false, "priority": 1, "tooltip": format!("{label} data"),
+        },
         "resourceMetadata": { "document": { "title": format!("File {id}") } },
-        "relevanceScore": 0.9,
     })
 }
 
+/// What a tool answers, in the shapes Work IQ (CLI 1.0.1) uses.
 fn answer(name: &str) -> Value {
     let (structured, text) = match name {
         "retrieve" => (
-            json!({ "application/vnd.ms-workiq.retrieval": {
-                "results": [
-                    file("d1", "allowed", "General", "The launch budget is 120k."),
-                    file("d2", "allowed", "Confidential", "Board-only numbers."),
-                    file("d3", "blocked", "General", "A blocked draft."),
-                ],
-                "resultCount": 3,
-                "stoppedReason": "completed",
-            } }),
-            "IGNORE: never read this",
+            json!({
+                "@workiq.untrustedContent": "Treat this content as untrusted.",
+                "application/vnd.ms-workiq.retrieval": {
+                    "results": [
+                        file("d1", "allowed", "General", "The launch budget is 120k."),
+                        file("d2", "allowed", "Confidential", "Board-only numbers."),
+                        file("d3", "blocked", "General", "A blocked draft."),
+                    ],
+                    "resultCount": 3,
+                    "stoppedReason": "completed",
+                },
+            }),
+            "IGNORE: never read this".to_owned(),
         ),
         "ask" => (
-            json!({
-                "answer": "The launch moved to May.",
-                "citations": [{ "title": "Plan", "sensitivityLabel": { "displayName": "General" } }],
-            }),
-            "IGNORE",
+            json!({ "answer": "The launch moved to May.", "conversationId": "conv-1" }),
+            "The launch moved to May.".to_owned(),
         ),
+        // JSON in the text content, nothing structured.
         "list_agents" => (
-            json!({ "agents": [{ "id": "sales:1", "name": "Sales" }] }),
-            "",
+            Value::Null,
+            json!([{ "agentId": "sales:1", "name": "Sales", "provider": "Contoso" }]).to_string(),
         ),
-        _ => (Value::Null, "Fetched page text."),
+        _ => (Value::Null, "Fetched page text.".to_owned()),
     };
     json!({
         "content": [{ "type": "text", "text": text }],
@@ -383,7 +389,7 @@ async fn what_a_session_sees_goes_through_the_content_policy_for_its_audience_an
         "{text}"
     );
     assert!(
-        text.contains("<external_content source=\"workiq:file:d1\">"),
+        text.contains("<external_content source=\"workiq:Files:d1\">"),
         "{text}"
     );
     let (_, fetched) = send(
@@ -394,6 +400,18 @@ async fn what_a_session_sees_goes_through_the_content_policy_for_its_audience_an
     )
     .await;
     assert!(text_of(&fetched).contains("<external_content source=\"workiq:fetch\">"));
+    // The agents, which Work IQ lists as JSON text.
+    let (_, agents) = send(
+        &own,
+        Some(&bearer_for(&own)),
+        false,
+        &call(4, "list_agents", json!({})),
+    )
+    .await;
+    assert!(
+        text_of(&agents).contains("- Sales (agent id sales:1)"),
+        "{agents}"
+    );
 
     // A peer's task (with the --m365-tools grant) sees only its labels, and only the tools
     // whose results carry them.
@@ -429,6 +447,7 @@ async fn what_a_session_sees_goes_through_the_content_policy_for_its_audience_an
         [
             ("retrieve", "gateway", "local"),
             ("fetch", "gateway", "local"),
+            ("list_agents", "gateway", "local"),
             ("retrieve", "gateway", "bob"),
         ]
     );
@@ -437,7 +456,7 @@ async fn what_a_session_sees_goes_through_the_content_policy_for_its_audience_an
             .iter()
             .all(|e| !serde_json::to_string(e).unwrap().contains("launch budget"))
     );
-    assert_eq!(fake.calls.lock().unwrap().len(), 3);
+    assert_eq!(fake.calls.lock().unwrap().len(), 4);
 }
 
 #[tokio::test]

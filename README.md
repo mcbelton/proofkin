@@ -799,6 +799,11 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
   labels are only known once it runs, so a later step for a peer gets a plan check
   **warning**, and is checked again when it is sent: it is refused if what was found has
   labels beyond the peer's grant.
+- Work IQ labels files and mail, but gives meetings, Teams chats and people no label
+  information, so those go only to your own workers, never to a peer. People results also
+  come without Work IQ's decision on whether they may be handed out, so they are withheld
+  (`people` finds nothing usable for now, [#241](https://github.com/mcbelton/proofkin/issues/241);
+  see [docs/work-iq.md](docs/work-iq.md#what-work-iq-offers)).
 - Searches are audited and held to the profile's Work IQ budgets. A Work IQ error or a budget
   refusal fails the step with its one-line message.
 - The run record keeps, for each step, the sources (title, type, label, link), how many
@@ -2255,7 +2260,8 @@ its log. `python scripts/evidence.py --live` runs it too while `PROOFKIN_LIVE_WO
   maximum (`share add ... --access <level>`). Your own tasks get `--access` in `--workspace`.
 - Microsoft 365 content is off for every peer until you grant it:
   `peers allow ... --m365 General,Public,unlabeled` lets a peer receive Work IQ context
-  with only those sensitivity labels (`unlabeled` allows content without a label), and
+  with only those sensitivity labels (`unlabeled` allows content Work IQ says has no label;
+  content with no label information, such as meetings and chats, goes to no peer), and
   `--m365-tools` also lets its tasks use your Work IQ, read only. `--m365 off` removes the
   grant; allowing the peer again without `--m365` keeps it. Your own digital workers get
   everything you can read.
