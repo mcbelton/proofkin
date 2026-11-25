@@ -2966,9 +2966,17 @@ impl Inner {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let branch = format!("p2p/{}/{task_id}-{stamp}", branch_part(from));
-            let wt = Worktree::create(&share.path, &self.worktrees_dir, &branch)
+            let mut wt = Worktree::create(&share.path, &self.worktrees_dir, &branch)
                 .await
                 .context("creating the task's worktree")?;
+            // If the task stops before its work is committed (it is cancelled, or this agent
+            // stops), what the model changed stays on the task's branch.
+            let (subject, own) = commit_subject(task);
+            wt.keep_unfinished(format!(
+                "{subject} (unfinished)\n\n{}Task {task_id} from {from}: it stopped before it finished. Kept by {} with Proofkin.",
+                own.map(|o| format!("{o}\n\n")).unwrap_or_default(),
+                self.name
+            ));
             ctx.workspace = wt.path.clone();
             Some(wt)
         } else {
@@ -3735,10 +3743,11 @@ async fn run_connection(
         // Only if the peer doesn't come back quickly (e.g. this connection lost the
         // simultaneous-dial tie-break) is it reported gone. Its tasks wait longer (the
         // task grace) for it to come back: then the tasks delegated to it fail and the
-        // tasks it asked this agent to run stop.
+        // tasks it asked this agent to run stop. Both count only awake time: a peer gone
+        // while this machine slept gets the grace again once it wakes.
         let inner = inner.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(DISCONNECT_GRACE).await;
+            crate::awake::sleep(DISCONNECT_GRACE).await;
             let gone = !inner.peers.lock().unwrap().contains_key(&peer_id);
             if !gone {
                 return;
@@ -3752,7 +3761,7 @@ async fn run_connection(
                 });
             }
             inner.report_reconnecting(&peer_id, &name);
-            tokio::time::sleep(inner.task_grace.saturating_sub(DISCONNECT_GRACE)).await;
+            crate::awake::sleep(inner.task_grace.saturating_sub(DISCONNECT_GRACE)).await;
             // Still gone since then (not back, nor gone again later).
             if inner.left.lock().unwrap().get(&peer_id) != Some(&left) {
                 return;
