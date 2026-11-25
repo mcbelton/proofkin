@@ -2461,6 +2461,12 @@ proofkin plugin disable reviewer --profile alice  # enable / remove
   placeholders; values not given with `--set` come from environment variables of the same
   name). `${PLUGIN_ROOT}` (and the Claude and Copilot spellings) becomes the plugin's
   folder, `${PLUGIN_DATA}` a folder it may write to, `${workspaceFolder}` the shared folder.
+- **Microsoft's Work IQ plugin** (`proofkin plugin add microsoft/work-iq:plugins/workiq`)
+  keeps its skills, and its MCP server (the hosted Work IQ address with its own sign-in
+  settings, or the CLI's `@microsoft/workiq mcp`) becomes this agent's own
+  [Work IQ server](#work-iq-as-a-tool-for-tasks-mcpworkiq): offer it with `proofkin mcp
+  add app workiq --plugin workiq`, and tasks reach Work IQ through your sign-in and the
+  gateway, with only the tools that read.
 - **Turning a plugin off** withdraws its skills, agents and the servers it offered; turning it on
   offers them again. **Updating** keeps each offer's access, tools and values, and pauses
   servers that would now start differently until you look at them and resume them.

@@ -398,6 +398,34 @@ pub struct McpTemplate {
     /// The values its owner provides, in order of first use.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<McpInput>,
+    /// Microsoft's Work IQ server (its hosted address, or `@microsoft/workiq mcp`): offered
+    /// as this agent's own Work IQ, through its sign-in and gateway ([`McpServer::workiq`]),
+    /// never as a connection of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workiq: bool,
+}
+
+/// Whether a server is Microsoft's Work IQ: the hosted service, or its CLI's MCP server.
+fn is_workiq(t: &McpTemplate) -> bool {
+    let hosted = t
+        .url
+        .as_deref()
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .is_some_and(|url| url.host_str() == Some("workiq.svc.cloud.microsoft"));
+    let program = t
+        .command
+        .as_deref()
+        .and_then(|c| std::path::Path::new(c).file_stem())
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let has = |arg: &str| t.args.iter().any(|a| a == arg);
+    let cli = has("mcp")
+        && (program == "workiq"
+            || (program == "npx"
+                && t.args
+                    .iter()
+                    .any(|a| a == "@microsoft/workiq" || a.starts_with("@microsoft/workiq@"))));
+    hosted || cli
 }
 
 enum Placeholder {
@@ -514,6 +542,9 @@ impl McpTemplate {
     /// How it starts or where it is, for review: values are hidden unless they are
     /// only a placeholder, and arguments are scanned for secrets.
     pub fn describe(&self) -> String {
+        if self.workiq {
+            return "Work IQ through this agent's own sign-in and gateway".to_owned();
+        }
         let mut text = match (&self.command, &self.url) {
             (Some(c), _) => std::iter::once(c.as_str())
                 .chain(self.args.iter().map(String::as_str))
@@ -546,6 +577,9 @@ impl McpTemplate {
 
     /// The server to offer in `fill.folder`, with every placeholder filled in.
     pub fn instantiate(&self, fill: &Fill) -> Result<McpServer> {
+        if self.workiq {
+            return Ok(McpServer::workiq(self.tools.clone()));
+        }
         let mut missing: Vec<String> = Vec::new();
         for value in fill.values.values() {
             if value.contains(['\r', '\n']) {
@@ -730,6 +764,24 @@ fn parse_server(
         if !tools.iter().any(|t| t == "*") {
             t.tools = tools;
         }
+    }
+    if is_workiq(&t) {
+        use crate::workiq::gateway::DEFAULT_TOOLS;
+        notes.push(format!(
+            "{name}: Work IQ, offered through this agent's own Work IQ sign-in (proofkin auth \
+             login workiq) and gateway, with only its tools that read; the server's own \
+             connection and sign-in settings aren't used"
+        ));
+        let tools = t
+            .tools
+            .into_iter()
+            .filter(|tool| DEFAULT_TOOLS.contains(&tool.as_str()))
+            .collect();
+        return Ok(McpTemplate {
+            tools,
+            workiq: true,
+            ..Default::default()
+        });
     }
     if obj.contains_key("cwd") {
         notes.push(format!("{name}: its working folder (cwd) isn't used"));

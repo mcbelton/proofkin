@@ -235,8 +235,9 @@ the owner opts in.
 ### 8. Plugins and enterprise skills
 
 Adding Microsoft's Work IQ plugin (`microsoft/work-iq`, `plugins/workiq`) keeps its skills
-and maps its MCP server (the hosted URL, or `@microsoft/workiq`) to the native connection,
-instead of today's note that sign-in helpers aren't used. Later: find the organization's
+and maps its MCP server (the hosted URL, or `@microsoft/workiq`) to the agent's own `workiq`
+server: Work IQ through the agent's sign-in and gateway (section 6), never the plugin's own
+connection or sign-in settings. Later: find the organization's
 skills and plugins with Work IQ's `discover` and add them through the usual plugin review.
 
 ### 9. Audit, usage and budgets
