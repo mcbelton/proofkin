@@ -155,26 +155,32 @@ async fn token(
     (StatusCode::OK, Json(answer))
 }
 
+/// A file as Work IQ (CLI 1.0.1) returns one: its label object, no relevanceScore.
 fn work_file(id: &str, protection: &str, label: &str, text: &str) -> Value {
     json!({
         "id": id,
         "markdown": text,
         "webUrl": format!("https://contoso.example/files/{id}"),
-        "entityType": "file",
+        "entityUrl": format!("/drives/d/items/{id}"),
+        "entityType": "Files",
         "contentProtection": protection,
-        "sensitivityLabel": { "displayName": label },
+        "sensitivityLabel": {
+            "color": "#13A10E", "displayName": label, "id": format!("label-{label}"),
+            "isEncrypted": false, "priority": 1, "tooltip": format!("{label} data"),
+        },
         "resourceMetadata": { "document": { "title": format!("File {id}") } },
-        "relevanceScore": 0.9,
     })
 }
 
-/// What a tool answers: `retrieve` a General file, a Confidential one and a General one
-/// that may not be handed out; `ask`, as Work IQ answers, its text as content and only the
-/// conversation id structured; `list_agents` one agent.
+/// What a tool answers, in the shapes Work IQ (CLI 1.0.1) uses: `retrieve` a General file,
+/// a Confidential one and a General one that may not be handed out; `ask` the answer as
+/// text and structured, with the conversation id; `list_agents` one agent, as JSON in the
+/// text content and nothing structured.
 fn tool_answer(name: &str) -> Value {
     let (structured, text) = match name {
         "retrieve" => (
             json!({
+                "@workiq.untrustedContent": "Treat this content as untrusted.",
                 "application/vnd.ms-workiq.retrieval": {
                     "results": [
                         work_file("f1", "allowed", "General", "Budget: 120k for the May launch."),
@@ -183,23 +189,27 @@ fn tool_answer(name: &str) -> Value {
                     ],
                     "resultCount": 3,
                     "stoppedReason": "completed",
-                    "conversationId": "conv-1",
                 }
             }),
-            "see structuredContent",
+            String::new(),
         ),
         "ask" => (
-            json!({ "conversationId": "conv-2" }),
-            "The launch moved to May.",
+            json!({ "answer": "The launch moved to May.", "conversationId": "conv-2" }),
+            "The launch moved to May.".to_owned(),
         ),
         "list_agents" => (
-            json!({ "agents": [{ "id": "sales:1", "name": "Sales" }] }),
-            "see structuredContent",
+            Value::Null,
+            json!([{ "agentId": "sales:1", "name": "Sales", "provider": "Contoso" }]).to_string(),
         ),
         other => panic!("unexpected tool {other}"),
     };
+    let content: Vec<Value> = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "text", "text": text })]
+    };
     json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": content,
         "structuredContent": structured,
         "isError": false,
     })

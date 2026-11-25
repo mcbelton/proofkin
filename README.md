@@ -812,6 +812,11 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
   labels are only known once it runs, so a later step for a peer gets a plan check
   **warning**, and is checked again when it is sent: it is refused if what was found has
   labels beyond the peer's grant.
+- Work IQ labels files and mail, but gives meetings, Teams chats and people no label
+  information, so those go only to your own workers, never to a peer. People results also
+  come without Work IQ's decision on whether they may be handed out, so they are withheld
+  (`people` finds nothing usable for now, [#241](https://github.com/mcbelton/proofkin/issues/241);
+  see [docs/work-iq.md](docs/work-iq.md#what-work-iq-offers)).
 - Searches are audited and held to the profile's Work IQ budgets. A Work IQ error or a budget
   refusal fails the step with its one-line message.
 - The run record keeps, for each step, the sources (title, type, label, link), how many
@@ -2246,10 +2251,11 @@ ask @workiq What changed in the launch plan this week?
 
 `$env:PROOFKIN_LIVE_WORKIQ = "cli"` (or `hosted`, with `PROOFKIN_LIVE_WORKIQ_TENANT` and
 `PROOFKIN_LIVE_WORKIQ_CLIENT_ID`), then `python scripts/live_workiq.py`. It runs the live
-check: a fresh profile signs in, passes the doctor, runs a plan with a `workiq=` step for its
-own digital worker (real Copilot, on your GitHub CLI sign-in) and an `@workiq` step, then
-verifies the evidence and that every call only read. Your Microsoft 365 content stays out of
-its log. `python scripts/evidence.py --live` runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
+check: a fresh profile signs in, passes the doctor, lists the Work IQ agents (only how many
+is shown), runs a plan with a `workiq=` step for its own digital worker (real Copilot, on your
+GitHub CLI sign-in) and an `@workiq` step, then verifies the evidence and that every call only
+read. Your Microsoft 365 content stays out of its log. `python scripts/evidence.py --live`
+runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
 
 ### Work IQ troubleshooting
 
@@ -2285,7 +2291,8 @@ its log. `python scripts/evidence.py --live` runs it too while `PROOFKIN_LIVE_WO
   maximum (`share add ... --access <level>`). Your own tasks get `--access` in `--workspace`.
 - Microsoft 365 content is off for every peer until you grant it:
   `peers allow ... --m365 General,Public,unlabeled` lets a peer receive Work IQ context
-  with only those sensitivity labels (`unlabeled` allows content without a label), and
+  with only those sensitivity labels (`unlabeled` allows content Work IQ says has no label;
+  content with no label information, such as meetings and chats, goes to no peer), and
   `--m365-tools` also lets its tasks use your Work IQ, read only. `--m365 off` removes the
   grant; allowing the peer again without `--m365` keeps it. Your own digital workers get
   everything you can read.
@@ -2710,7 +2717,7 @@ Workflow for a change:
 - [docs/agent-factory.md](docs/agent-factory.md) and [docs/agent-factory/](docs/agent-factory): the design for the agent factory: agents described in plain words, evaluated, released signed and deployed as digital workers, with its spec, API contract, architecture, threat model and test plan (being built, tracked in [#175](https://github.com/mcbelton/proofkin/issues/175))
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
-- [scripts/live_workiq.py](scripts/live_workiq.py): live Work IQ check against your tenant (`PROOFKIN_LIVE_WORKIQ=cli|hosted`): sign-in, doctor, a `workiq=` step on real Copilot and an `@workiq` step, evidence and read-only audit
+- [scripts/live_workiq.py](scripts/live_workiq.py): live Work IQ check against your tenant (`PROOFKIN_LIVE_WORKIQ=cli|hosted`): sign-in, doctor, the agents list, a `workiq=` step on real Copilot and an `@workiq` step, evidence and read-only audit
 - [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server and [tests/fixtures/plugin/](tests/fixtures/plugin) a Claude Code style plugin (a skill, an MCP server, a hook that must never run), [tests/fixtures/speckit/](tests/fixtures/speckit) and [tests/fixtures/openspec/](tests/fixtures/openspec) a Spec Kit feature and an OpenSpec change for the tests; [tests/connect.rs](tests/connect.rs) drives the MCP and A2A endpoints like other agents do
 - [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)
 
