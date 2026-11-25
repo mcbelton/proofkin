@@ -1,10 +1,11 @@
 """Live Work IQ check against a real tenant (docs/work-iq.md, Testing). It only reads.
 
 A fresh profile signs in to Work IQ and its doctor runs every check (the last is one small
-retrieve). Its agent then runs a plan with a workiq= step for its own digital worker (real
-Copilot, on the profile's GitHub sign-in) and an @workiq step. Then the run's evidence
-verifies, the step's signed evidence records the Work IQ context by its hash, and every call
-in the profile's Work IQ audit file was a read.
+retrieve), and it lists the agents Work IQ offers (only how many is shown). Its agent then
+runs a plan with a workiq= step for its own digital worker (real Copilot, on the profile's
+GitHub sign-in) and an @workiq step. Then the run's evidence verifies, the step's signed
+evidence records the Work IQ context by its hash, and every call in the profile's Work IQ
+audit file was a read.
 
   PROOFKIN_LIVE_WORKIQ=cli      Microsoft's Work IQ CLI, signed in, with its EULA accepted by
                                 you (`workiq accept-eula`). Optional: PROOFKIN_LIVE_WORKIQ_CLI_PATH,
@@ -129,8 +130,9 @@ def main():
     for var in ("PROOFKIN_TEST_WORKIQ_URL", "PROOFKIN_TEST_ENTRA_URL"):
         env.pop(var, None)
 
-    def cli(*args, timeout=300, shown=False):
-        """Runs a command; `shown` prints its output as it comes (a device code to enter)."""
+    def cli(*args, timeout=300, shown=False, quiet=False):
+        """Runs a command; `shown` prints its output as it comes (a device code to enter), `quiet`
+        prints none of it."""
         p = subprocess.Popen([EXE, *args], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         lines = []
@@ -149,7 +151,7 @@ def main():
             p.wait()
         reader.join(5)
         out = "".join(lines)
-        if not shown:
+        if not shown and not quiet:
             print("\n".join(f"  {mask(line)}" for line in out.strip().splitlines()), flush=True)
         return p.returncode, out
 
@@ -177,6 +179,13 @@ def main():
         failed = [line.strip() for line in out.splitlines() if "FAILED" in line or "fix (" in line]
         check("workiq: the doctor passes every check, with one retrieve",
               code == 0 and "Work IQ is ready." in out, failed)
+
+        print("== the agents Work IQ offers (only how many is shown)")
+        code, out = cli("workiq", "agents", "--profile", "owner", quiet=True)
+        listed = [] if "lists no agents" in out else [line for line in out.splitlines() if line.strip()]
+        print(f"  {len(listed)} agent(s) listed", flush=True)
+        check("workiq: proofkin workiq agents reads the agents list Work IQ gives",
+              code == 0, out.strip().splitlines()[-1:] if code != 0 else "")
 
         print("== a digital worker for the owner, on its Copilot sign-in, started with it")
         cli("worker", "create", "helper", "--owner", "owner", "--providers", "copilot", "--start-with-owner")

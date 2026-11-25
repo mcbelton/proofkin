@@ -334,9 +334,10 @@ The step-by-step guide, with a check after each step and troubleshooting, is in 
   loopback address. The CLI connection is tested the same way with `--cli-path`.
 - A `WIQ-*` claim in `evidence/claims.json` for each behavior above.
 - A live check behind `PROOFKIN_LIVE_WORKIQ=hosted|cli` (`scripts/live_workiq.py`), for a
-  tenant with Work IQ: sign-in, doctor (one `retrieve`), a `workiq=` step sent to the owner's
-  own worker on real Copilot and an `@workiq` step, then the evidence and an audit that shows
-  only reads. It never prints Microsoft 365 content.
+  tenant with Work IQ: sign-in, doctor (one `retrieve`), the agents list (only its size is
+  shown), a `workiq=` step sent to the owner's own worker on real Copilot and an `@workiq`
+  step, then the evidence and an audit that shows only reads. It never prints Microsoft 365
+  content.
 
 ## Work items
 

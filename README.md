@@ -2221,10 +2221,11 @@ ask @workiq What changed in the launch plan this week?
 
 `$env:PROOFKIN_LIVE_WORKIQ = "cli"` (or `hosted`, with `PROOFKIN_LIVE_WORKIQ_TENANT` and
 `PROOFKIN_LIVE_WORKIQ_CLIENT_ID`), then `python scripts/live_workiq.py`. It runs the live
-check: a fresh profile signs in, passes the doctor, runs a plan with a `workiq=` step for its
-own digital worker (real Copilot, on your GitHub CLI sign-in) and an `@workiq` step, then
-verifies the evidence and that every call only read. Your Microsoft 365 content stays out of
-its log. `python scripts/evidence.py --live` runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
+check: a fresh profile signs in, passes the doctor, lists the Work IQ agents (only how many
+is shown), runs a plan with a `workiq=` step for its own digital worker (real Copilot, on your
+GitHub CLI sign-in) and an `@workiq` step, then verifies the evidence and that every call only
+read. Your Microsoft 365 content stays out of its log. `python scripts/evidence.py --live`
+runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
 
 ### Work IQ troubleshooting
 
@@ -2686,7 +2687,7 @@ Workflow for a change:
 - [docs/agent-factory.md](docs/agent-factory.md) and [docs/agent-factory/](docs/agent-factory): the design for the agent factory: agents described in plain words, evaluated, released signed and deployed as digital workers, with its spec, API contract, architecture, threat model and test plan (being built, tracked in [#175](https://github.com/mcbelton/proofkin/issues/175))
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
-- [scripts/live_workiq.py](scripts/live_workiq.py): live Work IQ check against your tenant (`PROOFKIN_LIVE_WORKIQ=cli|hosted`): sign-in, doctor, a `workiq=` step on real Copilot and an `@workiq` step, evidence and read-only audit
+- [scripts/live_workiq.py](scripts/live_workiq.py): live Work IQ check against your tenant (`PROOFKIN_LIVE_WORKIQ=cli|hosted`): sign-in, doctor, the agents list, a `workiq=` step on real Copilot and an `@workiq` step, evidence and read-only audit
 - [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server and [tests/fixtures/plugin/](tests/fixtures/plugin) a Claude Code style plugin (a skill, an MCP server, a hook that must never run), [tests/fixtures/speckit/](tests/fixtures/speckit) and [tests/fixtures/openspec/](tests/fixtures/openspec) a Spec Kit feature and an OpenSpec change for the tests; [tests/connect.rs](tests/connect.rs) drives the MCP and A2A endpoints like other agents do
 - [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)
 
