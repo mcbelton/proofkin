@@ -68,6 +68,80 @@ pub enum EvidenceKind {
     Approval,
 }
 
+/// Where work context is in a task's prompt (Microsoft 365 content through Work IQ), as its
+/// requester says, with what it held. The worker records its hash (see [`ContextUse`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRef {
+    /// Where the context came from: `workiq`.
+    pub source: String,
+    /// Its byte offset and length in the task's prompt.
+    pub start: usize,
+    pub len: usize,
+    /// How many results it held, and their labels.
+    pub results: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+}
+
+/// Work context a task's prompt had, as its worker found it there: where it came from, its
+/// SHA-256, how many results it held and their labels (as its requester said). Never its
+/// content, which stays with the requester (see [`crate::plan::WorkRecord`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUse {
+    pub source: String,
+    pub sha256: String,
+    pub results: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+}
+
+/// Most work context parts a task may say its prompt has, and most labels one may carry.
+const MAX_CONTEXT_PARTS: usize = 20;
+const MAX_CONTEXT_LABELS: usize = 50;
+
+impl ContextRef {
+    /// What `prompt` holds where this says: its hash, with what the requester says it held.
+    /// Fails unless it is a non-empty, whole part of `prompt` and its words are well-formed.
+    pub fn use_in(&self, prompt: &str) -> Result<ContextUse> {
+        let name_ok = |s: &str| {
+            !s.is_empty() && s.len() <= 100 && !s.chars().any(|c| c.is_control() || c == '`')
+        };
+        if !name_ok(&self.source) || self.labels.len() > MAX_CONTEXT_LABELS {
+            bail!("its source or labels aren't well-formed");
+        }
+        if !self.labels.iter().all(|l| name_ok(l)) {
+            bail!("its labels aren't well-formed");
+        }
+        let text = self
+            .start
+            .checked_add(self.len)
+            .filter(|_| self.len > 0)
+            .and_then(|end| prompt.get(self.start..end))
+            .ok_or_else(|| anyhow!("it isn't a part of the task's prompt"))?;
+        Ok(ContextUse {
+            source: self.source.clone(),
+            sha256: sha256_hex(text.as_bytes()),
+            results: self.results,
+            labels: self.labels.clone(),
+        })
+    }
+}
+
+/// The [`ContextUse`]s of the work context `refs` say `prompt` has. Fails if one of them
+/// isn't a whole part of it, or there are too many.
+pub fn context_uses(prompt: &str, refs: &[ContextRef]) -> Result<Vec<ContextUse>> {
+    if refs.len() > MAX_CONTEXT_PARTS {
+        bail!("a task has at most {MAX_CONTEXT_PARTS} parts of work context");
+    }
+    refs.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.use_in(prompt)
+                .map_err(|e| anyhow!("work context part {} of the task: {e}", i + 1))
+        })
+        .collect()
+}
+
 /// A signed record of what an agent's runtime observed about one task or approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
@@ -98,6 +172,11 @@ pub struct Evidence {
     /// (absent otherwise, so other records sign as before).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<Box<crate::runs::RunRecord>>,
+    /// The work context the task's prompt had (Microsoft 365 through Work IQ): its hash and
+    /// what it held, never its content (absent when there was none, so other records sign
+    /// as before).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<ContextUse>,
     /// Ed25519 signature (hex) over everything above.
     #[serde(default)]
     pub signature: String,
@@ -130,6 +209,7 @@ impl Evidence {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             team: None,
+            context: Vec::new(),
             signature: String::new(),
         }
     }
@@ -240,6 +320,24 @@ impl Evidence {
                     code_list(&git.left_out)
                 );
             }
+        }
+        for c in &self.context {
+            text += &format!(
+                "**Work context** from {}: {} result{}{}, SHA-256 `{}…` (its content stays with the requester)\n",
+                if c.source == "workiq" {
+                    "Microsoft 365 (Work IQ)"
+                } else {
+                    c.source.as_str()
+                },
+                c.results,
+                if c.results == 1 { "" } else { "s" },
+                if c.labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", c.labels.join(", "))
+                },
+                c.sha256.chars().take(12).collect::<String>()
+            );
         }
         text
     }
@@ -455,6 +553,63 @@ mod tests {
             output: "ok".into(),
         });
         e
+    }
+
+    #[test]
+    fn work_context_is_recorded_by_the_hash_of_its_part_of_the_prompt() {
+        let prompt =
+            "Rule\n\n## Microsoft 365 context\nLaunch is in May. é\n---\nYour task:\nDo it";
+        let part = "## Microsoft 365 context\nLaunch is in May. é\n";
+        let at = |start: usize, len: usize| ContextRef {
+            source: "workiq".into(),
+            start,
+            len,
+            results: 1,
+            labels: vec!["General".into()],
+        };
+        let start = prompt.find(part).unwrap();
+        let used = context_uses(prompt, &[at(start, part.len())]).unwrap();
+        assert_eq!(
+            used,
+            [ContextUse {
+                source: "workiq".into(),
+                sha256: sha256_hex(part.as_bytes()),
+                results: 1,
+                labels: vec!["General".into()],
+            }]
+        );
+        // Outside the prompt, empty, or through a character: refused, naming the part.
+        let inside = start + part.find('é').unwrap() + 1;
+        for bad in [
+            at(start, 1_000),
+            at(start, 0),
+            at(inside, 3),
+            at(usize::MAX, 2),
+        ] {
+            let err = context_uses(prompt, std::slice::from_ref(&bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("work context part 1"),
+                "{bad:?}: {err}"
+            );
+        }
+        let mut odd = at(start, part.len());
+        odd.labels = vec!["General`".into()];
+        assert!(context_uses(prompt, &[odd]).is_err());
+
+        // A record with context signs and verifies, and says nothing of its content; one
+        // without signs as before (the field is left out).
+        let key = SecretKey::generate();
+        let mut e = record(&key);
+        let plain = serde_json::to_string(&e.clone().sign("out", &key)).unwrap();
+        assert!(!plain.contains("context"), "{plain}");
+        e.context = used;
+        let signed = e.sign("out", &key);
+        signed.verify(&key.public(), "out").unwrap();
+        let json = serde_json::to_string(&signed).unwrap();
+        assert!(!json.contains("Launch"), "{json}");
+        let mut forged = signed.clone();
+        forged.context[0].results = 7;
+        assert!(forged.verify(&key.public(), "out").is_err());
     }
 
     #[test]

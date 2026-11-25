@@ -1937,6 +1937,10 @@ impl Inner {
                 self.name
             );
         }
+        // The work context its signed evidence will record must be in its prompt.
+        if let Err(e) = crate::evidence::context_uses(&task.prompt, &task.context) {
+            bail!("{} refused the task: {e:#}", self.name);
+        }
         let mut mcp = BTreeMap::new();
         for server in &task.mcp {
             let Some(def) = share.mcp.get(server) else {
@@ -2577,6 +2581,9 @@ impl Inner {
         );
         evidence.share = Some(share.name.clone());
         evidence.prompt_sha256 = sha256_hex(task.prompt.as_bytes());
+        // Checked when the team step was admitted.
+        evidence.context =
+            crate::evidence::context_uses(&task.prompt, &task.context).unwrap_or_default();
         evidence.git = outcome.git;
         evidence.team = Some(Box::new(outcome.record));
         Ok(Served {
@@ -3027,6 +3034,9 @@ impl Inner {
         evidence.provider = Some(task.provider);
         evidence.share = Some(share.name.clone());
         evidence.prompt_sha256 = sha256_hex(task.prompt.as_bytes());
+        // Checked when the task was admitted.
+        evidence.context =
+            crate::evidence::context_uses(&task.prompt, &task.context).unwrap_or_default();
         evidence.attempts = used;
         evidence.checks = results;
         let mut patch = None;

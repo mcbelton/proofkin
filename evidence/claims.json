@@ -1299,6 +1299,15 @@
       ]
     },
     {
+      "id": "WIQ-14",
+      "area": "work-iq",
+      "claim": "A workiq= step's signed evidence records the Work IQ context its task had by hash, never its content: the plan's agent sends the task with where the Microsoft 365 section is in its prompt and how many results it held with their labels, and the worker refuses a task whose section isn't a whole part of its prompt, else signs context [{source workiq, sha256 of exactly that part, results, labels}] (a team step's lead too), and its result's summary says Work context from Microsoft 365 (Work IQ) with the count, labels and the start of the hash. The run record keeps the section and its SHA-256 on the plan's machine; runs verify fails a step whose evidence doesn't record the hash of the section the run kept for it, or whose kept section no longer has its hash. Records without context sign as before; claims never rest on Work IQ content.",
+      "tests": [
+        "agents::a_steps_signed_evidence_records_its_work_iq_context_by_hash_never_its_content",
+        "lib::evidence::work_context_is_recorded_by_the_hash_of_its_part_of_the_prompt"
+      ]
+    },
+    {
       "id": "MDL-1",
       "area": "models",
       "claim": "Every task result names the model that did the work, as its provider says: Copilot from the CLI's usage events of the session's own agent (else the model the task asked for), Claude from the Agent SDK's init message, Codex from the thread's model or the top-level model of the profile's own config.toml. A worker sends it with the result (a field older peers ignore) and names it in the signed output's evidence summary, so the record vouches for it and older requesters verify it as before; names are cleaned to the characters model names use before they are shown. The web UI's task and step cards (after the provider), the worker's audit log, run records and reports, the tracker's step comments and the CLI's printed results show it; without a model the result is as before.",

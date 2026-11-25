@@ -3650,6 +3650,102 @@ async fn a_granted_peer_gets_only_the_work_iq_results_its_grant_allows() {
     assert_eq!(record.labels, ["General"]);
 }
 
+/// The peer's signed evidence says which Work IQ context its task had (its hash, how many
+/// results and their labels) but never what it said; the run keeps that, and `runs verify`
+/// checks that the two agree.
+#[tokio::test]
+async fn a_steps_signed_evidence_records_its_work_iq_context_by_hash_never_its_content() {
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let work = FakeWork::new(vec![workiq_file("f2", "General", "Launch is in May.", 0.5)]);
+    let ctx = workiq_run(helper_id, work);
+    let text = "a @partner workiq=files Find the launch dates";
+    let plan = Plan::parse(text).unwrap();
+    let started = proofkin::runs::unix_now();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+
+    let StepState::Done {
+        evidence: Some(evidence),
+        output,
+        ..
+    } = &states["a"]
+    else {
+        panic!("{:?}", states["a"])
+    };
+    let kept = ctx.work_log.records()["a"].clone();
+    assert!(kept.text.contains("Launch is in May."), "{}", kept.text);
+    assert_eq!(
+        kept.sha256,
+        proofkin::evidence::sha256_hex(kept.text.as_bytes())
+    );
+    assert_eq!(
+        evidence.context,
+        [proofkin::evidence::ContextUse {
+            source: "workiq".into(),
+            sha256: kept.sha256.clone(),
+            results: 1,
+            labels: vec!["General".into()],
+        }]
+    );
+    let signed = serde_json::to_string(evidence).unwrap();
+    assert!(!signed.contains("Launch is in May"), "{signed}");
+    assert!(
+        output.contains("**Work context** from Microsoft 365 (Work IQ): 1 result (General)"),
+        "{output}"
+    );
+
+    let mut run = RunRecord::new(
+        "boss",
+        &boss.id().to_string(),
+        text,
+        &plan,
+        &states,
+        started,
+    );
+    run.peer_ids = proofkin::runs::peer_ids(&boss);
+    run.workiq = ctx.work_log.records();
+    let checks = run.verify(None);
+    assert!(checks.iter().all(|(_, r)| r.is_ok()), "{checks:?}");
+    // Kept context that isn't what the evidence records fails it.
+    let mut edited = run.clone();
+    edited.workiq.get_mut("a").unwrap().text.push('!');
+    let failed = edited.verify(None);
+    assert!(
+        format!("{:#}", failed[0].1.as_ref().unwrap_err()).contains("doesn't have the hash"),
+        "{failed:?}"
+    );
+    let mut other = run.clone();
+    let record = other.workiq.get_mut("a").unwrap();
+    record.text = "## Other context\n".into();
+    record.sha256 = proofkin::evidence::sha256_hex(record.text.as_bytes());
+    let failed = other.verify(None);
+    assert!(
+        format!("{:#}", failed[0].1.as_ref().unwrap_err())
+            .contains("doesn't record the Work IQ context it was sent"),
+        "{failed:?}"
+    );
+
+    // A task that says its prompt has context it hasn't is refused.
+    let partner = boss
+        .peers()
+        .into_iter()
+        .find(|p| p.name == "partner")
+        .unwrap()
+        .id;
+    let mut task = LlmTask::new(Provider::Copilot, "hello");
+    task.context = vec![proofkin::evidence::ContextRef {
+        source: "workiq".into(),
+        start: 2,
+        len: 50,
+        results: 1,
+        labels: Vec::new(),
+    }];
+    let refused = boss.delegate(partner, task).await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("work context part 1 of the task"),
+        "{refused:#}"
+    );
+}
+
 #[tokio::test]
 async fn a_later_step_is_refused_at_send_time_when_what_was_found_exceeds_its_grant() {
     let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;

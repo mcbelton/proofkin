@@ -3188,6 +3188,13 @@ pub struct WorkRecord {
     pub kept: usize,
     pub withheld: usize,
     pub request_ids: String,
+    /// For a `workiq=` step: the section of its task's prompt with what was found, and its
+    /// SHA-256, which the step's signed evidence records (never the text itself; see
+    /// [`crate::evidence::ContextUse`]). Kept on this machine with the rest of the record.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
 }
 
 /// The [`WorkRecord`]s of a run, by step.
@@ -3367,18 +3374,18 @@ fn m365_refusal(
 }
 
 /// Searches Work IQ for `step` (which goes to `peer`) and returns the prompt section for
-/// what `peer` may receive. The labels kept and the sources are logged in `ctx`.
+/// what `peer` may receive. The labels kept, the sources and the section are logged in `ctx`.
 async fn search_work(
     agent: &Agent,
     ctx: &RunContext,
     step: &Step,
     peer: &PeerInfo,
-) -> Result<String> {
+) -> Result<crate::workiq::content::Section> {
     let Some(work) = &ctx.work_context else {
         bail!("Work IQ isn't set up for this run");
     };
     let Some((strategy, capabilities)) = step.workiq_request() else {
-        return Ok(String::new());
+        return Ok(Default::default());
     };
     let audience = fresh_recipients(agent, ctx)
         .audience_of(&peer.id)
@@ -3406,9 +3413,15 @@ async fn search_work(
             kept: section.kept,
             withheld: section.withheld.total(),
             request_ids: result.ids.to_string(),
+            sha256: if section.text.is_empty() {
+                String::new()
+            } else {
+                crate::evidence::sha256_hex(section.text.as_bytes())
+            },
+            text: section.text.clone(),
         },
     );
-    Ok(section.text)
+    Ok(section)
 }
 
 /// Asks Work IQ for `step`, a `@workiq` step, as the owner's own agent: `question` is the
@@ -3441,6 +3454,7 @@ fn ask_workiq(
                 kept: section.kept,
                 withheld: section.withheld.total(),
                 request_ids: result.ids.to_string(),
+                ..WorkRecord::default()
             },
         );
         Ok(Delivered {
@@ -3737,11 +3751,27 @@ pub async fn run_plan_with(
                         changed = true;
                         continue;
                     }
-                    let prompt = if step.workiq.is_empty() {
-                        prompt
+                    let (prompt, context) = if step.workiq.is_empty() {
+                        (prompt, None)
                     } else {
                         match search_work(agent, ctx, step, &peer).await {
-                            Ok(work) => step_prompt_with(step, &deps, &format!("{issue}{work}")),
+                            Ok(work) => {
+                                let full =
+                                    step_prompt_with(step, &deps, &format!("{issue}{}", work.text));
+                                // Where it is in the prompt, so the peer's signed evidence
+                                // records its hash.
+                                let at = (!work.text.is_empty())
+                                    .then(|| full.find(&work.text))
+                                    .flatten();
+                                let context = at.map(|start| crate::evidence::ContextRef {
+                                    source: "workiq".to_owned(),
+                                    start,
+                                    len: work.text.len(),
+                                    results: work.kept,
+                                    labels: work.labels.clone(),
+                                });
+                                (full, context)
+                            }
                             Err(e) => {
                                 let state = StepState::failed(Some(peer.name), format!("{e:#}"));
                                 on_update(&step.id, &state);
@@ -3753,6 +3783,7 @@ pub async fn run_plan_with(
                     };
                     let mut task = LlmTask::new(step.provider, prompt.clone())
                         .with_checks(step.checks.clone(), step.attempts);
+                    task.context = context.into_iter().collect();
                     task.mcp = step.mcp.clone();
                     task.model = step.model.clone();
                     task.effort = step.effort.clone();
@@ -3830,6 +3861,8 @@ pub async fn run_plan_with(
                                     "Open a pull request from {}: {}",
                                     ask.branch, ask.title
                                 );
+                                // Its prompt is the pull request's: no work context in it.
+                                task.context.clear();
                                 task.title = Some(ask.title.clone());
                                 task.pull_request = Some(Box::new(ask));
                             }
