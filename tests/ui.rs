@@ -633,12 +633,18 @@ async fn ui_cancels_running_tasks_and_shows_the_audit_log() {
 /// Starts the web UI of profile `solo` in `home`, running its tasks with [`Echo`]:
 /// its agent, port and access token.
 async fn solo_ui(home: &std::path::Path) -> (Agent, u16, String) {
-    let mut config = AgentConfig::new("solo", SecretKey::generate());
+    ui_of(home, "solo").await
+}
+
+/// Starts the web UI of profile `name` in `home`, running its tasks with [`Echo`]:
+/// its agent, port and access token.
+async fn ui_of(home: &std::path::Path, name: &str) -> (Agent, u16, String) {
+    let mut config = AgentConfig::new(name, SecretKey::generate());
     config.network = Network::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
     let (agent, events) = Agent::bind(config).await.unwrap();
     let info = UiInfo {
-        profile: Profile::open_in(home, "solo").unwrap(),
+        profile: Profile::open_in(home, name).unwrap(),
         network: Network::Local,
         serving: true,
         access: Access::ReadOnly,
@@ -4169,5 +4175,313 @@ async fn a_workiq_sign_in_made_while_the_agent_runs_counts_at_once() {
     signed_in.save().unwrap();
     let after = check().await;
     assert_eq!(after["ok"], true, "{after}");
+    agent.shutdown().await;
+}
+
+/// The fake Work IQ CLI (`workiq mcp` over stdio) of tests/workiq_cli.rs.
+const FAKE_WORKIQ_CLI: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/workiq_cli_mcp.py"
+);
+
+/// A Work IQ CLI at a path of its own (not on the PATH), started as the real one is:
+/// `workiq.cmd` on Windows, `workiq` elsewhere. It logs what it was asked in `state`.
+fn fake_workiq_cli_at(dir: &std::path::Path, state: &std::path::Path) -> std::path::PathBuf {
+    let (script, state) = (FAKE_WORKIQ_CLI, state.display());
+    if cfg!(windows) {
+        let path = dir.join("workiq.cmd");
+        let text = format!("@python \"{script}\" \"{state}\" ok %*\r\n");
+        std::fs::write(&path, text).unwrap();
+        path
+    } else {
+        let path = dir.join("workiq");
+        let text = format!("#!/bin/sh\nexec python3 '{script}' '{state}' ok \"$@\"\n");
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+}
+
+/// Asks the web UI at `port`, with its access `token` unless it is `None`, sending `body`
+/// unless it is null.
+async fn call_ui(
+    port: u16,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> Response {
+    let host = format!("127.0.0.1:{port}");
+    let body = (!body.is_null()).then(|| body.to_string());
+    request(port, method, path, &host, token, body.as_deref()).await
+}
+
+/// The page's Work IQ account, only with the access token: signed in through a Work IQ CLI
+/// at a path of its own, checked by the doctor, given budgets, and signed out again.
+#[tokio::test]
+async fn the_workiq_api_signs_in_through_the_cli_runs_the_doctor_sets_budgets_and_signs_out() {
+    // A name of its own: where there is an OS credential store, signing in and out deletes
+    // the profile's Work IQ token there (this one never had one).
+    let name = "proofkin-ui-test-workiq";
+    let home = tempfile::tempdir().unwrap();
+    let (bin, cli_state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let cli = fake_workiq_cli_at(bin.path(), cli_state.path());
+    let (agent, port, token) = ui_of(home.path(), name).await;
+    let call = |method: &'static str, path: &'static str, body: Value| {
+        let token = token.clone();
+        async move { call_ui(port, Some(&token), method, path, body).await }
+    };
+    let sign_in = serde_json::json!({
+        "account": "ada@contoso.example",
+        "cli_path": cli.display().to_string(),
+    });
+    let budget = serde_json::json!({ "per_day": 50, "per_run": 5 });
+
+    for (method, path, body) in [
+        ("GET", "/api/workiq", Value::Null),
+        ("POST", "/api/workiq/sign-in", sign_in.clone()),
+        ("POST", "/api/workiq/doctor", Value::Null),
+        ("PUT", "/api/workiq/budget", budget.clone()),
+        ("DELETE", "/api/workiq", Value::Null),
+    ] {
+        let anonymous = call_ui(port, None, method, path, body).await;
+        assert_eq!(anonymous.status, 401, "{method} {path}: {}", anonymous.body);
+    }
+
+    let before = call("GET", "/api/workiq", Value::Null).await.json();
+    assert_eq!(before["signed_in"], false, "{before}");
+    for field in ["line", "connection", "user", "cli", "not_used"] {
+        assert!(before[field].is_null(), "{field}: {before}");
+    }
+    assert_eq!(before["holder"], name);
+    assert_eq!(before["own"], true);
+    assert_eq!(
+        before["hint"],
+        format!("proofkin auth login workiq --profile {name}")
+    );
+
+    let signed_in = call("POST", "/api/workiq/sign-in", sign_in).await;
+    assert_eq!(signed_in.status, 200, "{}", signed_in.body);
+    let line = "ada@contoso.example through the Work IQ CLI";
+    assert_eq!(
+        signed_in.json(),
+        serde_json::json!({ "who": "ada@contoso.example", "line": line })
+    );
+
+    let after = call("GET", "/api/workiq", Value::Null).await.json();
+    assert_eq!(after["signed_in"], true, "{after}");
+    assert_eq!(after["line"], line);
+    assert_eq!(after["connection"], "cli");
+    assert_eq!(after["user"], "ada@contoso.example");
+    let path = cli.display().to_string();
+    assert_eq!(
+        after["cli"],
+        serde_json::json!({ "account": "ada@contoso.example", "path": path })
+    );
+    let usage = &after["usage"];
+    assert_eq!(usage["today"], 0, "{after}");
+    assert_eq!(usage["per_day"], 200, "{after}");
+    assert_eq!(usage["per_run"], 25, "{after}");
+    assert_eq!(usage["runs"], serde_json::json!({}), "{after}");
+    let day = usage["day"].as_str().unwrap();
+    assert!(
+        chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok(),
+        "{after}"
+    );
+
+    let doctor = call("POST", "/api/workiq/doctor", Value::Null).await;
+    assert_eq!(doctor.status, 200, "{}", doctor.body);
+    let report = doctor.json();
+    assert_eq!(report["profile"], name);
+    assert_eq!(report["ok"], true, "{report}");
+    let checks = report["checks"].as_array().unwrap();
+    let column = |key: &str| -> Vec<Value> { checks.iter().map(|c| c[key].clone()).collect() };
+    assert_eq!(
+        column("name"),
+        ["discovery", "sign-in", "token", "tools", "retrieve"],
+        "{report}"
+    );
+    assert_eq!(
+        column("result"),
+        ["skipped", "ok", "skipped", "ok", "ok"],
+        "{report}"
+    );
+    assert_eq!(report["checks"][1]["detail"], line);
+
+    let neither = call("PUT", "/api/workiq/budget", serde_json::json!({})).await;
+    assert_eq!(neither.status, 400, "{}", neither.body);
+    assert!(neither.body.contains("--per-day"), "{}", neither.body);
+    let zero = serde_json::json!({ "per_day": 0, "per_run": 5 });
+    let zero = call("PUT", "/api/workiq/budget", zero).await;
+    assert_eq!(zero.status, 400, "{}", zero.body);
+    assert!(zero.body.contains("at least one call"), "{}", zero.body);
+    let set = call("PUT", "/api/workiq/budget", budget).await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(
+        set.json(),
+        serde_json::json!({ "per_day": 50, "per_run": 5 })
+    );
+    let budgeted = call("GET", "/api/workiq", Value::Null).await.json();
+    let usage = &budgeted["usage"];
+    assert_eq!(usage["per_day"], 50, "{budgeted}");
+    assert_eq!(usage["per_run"], 5, "{budgeted}");
+    // The doctor's retrieve counts against the budget (unless the day changed since).
+    if usage["day"] == after["usage"]["day"] {
+        assert_eq!(usage["today"], 1, "{budgeted}");
+    }
+
+    let state = call("GET", "/api/state", Value::Null).await.json();
+    let feed = state["feed"].to_string();
+    assert!(
+        feed.contains("Work IQ signed in through the Work IQ CLI as ada@contoso.example"),
+        "{feed}"
+    );
+
+    let signed_out = call("DELETE", "/api/workiq", Value::Null).await;
+    assert_eq!(signed_out.status, 200, "{}", signed_out.body);
+    let gone = call("GET", "/api/workiq", Value::Null).await.json();
+    assert_eq!(gone["signed_in"], false, "{gone}");
+    assert!(gone["line"].is_null() && gone["cli"].is_null(), "{gone}");
+    // The budgets outlive the account.
+    assert_eq!(gone["usage"]["per_day"], 50, "{gone}");
+    let again = call("DELETE", "/api/workiq", Value::Null).await;
+    assert_eq!(again.status, 400, "{}", again.body);
+    assert!(again.body.contains("not signed in"), "{}", again.body);
+    let state = call("GET", "/api/state", Value::Null).await.json();
+    let feed = state["feed"].to_string();
+    assert!(feed.contains("Work IQ signed out"), "{feed}");
+    agent.shutdown().await;
+}
+
+/// A digital worker's page shows the Work IQ account it uses, its owner's, and leaves
+/// signing in, signing out and budgets to the owner; a worker its owner didn't let use the
+/// account says why.
+#[tokio::test]
+async fn a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_the_owner() {
+    let home = tempfile::tempdir().unwrap();
+    let mut owner = Profile::open_in(home.path(), "owner").unwrap();
+    owner.config.workiq = Some(proofkin::profile::WorkIqAccount {
+        connection: proofkin::profile::WorkIqConnection::Cli {
+            account: Some("ada@contoso.example".into()),
+            program: None,
+        },
+        upn: "ada@contoso.example".into(),
+        display_name: "ada@contoso.example".into(),
+        tenant_id: "unknown".into(),
+        added: 0,
+    });
+    owner.save().unwrap();
+    let mut worker = Profile::open_in(home.path(), "helper").unwrap();
+    worker.config.owner = Some("owner".into());
+    worker.config.workiq_from_owner = true;
+    worker.save().unwrap();
+    let (agent, port, token) = ui_of(home.path(), "helper").await;
+    let call = |method: &'static str, path: &'static str, body: Value| {
+        let token = token.clone();
+        async move { call_ui(port, Some(&token), method, path, body).await }
+    };
+
+    let shown = call("GET", "/api/workiq", Value::Null).await.json();
+    assert_eq!(shown["signed_in"], true, "{shown}");
+    assert_eq!(shown["line"], "ada@contoso.example through the Work IQ CLI");
+    assert_eq!(shown["holder"], "owner");
+    assert_eq!(shown["own"], false);
+    assert!(shown["not_used"].is_null(), "{shown}");
+    assert_eq!(shown["hint"], "proofkin auth login workiq --profile owner");
+
+    let sign_in = serde_json::json!({ "account": "bob@contoso.example" });
+    let budget = serde_json::json!({ "per_day": 5 });
+    for (method, path, body, instead) in [
+        ("POST", "/api/workiq/sign-in", sign_in, "sign in there"),
+        ("DELETE", "/api/workiq", Value::Null, "sign out there"),
+        ("PUT", "/api/workiq/budget", budget, "set its budget there"),
+    ] {
+        let refused = call(method, path, body).await;
+        assert_eq!(refused.status, 400, "{method} {path}: {}", refused.body);
+        assert_eq!(
+            refused.json()["error"],
+            format!("helper uses owner's Work IQ account; {instead}")
+        );
+    }
+    // Nothing changed: the owner is still signed in, and the worker has no budgets of its own.
+    let owner = Profile::open_in(home.path(), "owner").unwrap();
+    assert!(owner.config.workiq.is_some());
+    let mut helper = Profile::open_in(home.path(), "helper").unwrap();
+    assert!(helper.config.workiq_budget.is_none());
+
+    helper.config.workiq_from_owner = false;
+    helper.save().unwrap();
+    let not_used = call("GET", "/api/workiq", Value::Null).await.json();
+    assert_eq!(not_used["signed_in"], false, "{not_used}");
+    let why = not_used["not_used"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("may not use 'owner''s Work IQ account"),
+        "{not_used}"
+    );
+    agent.shutdown().await;
+}
+
+/// The page has the Work IQ card after the GitHub card, every element app.js looks up for
+/// it, and the card's two dialogs (sign in, budget), which close with Escape and Cancel like
+/// the others; the card loads from and acts through the Work IQ API.
+#[tokio::test]
+async fn the_page_has_the_workiq_card_after_the_github_card_and_guards_its_dialogs() {
+    let home = tempfile::tempdir().unwrap();
+    let (agent, port, _token) = solo_ui(home.path()).await;
+    let host = format!("127.0.0.1:{port}");
+    let page = request(port, "GET", "/", &host, None, None).await.body;
+    let at = |needle: &str| page.find(needle).expect(needle);
+    let card = at(r#"<section class="card" aria-labelledby="workiq-h">"#);
+    assert!(at(r#"aria-labelledby="github-h""#) < card);
+    assert!(card < at(r#"aria-labelledby="tracker-h""#));
+    let section = &page[card..card + page[card..].find("</section>").unwrap()];
+    assert!(section.contains(">Work IQ</h2>"), "{section}");
+    assert!(section.contains(r#"id="workiq""#), "{section}");
+    let app = request(port, "GET", "/app.js", &host, None, None)
+        .await
+        .body;
+    let guarded = regex::Regex::new(r"for \(const id of \[([^\]]+)\]\) guardDialog")
+        .unwrap()
+        .captures(&app)
+        .expect("app.js guards its dialogs")[1]
+        .to_owned();
+    for (dialog, cancel) in [
+        ("workiq-dialog", "workiq-cancel"),
+        ("workiq-budget-dialog", "workiq-budget-cancel"),
+    ] {
+        assert!(page.contains(&format!(r#"<dialog id="{dialog}""#)));
+        assert!(
+            guarded.contains(&format!("\"#{dialog}\"")),
+            "{dialog} isn't guarded"
+        );
+        let closes =
+            format!(r##"$("#{cancel}").addEventListener("click", () => $("#{dialog}").close());"##);
+        assert!(app.contains(&closes), "Cancel doesn't close {dialog}");
+    }
+    // An element app.js looks up that isn't on the page stops it starting.
+    let ids = regex::Regex::new(r##""#(workiq[\w-]*)""##)
+        .unwrap()
+        .captures_iter(&app)
+        .map(|c| c[1].to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(ids.len() >= 15, "{ids:?}");
+    for id in &ids {
+        assert!(
+            page.contains(&format!(r#"id="{id}""#)),
+            "#{id} isn't on the page"
+        );
+    }
+    for path in [
+        "/api/workiq",
+        "/api/workiq/sign-in",
+        "/api/workiq/doctor",
+        "/api/workiq/budget",
+    ] {
+        assert!(app.contains(&format!("\"{path}\"")), "{path}");
+    }
     agent.shutdown().await;
 }

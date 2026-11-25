@@ -1358,6 +1358,16 @@
       ]
     },
     {
+      "id": "WIQ-22",
+      "area": "work-iq",
+      "claim": "The web UI has a token-guarded API for the profile's Work IQ account, which reads the profile as its files are now, so a sign-in made in another process counts. GET /api/workiq answers whether the account the agent uses is signed in, its line, how it connects (hosted or cli), its user, the CLI's account and path for a CLI account, the profile it belongs to (a digital worker may use its owner's) and whether that is this profile, why a digital worker its owner didn't let use theirs has none (not_used), the sign-in command, and today's calls against the per-day and per-run budgets (with each run's calls). POST /api/workiq/doctor answers the doctor's checks with their results, details and fixes, always as 200. POST /api/workiq/sign-in (account, cli_path) signs the profile in through Microsoft's Work IQ CLI as proofkin auth login workiq --cli does and answers who signed in and the line; DELETE /api/workiq signs out, and is refused when not signed in; each adds a line to the activity. PUT /api/workiq/budget (per_day, per_run) sets the budgets. Errors are 400s in the sign-in's or set_budget's own words. A digital worker that uses its owner's account sees it but is refused signing in, signing out and budgets: its owner does those. The page's Work IQ card, after the GitHub card, shows this from GET /api/workiq and acts through these endpoints; every element its script looks up is on the page, and its sign-in and budget dialogs close with Escape and Cancel like the others.",
+      "tests": [
+        "ui::the_workiq_api_signs_in_through_the_cli_runs_the_doctor_sets_budgets_and_signs_out",
+        "ui::a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_the_owner",
+        "ui::the_page_has_the_workiq_card_after_the_github_card_and_guards_its_dialogs"
+      ]
+    },
+    {
       "id": "MDL-1",
       "area": "models",
       "claim": "Every task result names the model that did the work, as its provider says: Copilot from the CLI's usage events of the session's own agent (else the model the task asked for), Claude from the Agent SDK's init message, Codex from the thread's model or the top-level model of the profile's own config.toml. A worker sends it with the result (a field older peers ignore) and names it in the signed output's evidence summary, so the record vouches for it and older requesters verify it as before; names are cleaned to the characters model names use before they are shown. The web UI's task and step cards (after the provider), the worker's audit log, run records and reports, the tracker's step comments and the CLI's printed results show it; without a model the result is as before.",
