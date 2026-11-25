@@ -289,6 +289,11 @@ step-by-step guide with a check after each step.
 
 - Tests against a fake Work IQ server (sessions, SSE, `structuredContent`, every error class,
   delays), fake Entra endpoints, and a fake stdio server for the CLI connection.
+- The commands through the program itself (`tests/workiq_e2e.rs`): sign-in, `workiq doctor`,
+  `workiq agents`, `kb import workiq`, and a plan's `@workiq` and `workiq=` steps run by
+  `proofkin`'s own agent, against the fakes. The test-only settings
+  `PROOFKIN_TEST_WORKIQ_URL` and `PROOFKIN_TEST_ENTRA_URL` point it at them; they take only a
+  loopback address. The CLI connection is tested the same way with `--cli-path`.
 - A `WIQ-*` claim in `evidence/claims.json` for each behavior above.
 - A live check behind `PROOFKIN_LIVE_WORKIQ=hosted|cli`, for a tenant with Work IQ: sign-in,
   doctor, one `retrieve`, one `workiq=` step sent to the owner's own worker. It only reads.

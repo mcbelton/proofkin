@@ -1825,7 +1825,10 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
 tasks wait for a peer that dropped off to come back (default 60, see
-[Cancelling tasks](#cancelling-tasks)). Each setting also works under its
+[Cancelling tasks](#cancelling-tasks)). For tests only, `PROOFKIN_TEST_WORKIQ_URL` and
+`PROOFKIN_TEST_ENTRA_URL` point Work IQ and its sign-in at fakes on this machine; they take
+only a loopback address such as `http://127.0.0.1:8080` and refuse anything else, so no token
+can go elsewhere. Each setting also works under its
 name from before the rename (`P2PAGENTS_HOME`, ...).
 
 ## Web UI

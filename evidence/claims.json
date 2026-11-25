@@ -1308,6 +1308,16 @@
       ]
     },
     {
+      "id": "WIQ-25",
+      "area": "work-iq",
+      "claim": "The Work IQ commands work through the program itself, as a user runs them, against a fake Work IQ and Entra: auth login workiq --device-code signs in, workiq doctor passes its five checks, workiq agents lists the agents, kb import workiq saves what the content policy keeps (withheld counted), and an agent started with proofkin --name runs a plan's @workiq step itself and sends a workiq= step to a peer with only the results its Microsoft 365 grant allows; runs verify passes and the step's signed evidence records the context by the hash of the section the run kept; workiq usage counts every call; each run uses the refresh token the run before saved (Entra rotates them); after auth logout workiq the doctor fails. The same commands work through the Work IQ CLI given with --cli-path. The test-only settings PROOFKIN_TEST_WORKIQ_URL and PROOFKIN_TEST_ENTRA_URL that point the program at the fakes take only a root http(s) address on the loopback interface (localhost or a loopback IP); any other value is refused, never replaced by the real service, so no token goes elsewhere.",
+      "tests": [
+        "workiq_e2e::the_work_iq_commands_run_through_the_program_with_a_hosted_account",
+        "workiq_e2e::the_work_iq_commands_run_through_the_program_with_the_work_iq_cli",
+        "lib::workiq::the_test_settings_take_only_an_address_on_this_machine"
+      ]
+    },
+    {
       "id": "MDL-1",
       "area": "models",
       "claim": "Every task result names the model that did the work, as its provider says: Copilot from the CLI's usage events of the session's own agent (else the model the task asked for), Claude from the Agent SDK's init message, Codex from the thread's model or the top-level model of the profile's own config.toml. A worker sends it with the result (a field older peers ignore) and names it in the signed output's evidence summary, so the record vouches for it and older requesters verify it as before; names are cleaned to the characters model names use before they are shown. The web UI's task and step cards (after the provider), the worker's audit log, run records and reports, the tracker's step comments and the CLI's printed results show it; without a model the result is as before.",
