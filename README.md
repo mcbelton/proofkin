@@ -802,16 +802,18 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
 - Searches are audited and held to the profile's Work IQ budgets. A Work IQ error or a budget
   refusal fails the step with its one-line message.
 - The run record keeps, for each step, the sources (title, type, label, link), how many
-  results were kept and withheld, the request ids, and the section of the prompt with what
-  was found and its SHA-256. It stays on this machine.
+  results were kept and withheld, the request ids, and the SHA-256 of the section of the
+  prompt with what was found. The section itself is Microsoft 365 content, so it is never in
+  run.json (the file you download and share to be verified): the run keeps it next to it, in
+  `<step>.workiq.md`, on this machine.
 - The step's signed evidence records the context by hash, never its content: the task says
   where the section is in its prompt, and the worker signs `context: [{source: "workiq",
   sha256, results, labels}]` for exactly that part of the prompt it got (a task whose
   section isn't in its prompt is refused). The result's summary says so: **Work context**
   from Microsoft 365 (Work IQ): 3 results (General), SHA-256 `…`. `proofkin runs verify`
-  checks that each such step's evidence records the hash of the section the run kept, and
-  that the kept section still has it. Claims never rest on it: only checks and sign-offs
-  prove them.
+  checks that each such step's evidence records the hash the run kept, and (given the run's
+  folder) that the kept section still has it. Claims never rest on it: only checks and
+  sign-offs prove them.
 
 ### Asking Microsoft 365 in a step (`@workiq`)
 

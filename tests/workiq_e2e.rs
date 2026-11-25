@@ -598,7 +598,13 @@ async fn the_work_iq_commands_run_through_the_program_with_a_hosted_account() {
             "labels": ["General"],
         }])
     );
-    let text = kept["text"].as_str().unwrap();
+    // The context is kept next to run.json, never in it.
+    assert!(kept.get("text").is_none(), "{kept:#}");
+    let text = std::fs::read_to_string(
+        home.path()
+            .join(format!("profiles/boss/runs/{id}/b.workiq.md")),
+    )
+    .unwrap();
     assert!(text.contains("120k for the May launch"), "{text}");
     assert_eq!(
         kept["sha256"].as_str().unwrap(),

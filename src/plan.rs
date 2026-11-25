@@ -3206,10 +3206,13 @@ pub struct WorkRecord {
     pub request_ids: String,
     /// For a `workiq=` step: the section of its task's prompt with what was found, and its
     /// SHA-256, which the step's signed evidence records (never the text itself; see
-    /// [`crate::evidence::ContextUse`]). Kept on this machine with the rest of the record.
+    /// [`crate::evidence::ContextUse`]). The text is Microsoft 365 content, so it is never
+    /// written with the record: a saved run keeps it next to its run.json, in
+    /// `<step>.workiq.md` (see [`crate::runs::RunRecord::save`]), and a run.json shared to be
+    /// verified has only the hash.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sha256: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing)]
     pub text: String,
 }
 

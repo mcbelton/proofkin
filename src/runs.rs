@@ -484,7 +484,7 @@ impl RunRecord {
                             Err(anyhow::anyhow!("the same evidence is used by another step"))
                         }
                     })
-                    .and_then(|()| self.context_recorded(s, evidence))
+                    .and_then(|()| self.context_recorded(s, evidence, dir))
                     .and_then(|()| verify_step(evidence, output, &s.step.id, dir));
                 Some((s.step.id.clone(), check))
             })
@@ -492,14 +492,20 @@ impl RunRecord {
     }
 
     /// A step that was sent Work IQ context: its signed evidence records the hash of the
-    /// context this run kept for it, which the kept text has. Content never enters evidence,
-    /// so this is how a record says which context the work was done with.
-    fn context_recorded(&self, s: &StepRecord, e: &Evidence) -> Result<()> {
+    /// context this run kept for it, which the kept text has (in the record while the run is
+    /// new, else in its `<step>.workiq.md` in `dir`; a run.json alone has only the hash).
+    /// Content never enters evidence, so this is how a record says which context the work
+    /// was done with.
+    fn context_recorded(&self, s: &StepRecord, e: &Evidence, dir: Option<&Path>) -> Result<()> {
         let Some(work) = self.workiq.get(&s.step.id).filter(|w| !w.sha256.is_empty()) else {
             return Ok(());
         };
-        if !work.text.is_empty() && crate::evidence::sha256_hex(work.text.as_bytes()) != work.sha256
-        {
+        let kept = if work.text.is_empty() {
+            dir.and_then(|d| std::fs::read(context_path(d, &s.step.id)).ok())
+        } else {
+            Some(work.text.as_bytes().to_vec())
+        };
+        if kept.is_some_and(|text| crate::evidence::sha256_hex(&text) != work.sha256) {
             bail!("the Work IQ context this run kept for it doesn't have the hash it records");
         }
         if !e
@@ -743,7 +749,8 @@ impl RunRecord {
         md
     }
 
-    /// Saves `run.json`, `report.md` and step patches in `runs_dir/<id>/`.
+    /// Saves `run.json`, `report.md`, step patches and the Work IQ context of the steps that
+    /// had some (`<step>.workiq.md`, never in run.json) in `runs_dir/<id>/`.
     pub fn save(&self, runs_dir: &Path) -> Result<PathBuf> {
         let dir = runs_dir.join(&self.id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -754,6 +761,9 @@ impl RunRecord {
             {
                 std::fs::write(dir.join(format!("{}.patch", s.step.id)), patch)?;
             }
+        }
+        for (step, work) in self.workiq.iter().filter(|(_, w)| !w.text.is_empty()) {
+            std::fs::write(context_path(&dir, step), &work.text)?;
         }
         std::fs::write(dir.join("run.json"), serde_json::to_vec_pretty(self)?)?;
         let report = dir.join("report.md");
@@ -812,6 +822,11 @@ impl RunRecord {
                 run.reverified(Some(&dir)).0
             })
     }
+}
+
+/// Where a saved run keeps the Work IQ context step `step` was sent.
+fn context_path(dir: &Path, step: &str) -> PathBuf {
+    dir.join(format!("{step}.workiq.md"))
 }
 
 fn verify_step(
