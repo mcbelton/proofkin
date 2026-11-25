@@ -1,8 +1,8 @@
 //! The web UI's Work IQ account (see [`crate::workiq`] and docs/work-iq.md): the account the
 //! agent uses and today's calls against its budgets, the doctor's checks, a sign-in through
-//! Microsoft's Work IQ CLI (as `proofkin auth login workiq --cli`), signing out, and the
-//! budgets. Each handler reads the profile as it is now, so a sign-in made in another
-//! process counts.
+//! Microsoft's Work IQ CLI (as `proofkin auth login workiq --cli`), signing out, the
+//! budgets, and the declarative agents a `@workiq` step can ask. Each handler reads the
+//! profile as it is now, so a sign-in made in another process counts.
 
 use axum::Json;
 use axum::extract::State;
@@ -11,8 +11,11 @@ use serde_json::{Value, json};
 
 use super::{ApiError, AppState, bad_request, internal};
 use crate::profile::{Profile, WorkIqConnection};
+use crate::runs::one_line;
 use crate::workiq::account::{account_line, logout};
 use crate::workiq::audit::{Audit, set_budget};
+use crate::workiq::content::read_agents;
+use crate::workiq::context::client_for_profile;
 use crate::workiq::doctor::Doctor;
 use crate::workiq::login::CliLogin;
 
@@ -160,4 +163,20 @@ pub(super) async fn budget(
         "per_day": budget.per_day(),
         "per_run": budget.per_run(),
     })))
+}
+
+/// The declarative agents Work IQ offers the account this profile uses, by name and the id a
+/// `@workiq` step's `agent=` takes, as `proofkin workiq agents` lists them. Not signed in,
+/// or a Work IQ error, is a 400 with its message on one line: the plan builder shows it as a
+/// hint under its Agent list.
+pub(super) async fn agents(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let failed = |e: anyhow::Error| bad_request(one_line(&format!("{e:#}")));
+    let client = client_for_profile(&s.profile_now()).map_err(failed)?;
+    let listed = client.list_agents().await.map_err(failed)?;
+    let agents: Vec<Value> = read_agents(&listed)
+        .map_err(failed)?
+        .into_iter()
+        .map(|agent| json!({ "name": agent.name, "id": agent.id }))
+        .collect();
+    Ok(Json(json!({ "agents": agents })))
 }

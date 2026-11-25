@@ -1082,6 +1082,7 @@ pub async fn start_with_work(
         .route("/api/workiq/doctor", post(workiq::doctor))
         .route("/api/workiq/sign-in", post(workiq::sign_in))
         .route("/api/workiq/budget", put(workiq::budget))
+        .route("/api/workiq/agents", get(workiq::agents))
         .route(
             "/api/connect",
             get(connect::state)
@@ -3863,8 +3864,8 @@ async fn run_file(State(s): State<AppState>, Path(id): Path<String>) -> Result<R
         .into_response())
 }
 
-/// Saved run `id`: its summary, verdict, Markdown report, re-checked signatures and
-/// the steps with something to preview.
+/// Saved run `id`: its summary, verdict, Markdown report, re-checked signatures, the steps
+/// with something to preview and where the steps' Microsoft 365 work context came from.
 fn run_details(s: &Shared, id: &str) -> Result<Value> {
     let dir = s.info.profile.runs_dir();
     let run = RunRecord::load(&dir, id)?;
@@ -3896,7 +3897,28 @@ fn run_details(s: &Shared, id: &str) -> Result<Value> {
         "previews": previews,
         "tracked": run.tracked,
         "pull_requests": run_pulls_json(s, &run),
+        "workiq": run_workiq_json(&run),
     }))
+}
+
+/// What Work IQ found for each step that used it (its `workiq=` search, or a `@workiq` step's
+/// answer), in step order: its sources, their labels and how many results were kept and
+/// withheld (see [`crate::plan::WorkRecord`]). Never the context itself (`text`): the page
+/// learns where a step's work context came from, not what it said.
+fn run_workiq_json(run: &RunRecord) -> Vec<Value> {
+    run.steps
+        .iter()
+        .filter_map(|s| {
+            let work = run.workiq.get(&s.step.id)?;
+            Some(json!({
+                "step": s.step.id,
+                "sources": work.sources,
+                "labels": work.labels,
+                "kept": work.kept,
+                "withheld": work.withheld,
+            }))
+        })
+        .collect()
 }
 
 /// The work of `run` a pull request can be opened from (see [`crate::plan::run_work`]),
