@@ -1026,7 +1026,7 @@ const STEP_OPTIONS: &[&str] = &[
 const MAX_TIMEOUT: u64 = 7 * 24 * 3600;
 
 /// Seconds in a step's `timeout=` value: a number and a unit (s, m, h or d).
-fn parse_timeout(value: &str) -> Result<u64> {
+pub(crate) fn parse_timeout(value: &str) -> Result<u64> {
     let digits = value.chars().take_while(char::is_ascii_digit).count();
     let (n, unit) = value.split_at(digits);
     let n: u64 = n.parse().map_err(|_| {

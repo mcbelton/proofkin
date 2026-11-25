@@ -539,6 +539,14 @@ impl SdkExecutor {
             None => Ok(Vec::new()),
         }
     }
+
+    /// Stops its Copilot CLI instance, for a command that started one only for a task
+    /// (the Node bridge stops when the executor is dropped).
+    pub async fn stop(&self) {
+        if let Some(copilot) = &self.copilot {
+            copilot.stop().await;
+        }
+    }
 }
 
 #[async_trait]

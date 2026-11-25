@@ -1313,6 +1313,41 @@ In the web UI, **Plugins & tools › Agents** adds one (pasted, or loaded from a
 lists yours and your plugins' with what each uses and its instructions. In the plan editor,
 each task card has an **Agent** field, and the text view lists agents beside the plan.
 
+#### The agent factory
+
+The [agent factory](docs/agent-factory.md) turns your description into an agent that proves
+itself before it works (being built, tracked in
+[#175](https://github.com/mcbelton/proofkin/issues/175)). An agent is a **blueprint**: its
+whole definition as JSON (`proofkin.agent-blueprint/v1`): its requirements, instructions,
+skills, the access and tools it asks for, the models it may run on, and an eval suite with
+a case for every requirement. Asking grants nothing: the folders it works in, their MCP
+offers and your grants decide what its tasks get.
+
+```powershell
+proofkin factory templates                                              # code-reviewer, implementer, researcher...: purpose, most access, eval cases
+proofkin factory new reviewer --template code-reviewer --profile alice  # a draft from a template, with no model
+proofkin factory new fin-analyst --describe "Analyze quarterly reports, extract key metrics, flag risks, write an executive summary" --profile alice
+proofkin factory show fin-analyst --profile alice    # what it asks for, how it is tested, its problems, who wrote it
+proofkin factory edit fin-analyst --profile alice    # in VISUAL or EDITOR; --from FILE (or -) replaces it
+proofkin factory check fin-analyst --profile alice   # fails while it has errors; --file checks a blueprint file
+proofkin factory list --profile alice                # delete NAME removes a draft
+```
+
+- `--describe` has the profile's default model write the draft (`--using` picks another
+  provider it is signed in to): read-only, in an empty folder, given what the profile has
+  (skills, topics, folders, models) as data and your words with secrets redacted. The draft
+  is checked and its problems go back to the model, at most 3 tries in all; then you get
+  the last draft with its problems. It records the provider, model and effort that wrote it
+  and the SHA-256 of your words, not the words.
+- Each problem has a code, says what is wrong and how to fix it, and points at its field
+  (`/skills/0`). Errors (a skill, folder or model the profile doesn't have, a requirement
+  no case proves) must be fixed; warnings flag asking for more than it needs (full access
+  with no check, every tool of a server, all of Microsoft 365, delegation).
+- Eval cases expect `contains`, `not-contains`, `regex`, `json-schema`, `max-words`,
+  `files-changed` or a folder `check`, and a `judge` rubric is scored by a model. Their
+  fixtures are files in the agent's `fixtures/` folder.
+- Drafts, and each agent's state and history, are kept in the profile's `factory/` folder.
+
 **Plan check.** Before a plan runs, it is checked against what exists now:
 
 - connected peers, and the folders they share with you (each folder's checks, your access
@@ -1827,7 +1862,7 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
-`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin factory templates|new|list|show|edit|check|delete`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
@@ -2437,6 +2472,7 @@ Workflow for a change:
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text) with the usage providers reported, summed per peer and provider
+- [src/factory/](src/factory) and [factory/templates/](factory/templates): the agent factory: blueprints checked against the profile and linted for least privilege (`blueprint.rs`), eval suites and their graders (`evals.rs`), the profile's factory store (`store.rs`), the built-in templates (`templates.rs`), drafts written by the owner's model (`draft.rs`) and `proofkin factory` (`cli.rs`)
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.proofkin-data` folder, named shares with a maximum access, their checks and MCP servers)
 - [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config), MCP configuration files and server templates with placeholders
 - [src/plugins.rs](src/plugins.rs): plugins (sources, fetching for review, the Copilot CLI, Claude Code and Agent Plugins layouts, marketplaces, the profile's plugin store, offers made from templates)
@@ -2469,7 +2505,7 @@ Workflow for a change:
 - [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card, [ui/models.js](ui/models.js) the model lists and the Models dialog, [ui/connect.js](ui/connect.js) the Connect other agents card
 - [docs/ux-guidelines.md](docs/ux-guidelines.md): the UI's design guidelines and definition of done
 - [docs/work-iq.md](docs/work-iq.md): the design for Microsoft 365 work context through Work IQ (being built, tracked in [#36](https://github.com/mcbelton/proofkin/issues/36))
-- [docs/agent-factory.md](docs/agent-factory.md) and [docs/agent-factory/](docs/agent-factory): the design for the agent factory: agents described in plain words, evaluated, released signed and deployed as digital workers, with its spec, API contract, architecture, threat model and test plan (proposed, tracked in [#175](https://github.com/mcbelton/proofkin/issues/175))
+- [docs/agent-factory.md](docs/agent-factory.md) and [docs/agent-factory/](docs/agent-factory): the design for the agent factory: agents described in plain words, evaluated, released signed and deployed as digital workers, with its spec, API contract, architecture, threat model and test plan (being built, tracked in [#175](https://github.com/mcbelton/proofkin/issues/175))
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
 - [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server and [tests/fixtures/plugin/](tests/fixtures/plugin) a Claude Code style plugin (a skill, an MCP server, a hook that must never run), [tests/fixtures/speckit/](tests/fixtures/speckit) and [tests/fixtures/openspec/](tests/fixtures/openspec) a Spec Kit feature and an OpenSpec change for the tests; [tests/connect.rs](tests/connect.rs) drives the MCP and A2A endpoints like other agents do

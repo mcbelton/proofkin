@@ -107,6 +107,10 @@ enum Command {
     /// skills they follow and the MCP servers they use; a profile's own, or from plugins.
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// The agent factory: agents described as blueprints, checked against the profile,
+    /// started from a template or drafted by its model from your words.
+    #[command(subcommand)]
+    Factory(proofkin::factory::cli::FactoryCommand),
     /// Spec-driven development: check a feature's spec, REST API contract and UX
     /// prototype, its design and its review pack (the checks plan steps run as
     /// verify=spec:api,design:threats,...), or import a Spec Kit or OpenSpec spec as a plan.
@@ -1560,6 +1564,7 @@ async fn main() -> Result<()> {
         Some(Command::Playbook(command)) => run_playbook(command),
         Some(Command::Skill(command)) => run_skill(command),
         Some(Command::Agent(command)) => run_agent_command(command),
+        Some(Command::Factory(command)) => proofkin::factory::cli::run(command).await,
         Some(Command::Spec(command)) => run_spec(command),
         Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command).await,

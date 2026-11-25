@@ -58,8 +58,8 @@ Rules that apply to every field:
 | Problem | path | string, a JSON pointer | No | Public | Point at the field | Not stored | Where in the blueprint, e.g. /capabilities/mcp/0 |
 | Draft | blueprint | Blueprint | Yes | Confidential | Show and edit the draft | Until the owner deletes the draft | The blueprint as drafted or edited |
 | Draft | problems | array of Problem | Yes | Internal | Say what must change before building | Not stored (computed) | Empty when it passes validation |
-| Draft | provenance | object {provider, model, effort, template, description_sha256, at} | Yes | Internal | Record what wrote the draft | As long as the agent; copied into releases | Which model wrote it, from which template, and a hash of the description (not its text) |
-| Draft | tries | integer, 1 to 3 | Yes | Internal | Show how many tries the model needed | Kept with the provenance | Model tries until it passed or gave up |
+| Draft | provenance | object {source, provider, model, effort, template, description_sha256, at} | Yes | Internal | Record what wrote the draft | As long as the agent; copied into releases | How it was first written (`model`, `template` or `file`): which model wrote it, from which template, and a hash of the description (not its text) |
+| Draft | tries | integer, 0 to 3 | Yes | Internal | Show how many tries the model needed | Kept with the provenance | Model tries until it passed or gave up; 0 when no model wrote it |
 | CheckRequest | folders | array of shared folder names | No | Internal | Check against these deployment folders | Not stored | Defaults to the blueprint's deploy folders |
 | CheckResult | passed | boolean | Yes | Public | Say whether it can be built | Not stored | True when no problem is an error |
 | CheckResult | problems | array of Problem | Yes | Internal | List errors and warnings with fixes | Not stored | Least-privilege warnings included |

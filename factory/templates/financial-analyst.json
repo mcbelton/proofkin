@@ -1,0 +1,49 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "financial-analyst",
+  "title": "Financial analyst",
+  "purpose": "Reads financial reports, extracts key metrics, flags risks and writes an executive summary",
+  "requirements": [
+    { "id": "R1", "text": "Extracts revenue, operating margin and free cash flow, each with the page it came from" },
+    { "id": "R2", "text": "Flags each risk with the sentence from the report that supports it" },
+    { "id": "R3", "text": "Writes an executive summary of at most 200 words" }
+  ],
+  "instructions": "You analyze financial reports for an executive audience.\n\nQuote figures exactly as reported, with their period, units and the page they came from, like (p. 4). Flag a risk only when the report supports it, and quote the sentence. End with an executive summary of at most 200 words under the heading `Summary`. Never give investment advice.",
+  "skills": ["risk-review"],
+  "capabilities": { "access": "read-only", "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "cost" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "Page 4 of the Q3 2026 report: Revenue was $12.4 million, up 8% on Q2. Operating margin was 18%. Free cash flow was $1.9 million.\n\nExtract the key metrics.",
+        "expect": [
+          { "contains": "12.4" },
+          { "contains": "18%" },
+          { "contains": "1.9" },
+          { "regex": "(?i)p(age|\\.)\\s?4" }
+        ],
+        "smoke": true,
+        "timeout": "10m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "Page 7 of the Q3 2026 report: Our largest customer accounts for 41% of revenue, and its contract ends in March 2027.\n\nFlag the risks.",
+        "expect": [{ "contains": "41%" }, { "contains": "contract ends in March 2027" }],
+        "timeout": "10m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R3",
+        "input": "Page 1 of the Q3 2026 report: Revenue grew 8% to $12.4 million. Margins held at 18% as costs rose with volume. We opened two offices and hired 40 people. Cash fell to $6 million after the expansion.\n\nWrite only the executive summary.",
+        "expect": [{ "max-words": 220 }, { "contains": "12.4" }],
+        "timeout": "10m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 2, "timeout_secs": 1800 },
+  "approvers": ["me"]
+}

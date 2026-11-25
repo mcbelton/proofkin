@@ -1623,6 +1623,23 @@
       ]
     },
     {
+      "id": "FAC-1",
+      "area": "agent-factory",
+      "claim": "An agent blueprint (proofkin.agent-blueprint/v1) is checked against the profile it is for: its skills, knowledge topics, folders with their checks and MCP servers, the providers it is signed in to, the models and efforts it allows, approvers on its allowlist and unique requirement ids, and a name nothing else has. Each problem has a stable code, is an error or a warning, and says what is wrong, how to fix it and the JSON pointer of the field. Asking for more than it needs (full access with no check, every tool of a server, every Work IQ source, delegation, instructions that ask for tools) is a least-privilege warning naming the narrower choice (AC-6).",
+      "tests": [
+        "lib::factory::blueprint::a_valid_blueprint_has_no_problems_and_round_trips",
+        "lib::factory::blueprint::text_that_is_not_a_v1_blueprint_is_one_problem_saying_why",
+        "lib::factory::blueprint::references_the_profile_lacks_are_errors_with_their_fix",
+        "lib::factory::blueprint::requirements_are_numbered_unique_and_stated",
+        "lib::factory::blueprint::capabilities_must_hang_together",
+        "lib::factory::blueprint::texts_budgets_and_memory_stay_in_range",
+        "lib::factory::blueprint::least_privilege_lint_warns_and_names_the_narrower_choice",
+        "lib::factory::blueprint::errors_come_before_warnings",
+        "lib::factory::blueprint::a_name_in_use_or_reserved_is_refused",
+        "factory::a_blueprint_file_is_checked_with_the_fixtures_next_to_it"
+      ]
+    },
+    {
       "id": "FAC-2",
       "area": "agent-factory",
       "claim": "A task records the usage its provider reported: the Copilot session's tokens and premium requests, the Claude Agent SDK's tokens and cost estimate, and the tokens of Codex's turn. A provider that reports none records none, not zero. Usage adds up over a task's attempts, goes back to the requester with the result (older peers ignore it) and is kept in the worker's audit entry, which holds no prompt or output text. The web UI shows it on a finished task and in the audit, and proofkin audit sums it per peer and provider.",
@@ -1636,6 +1653,58 @@
         "agents::the_worker_reports_what_its_provider_said_the_work_used"
       ],
       "live": ["worker1 audited what Copilot said boss's tasks used"]
+    },
+    {
+      "id": "FAC-3",
+      "area": "agent-factory",
+      "claim": "The profile's factory keeps drafts, and each agent's lifecycle state and history (who, when, what), in its factory folder: written atomically under a lock, for its owner only. They survive restarts and concurrent writers, a damaged file is reported with its path and left as it is, a name has one agent, and an agent with releases is never deleted. proofkin factory list, show, edit, check and delete work on them: edit takes the blueprint from an editor, a file or stdin and keeps it with its problems (text that isn't JSON or renames the agent isn't saved), and check fails while a draft has errors, showing each with its fix.",
+      "tests": [
+        "lib::factory::store::drafts_and_their_history_survive_a_restart_and_concurrent_writers",
+        "lib::factory::store::a_damaged_file_is_reported_with_its_path_and_left_as_it_is",
+        "lib::factory::store::a_name_has_one_agent_and_deleting_keeps_released_ones",
+        "factory::a_template_starts_a_draft_that_is_listed_shown_checked_and_deleted",
+        "factory::edits_are_checked_when_saved_and_kept_with_their_problems"
+      ]
+    },
+    {
+      "id": "FAC-4",
+      "area": "agent-factory",
+      "claim": "An agent's eval suite has cases that each name the requirement they prove, give a task, its fixtures and what to expect, and every requirement needs a case with a deterministic expectation (AC-10). contains, not-contains, regex, json-schema, max-words, files-changed and check expectations pass and fail as the design says (check runs the folder's check in the run's folder); a judge rubric is scored by a model, never graded here. Fixtures must be files in the agent's fixtures folder, reached without links.",
+      "tests": [
+        "lib::factory::evals::cases_name_a_requirement_give_a_task_and_expect_what_the_agent_can_do",
+        "lib::factory::evals::every_requirement_needs_a_case_with_a_deterministic_expectation",
+        "lib::factory::evals::every_expectation_kind_parses_and_bad_ones_say_why",
+        "lib::factory::evals::deterministic_graders_pass_and_fail_as_specified",
+        "lib::factory::evals::a_check_expectation_runs_the_folders_check_in_the_runs_folder",
+        "lib::factory::evals::a_judge_rubric_is_scored_by_a_model_never_graded",
+        "lib::factory::evals::glob_patterns_match_paths_as_documented",
+        "lib::factory::evals::fixtures_must_be_files_in_the_agents_fixtures_folder",
+        "factory::a_blueprint_file_is_checked_with_the_fixtures_next_to_it"
+      ]
+    },
+    {
+      "id": "FAC-5",
+      "area": "agent-factory",
+      "claim": "proofkin factory templates lists the built-in templates with their purpose, most access and number of eval cases. Each passes validation unchanged with a case for every requirement, and proofkin factory new --template makes a draft from one with no model, on the providers the profile is signed in to (AC-4).",
+      "tests": [
+        "lib::factory::templates::templates_are_listed_with_their_purpose_access_and_cases",
+        "lib::factory::templates::every_template_passes_validation_unchanged_with_a_case_for_every_requirement",
+        "lib::factory::templates::a_draft_from_a_template_runs_on_the_providers_the_profile_signed_in_to",
+        "factory::a_template_starts_a_draft_that_is_listed_shown_checked_and_deleted"
+      ]
+    },
+    {
+      "id": "FAC-6",
+      "area": "agent-factory",
+      "claim": "proofkin factory new --describe has the profile's default model write a draft from the owner's words: read-only, in an empty folder, given what the profile has as data and the description with secrets redacted. The draft is checked, and its problems go back to the model, at most 3 tries in all; then the owner gets the last draft with its problems (AC-1, AC-2). Its provenance records the provider, model, effort, template, the SHA-256 of the description (not its text), the time and the tries. Drafting grants nothing, whatever the description says (AC-3, TM-1), and needs a provider the profile is signed in to.",
+      "tests": [
+        "lib::factory::draft::the_owners_model_drafts_a_checked_blueprint_with_its_provenance",
+        "lib::factory::draft::problems_go_back_to_the_model_at_most_three_tries",
+        "lib::factory::draft::a_template_starts_the_draft",
+        "lib::factory::draft::drafting_grants_nothing_whatever_the_description_says",
+        "factory::drafting_needs_a_provider_the_profile_is_signed_in_to"
+      ],
+      "live": ["worker1's model drafted an agent from a description that passes the factory check"]
     }
   ]
 }

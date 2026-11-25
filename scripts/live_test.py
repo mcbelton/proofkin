@@ -694,6 +694,20 @@ try:
           left and removed[0] == 0 and "deleted" in removed[1]
           and not os.path.exists(os.path.join(HOME, "profiles", "helper")) and "helper" not in trust,
           (left, removed, trust))
+
+    print("== worker1's model drafts an agent from a description (its agent stopped: one Copilot per profile)")
+    drafted = subprocess.run(
+        [EXE, "factory", "new", "fin-analyst", "--describe",
+         "Analyze quarterly financial reports: extract revenue, margins and cash flow with the page each came from, "
+         "flag risks with the sentence that supports them, and write an executive summary of at most 200 words",
+         "--profile", "worker1"],
+        env=ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=900, encoding="utf-8", errors="replace")
+    print(drafted.stdout + drafted.stderr)
+    _, shown = cli("factory", "show", "fin-analyst", "--profile", "worker1")
+    checked, check_out = cli("factory", "check", "fin-analyst", "--profile", "worker1")
+    check("worker1's model drafted an agent from a description that passes the factory check",
+          drafted.returncode == 0 and "drafted by copilot's model" in drafted.stdout and checked == 0
+          and "written: by copilot's model" in shown, shown + check_out)
 finally:
     for a in reversed(agents):
         a.stop()
