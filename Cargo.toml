@@ -37,6 +37,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Paused time, for tests of waits that count only awake time (src/awake.rs).
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 [patch.crates-io]
 # Same as iroh 1.4.1 without the cdylib crate type; see vendor/iroh/VENDORED.md.

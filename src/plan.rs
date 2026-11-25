@@ -3344,13 +3344,14 @@ fn rejoin(
     (sent.peer, work)
 }
 
-/// `work`, cancelled (by dropping it) once `secs` have passed.
+/// `work`, cancelled (by dropping it) once `secs` of awake time have passed (time the
+/// machine sleeps doesn't count, see [`crate::awake`]).
 async fn within<T>(secs: Option<u64>, work: impl Future<Output = Result<T>>) -> Result<T> {
     match secs {
         None => work.await,
-        Some(secs) => tokio::time::timeout(std::time::Duration::from_secs(secs), work)
+        Some(secs) => crate::awake::timeout(std::time::Duration::from_secs(secs), work)
             .await
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|| {
                 Err(anyhow!(
                     "cancelled: it took longer than its timeout={}",
                     timeout_text(secs)

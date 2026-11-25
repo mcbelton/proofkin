@@ -959,10 +959,19 @@
     {
       "id": "NET-7",
       "area": "network",
-      "claim": "A dropped connection doesn't fail tasks at once: they say they are reconnecting, and carry on if the peer comes back within the task grace (60 s by default), their results arriving over the new connection. An agent that stops on purpose tells its peers first: the tasks it runs for them fail at once, saying it stopped, and the tasks it gave them are cancelled.",
+      "claim": "A dropped connection doesn't fail tasks at once: they say they are reconnecting, and carry on if the peer comes back within the task grace (60 s of awake time by default, NET-8), their results arriving over the new connection. An agent that stops on purpose tells its peers first: the tasks it runs for them fail at once, saying it stopped, and the tasks it gave them are cancelled.",
       "tests": [
         "agents::tasks_survive_a_dropped_connection_when_the_peer_comes_back_in_time",
         "agents::delegated_task_fails_at_once_when_the_worker_stops"
+      ]
+    },
+    {
+      "id": "NET-8",
+      "area": "network",
+      "claim": "Waits count only the time the machine is awake (src/awake.rs; issue #243): they go in ticks of at most 10 s, and a tick that ends more than 15 s later than asked for (the machine was suspended) counts nothing, so a suspension costs a wait at most one tick. The task grace (NET-7), a Copilot model run's hour (EDD-12; the SDK's own wait is a week, so it never stops a run first) and a step's timeout= use them: time spent asleep doesn't use up a peer's grace, a model's run or a step's timeout, so the tasks running when a laptop goes to sleep go on after it wakes.",
+      "tests": [
+        "lib::awake::time_the_machine_was_suspended_doesnt_count",
+        "lib::awake::a_timeout_counts_only_awake_time_and_lets_work_that_ends_in_time_finish"
       ]
     },
     {
@@ -1569,10 +1578,18 @@
     {
       "id": "EDD-12",
       "area": "evidence",
-      "claim": "A model run that stops before it finishes (it runs out of time, a Copilot run being allowed up to an hour, or its provider fails) is a failed attempt: with attempts left, the next one goes on in the same worktree, told why the last run stopped, its progress saying it goes on from where the last run stopped and the result listing the stopped attempt; when it was the last attempt, what the model changed is committed to the task's branch before the error goes back, naming the branch and commit. A step whose task failed shows its peer's error alone: only a result that says it succeeded without the record its checks or sign-off need is suspect.",
+      "claim": "A model run that stops before it finishes (it runs out of time, a Copilot run being allowed up to an hour of awake time (NET-8), or its provider fails) is a failed attempt: with attempts left, the next one goes on in the same worktree, told why the last run stopped, its progress saying it goes on from where the last run stopped and the result listing the stopped attempt; when it was the last attempt, what the model changed is committed to the task's branch before the error goes back, naming the branch and commit. A step whose task failed shows its peer's error alone: only a result that says it succeeded without the record its checks or sign-off need is suspect.",
       "tests": [
         "agents::a_model_run_that_stops_is_a_failed_attempt_and_keeps_its_work",
         "lib::plan::a_failed_step_says_what_its_peer_said_and_only_a_success_needs_its_record"
+      ]
+    },
+    {
+      "id": "EDD-13",
+      "area": "evidence",
+      "claim": "A task that stops before its work is committed other than by its model's run stopping (it is cancelled, or its agent stops) keeps what the model changed (issue #243): its worktree, asked to when the task made it, commits what is left to the task's branch as \"<subject> (unfinished)\" when it goes, leaving out build and tool caches as task commits do. A worktree that wasn't asked to (one that checks a patch) commits nothing, and once a task's work was committed nothing more is.",
+      "tests": [
+        "lib::worktree::a_dropped_worktree_keeps_its_unfinished_work_on_its_branch_when_asked_to"
       ]
     },
     {

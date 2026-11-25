@@ -25,9 +25,13 @@ use crate::profile::{
     CopilotCredentials, DEFAULT_GITHUB_HOST, INHERITED_CREDENTIAL_VARS, github_login,
 };
 
-/// The longest one Copilot model run may take (a task with attempts left goes on in another
-/// attempt; a step's `timeout=` stops it sooner).
+/// The longest one Copilot model run may take, in awake time (a task with attempts left
+/// goes on in another attempt; a step's `timeout=` stops it sooner).
 const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// The SDK's own limit on a run, which counts the time the machine sleeps: long enough that
+/// [`TASK_TIMEOUT`], which doesn't, is what stops a run.
+const SDK_WAIT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Built-in Copilot CLI tools a session may use, per access level. Everything
 /// else (web_fetch, sub-agents, skills, MCP servers such as GitHub's) is not
@@ -353,9 +357,15 @@ impl CopilotBackend {
         }));
         // If this future is dropped (the task was cancelled), stop the model too.
         let mut guard = AbortOnDrop(Some(session.clone()));
-        let reply = session
-            .send_and_wait(MessageOptions::new(task.prompt.clone()).with_wait_timeout(TASK_TIMEOUT))
-            .await;
+        let wait = session
+            .send_and_wait(MessageOptions::new(task.prompt.clone()).with_wait_timeout(SDK_WAIT));
+        let reply = match crate::awake::timeout(TASK_TIMEOUT, wait).await {
+            Some(reply) => reply.map_err(anyhow::Error::from),
+            None => {
+                let _ = session.abort().await;
+                Err(anyhow!("timed out after {TASK_TIMEOUT:?}"))
+            }
+        };
         guard.0 = None;
         // What the session used, as the CLI accounts for it (none if it doesn't say).
         let usage = match &reply {

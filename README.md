@@ -687,9 +687,11 @@ dialed each other at once) or drops and comes back, running tasks carry on and t
 results arrive over the new connection. After 2 seconds the peer shows as disconnected and
 its tasks say **reconnecting to** it. They are failed (on your side) and cancelled (on the
 peer's) only if it stays away for the **task grace**: 60 seconds, or
-`PROOFKIN_TASK_GRACE_SECS`. An agent that stops on purpose (Ctrl+C, or **Stop** on a
-digital worker) says so first: the tasks it runs for you fail at once ("worker stopped
-before it finished the task"), and it cancels the tasks it gave its peers.
+`PROOFKIN_TASK_GRACE_SECS`. Only time the machine is awake counts, so sleep doesn't use up a
+peer's grace: the tasks that were running when a laptop went to sleep go on after it wakes.
+An agent that stops on purpose (Ctrl+C, or **Stop** on a digital worker) says so first: the
+tasks it runs for you fail at once ("worker stopped before it finished the task"), and it
+cancels the tasks it gave its peers.
 
 ### Squads and plans
 
@@ -723,7 +725,7 @@ report after api,tests @helper Write a one-paragraph status report
   away for good, the step moves to another member that can take it, and its task says
   **moved here** and why. A step on a named `@peer` fails instead.
 - `timeout=30m` (`s`, `m`, `h` or `d`, up to 7 days) cancels a step that takes longer, on
-  every peer working on it; it fails with the reason.
+  every peer working on it; it fails with the reason. Time the machine sleeps doesn't count.
 - A step starts when the steps it waits for (`after`) are done, and gets what each was asked
   (up to 1,000 characters) and its result (up to 8,000 characters) ahead of its prompt.
   Steps without dependencies run at once.
@@ -1100,7 +1102,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `team @lead:folder`, `levels=N` | Instead of a model, the lead's team does it, with the folder's team plan ([team steps](#team-steps-handing-work-down-a-level)). `levels=` (1 to 3, default 1) is how many levels down it may go. |
 | `pr @peer:folder` | Instead of a model, the folder's agent opens the pull request with the work of the steps before it there, then waits until it is merged ([pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan)). Takes only `timeout=`, `issue=` and `reviewers=`. |
 | `reviewers=me,carol,octocat` | On a `pr` step: who is asked to review the pull request, by GitHub account (`me`, a peer on your allowlist, or a GitHub login; `none` asks no one). Without it, those who signed off before it are asked. |
-| `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
+| `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days; time the machine sleeps doesn't count), on every peer working on it. |
 | `workiq=all` / `workiq=email,files` | Searches your Microsoft 365 (Work IQ) for the step's own words when the step is sent, and puts what it finds in the prompt before `Your task:`. `all` searches everything; a list names sources: `email`, `meetings`, `files`, `teams`, `people`, `connectors`. Not on sign-offs. See [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq). |
 | `issue=#15` | With a [tracker](#tracked-work): the step works on that issue of the tracker's repository instead of a new sub-issue, and its task gets the issue's title and body in front of it (as external content, secrets redacted, cut at 20,000 characters, saying how much was left out), so the plan needn't repeat them. Its commit is titled with the issue's title. |
 
@@ -1156,14 +1158,17 @@ review @alice:app verify=test Check the change:
 - **Retries**: when a task took more than one attempt, its output is the first attempt's
   report, then, for each later attempt, a line "Attempt 2 of 3, after these checks failed:
   fmt, clippy" and that attempt's report.
-- **A model run that stops**: a Copilot model run may take up to an hour (Claude and Codex
-  runs have no limit of their own; a step's `timeout=` stops any sooner). A run that stops
+- **A model run that stops**: a Copilot model run may take up to an hour of awake time (time
+  the machine sleeps doesn't count; Claude and Codex runs have no limit of their own; a
+  step's `timeout=` stops any sooner). A run that stops
   before the model finishes (it runs out of time, or its provider fails) is a failed attempt:
   with attempts left, the next one goes on in the same worktree, told why the last run
   stopped, and the output says "The model's run stopped before it finished: …" then
   "Attempt 2 of 3, after the model's run stopped". If it was the last attempt, the task fails
   with that error, and what the model changed is committed to the task's branch first; the
-  error names the branch and commit.
+  error names the branch and commit. A task that stops before its work is committed in any
+  other way (it is cancelled, or its agent stops) keeps it too: what the model changed is
+  committed to the task's branch as "… (unfinished)", without build and tool caches.
 - **Checks while it works**: a step's model (Copilot or Claude) can run the step's checks
   itself while it works, with the `run_check` tool its worker gives it (MCP server
   `proofkin-checks`). The tool runs one in the task's workspace, as the runtime will
@@ -2679,6 +2684,7 @@ Workflow for a change:
 
 - [src/protocol.rs](src/protocol.rs): wire messages (`hello` with addresses, capabilities, models and the models its accounts offer, `peers`, `chat`, `task_request`, `task_result`, `task_cancel`, `task_progress`, `load`, `shares`, `models`; unknown types are ignored) and the `p2pagents/1` ALPN
 - [src/agent.rs](src/agent.rs): `Agent` node on an iroh endpoint: allowlist enforcement, dialing, gossip, auto-reconnect, broadcast, task delegation with permissions and hourly limits, task slots and queue, live progress and load reports, the task grace for dropped peers, shutdown (telling peers)
+- [src/awake.rs](src/awake.rs): waits that count only the time the machine is awake (the task grace, a model run's limit, `timeout=`)
 - [src/trust.rs](src/trust.rs): allowlist (`peers.json`) and `p2pa1...` tickets
 - [src/llm/mod.rs](src/llm/mod.rs): `Provider`, `Access`, `LlmTask`, the `Executor` trait and `SdkExecutor`
 - [src/llm/copilot.rs](src/llm/copilot.rs): per-agent Copilot instance on the official Rust SDK (own token and `COPILOT_HOME`), with per-access tool allowlists and the path-checking permission handler
@@ -2701,7 +2707,7 @@ Workflow for a change:
 - [src/plan.rs](src/plan.rs): squads (`squads.json`), plan parsing and validation (claims, checks, approvals), and the dependency-ordered plan runner (load-aware squad picks, rerouting, timeouts)
 - [src/team.rs](src/team.rs): team steps: team plans, handing work down a level, and the lead's team run with its progress reported upward
 - [src/evidence.rs](src/evidence.rs): signed evidence records, owner-defined checks (run with a timeout, process tree killed) and retry prompts
-- [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches
+- [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches, and the unfinished work a stopped task keeps
 - [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification
 - [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
 - [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec, design, implement-spec, implement-speckit and rehearse plan templates; [src/spec_import.rs](src/spec_import.rs): Spec Kit and OpenSpec specs as claims, knowledge and plans

@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod audit;
 pub mod auth;
+pub mod awake;
 pub mod boundary;
 pub mod checks_mcp;
 pub mod design;

@@ -33,25 +33,38 @@ pub struct Worktree {
     pub branch: String,
     pub base: String,
     hooks: PathBuf,
+    /// What to commit what is left with if the worktree goes before its work was committed
+    /// (see [`Worktree::keep_unfinished`]).
+    unfinished: Option<String>,
 }
 
-async fn git(dir: &Path, hooks: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new("git");
+/// How a task's commits are made: by `proofkin`, never by the owner's git identity.
+const COMMITTER: [&str; 4] = [
+    "-c",
+    "user.name=proofkin",
+    "-c",
+    "user.email=proofkin@localhost",
+];
+
+/// `git -C dir <args>`, with no hooks, prompts or inherited credentials.
+fn git_command(dir: &Path, hooks: &Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
     cmd.arg("-C")
         .arg(dir)
         .arg("-c")
         .arg(format!("core.hooksPath={}", hooks.display()))
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+        .stdin(Stdio::null());
     for var in INHERITED_CREDENTIAL_VARS {
         cmd.env_remove(var);
     }
-    let out = cmd
-        .output()
-        .await
-        .context("running git (is it installed and on PATH?)")?;
+    cmd
+}
+
+/// What git printed, or its error.
+fn git_output(args: &[&str], out: std::io::Result<std::process::Output>) -> Result<String> {
+    let out = out.context("running git (is it installed and on PATH?)")?;
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -60,6 +73,17 @@ async fn git(dir: &Path, hooks: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+async fn git(dir: &Path, hooks: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::from(git_command(dir, hooks, args));
+    cmd.kill_on_drop(true);
+    git_output(args, cmd.output().await)
+}
+
+/// [`git`], where nothing can be awaited (a worktree that is dropped).
+fn git_blocking(dir: &Path, hooks: &Path, args: &[&str]) -> Result<String> {
+    git_output(args, git_command(dir, hooks, args).output())
 }
 
 /// A branch-safe form of `name`.
@@ -166,7 +190,16 @@ impl Worktree {
             branch: branch.to_owned(),
             base,
             hooks,
+            unfinished: None,
         })
+    }
+
+    /// Has what is left in the worktree committed to its branch with `message` if the
+    /// worktree goes before its work was committed (its task was cancelled, or its agent
+    /// stopped), so it can be looked at or gone on from. Build and tool caches stay out, as
+    /// in [`Worktree::commit`].
+    pub fn keep_unfinished(&mut self, message: String) {
+        self.unfinished = Some(message);
     }
 
     /// Applies `patch` to the worktree's files. Refused if it would create a symlink
@@ -223,7 +256,10 @@ impl Worktree {
             left_out: Vec::new(),
         };
         git(&self.path, &self.hooks, &["add", "-A"]).await?;
-        record.left_out = self.unstage_caches().await?;
+        let (path, hooks) = (self.path.clone(), self.hooks.clone());
+        record.left_out = tokio::task::spawn_blocking(move || unstage_caches(&path, &hooks))
+            .await
+            .context("leaving caches out of the commit")??;
         if git(
             &self.path,
             &self.hooks,
@@ -235,22 +271,9 @@ impl Worktree {
         {
             return Ok((record, None));
         }
-        git(
-            &self.path,
-            &self.hooks,
-            &[
-                "-c",
-                "user.name=proofkin",
-                "-c",
-                "user.email=proofkin@localhost",
-                "commit",
-                "--no-verify",
-                "-q",
-                "-m",
-                message,
-            ],
-        )
-        .await?;
+        let mut args = COMMITTER.to_vec();
+        args.extend(["commit", "--no-verify", "-q", "-m", message]);
+        git(&self.path, &self.hooks, &args).await?;
         let commit = git(&self.path, &self.hooks, &["rev-parse", "HEAD"])
             .await?
             .trim()
@@ -267,71 +290,24 @@ impl Worktree {
         Ok((record, (patch.len() <= MAX_PATCH_BYTES).then_some(patch)))
     }
 
-    /// Takes the new files of build and tool caches out of the index (they stay in the
-    /// worktree, untracked); the cache folders and files it took out.
-    async fn unstage_caches(&self) -> Result<Vec<String>> {
-        let added = git(
+    /// Commits what is left in the worktree but build and tool caches (see
+    /// [`Worktree::keep_unfinished`]); the commit, None if nothing was left. It blocks.
+    fn commit_left(&self, message: &str) -> Result<Option<String>> {
+        git_blocking(&self.path, &self.hooks, &["add", "-A"])?;
+        unstage_caches(&self.path, &self.hooks)?;
+        let staged = git_blocking(
             &self.path,
             &self.hooks,
-            &[
-                "-c",
-                "core.quotepath=off",
-                "diff",
-                "--cached",
-                "--name-only",
-                "--no-renames",
-                "--diff-filter=A",
-                "-z",
-            ],
-        )
-        .await?;
-        // The base commit's folders, read only when a new file is named like a cache.
-        let mut folders: Option<std::collections::HashSet<String>> = None;
-        let mut left_out: Vec<String> = Vec::new();
-        for path in added.split('\0').filter(|p| !p.is_empty()) {
-            if left_out
-                .iter()
-                .any(|f| f.ends_with('/') && path.starts_with(f.as_str()))
-            {
-                continue;
-            }
-            let named = |part: &str| CACHE_DIRS.contains(&part) || ROOT_CACHE_DIRS.contains(&part);
-            if folders.is_none() && path.split('/').any(named) {
-                let listing = git(
-                    &self.path,
-                    &self.hooks,
-                    &[
-                        "-c",
-                        "core.quotepath=off",
-                        "ls-tree",
-                        "-r",
-                        "-d",
-                        "-z",
-                        "--name-only",
-                        "HEAD",
-                    ],
-                )
-                .await?;
-                folders = Some(
-                    listing
-                        .split('\0')
-                        .filter(|p| !p.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
-                );
-            }
-            let tracked = |folder: &str| folders.as_ref().is_some_and(|f| f.contains(folder));
-            if let Some(part) = cache_part(path, &tracked) {
-                left_out.push(part);
-            }
+            &["diff", "--cached", "--name-only"],
+        )?;
+        if staged.trim().is_empty() {
+            return Ok(None);
         }
-        // A few at a time: a command line has a length limit.
-        for chunk in left_out.chunks(100) {
-            let mut args = vec!["--literal-pathspecs", "rm", "--cached", "-r", "-q", "--"];
-            args.extend(chunk.iter().map(|p| p.trim_end_matches('/')));
-            git(&self.path, &self.hooks, &args).await?;
-        }
-        Ok(left_out)
+        let mut args = COMMITTER.to_vec();
+        args.extend(["commit", "--no-verify", "-q", "-m", message]);
+        git_blocking(&self.path, &self.hooks, &args)?;
+        let commit = git_blocking(&self.path, &self.hooks, &["rev-parse", "HEAD"])?;
+        Ok(Some(commit.trim().to_owned()))
     }
 
     /// Attaches `text` to `commit` as a note under [`NOTES_REF`].
@@ -364,6 +340,72 @@ impl Worktree {
     }
 }
 
+/// Takes the new files of build and tool caches out of `worktree`'s index (they stay in the
+/// worktree, untracked); the cache folders and files it took out. It blocks: it runs where
+/// nothing can be awaited too (a worktree that is dropped).
+fn unstage_caches(worktree: &Path, hooks: &Path) -> Result<Vec<String>> {
+    let added = git_blocking(
+        worktree,
+        hooks,
+        &[
+            "-c",
+            "core.quotepath=off",
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=A",
+            "-z",
+        ],
+    )?;
+    // The base commit's folders, read only when a new file is named like a cache.
+    let mut folders: Option<std::collections::HashSet<String>> = None;
+    let mut left_out: Vec<String> = Vec::new();
+    for path in added.split('\0').filter(|p| !p.is_empty()) {
+        if left_out
+            .iter()
+            .any(|f| f.ends_with('/') && path.starts_with(f.as_str()))
+        {
+            continue;
+        }
+        let named = |part: &str| CACHE_DIRS.contains(&part) || ROOT_CACHE_DIRS.contains(&part);
+        if folders.is_none() && path.split('/').any(named) {
+            let listing = git_blocking(
+                worktree,
+                hooks,
+                &[
+                    "-c",
+                    "core.quotepath=off",
+                    "ls-tree",
+                    "-r",
+                    "-d",
+                    "-z",
+                    "--name-only",
+                    "HEAD",
+                ],
+            )?;
+            folders = Some(
+                listing
+                    .split('\0')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            );
+        }
+        let tracked = |folder: &str| folders.as_ref().is_some_and(|f| f.contains(folder));
+        if let Some(part) = cache_part(path, &tracked) {
+            left_out.push(part);
+        }
+    }
+    // A few at a time: a command line has a length limit.
+    for chunk in left_out.chunks(100) {
+        let mut args = vec!["--literal-pathspecs", "rm", "--cached", "-r", "-q", "--"];
+        args.extend(chunk.iter().map(|p| p.trim_end_matches('/')));
+        git_blocking(worktree, hooks, &args)?;
+    }
+    Ok(left_out)
+}
+
 /// The note under [`NOTES_REF`] on commit `rev` of `repo`, if it has one.
 pub async fn read_note(repo: &Path, rev: &str) -> Result<Option<String>> {
     let mut cmd = Command::new("git");
@@ -384,8 +426,12 @@ pub async fn read_note(repo: &Path, rev: &str) -> Result<Option<String>> {
 }
 
 impl Drop for Worktree {
-    /// Removes the worktree folder; the branch (and its commit) stays in the repository.
+    /// Commits what is left if asked to (see [`Worktree::keep_unfinished`]), then removes the
+    /// worktree folder; the branch (and its commits) stays in the repository.
     fn drop(&mut self) {
+        if let Some(message) = self.unfinished.take() {
+            let _ = self.commit_left(&message);
+        }
         let _ = std::process::Command::new("git")
             .arg("-C")
             .arg(&self.repo)
@@ -499,6 +545,57 @@ mod tests {
             numstat_paths("0\t0\t\0old.rs\0new.rs\0"),
             ["old.rs", "new.rs"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_worktree_keeps_its_unfinished_work_on_its_branch_when_asked_to() {
+        let repo = repo().await;
+        let root = tempfile::tempdir().unwrap();
+        let hooks = root.path().join(".no-hooks");
+        let subject = |branch: &'static str| {
+            let (repo, hooks) = (repo.path().to_owned(), hooks.clone());
+            async move {
+                git(&repo, &hooks, &["log", "-1", "--format=%s", branch])
+                    .await
+                    .unwrap()
+                    .trim()
+                    .to_owned()
+            }
+        };
+        // Cancelled halfway: what it changed is committed, its caches aren't.
+        let mut wt = Worktree::create(repo.path(), root.path(), "p2p/boss/7-1")
+            .await
+            .unwrap();
+        wt.keep_unfinished("Half done (unfinished)".into());
+        std::fs::write(wt.path.join("a.txt"), "one\nhalf\n").unwrap();
+        std::fs::create_dir(wt.path.join("__pycache__")).unwrap();
+        std::fs::write(wt.path.join("__pycache__/a.pyc"), "\0").unwrap();
+        drop(wt);
+        assert_eq!(subject("p2p/boss/7-1").await, "Half done (unfinished)");
+        let files = git(
+            repo.path(),
+            &hooks,
+            &["show", "--name-only", "--format=", "p2p/boss/7-1"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(files.trim(), "a.txt");
+
+        // Not asked to, or once its work was committed, nothing more is.
+        let other = Worktree::create(repo.path(), root.path(), "p2p/boss/8-1")
+            .await
+            .unwrap();
+        std::fs::write(other.path.join("a.txt"), "changed\n").unwrap();
+        drop(other);
+        assert_eq!(subject("p2p/boss/8-1").await, "init");
+        let mut done = Worktree::create(repo.path(), root.path(), "p2p/boss/9-1")
+            .await
+            .unwrap();
+        done.keep_unfinished("never".into());
+        std::fs::write(done.path.join("b.txt"), "new\n").unwrap();
+        done.commit("done").await.unwrap();
+        drop(done);
+        assert_eq!(subject("p2p/boss/9-1").await, "done");
     }
 
     #[tokio::test]
