@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,6 +129,12 @@ impl CopilotBackend {
         let mut env = vec![("COPILOT_HOME".to_owned(), creds.home.into_os_string())];
         if creds.host != DEFAULT_GITHUB_HOST {
             env.push(("COPILOT_GH_HOST".to_owned(), creds.host.clone().into()));
+        }
+        // The model's shell gets the Node.js this agent's `node` runs, not a shim of it.
+        if let Some(path) = std::env::var_os("PATH")
+            && let Some(path) = path_with_real_node(&path).await
+        {
+            env.push(("PATH".to_owned(), path));
         }
         let remove: Vec<&str> = INHERITED_CREDENTIAL_VARS
             .iter()
@@ -515,6 +523,44 @@ pub fn find_copilot_cli() -> Result<PathBuf> {
         .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
         .find(|p| p.is_file())
         .ok_or_else(|| anyhow!("Copilot CLI not found; install it or set COPILOT_CLI_PATH"))
+}
+
+/// How Node.js is named on `PATH`.
+const NODE_NAMES: &[&str] = if cfg!(windows) {
+    &["node.exe", "node.cmd"]
+} else {
+    &["node"]
+};
+
+/// `path` (a `PATH`) with the folder of the Node.js that its `node` really runs first, when
+/// that `node` is a version manager's shim (nvm for Windows, Volta): inside the model's
+/// sandboxed shell a shim may not find which version to run, and the shell has no Node.js
+/// (#17). None when nothing changes: no `node`, or it is the real one.
+async fn path_with_real_node(path: &OsStr) -> Option<OsString> {
+    let found = std::env::split_paths(path)
+        .flat_map(|dir| NODE_NAMES.iter().map(move |n| dir.join(n)))
+        .find(|p| p.is_file())?;
+    let mut command = tokio::process::Command::new(&found);
+    command
+        .args(["-p", "process.execPath"])
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    let real = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    if !out.status.success() || !real.is_absolute() || !real.is_file() {
+        return None;
+    }
+    let dir = real.parent()?;
+    if found.parent() == Some(dir) {
+        return None;
+    }
+    let rest = std::env::split_paths(path).filter(|d| d != dir);
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(rest)).ok()
 }
 
 /// Why the Copilot CLI at `cli` didn't start, and what to do. The CLI updates itself,
@@ -974,6 +1020,52 @@ mod tests {
     use super::*;
     use PermissionRequestKind::*;
     use serde_json::json;
+
+    /// A `node` in `dir` that prints `says`, as `node -p process.execPath` prints the
+    /// executable it really is.
+    fn fake_node(dir: &Path, says: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        if cfg!(windows) {
+            let script = format!("@echo {}\r\n", says.display());
+            std::fs::write(dir.join("node.cmd"), script).unwrap();
+        } else {
+            let file = dir.join("node");
+            std::fs::write(&file, format!("#!/bin/sh\necho '{}'\n", says.display())).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_models_shell_gets_the_node_a_version_managers_shim_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shim, real, other) = (
+            dir.path().join("shim"),
+            dir.path().join("installs").join("v24"),
+            dir.path().join("bin"),
+        );
+        // nvm for Windows' `node` is a shim that runs the version it is set to.
+        let node = real.join(NODE_NAMES[0]);
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(&node, "").unwrap();
+        fake_node(&shim, &node);
+        let path = std::env::join_paths([&other, &shim, &real]).unwrap();
+        let changed = path_with_real_node(&path).await.unwrap();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&changed).collect();
+        assert_eq!(dirs, [real.clone(), other.clone(), shim.clone()]);
+
+        // A `node` that is the real one changes nothing, and neither does no Node.js.
+        let own = dir.path().join("own");
+        let named = own.join(if cfg!(windows) { "node.cmd" } else { "node" });
+        fake_node(&own, &named);
+        let path = std::env::join_paths([&own, &other]).unwrap();
+        assert_eq!(path_with_real_node(&path).await, None);
+        let path = std::env::join_paths([&other]).unwrap();
+        assert_eq!(path_with_real_node(&path).await, None);
+    }
 
     fn workspace() -> (tempfile::TempDir, Workspace) {
         let dir = tempfile::tempdir().unwrap();

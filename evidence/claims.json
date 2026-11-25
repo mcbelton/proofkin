@@ -855,6 +855,14 @@
       "tests": ["lib::llm::copilot::earlier_cli_versions_kept_after_an_update_are_found_newest_first"]
     },
     {
+      "id": "COP-2",
+      "area": "providers",
+      "claim": "A Copilot model's sandboxed shell finds the Node.js its agent's own node runs (issue #17): when the Copilot CLI starts, the agent asks the first node on its PATH for process.execPath, and when that executable is in another folder (node is a version manager's shim, such as nvm for Windows', which can't find which version to run inside the sandbox) the CLI's PATH gets that folder first, once. A node that is the real one, or no Node.js, leaves the PATH as it is.",
+      "tests": [
+        "lib::llm::copilot::the_models_shell_gets_the_node_a_version_managers_shim_runs"
+      ]
+    },
+    {
       "id": "CLI-1",
       "area": "cli",
       "claim": "The command line definition is valid (no conflicting flags or subcommands).",
