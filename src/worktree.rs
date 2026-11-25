@@ -657,6 +657,7 @@ mod tests {
             verified: true,
             refused: false,
             model: None,
+            usage: None,
         };
         let mut run = crate::runs::RunRecord::for_task(
             "boss",

@@ -107,6 +107,10 @@ enum Command {
     /// skills they follow and the MCP servers they use; a profile's own, or from plugins.
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// The agent factory: agents described as blueprints, checked against the profile,
+    /// started from a template or drafted by its model from your words.
+    #[command(subcommand)]
+    Factory(proofkin::factory::cli::FactoryCommand),
     /// Spec-driven development: check a feature's spec, REST API contract and UX
     /// prototype, its design and its review pack (the checks plan steps run as
     /// verify=spec:api,design:threats,...), or import a Spec Kit or OpenSpec spec as a plan.
@@ -1560,6 +1564,7 @@ async fn main() -> Result<()> {
         Some(Command::Playbook(command)) => run_playbook(command),
         Some(Command::Skill(command)) => run_skill(command),
         Some(Command::Agent(command)) => run_agent_command(command),
+        Some(Command::Factory(command)) => proofkin::factory::cli::run(command).await,
         Some(Command::Spec(command)) => run_spec(command),
         Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command).await,
@@ -1632,7 +1637,7 @@ fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
         let access = e.access.map_or("-".to_owned(), |a| a.to_string());
         let outcome = serde_json::to_value(e.outcome)?;
         println!(
-            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}{}",
+            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}{}{}",
             format!(
                 "{} {:02}:{:02}:{:02}",
                 civil_date(days),
@@ -1660,7 +1665,25 @@ fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
                 .as_deref()
                 .map(|err| format!("\n{:>22}{err}", "error: "))
                 .unwrap_or_default(),
+            e.usage
+                .as_ref()
+                .map(|u| format!("\n{:>22}{}", "used: ", u.describe()))
+                .unwrap_or_default(),
         );
+    }
+    let totals = proofkin::audit::usage_totals(&entries);
+    if !totals.is_empty() {
+        println!("usage by peer and provider, as providers reported it:");
+        for t in &totals {
+            println!(
+                "  {:<14} {:<8} {:>5} task{}  {}",
+                t.peer,
+                t.provider,
+                t.tasks,
+                if t.tasks == 1 { " " } else { "s" },
+                t.usage.describe()
+            );
+        }
     }
     println!("log: {}", profile.audit_path().display());
     Ok(())

@@ -16,7 +16,7 @@ use proofkin::runs::{RunRecord, Verdict};
 use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
 use proofkin::{
     Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, Ran,
-    SecretKey, TaskContext, TrustStore, TrustedPeer,
+    SecretKey, TaskContext, TrustStore, TrustedPeer, Usage,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
@@ -57,7 +57,11 @@ impl Executor for FakeExecutor {
                 .ends_with("which model")
                 .then(|| "fake-model-7".to_owned())
         });
-        Ok(Ran::new(self.answer(task, ctx).await?, model).with_effort(task.effort.clone()))
+        // "report-usage": a provider that reports what each run used.
+        let usage = task.prompt.contains("report-usage").then(fake_usage);
+        Ok(Ran::new(self.answer(task, ctx).await?, model)
+            .with_effort(task.effort.clone())
+            .with_usage(usage))
     }
 
     /// Copilot lists three models: one with reasoning efforts, one without, and one
@@ -703,6 +707,67 @@ async fn the_worker_says_which_model_did_the_work() {
     let plan = Plan::parse("a @worker which model").unwrap();
     let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
     assert_eq!(states["a"].model(), Some("fake-model-7"));
+}
+
+/// What the fake provider says each "report-usage" run used.
+fn fake_usage() -> Usage {
+    Usage {
+        input_tokens: Some(1_000),
+        cached_input_tokens: Some(600),
+        output_tokens: Some(50),
+        premium_requests: Some(1.0),
+        cost_usd: None,
+    }
+}
+
+#[tokio::test]
+async fn the_worker_reports_what_its_provider_said_the_work_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let checks = parse_checks(&[format!("fixed={}", exists_check("fixed.txt"))]).unwrap();
+    worker
+        .shares
+        .add_with("repo", dir.path(), Access::Full, checks, false)
+        .unwrap();
+    worker.grant("boss", Access::Full, &["data", "repo"]);
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    worker.audit = Some(Arc::new(AuditLog::new(audit_path.clone())));
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let once = fake_usage();
+    let done = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "report-usage"))
+        .await
+        .unwrap();
+    assert_eq!(done.usage, Some(once.clone()));
+    // A provider that reports none: none, not zero.
+    let plain = boss
+        .delegate_verified(worker.id(), LlmTask::new(Provider::Copilot, "hello"))
+        .await
+        .unwrap();
+    assert_eq!(plain.usage, None);
+    // Every attempt's usage counts.
+    let retried = LlmTask::new(Provider::Copilot, "report-usage fix-on-retry")
+        .in_share("repo")
+        .with_checks(vec!["fixed".into()], Some(2));
+    let retried = boss.delegate_verified(worker.id(), retried).await.unwrap();
+    assert!(retried.ok, "{}", retried.output);
+    assert_eq!(retried.usage, Some(once.plus(&once)));
+    // The worker's audit records it, and neither the prompt nor the output.
+    let entries = AuditLog::read(&audit_path, 10).unwrap();
+    let used: Vec<Option<Usage>> = entries.iter().map(|e| e.usage.clone()).collect();
+    assert_eq!(used, [Some(once.clone()), None, Some(once.plus(&once))]);
+    let text = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        !text.contains("report-usage") && !text.contains("fixed it"),
+        "{text}"
+    );
 }
 
 #[tokio::test]

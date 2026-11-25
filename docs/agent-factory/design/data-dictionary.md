@@ -58,8 +58,8 @@ Rules that apply to every field:
 | Problem | path | string, a JSON pointer | No | Public | Point at the field | Not stored | Where in the blueprint, e.g. /capabilities/mcp/0 |
 | Draft | blueprint | Blueprint | Yes | Confidential | Show and edit the draft | Until the owner deletes the draft | The blueprint as drafted or edited |
 | Draft | problems | array of Problem | Yes | Internal | Say what must change before building | Not stored (computed) | Empty when it passes validation |
-| Draft | provenance | object {provider, model, effort, template, description_sha256, at} | Yes | Internal | Record what wrote the draft | As long as the agent; copied into releases | Which model wrote it, from which template, and a hash of the description (not its text) |
-| Draft | tries | integer, 1 to 3 | Yes | Internal | Show how many tries the model needed | Kept with the provenance | Model tries until it passed or gave up |
+| Draft | provenance | object {source, provider, model, effort, template, description_sha256, at} | Yes | Internal | Record what wrote the draft | As long as the agent; copied into releases | How it was first written (`model`, `template` or `file`): which model wrote it, from which template, and a hash of the description (not its text) |
+| Draft | tries | integer, 0 to 3 | Yes | Internal | Show how many tries the model needed | Kept with the provenance | Model tries until it passed or gave up; 0 when no model wrote it |
 | CheckRequest | folders | array of shared folder names | No | Internal | Check against these deployment folders | Not stored | Defaults to the blueprint's deploy folders |
 | CheckResult | passed | boolean | Yes | Public | Say whether it can be built | Not stored | True when no problem is an error |
 | CheckResult | problems | array of Problem | Yes | Internal | List errors and warnings with fixes | Not stored | Least-privilege warnings included |
@@ -156,7 +156,7 @@ Rules that apply to every field:
 | EvalRun | verdict | string: passed or failed, per expectation | Yes | Internal | Prove the requirement | As long as the agent | Each expectation's result |
 | EvalRun | evidence | object, signed evidence | Yes | Internal | Show the task ran as reported | As long as the agent | The worker's signed evidence of the task |
 | AuditEntry | agent | string, agent@version | No | Internal | Count tasks per agent and version | 90 days (the audit's) | Added to audit.jsonl; no prompt or output text |
-| AuditEntry | usage | object {input_tokens, output_tokens, cost} | No | Internal | Show usage and cost | 90 days (the audit's) | Only what the provider reports |
+| AuditEntry | usage | object {input_tokens, cached_input_tokens, output_tokens, premium_requests, cost_usd} | No | Internal | Show usage and cost | 90 days (the audit's) | Only what the provider reports: none when it reports none, never zero; Copilot premium requests, the Claude Agent SDK's cost estimate in US dollars |
 | Lesson | text | string (Markdown) | Yes | Confidential | Keep what verified work taught the agent | The blueprint's retention_days (90 by default) | Saved only from verified results; keeps Microsoft 365 labels |
 
 ## Domain model

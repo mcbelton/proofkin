@@ -9,6 +9,7 @@ use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::hooks::{HookContext, PostToolUseInput, PostToolUseOutput, SessionHooks};
 use github_copilot_sdk::rpc::SandboxConfig;
 use github_copilot_sdk::session::Session;
+use github_copilot_sdk::session_events::UsageGetMetricsResult;
 use github_copilot_sdk::subscription::RecvErrorKind;
 use github_copilot_sdk::types::{
     McpHttpServerConfig, McpServerConfig, McpStdioServerConfig, MessageOptions,
@@ -18,7 +19,7 @@ use github_copilot_sdk::{Client, ClientOptions};
 use serde_json::{Value, json};
 
 use super::policy::{Workspace, home_secret_paths};
-use super::{Access, LlmTask, Ran};
+use super::{Access, LlmTask, Ran, Usage};
 use crate::mcp::McpServer;
 use crate::profile::{
     CopilotCredentials, DEFAULT_GITHUB_HOST, INHERITED_CREDENTIAL_VARS, github_login,
@@ -356,6 +357,17 @@ impl CopilotBackend {
             .send_and_wait(MessageOptions::new(task.prompt.clone()).with_wait_timeout(TASK_TIMEOUT))
             .await;
         guard.0 = None;
+        // What the session used, as the CLI accounts for it (none if it doesn't say).
+        let usage = match &reply {
+            Ok(_) => session
+                .rpc()
+                .usage()
+                .get_metrics()
+                .await
+                .ok()
+                .and_then(|metrics| session_usage(&metrics)),
+            Err(_) => None,
+        };
         let mut used = models.lock().unwrap().clone();
         let mut used_efforts = efforts.lock().unwrap().clone();
         if used.is_empty() && reply.is_ok() {
@@ -387,8 +399,33 @@ impl CopilotBackend {
             Some(used.join(", "))
         };
         // The effort of the last model call, as the CLI says; else the one it was given.
-        Ok(Ran::new(text, model).with_effort(used_efforts.pop().or(effort)))
+        Ok(Ran::new(text, model)
+            .with_effort(used_efforts.pop().or(effort))
+            .with_usage(usage))
     }
+}
+
+/// What a session used, from the CLI's metrics: the tokens of every model it called
+/// (sub-agents' too) and the premium requests its prompt cost. None if it called none.
+fn session_usage(metrics: &UsageGetMetricsResult) -> Option<Usage> {
+    if metrics.model_metrics.is_empty() {
+        return None;
+    }
+    let count = |n: i64| u64::try_from(n).unwrap_or(0);
+    let (mut input, mut cached, mut output) = (0u64, 0u64, 0u64);
+    for metric in metrics.model_metrics.values() {
+        input = input.saturating_add(count(metric.usage.input_tokens));
+        cached = cached.saturating_add(count(metric.usage.cache_read_tokens));
+        output = output.saturating_add(count(metric.usage.output_tokens));
+    }
+    Some(Usage {
+        input_tokens: Some(input),
+        cached_input_tokens: Some(cached),
+        output_tokens: Some(output),
+        premium_requests: Some(metrics.total_premium_request_cost)
+            .filter(|n| n.is_finite() && *n >= 0.0),
+        cost_usd: None,
+    })
 }
 
 /// Adds the reasoning effort of a usage event of the session's own agent (not a
@@ -1101,6 +1138,48 @@ mod tests {
         assert_eq!(config["mcp-browser"]["env"]["TOKEN"], "t");
         assert_eq!(config["mcp-docs"]["type"], "sse");
         assert_eq!(config["mcp-docs"]["tools"], json!(["*"]));
+    }
+
+    #[test]
+    fn a_sessions_usage_is_its_models_tokens_and_its_premium_requests() {
+        use github_copilot_sdk::session_events::{
+            UsageMetricsModelMetric, UsageMetricsModelMetricUsage,
+        };
+        let metric = |input, cached, output| UsageMetricsModelMetric {
+            usage: UsageMetricsModelMetricUsage {
+                input_tokens: input,
+                cache_read_tokens: cached,
+                output_tokens: output,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let none = UsageGetMetricsResult::default();
+        assert_eq!(
+            session_usage(&none),
+            None,
+            "no model called: none, not zero"
+        );
+        let metrics = UsageGetMetricsResult {
+            model_metrics: [
+                ("claude-sonnet-5.5".to_owned(), metric(9_000, 6_000, 400)),
+                ("gpt-5-mini".to_owned(), metric(1_000, 0, 100)),
+                ("odd".to_owned(), metric(-5, -1, -2)),
+            ]
+            .into(),
+            total_premium_request_cost: 1.33,
+            ..Default::default()
+        };
+        assert_eq!(
+            session_usage(&metrics),
+            Some(Usage {
+                input_tokens: Some(10_000),
+                cached_input_tokens: Some(6_000),
+                output_tokens: Some(500),
+                premium_requests: Some(1.33),
+                cost_usd: None,
+            })
+        );
     }
 
     #[test]

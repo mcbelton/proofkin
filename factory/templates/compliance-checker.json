@@ -1,0 +1,44 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "compliance-checker",
+  "title": "Compliance checker",
+  "purpose": "Checks a change or document against the policies it is given and reports each gap with the clause it breaks",
+  "requirements": [
+    { "id": "R1", "text": "Names the policy clause behind each gap it reports" },
+    { "id": "R2", "text": "Rates each gap blocking or advisory" },
+    { "id": "R3", "text": "Answers Complies when it finds no gap, listing the clauses it checked" }
+  ],
+  "instructions": "You check material against the policies you are given.\n\nWrite one line per gap: `[blocking|advisory] clause: what breaks it, where (path:line or section)`. Cite each clause exactly as the policy numbers it. Blocking means a release must wait; advisory means it should be fixed later. If nothing breaks a policy, answer `Complies.` and list the clauses you checked.",
+  "skills": ["compliance-check"],
+  "capabilities": { "access": "read-only", "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "cost" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "Policies:\n- P-1: Personal data is never written to logs.\n- P-2: Every API call is authenticated.\n\nChange:\n```python\nlogger.info(f\"signed in {user.email}\")\n```",
+        "expect": [{ "contains": "P-1" }],
+        "smoke": true,
+        "timeout": "10m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "Policies:\n- P-1: Personal data is never written to logs.\n- P-2: Every API call is authenticated.\n\nChange:\n```python\nlogger.info(f\"signed in {user.email}\")\n```",
+        "expect": [{ "regex": "(?i)\\b(blocking|advisory)\\b" }],
+        "timeout": "10m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R3",
+        "input": "Policies:\n- P-1: Personal data is never written to logs.\n\nChange:\n```python\nlogger.info(\"sign-in succeeded\")\n```",
+        "expect": [{ "contains": "Complies" }],
+        "timeout": "10m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 2, "timeout_secs": 1800 },
+  "approvers": ["me"]
+}

@@ -3,6 +3,7 @@
 //! the outcome and how long it took. The prompt itself is not stored, only its
 //! SHA-256 and length, so the log can be kept without holding peers' prompts.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -12,7 +13,7 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::llm::{Access, LlmTask, Provider};
+use crate::llm::{Access, LlmTask, Provider, Usage};
 
 const MAX_ERROR_CHARS: usize = 300;
 
@@ -58,6 +59,9 @@ pub struct AuditEntry {
     /// The model that did the work, as its provider said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// What the work used, as its provider reported it (none if it reported none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 impl AuditEntry {
@@ -102,8 +106,41 @@ impl AuditEntry {
             origin: None,
             team: task.team.is_some(),
             model: None,
+            usage: None,
         }
     }
+}
+
+/// What one peer's tasks on one provider used, summed from audit entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageTotal {
+    pub peer: String,
+    pub provider: Provider,
+    /// How many of its tasks reported usage.
+    pub tasks: usize,
+    pub usage: Usage,
+}
+
+/// The usage of `entries` summed per peer and provider, by peer then provider. Tasks
+/// that reported none count in none.
+pub fn usage_totals(entries: &[AuditEntry]) -> Vec<UsageTotal> {
+    let mut totals: BTreeMap<(&str, Provider), (usize, Usage)> = BTreeMap::new();
+    for entry in entries {
+        if let Some(usage) = &entry.usage {
+            let total = totals.entry((&entry.peer, entry.provider)).or_default();
+            total.0 += 1;
+            total.1 = total.1.plus(usage);
+        }
+    }
+    totals
+        .into_iter()
+        .map(|((peer, provider), (tasks, usage))| UsageTotal {
+            peer: peer.to_owned(),
+            provider,
+            tasks,
+            usage,
+        })
+        .collect()
 }
 
 /// Append-only audit log file.
@@ -212,5 +249,66 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn usage_is_recorded_without_text_and_summed_per_peer_and_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::new(dir.path().join("audit.jsonl"));
+        let id = iroh::SecretKey::generate().public();
+        let ok: anyhow::Result<String> = Ok("the secret answer".into());
+        let used = |input, premium| Usage {
+            input_tokens: Some(input),
+            output_tokens: Some(10),
+            premium_requests: premium,
+            ..Usage::default()
+        };
+        let record = |peer: &str, provider, usage: Option<Usage>| {
+            let task = LlmTask::new(provider, "summarize secret-xyz");
+            let mut entry = AuditEntry::new(
+                peer,
+                &id,
+                1,
+                &task,
+                Some(Access::ReadOnly),
+                &ok,
+                SystemTime::now(),
+            );
+            entry.usage = usage;
+            log.record(&entry);
+        };
+        record("bob", Provider::Copilot, Some(used(100, Some(1.0))));
+        record("bob", Provider::Copilot, Some(used(50, Some(0.33))));
+        record("bob", Provider::Codex, Some(used(7, None)));
+        record("bob", Provider::Copilot, None);
+        record("amy", Provider::Copilot, Some(used(1, Some(1.0))));
+
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(!text.contains("secret"), "no prompt or output text: {text}");
+        assert!(
+            text.contains(
+                r#""usage":{"input_tokens":100,"output_tokens":10,"premium_requests":1.0}"#
+            )
+        );
+        let entries = AuditLog::read(log.path(), 10).unwrap();
+        assert_eq!(
+            entries[3].usage, None,
+            "none reported: none recorded, not zero"
+        );
+        let totals = usage_totals(&entries);
+        let summed: Vec<(&str, Provider, usize, Option<u64>)> = totals
+            .iter()
+            .map(|t| (t.peer.as_str(), t.provider, t.tasks, t.usage.input_tokens))
+            .collect();
+        assert_eq!(
+            summed,
+            [
+                ("amy", Provider::Copilot, 1, Some(1)),
+                ("bob", Provider::Copilot, 2, Some(150)),
+                ("bob", Provider::Codex, 1, Some(7)),
+            ]
+        );
+        assert_eq!(totals[1].usage.premium_requests, Some(1.33));
+        assert_eq!(totals[2].usage.premium_requests, None);
     }
 }

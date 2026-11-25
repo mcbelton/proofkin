@@ -207,6 +207,7 @@
                     }
                   ],
                   "provenance": {
+                    "source": "model",
                     "provider": "copilot",
                     "model": "claude-sonnet-5.5",
                     "effort": "high",
@@ -393,6 +394,7 @@
                     }
                   ],
                   "provenance": {
+                    "source": "model",
                     "provider": "copilot",
                     "model": "claude-sonnet-5.5",
                     "effort": "high",
@@ -1752,6 +1754,7 @@
                     }
                   ],
                   "provenance": {
+                    "source": "model",
                     "provider": "copilot",
                     "model": "claude-sonnet-5.5",
                     "effort": "high",
@@ -2200,7 +2203,23 @@
                 }
               },
               "thresholds": {
-                "type": "object"
+                "type": "object",
+                "properties": {
+                  "pass_rate": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "requirement_pass_rate": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "p95_secs": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
               }
             }
           },
@@ -2414,11 +2433,18 @@
           "provenance": {
             "type": "object",
             "required": [
-              "provider",
-              "model",
+              "source",
               "at"
             ],
             "properties": {
+              "source": {
+                "type": "string",
+                "enum": [
+                  "model",
+                  "template",
+                  "file"
+                ]
+              },
               "provider": {
                 "type": "string",
                 "enum": [
@@ -2448,7 +2474,8 @@
           },
           "tries": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "maximum": 3
           }
         }
       },

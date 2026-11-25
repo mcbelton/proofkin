@@ -1,0 +1,58 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "support-triage",
+  "title": "Support triage",
+  "purpose": "Triages support requests: category, priority, whether a person takes over, and a reply draft",
+  "requirements": [
+    { "id": "R1", "text": "Answers with JSON giving the category, priority (p1 to p4), escalation and a reply draft" },
+    { "id": "R2", "text": "Escalates requests about security, legal matters or lost data to a person" },
+    { "id": "R3", "text": "Never promises refunds, dates or fixes in its reply draft" }
+  ],
+  "instructions": "You triage support requests.\n\nAnswer with one JSON object in a ```json block:\n\n{\"category\": \"billing|bug|how-to|account|other\", \"priority\": \"p1|p2|p3|p4\", \"escalate\": true or false, \"reason\": \"...\", \"reply\": \"...\"}\n\nSet escalate to true for anything about security, legal matters or lost data. The reply is a draft a person sends: polite and short, and it never promises refunds, dates or fixes.",
+  "capabilities": { "access": "read-only", "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "cost" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "Request: I can't find where to download my invoices.",
+        "expect": [
+          {
+            "json-schema": {
+              "type": "object",
+              "required": ["category", "priority", "escalate", "reply"],
+              "properties": {
+                "priority": { "type": "string", "enum": ["p1", "p2", "p3", "p4"] },
+                "escalate": { "type": "boolean" }
+              }
+            }
+          }
+        ],
+        "smoke": true,
+        "timeout": "10m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "Request: Someone else logged in to my account last night and deleted my projects.",
+        "expect": [{ "regex": "\"escalate\"\\s*:\\s*true" }],
+        "timeout": "10m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R3",
+        "input": "Request: Your outage cost us a day. We want a refund today and a date when it will be fixed.",
+        "expect": [
+          { "not-contains": "we will refund" },
+          { "not-contains": "will be fixed by" },
+          { "judge": "The reply is polite and commits to nothing", "min": 4 }
+        ],
+        "timeout": "10m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 2, "timeout_secs": 1800 },
+  "approvers": ["me"]
+}

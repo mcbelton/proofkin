@@ -247,13 +247,14 @@ impl TaskContext {
 }
 
 /// What a model run gave back: its answer, the model that gave it, if the provider
-/// says (several, comma-separated, if the run used more than one), and the reasoning
-/// effort it worked at, if known.
+/// says (several, comma-separated, if the run used more than one), the reasoning
+/// effort it worked at, if known, and what it used, if the provider reports it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ran {
     pub output: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub usage: Option<Usage>,
 }
 
 impl Ran {
@@ -262,6 +263,7 @@ impl Ran {
             output: output.into(),
             model: model.map(|m| clean_model(&m)).filter(|m| !m.is_empty()),
             effort: None,
+            usage: None,
         }
     }
 
@@ -270,6 +272,12 @@ impl Ran {
         self.effort = effort
             .map(|e| e.trim().to_ascii_lowercase())
             .filter(|e| crate::models::check_effort(e).is_ok());
+        self
+    }
+
+    /// The run, saying what it used (none if that says nothing; see [`Usage::checked`]).
+    pub fn with_usage(mut self, usage: Option<Usage>) -> Self {
+        self.usage = usage.and_then(Usage::checked);
         self
     }
 
@@ -297,6 +305,143 @@ impl From<String> for Ran {
     fn from(output: String) -> Self {
         Self::new(output, None)
     }
+}
+
+/// What model runs used, as their provider reported it: tokens, and the cost where the
+/// provider says. What a provider doesn't report is left out, never zero, and a run
+/// whose provider reports nothing has no usage at all. It never holds any text.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Tokens the model read, those from its prompt cache included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Of those, the ones read from its prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// Tokens it wrote, its reasoning included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// GitHub Copilot premium requests, with the model's multiplier applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premium_requests: Option<f64>,
+    /// What the provider estimates it cost, in US dollars (the Claude Agent SDK does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+// Its amounts are numbers: JSON has no NaN, and `from_json` keeps only finite ones.
+impl Eq for Usage {}
+
+impl Usage {
+    /// Whether it says nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `self` and `other` together: each figure summed where either reports it.
+    pub fn plus(&self, other: &Usage) -> Usage {
+        fn tokens(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (a, b) => a.or(b),
+            }
+        }
+        fn amount(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            }
+        }
+        Usage {
+            input_tokens: tokens(self.input_tokens, other.input_tokens),
+            cached_input_tokens: tokens(self.cached_input_tokens, other.cached_input_tokens),
+            output_tokens: tokens(self.output_tokens, other.output_tokens),
+            premium_requests: amount(self.premium_requests, other.premium_requests),
+            cost_usd: amount(self.cost_usd, other.cost_usd),
+        }
+    }
+
+    /// Runs' usage together; none if none of them reported any.
+    pub fn sum<'a>(usages: impl IntoIterator<Item = &'a Usage>) -> Option<Usage> {
+        usages
+            .into_iter()
+            .fold(None, |total: Option<Usage>, u| {
+                Some(total.map_or_else(|| u.clone(), |t| t.plus(u)))
+            })
+            .filter(|u| !u.is_empty())
+    }
+
+    /// Usage in JSON as the bridge reports it (the fields above), keeping only figures
+    /// that are (see [`Usage::checked`]). None if no figure is.
+    pub fn from_json(value: &serde_json::Value) -> Option<Usage> {
+        let tokens = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        let amount = |key: &str| value.get(key).and_then(serde_json::Value::as_f64);
+        Usage {
+            input_tokens: tokens("input_tokens"),
+            cached_input_tokens: tokens("cached_input_tokens"),
+            output_tokens: tokens("output_tokens"),
+            premium_requests: amount("premium_requests"),
+            cost_usd: amount("cost_usd"),
+        }
+        .checked()
+    }
+
+    /// The usage with only amounts that are finite and not negative (token counts are
+    /// whole numbers already); none if nothing is left. For what peers and SDKs say.
+    pub fn checked(mut self) -> Option<Usage> {
+        for amount in [&mut self.premium_requests, &mut self.cost_usd] {
+            if amount.is_some_and(|n| !n.is_finite() || n < 0.0) {
+                *amount = None;
+            }
+        }
+        Some(self).filter(|u| !u.is_empty())
+    }
+
+    /// For people, with only what it reports: "12,345 tokens in (10,000 cached),
+    /// 678 tokens out, 1 premium request, $0.0123".
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        match (self.input_tokens, self.cached_input_tokens) {
+            (Some(n), Some(c)) => parts.push(format!(
+                "{} tokens in ({} cached)",
+                thousands(n),
+                thousands(c)
+            )),
+            (Some(n), None) => parts.push(format!("{} tokens in", thousands(n))),
+            (None, Some(c)) => parts.push(format!("{} cached tokens in", thousands(c))),
+            (None, None) => {}
+        }
+        if let Some(n) = self.output_tokens {
+            parts.push(format!("{} tokens out", thousands(n)));
+        }
+        if let Some(n) = self.premium_requests {
+            let shown = format!("{n:.2}");
+            let shown = shown.trim_end_matches('0').trim_end_matches('.');
+            let s = if shown == "1" { "" } else { "s" };
+            parts.push(format!("{shown} premium request{s}"));
+        }
+        if let Some(usd) = self.cost_usd {
+            parts.push(if usd < 1.0 {
+                format!("${usd:.4}")
+            } else {
+                format!("${usd:.2}")
+            });
+        }
+        parts.join(", ")
+    }
+}
+
+/// `n` with its thousands separated by commas.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Runs [`LlmTask`]s. Implemented by [`SdkExecutor`]; tests can supply fakes.
@@ -394,6 +539,14 @@ impl SdkExecutor {
             None => Ok(Vec::new()),
         }
     }
+
+    /// Stops its Copilot CLI instance, for a command that started one only for a task
+    /// (the Node bridge stops when the executor is dropped).
+    pub async fn stop(&self) {
+        if let Some(copilot) = &self.copilot {
+            copilot.stop().await;
+        }
+    }
 }
 
 #[async_trait]
@@ -445,7 +598,7 @@ impl Executor for SdkExecutor {
             );
         }
         let task = &task;
-        let (mut model, mut effort) = (None, None);
+        let (mut model, mut effort, mut usage) = (None, None, None);
         let run = async {
             let ran = match task.provider {
                 Provider::Copilot => {
@@ -465,10 +618,13 @@ impl Executor for SdkExecutor {
             }?;
             model = ran.model;
             effort = ran.effort;
+            usage = ran.usage;
             Ok(ran.output)
         };
         let output = changes::track_changes(&ctx.workspace, ctx.access, run).await?;
-        Ok(Ran::new(output, model).with_effort(effort))
+        Ok(Ran::new(output, model)
+            .with_effort(effort)
+            .with_usage(usage))
     }
 }
 
@@ -523,6 +679,64 @@ mod tests {
         );
         assert_eq!(clean_model(&"m".repeat(300)).len(), 100);
         assert_eq!(Ran::new("out", Some("`".into())).model, None);
+    }
+
+    #[test]
+    fn usage_keeps_only_what_providers_report_and_adds_up_runs() {
+        let bridge = serde_json::json!({
+            "input_tokens": 12_345, "cached_input_tokens": 10_000, "output_tokens": 678,
+            "cost_usd": 0.0123, "premium_requests": -1, "surprise": "ignored"
+        });
+        let claude = Usage::from_json(&bridge).unwrap();
+        assert_eq!(claude.premium_requests, None, "a negative amount isn't one");
+        assert_eq!(
+            claude.describe(),
+            "12,345 tokens in (10,000 cached), 678 tokens out, $0.0123"
+        );
+        // A provider that reports nothing (or nothing usable) gives no usage, not zero.
+        for nothing in [
+            serde_json::json!({}),
+            serde_json::json!(null),
+            serde_json::json!({ "input_tokens": "many", "output_tokens": -3, "cost_usd": "1" }),
+        ] {
+            assert_eq!(Usage::from_json(&nothing), None, "{nothing}");
+        }
+        assert_eq!(
+            Ran::new("out", None)
+                .with_usage(Some(Usage::default()))
+                .usage,
+            None
+        );
+
+        let copilot = Usage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(22),
+            premium_requests: Some(1.0),
+            ..Usage::default()
+        };
+        assert_eq!(
+            copilot.describe(),
+            "1,000 tokens in, 22 tokens out, 1 premium request"
+        );
+        // Each figure adds up where any run reports it, and stays out where none does.
+        let total = Usage::sum([&copilot, &claude, &copilot]).unwrap();
+        assert_eq!(total.input_tokens, Some(14_345));
+        assert_eq!(total.cached_input_tokens, Some(10_000));
+        assert_eq!(total.output_tokens, Some(722));
+        assert_eq!(total.premium_requests, Some(2.0));
+        assert_eq!(total.cost_usd, Some(0.0123));
+        assert_eq!(Usage::sum([]), None);
+        let premium = Usage {
+            premium_requests: Some(0.33 + 1.0),
+            cost_usd: Some(12.5),
+            ..Usage::default()
+        };
+        assert_eq!(premium.describe(), "1.33 premium requests, $12.50");
+        // On the wire, what isn't reported isn't sent.
+        assert_eq!(
+            serde_json::to_string(&copilot).unwrap(),
+            r#"{"input_tokens":1000,"output_tokens":22,"premium_requests":1.0}"#
+        );
     }
 
     #[test]

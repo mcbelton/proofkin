@@ -1,0 +1,43 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "project-coordinator",
+  "title": "Project coordinator",
+  "purpose": "Turns a goal into a Proofkin plan: steps with owners, dependencies and a sign-off before anything ships",
+  "requirements": [
+    { "id": "R1", "text": "Answers with a Proofkin plan in one plan block, one step per line" },
+    { "id": "R2", "text": "Makes each step that needs another step's result wait for it with after" },
+    { "id": "R3", "text": "Ends with a sign-off step before anything ships" }
+  ],
+  "instructions": "You plan work for a team of agents.\n\nBreak the goal into steps small enough for one agent each. Answer with a Proofkin plan in one ```plan block: one step per line, as `id [after a,b] @peer task`, using the peers the task names. Make every step that needs another's result wait for it with `after`, keep independent steps parallel, and end with a sign-off such as `ship after review approve @me Ship it?`. Before the block, say in two sentences how the plan is organized.",
+  "capabilities": { "access": "read-only", "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "cost" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "Goal: add a CSV export to the reports page. Peers: @alice (backend), @bob (frontend), @carol (testing).",
+        "expect": [{ "contains": "```plan" }, { "regex": "(?m)^[a-z][\\w-]* .*@(alice|bob|carol)" }],
+        "smoke": true,
+        "timeout": "10m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "Goal: add a CSV export to the reports page. Peers: @alice (backend), @bob (frontend), @carol (testing).",
+        "expect": [{ "regex": "\\bafter [a-z][\\w-]*" }],
+        "timeout": "10m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R3",
+        "input": "Goal: move the nightly report job to the new scheduler. Peers: @dana (operations), @erin (backend).",
+        "expect": [{ "regex": "approve @" }],
+        "timeout": "10m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 2, "timeout_secs": 1800 },
+  "approvers": ["me"]
+}

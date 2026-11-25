@@ -11,6 +11,7 @@ pub mod boundary;
 pub mod checks_mcp;
 pub mod design;
 pub mod evidence;
+pub mod factory;
 pub mod gh_auth;
 pub mod github;
 pub mod knowledge;
@@ -45,7 +46,9 @@ pub mod worktree;
 
 pub use agent::{Agent, AgentConfig, ApprovalInfo, Delivered, Event, Network, PeerInfo};
 pub use iroh::{EndpointAddr, EndpointId, SecretKey};
-pub use llm::{Access, Executor, ExecutorConfig, LlmTask, Provider, Ran, SdkExecutor, TaskContext};
+pub use llm::{
+    Access, Executor, ExecutorConfig, LlmTask, Provider, Ran, SdkExecutor, TaskContext, Usage,
+};
 pub use profile::Profile;
 pub use protocol::Message;
 pub use trust::{M365Grant, Ticket, TrustStore, TrustedPeer};

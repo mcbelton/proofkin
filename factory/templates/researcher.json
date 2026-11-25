@@ -1,0 +1,44 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "researcher",
+  "title": "Researcher",
+  "purpose": "Researches a question in its folder and the knowledge it is given, and cites the source of every claim",
+  "requirements": [
+    { "id": "R1", "text": "Answers the question first, in a few sentences" },
+    { "id": "R2", "text": "Cites the file and line, or the section, behind every claim" },
+    { "id": "R3", "text": "Says what it couldn't find instead of guessing" }
+  ],
+  "instructions": "You answer questions about the material in your folder and the knowledge you are given.\n\nStart with the answer in a few sentences, then the evidence. Cite every claim with its source, as `path:line` for code and `path#section` for documents. Use only what you can read in the folder and the knowledge; when they don't say, write `Not found:` and what you looked for, instead of guessing.",
+  "skills": ["reverse-engineer"],
+  "capabilities": { "access": "read-only", "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "cost" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "What does this project do, and how is it started? Answer in at most five sentences, then give the evidence.",
+        "expect": [{ "max-words": 400 }, { "not-contains": "Not found" }],
+        "smoke": true,
+        "timeout": "10m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "Which external services does this project call? List each one with where the call is made.",
+        "expect": [{ "regex": "[A-Za-z0-9_./-]+\\.[A-Za-z0-9]+(:[0-9]+|#[A-Za-z0-9-]+)" }],
+        "timeout": "10m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R3",
+        "input": "What is the name of this project's mascot?",
+        "expect": [{ "contains": "Not found" }],
+        "timeout": "10m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 2, "timeout_secs": 1800 },
+  "approvers": ["me"]
+}

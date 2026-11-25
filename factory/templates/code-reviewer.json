@@ -1,0 +1,61 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "code-reviewer",
+  "title": "Code reviewer",
+  "purpose": "Reviews a change like a senior engineer and reports each finding with its file, line, severity and fix",
+  "requirements": [
+    { "id": "R1", "text": "Reports each finding as path:line, a severity (high, medium or low), the problem and a fix" },
+    { "id": "R2", "text": "Finds injection flaws and secrets written into code" },
+    { "id": "R3", "text": "Answers No findings when the change is sound, instead of inventing problems" }
+  ],
+  "instructions": "You review code changes for correctness, security and maintainability, the way a senior engineer would.\n\nRead the change and the code around it. Report each finding on its own line, most severe first:\n\n`path:line severity: the problem. Fix: what to change.`\n\nSeverity is high, medium or low. Report only what you can point to in the code. If the change is sound, answer `No findings.` and say what you checked. Don't rewrite the change yourself.",
+  "skills": ["code-review", "security-review"],
+  "capabilities": { "access": "read-only", "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "cost" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "Review this change:\n\n```diff\n--- a/app/users.py\n+++ b/app/users.py\n@@ -10,2 +10,3 @@ def find_user(db, name):\n-    return db.execute(\"SELECT * FROM users WHERE name = ?\", (name,))\n+    query = \"SELECT * FROM users WHERE name = '\" + name + \"'\"\n+    return db.execute(query)\n```",
+        "expect": [
+          { "regex": "users\\.py:1[0-9]" },
+          { "regex": "(?i)\\b(high|medium|low)\\b" },
+          { "regex": "(?i)\\bfix\\b" }
+        ],
+        "smoke": true,
+        "timeout": "10m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "Review this change:\n\n```diff\n--- a/app/users.py\n+++ b/app/users.py\n@@ -10,2 +10,3 @@ def find_user(db, name):\n-    return db.execute(\"SELECT * FROM users WHERE name = ?\", (name,))\n+    query = \"SELECT * FROM users WHERE name = '\" + name + \"'\"\n+    return db.execute(query)\n```",
+        "expect": [
+          { "regex": "(?i)injection" },
+          { "judge": "The fix uses a parameterized query instead of building the SQL from text", "min": 4 }
+        ],
+        "timeout": "10m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R2",
+        "input": "Review this change:\n\n```diff\n--- a/app/config.py\n+++ b/app/config.py\n@@ -1,1 +1,2 @@\n DATABASE_HOST = os.environ[\"DATABASE_HOST\"]\n+DATABASE_PASSWORD = \"hunter2-prod\"\n```",
+        "expect": [
+          { "regex": "(?i)(secret|password|credential)" },
+          { "contains": "config.py" }
+        ],
+        "timeout": "10m"
+      },
+      {
+        "id": "E4",
+        "requirement": "R3",
+        "input": "Review this change:\n\n```diff\n--- a/app/report.py\n+++ b/app/report.py\n@@ -3,3 +3,1 @@ def total(items):\n-    t = 0\n-    for i in items: t += i.amount\n-    return t\n+    return sum(item.amount for item in items)\n```",
+        "expect": [{ "contains": "No findings" }],
+        "timeout": "10m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 2, "timeout_secs": 1800 },
+  "approvers": ["me"]
+}

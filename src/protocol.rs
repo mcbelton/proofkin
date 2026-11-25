@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::evidence::Evidence;
-use crate::llm::{LlmTask, Provider};
+use crate::llm::{LlmTask, Provider, Usage};
 use crate::shares::ShareInfo;
 
 /// QUIC ALPN identifying this protocol; peers speaking anything else are refused.
@@ -75,6 +75,10 @@ pub enum Message {
         /// The worker also names it in the signed output's evidence summary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// What the work used, as its provider reported it: tokens, and premium requests
+        /// or cost where it says (none if it reported none; older peers don't say).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
     },
     /// Where a task the receiver delegated is now (sent while it runs, when it moves on).
     TaskProgress {
@@ -338,6 +342,7 @@ mod tests {
             Message::TaskResult {
                 refused: false,
                 model: None,
+                usage: None,
                 ..
             }
         ));
@@ -349,9 +354,19 @@ mod tests {
             patch: None,
             refused: false,
             model: Some("claude-sonnet-5.5".into()),
+            usage: Some(Usage {
+                input_tokens: Some(1200),
+                output_tokens: Some(80),
+                cost_usd: Some(0.0123),
+                ..Usage::default()
+            }),
         };
         let json = serde_json::to_string(&with_model).unwrap();
         assert!(json.contains(r#""model":"claude-sonnet-5.5""#), "{json}");
+        assert!(
+            json.contains(r#""usage":{"input_tokens":1200,"output_tokens":80,"cost_usd":0.0123}"#),
+            "{json}"
+        );
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), with_model);
         let load = r#"{"type":"load","running":2,"queued":1,"slots":2}"#;
         assert_eq!(
