@@ -3327,8 +3327,10 @@ async fn the_page_follows_the_ux_guidelines() {
 
 /// The plan editor (ui/plan-text.js) keeps plans valid: its palette puts each part
 /// where the plan syntax expects it, the plan check's fixes change the text as they
-/// say, and the builder's model writes back the plan it read. The cases
-/// (tests/plan_text.test.cjs) run in node, which loads the script as the page does.
+/// say, and the builder's model writes back the plan it read, each edit changing only
+/// its own options (among them a step's Microsoft 365 sources, `workiq=`, and a
+/// `@workiq` step's agent). The cases (tests/plan_text.test.cjs) run in node, which
+/// loads the script as the page does.
 #[test]
 fn the_plan_editor_keeps_plans_valid() {
     let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plan_text.test.cjs");
@@ -4131,6 +4133,204 @@ async fn the_workiq_import_route_writes_nothing_when_every_result_was_withheld()
     agent.shutdown().await;
 }
 
+/// The Knowledge section imports from Microsoft 365: its button opens a dialog with the
+/// topic, what to look for, where to look and whether to replace the topic, which says the
+/// topic keeps where it came from, closes with Escape and Cancel, shows the route's answer or
+/// error, and sends what the import route takes (by default all of Microsoft 365); the
+/// knowledge list then has the topic, with its labels.
+#[tokio::test]
+async fn the_knowledge_section_imports_from_microsoft_365_through_a_dialog() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, agent, port, token) = ui_with_work_results(
+        home.path(),
+        vec![
+            found_file("f1", "General", "Launch is in May.", "allowed"),
+            found_file("f2", "General", "Hidden.", "blocked"),
+        ],
+    )
+    .await;
+    let host = format!("127.0.0.1:{port}");
+    let page = request(port, "GET", "/", &host, None, None).await.body;
+    let at = |needle: &str| page.find(needle).expect(needle);
+    let kb = at(r#"<section class="runs-panel" aria-labelledby="kb-h">"#);
+    let section = &page[kb..kb + page[kb..].find("</section>").unwrap()];
+    assert!(
+        section.contains(r#"id="kb-import-btn">Import from Microsoft 365</button>"#),
+        "{section}"
+    );
+    let start = at(r#"<dialog id="kb-import-dialog""#);
+    let dialog = &page[start..start + page[start..].find("</dialog>").unwrap()];
+    for words in [
+        "<span>Topic name</span>",
+        "<span>What to look for</span>",
+        r#"maxlength="1000""#,
+        "<legend>Where to look</legend>",
+        "<span>Replace the topic if it exists</span>",
+        "The topic keeps where it came from: Microsoft 365, with the sensitivity labels of what it",
+        "it goes only to peers whose Microsoft 365 grant covers those labels",
+        r#"<p class="small" id="kb-import-result" role="status"></p>"#,
+        r#"<p class="form-error" id="kb-import-error" role="alert"></p>"#,
+        r#"<button type="button" class="btn" id="kb-import-cancel">Cancel</button>"#,
+        r#"<button type="submit" class="btn primary" id="kb-import-submit">Import topic</button>"#,
+    ] {
+        assert!(dialog.contains(words), "{words}: {dialog}");
+    }
+    let app = request(port, "GET", "/app.js", &host, None, None)
+        .await
+        .body;
+    let guarded = regex::Regex::new(r"for \(const id of \[([^\]]+)\]\) guardDialog")
+        .unwrap()
+        .captures(&app)
+        .expect("app.js guards its dialogs")[1]
+        .to_owned();
+    assert!(guarded.contains("\"#kb-import-dialog\""), "{guarded}");
+    let closes = concat!(
+        r##"$("#kb-import-cancel").addEventListener("click", "##,
+        r##"() => $("#kb-import-dialog").close());"##,
+    );
+    assert!(app.contains(closes), "Cancel doesn't close the dialog");
+    // An element app.js looks up that isn't on the page stops it starting: the button is in
+    // the Knowledge section, the rest in the dialog.
+    let ids = regex::Regex::new(r##""#(kb-import[\w-]*)"##)
+        .unwrap()
+        .captures_iter(&app)
+        .map(|c| c[1].to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(ids.len() >= 10, "{ids:?}");
+    for id in ids.iter().filter(|id| *id != "kb-import-btn") {
+        assert!(
+            dialog.contains(&format!(r#"id="{id}""#)),
+            "#{id} isn't in the dialog"
+        );
+    }
+    assert!(
+        app.contains(r#"api("/api/kb/import/workiq""#),
+        "the dialog doesn't import"
+    );
+
+    // What the dialog sends unless told otherwise: all of Microsoft 365, not replacing.
+    let body = serde_json::json!({
+        "topic": "launch",
+        "query": "the launch",
+        "from": "all",
+        "replace": false,
+    });
+    let done = import_workiq(port, Some(&token), body).await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    assert_eq!(
+        done.json(),
+        serde_json::json!({ "topic": "launch", "kept": 1, "withheld": 1, "labels": ["General"] })
+    );
+    let ops = call_ui(port, Some(&token), "GET", "/api/ops", Value::Null)
+        .await
+        .json();
+    let topic = ops["knowledge"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "launch")
+        .cloned()
+        .expect("the knowledge list has the topic");
+    assert_eq!(topic["workiq"], serde_json::json!(["General"]));
+    agent.shutdown().await;
+}
+
+/// A saved run answers, for each of its steps that had Microsoft 365 work context, where it
+/// came from: the sources, their labels, and how many results were kept and withheld, which
+/// the run dialog shows. Never the context itself: the run keeps it in its folder, and
+/// nothing of it reaches the page.
+#[tokio::test]
+async fn a_run_answers_its_steps_microsoft_365_sources_but_never_what_they_said() {
+    use proofkin::plan::WorkRecord;
+    use proofkin::workiq::content::Source;
+    let home = tempfile::tempdir().unwrap();
+    let profile = Profile::open_in(home.path(), "owner").unwrap();
+    let text = "find @alice workiq=files,email Summarize the launch\n\
+                notes after find @alice Write the launch notes";
+    let plan = proofkin::plan::Plan::parse(text).unwrap();
+    let mut run = proofkin::runs::RunRecord::new(
+        "owner",
+        &SecretKey::generate().public().to_string(),
+        text,
+        &plan,
+        &std::collections::BTreeMap::new(),
+        proofkin::runs::unix_now() - 60,
+    );
+    run.id = "run-1".into();
+    // What step find's search found: two results kept, whose text went into its prompt, and
+    // one withheld.
+    let context = "### From Microsoft 365\nThe budget is four million; the launch moves to May.";
+    let link = "https://contoso.sharepoint.com/sites/launch/Plan.docx";
+    run.workiq.insert(
+        "find".into(),
+        WorkRecord {
+            sources: vec![
+                Source {
+                    title: "Launch plan.docx".into(),
+                    kind: "file".into(),
+                    label: "General".into(),
+                    link: Some(link.into()),
+                },
+                Source {
+                    title: "Re: launch date".into(),
+                    kind: "email".into(),
+                    label: "General".into(),
+                    link: None,
+                },
+            ],
+            labels: vec!["General".into()],
+            kept: 2,
+            withheld: 1,
+            request_ids: "req-1".into(),
+            sha256: proofkin::evidence::sha256_hex(context.as_bytes()),
+            text: context.into(),
+        },
+    );
+    run.save(&profile.runs_dir()).unwrap();
+    let kept = profile.runs_dir().join("run-1").join("find.workiq.md");
+    assert_eq!(std::fs::read_to_string(kept).unwrap(), context);
+
+    let (agent, port, token) = ui_of(home.path(), "owner").await;
+    let path = "/api/runs/run-1";
+    let anonymous = call_ui(port, None, "GET", path, Value::Null).await;
+    assert_eq!(anonymous.status, 401, "{}", anonymous.body);
+    let answer = call_ui(port, Some(&token), "GET", path, Value::Null).await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(
+        answer.json()["workiq"],
+        serde_json::json!([{
+            "step": "find",
+            "sources": [
+                { "title": "Launch plan.docx", "kind": "file", "label": "General", "link": link },
+                { "title": "Re: launch date", "kind": "email", "label": "General", "link": null },
+            ],
+            "labels": ["General"],
+            "kept": 2,
+            "withheld": 1,
+        }]),
+        "only the step that had some, without its text"
+    );
+    for words in ["four million", "moves to May", "From Microsoft 365"] {
+        assert!(!answer.body.contains(words), "{words}: {}", answer.body);
+    }
+
+    // The run dialog shows them between the run's work and its report.
+    let page = call_ui(port, None, "GET", "/", Value::Null).await.body;
+    let at = |needle: &str| page.find(needle).expect(needle);
+    let place = at(r#"<div id="run-workiq""#);
+    assert!(at(r#"<dialog id="run-dialog""#) < at(r#"id="run-pulls""#));
+    assert!(at(r#"id="run-pulls""#) < place);
+    assert!(place < at(r#"id="run-report""#));
+    let app = call_ui(port, None, "GET", "/app.js", Value::Null)
+        .await
+        .body;
+    assert!(
+        app.contains("renderRunWorkiq(run.workiq ?? [])"),
+        "the run dialog doesn't show them"
+    );
+    agent.shutdown().await;
+}
+
 /// The owner signs in to Work IQ while the agent runs (`proofkin auth login workiq` in
 /// another process): the web UI's plan check, plans and imports use the sign-in at once.
 #[tokio::test]
@@ -4185,17 +4385,23 @@ const FAKE_WORKIQ_CLI: &str = concat!(
 );
 
 /// A Work IQ CLI at a path of its own (not on the PATH), started as the real one is:
-/// `workiq.cmd` on Windows, `workiq` elsewhere. It logs what it was asked in `state`.
-fn fake_workiq_cli_at(dir: &std::path::Path, state: &std::path::Path) -> std::path::PathBuf {
+/// `workiq.cmd` on Windows, `workiq` elsewhere, in one of the fake's modes (`ok` offers
+/// retrieve, send_mail and inspect; `full` retrieve, ask and list_agents). It logs what it
+/// was asked in `state`.
+fn fake_workiq_cli_at(
+    dir: &std::path::Path,
+    state: &std::path::Path,
+    mode: &str,
+) -> std::path::PathBuf {
     let (script, state) = (FAKE_WORKIQ_CLI, state.display());
     if cfg!(windows) {
         let path = dir.join("workiq.cmd");
-        let text = format!("@python \"{script}\" \"{state}\" ok %*\r\n");
+        let text = format!("@python \"{script}\" \"{state}\" {mode} %*\r\n");
         std::fs::write(&path, text).unwrap();
         path
     } else {
         let path = dir.join("workiq");
-        let text = format!("#!/bin/sh\nexec python3 '{script}' '{state}' ok \"$@\"\n");
+        let text = format!("#!/bin/sh\nexec python3 '{script}' '{state}' {mode} \"$@\"\n");
         std::fs::write(&path, text).unwrap();
         #[cfg(unix)]
         {
@@ -4229,7 +4435,7 @@ async fn the_workiq_api_signs_in_through_the_cli_runs_the_doctor_sets_budgets_an
     let name = "proofkin-ui-test-workiq";
     let home = tempfile::tempdir().unwrap();
     let (bin, cli_state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let cli = fake_workiq_cli_at(bin.path(), cli_state.path());
+    let cli = fake_workiq_cli_at(bin.path(), cli_state.path(), "ok");
     let (agent, port, token) = ui_of(home.path(), name).await;
     let call = |method: &'static str, path: &'static str, body: Value| {
         let token = token.clone();
@@ -4354,6 +4560,71 @@ async fn the_workiq_api_signs_in_through_the_cli_runs_the_doctor_sets_budgets_an
     let state = call("GET", "/api/state", Value::Null).await.json();
     let feed = state["feed"].to_string();
     assert!(feed.contains("Work IQ signed out"), "{feed}");
+    agent.shutdown().await;
+}
+
+/// The declarative agents a `@workiq` step can ask, for the plan builder's Agent list (which
+/// asks this route): those Work IQ lists for the profile's account, only with the access
+/// token, and a 400 that says why, on one line, when the profile isn't signed in or Work IQ
+/// can't list them.
+#[tokio::test]
+async fn the_workiq_agents_route_lists_the_agents_work_iq_offers_and_says_why_it_cannot() {
+    let home = tempfile::tempdir().unwrap();
+    let (agent, port, token) = ui_of(home.path(), "owner").await;
+    let path = "/api/workiq/agents";
+    let anonymous = call_ui(port, None, "GET", path, Value::Null).await;
+    assert_eq!(anonymous.status, 401, "{}", anonymous.body);
+
+    let not_signed_in = call_ui(port, Some(&token), "GET", path, Value::Null).await;
+    assert_eq!(not_signed_in.status, 400, "{}", not_signed_in.body);
+    let hint = "proofkin auth login workiq --profile owner";
+    assert_eq!(
+        not_signed_in.json()["error"],
+        format!("Work IQ is not signed in for profile 'owner'; run: {hint}")
+    );
+
+    // Signed in through a Work IQ CLI at a path of its own: the account a sign-in saves.
+    let sign_in = |cli: std::path::PathBuf| {
+        let mut profile = Profile::open_in(home.path(), "owner").unwrap();
+        profile.config.workiq = Some(proofkin::profile::WorkIqAccount {
+            connection: proofkin::profile::WorkIqConnection::Cli {
+                account: Some("ada@contoso.example".into()),
+                program: Some(cli),
+            },
+            upn: "ada@contoso.example".into(),
+            display_name: "ada@contoso.example".into(),
+            tenant_id: "unknown".into(),
+            added: 0,
+        });
+        profile.save().unwrap();
+    };
+    let (ok_bin, ok_state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    sign_in(fake_workiq_cli_at(ok_bin.path(), ok_state.path(), "ok"));
+    let unoffered = call_ui(port, Some(&token), "GET", path, Value::Null).await;
+    assert_eq!(unoffered.status, 400, "{}", unoffered.body);
+    let why = unoffered.json()["error"].as_str().unwrap().to_owned();
+    assert!(
+        why.contains("Work IQ does not offer the list_agents tool") && !why.contains('\n'),
+        "{why}"
+    );
+
+    let (full_bin, full_state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    sign_in(fake_workiq_cli_at(
+        full_bin.path(),
+        full_state.path(),
+        "full",
+    ));
+    let listed = call_ui(port, Some(&token), "GET", path, Value::Null).await;
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    assert_eq!(
+        listed.json(),
+        serde_json::json!({ "agents": [{ "name": "Sales", "id": "sales:1" }] })
+    );
+    let builder = call_ui(port, None, "GET", "/plan-builder.js", Value::Null).await;
+    assert!(
+        builder.body.contains(&format!("api(\"{path}\")")),
+        "the plan builder doesn't ask {path}"
+    );
     agent.shutdown().await;
 }
 

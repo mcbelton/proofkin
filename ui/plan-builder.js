@@ -20,6 +20,8 @@ const planBuilder = (() => {
   const filters = new Map();
   /// The field to focus after the next render (a card just added).
   let focusNext = null;
+  /// What Work IQ answered when asked for your agents (see workiqAgentsNow).
+  let workiqAgents = null;
 
   const editor = () => $("#plan-editor-text");
   const root = () => $("#plan-builder");
@@ -208,10 +210,12 @@ const planBuilder = (() => {
       el("span", { class: "pb-badge", "data-badge": k, hidden: true, text: "Incomplete" }),
       remove);
 
-    const who = select(s.approve ? signers() : s.team ? leads() : s.pr ? openers() : runners(), s.target,
+    const workiq = !s.approve && !s.team && !s.pr && planText.isWorkiq(s.target);
+    const who = select(s.approve ? signers() : s.team ? leads() : s.pr ? openers()
+      : { ...runners(), "Microsoft 365": [[planText.WORKIQ, "Microsoft 365 Copilot (@workiq)"]] }, s.target,
       s.approve ? "Choose who signs off…" : s.team ? "Choose whose team does it…" : s.pr ? "Choose whose clone opens it…" : "Choose who does it…");
     who.addEventListener("change", () => {
-      s.target = who.value || null;
+      planText.setTarget(s, who.value || null);
       if (s.approve) s.target = s.target?.split(":")[0] ?? null;
       changed(true);
     });
@@ -219,6 +223,7 @@ const planBuilder = (() => {
       rows: s.pr ? 1 : 3, spellcheck: "true",
       placeholder: s.approve ? "What the approver checks, e.g. The ADRs cover every decision and the contract has examples"
         : s.pr ? "Its title, e.g. Accept empty input in the parser (without one: the title of the work it opens)"
+        : workiq ? "What to ask, e.g. What did we decide about the launch date, and why?"
         : "What the agent does, e.g. Write the ADRs for the login change, and its REST API contract",
     });
     todo.value = planText.isTodo(planText.taskOf(s)) ? "" : planText.taskOf(s);
@@ -237,7 +242,11 @@ const planBuilder = (() => {
       ? [field(`${k}-target`, "Who signs off", who, "Their answer is signed evidence"),
         field(`${k}-todo`, "What to check", todo, "The approver sees this and the results of the steps it waits for"),
         changesField(s, k), provesField(s, k, true), waitsField(s, k)]
-      : [field(`${k}-target`, "Who does it", who, "A peer and one of the folders it shares with you, or any member of a squad"),
+      : workiq
+      ? [field(`${k}-target`, "Who does it", who, "Your own agent asks Microsoft 365 Copilot (Work IQ), with the results of the steps it waits for. The answer is context for later steps, never proof"),
+        field(`${k}-todo`, "What to ask", todo),
+        workiqAgentField(s, k), waitsField(s, k), moreOptions(s, k)]
+      : [field(`${k}-target`, "Who does it", who, "A peer and one of the folders it shares with you, any member of a squad, or Microsoft 365 Copilot"),
         field(`${k}-todo`, "What to do", todo),
         agentField(s, k),
         skillsField(s, k), checksField(s, k), provesField(s, k, planText.valuesOf(s, "verify").length > 0),
@@ -292,6 +301,40 @@ const planBuilder = (() => {
     ].filter(Boolean).join("; ");
     return field(`${k}-agent`, "Agent", pick,
       brings ? `${brings}.` : "A role from a plugin or your own, with its instructions, skills and MCP servers");
+  }
+
+  /// The declarative agents Work IQ offers your account (GET /api/workiq/agents), asked for
+  /// once each time the editor opens: { agents } or { error }, { loading } until it answers.
+  function workiqAgentsNow() {
+    if (workiqAgents) return workiqAgents;
+    const asked = (workiqAgents = { loading: true });
+    api("/api/workiq/agents")
+      .then((res) => Object.assign(asked, { loading: false, agents: res.agents ?? [] }))
+      .catch((e) => Object.assign(asked, { loading: false, error: e.message }))
+      .finally(() => {
+        if (workiqAgents === asked && active()) render();
+      });
+    return asked;
+  }
+
+  /// The Work IQ agent a @workiq step asks (agent=ID): none, Microsoft 365 Copilot answers.
+  function workiqAgentField(s, k) {
+    const now = workiqAgentsNow();
+    const chosen = planText.valuesOf(s, "agent")[0] ?? "";
+    const agents = now.agents ?? [];
+    const named = (a) => (agents.filter((b) => b.name === a.name).length > 1 ? `${a.name} (${a.id})` : a.name);
+    const pick = el("select", {},
+      el("option", { value: "", text: "None: Microsoft 365 Copilot answers" }),
+      ...agents.map((a) => el("option", { value: a.id, text: named(a), title: a.id })),
+      chosen && !agents.some((a) => a.id === chosen)
+        ? el("option", { value: chosen, text: now.loading ? chosen : `${chosen} (not available now)` }) : null);
+    pick.value = chosen;
+    pick.addEventListener("change", () => { planText.setValues(s, "agent", pick.value || null); changed(); });
+    const hint = now.loading ? "Asking Work IQ for the agents your account has…"
+      : now.error ? `Couldn't list your Work IQ agents: ${now.error}`
+        : agents.length ? "One of the declarative agents your account has in Microsoft 365 answers instead"
+          : "Work IQ lists no agents for your account: Microsoft 365 Copilot answers";
+    return field(`${k}-agent`, "Agent", pick, hint);
   }
 
   function skillsField(s, k) {
@@ -378,6 +421,23 @@ const planBuilder = (() => {
     return group(`${k}-after`, "Waits for", boxes, hint);
   }
 
+  /// The knowledge topic a step's result is saved as (save=), for later steps to get.
+  function saveField(s, k) {
+    const save = el("input", { type: "text", class: "mono", spellcheck: "false", autocomplete: "off", placeholder: "e.g. architecture" });
+    save.value = planText.valuesOf(s, "save")[0] ?? "";
+    save.addEventListener("change", () => {
+      const topic = save.value.trim();
+      if (topic && !/^(?!\.)[A-Za-z0-9._-]{1,64}$/.test(topic)) {
+        toast("A topic name uses letters, digits, '-', '_' or '.'", "error");
+        save.value = planText.valuesOf(s, "save")[0] ?? "";
+        return;
+      }
+      planText.setValues(s, "save", topic || null);
+      changed(true);
+    });
+    return field(`${k}-save`, "Save its result as knowledge", save, "A topic later steps can get");
+  }
+
   function moreOptions(s, k) {
     const folder = folderOf(s.target);
     const items = [];
@@ -402,6 +462,13 @@ const planBuilder = (() => {
     items.push(field(`${k}-issue`, "Its issue", issue, "An issue of the tracker's repository it works on; without one, a tracked run gives it a sub-issue"));
     set += Boolean(issue.value);
     if (s.pr) return details(`${k}-more`, `More options${set ? ` (${set} set)` : ""}`, items);
+    // Microsoft 365 Copilot answers a @workiq step: no provider, model, folder or tools of its
+    // own, but its answer can be kept as knowledge.
+    if (!s.team && planText.isWorkiq(s.target)) {
+      items.push(saveField(s, k));
+      set += planText.valuesOf(s, "save").length > 0;
+      return details(`${k}-more`, `More options${set ? ` (${set} set)` : ""}`, items);
+    }
     if (s.team) {
       const levels = el("select", {}, ...[1, 2, 3].map((n) => el("option", {
         value: String(n), text: n === 1 ? "Their team does it" : `It may go ${n} levels down (their team's own team steps)`,
@@ -487,20 +554,23 @@ const planBuilder = (() => {
         (on) => { toggle(s, "context", t)(on); changed(true); }))));
       set += context.length > 0;
     }
-    const save = el("input", { type: "text", class: "mono", spellcheck: "false", autocomplete: "off", placeholder: "e.g. architecture" });
-    save.value = planText.valuesOf(s, "save")[0] ?? "";
-    save.addEventListener("change", () => {
-      const topic = save.value.trim();
-      if (topic && !/^(?!\.)[A-Za-z0-9._-]{1,64}$/.test(topic)) {
-        toast("A topic name uses letters, digits, '-', '_' or '.'", "error");
-        save.value = planText.valuesOf(s, "save")[0] ?? "";
-        return;
-      }
-      planText.setValues(s, "save", topic || null);
-      changed(true);
-    });
-    items.push(field(`${k}-save`, "Save its result as knowledge", save, "A topic later steps can get"));
-    set += Boolean(save.value);
+    // A peer's or squad's step may search your Microsoft 365 for its own words (workiq=). A
+    // team step's lead plans its own steps, so it is offered none, but the sources its text
+    // has show, to be cleared.
+    const sources = planText.valuesOf(s, "workiq");
+    if (!s.team || sources.length) {
+      const known = planText.WORKIQ_SOURCES.map(([name]) => name);
+      const boxes = [...planText.WORKIQ_SOURCES, ...sources.filter((v) => !known.includes(v)).map((v) => [v, null])]
+        .map(([name, what]) => checkbox(`${k}-workiq-${name}`,
+          el("span", { class: "mono", text: name === "all" ? "all (everything)" : name }), sources.includes(name),
+          (on) => { planText.setValues(s, "workiq", planText.toggleSource(planText.valuesOf(s, "workiq"), name, on)); changed(true); },
+          { title: what ? `Searches ${what}` : "Not a Microsoft 365 source: uncheck it" }));
+      items.push(group(`${k}-workiq`, "Microsoft 365 (Work IQ)", boxes,
+        "When it is sent, the step searches your Microsoft 365 for its own words and gets what it finds. A peer gets only what its Microsoft 365 grant allows"));
+      set += sources.length > 0;
+    }
+    items.push(saveField(s, k));
+    set += planText.valuesOf(s, "save").length > 0;
     const mcp = planText.valuesOf(s, "mcp");
     const servers = [...new Set([...(folder?.mcp ?? []), ...mcp])];
     if (servers.length && !s.team) {
@@ -572,15 +642,16 @@ const planBuilder = (() => {
         if (!["timeout", "issue", "reviewers", "reviewer"].includes(option)) planText.setValues(s, option, null);
       }
     } else if (kind === "signoff") {
-      // A person's decision: no folder, checks, retries, patch, saved result, tools or agent.
+      // A person's decision: no folder, checks, retries, patch, saved result, tools, agent or search.
       s.target = "@me";
       s.using = null;
-      for (const option of ["verify", "attempts", "apply", "save", "mcp", "agent", "levels", "base"]) planText.setValues(s, option, null);
+      for (const option of ["verify", "attempts", "apply", "save", "mcp", "agent", "levels", "base", "workiq"]) planText.setValues(s, option, null);
     } else if (kind === "team") {
-      // The lead's team plan does and proves it: no checks, retries, patch, tools or agent of its own.
+      // The lead's team plan does and proves it: no checks, retries, patch, tools or agent of its
+      // own, and the builder offers it no Microsoft 365 search.
       s.target = null;
       s.using = null;
-      for (const option of ["verify", "attempts", "apply", "mcp", "agent", "base"]) planText.setValues(s, option, null);
+      for (const option of ["verify", "attempts", "apply", "mcp", "agent", "base", "workiq"]) planText.setValues(s, option, null);
     } else {
       s.target = null;
       planText.setValues(s, "levels", null);
@@ -832,6 +903,7 @@ const planBuilder = (() => {
     fresh = new WeakMap();
     showAll = false;
     check = null;
+    workiqAgents = null;
   }
 
   function init() {

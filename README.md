@@ -805,6 +805,10 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
   `connectors`. `all` searches everything (Work IQ's `copilot` strategy), a list with
   `connectors` uses `copilot` over those sources, any other list uses `grounding` over them.
   An unknown source is refused, and so is `workiq=` on an `approve` step.
+- In the web UI, the plan builder's **More options** for a step that goes to a peer or squad
+  has a **Microsoft 365 (Work IQ)** group with a checkbox per source (`all` clears the others,
+  and another source clears `all`), and the editor's palette has `workiq=all` and each
+  source as chips.
 - The plan check needs the profile's Work IQ sign-in (`proofkin auth login workiq`), and a
   target that is one of your digital workers or a peer you granted Microsoft 365 content with
   `proofkin peers allow <id> --name <name> --m365 <labels>`.
@@ -851,6 +855,10 @@ write after ask @alice Write the announcement
 - `agent=<id>` asks that declarative agent (sent as `agentId`); ids are letters, digits and
   `-`, `_`, `.`, `:`, `@`, at most 200 characters. List the ones your account has with
   `proofkin workiq agents --profile P` (name and id). Without `agent=`, Work IQ answers.
+- In the web UI, the plan builder offers **Microsoft 365 Copilot (@workiq)** as who does a
+  step (choosing it clears the options such a step can't have), with an **Agent** list of the
+  declarative agents Work IQ lists for your account (`GET /api/workiq/agents`; when it can't
+  list them, the list says why).
 - The plan check needs the profile's Work IQ sign-in (`proofkin auth login workiq`).
 - The step is marked as Microsoft 365 content with the labels of its citations. A citation
   without label information, or an answer with no citations, adds the label `unknown`. No
@@ -1638,8 +1646,8 @@ proofkin kb import workiq invoice-retention --query "invoice retention decisions
   (blocked, or without a protection status), nothing is written and the error says how many
   were withheld and why.
 - The search counts in the [audit file and budgets](#work-iq-audit-file-and-budgets) as a
-  knowledge import. The web UI's API does the same with `POST /api/kb/import/workiq`
-  (`topic`, `query`, `from`, `replace`).
+  knowledge import. In the web UI, **Import from Microsoft 365** under **Knowledge** does
+  the same, through `POST /api/kb/import/workiq` (`topic`, `query`, `from`, `replace`).
 
 **Operations.** On the machine where a service runs, its owner adds monitors: in the web
 UI (**Health → Add monitor**, which offers the folders' checks) or in a terminal. A monitor
@@ -2025,10 +2033,11 @@ proofkin --name me --providers copilot --serve --ui
   - **Builder** (forms, no syntax to learn): what must be true (claims), then a card per
     step, an agent task, a team task (handed to a peer's [team](#team-steps-handing-work-down-a-level);
     only folders that take team steps are offered) or a sign-off: who does it (connected peers, their folders and
-    squads), what to do, the [agent](#agents) it acts as (with what that agent brings),
+    squads, or [Microsoft 365 Copilot](#asking-microsoft-365-in-a-step-workiq)), what to do, the [agent](#agents) it acts as (with what that agent brings),
     skills (picked from a list with what each is for), the checks
     the folder offers (and the built-in ones), the claims it proves, the steps it waits
-    for, and more options (tries, model, knowledge, MCP servers, when to cancel it, its
+    for, and more options (tries, model, knowledge,
+    [Microsoft 365 search](#microsoft-365-search-in-a-step-workiq), MCP servers, when to cancel it, its
     issue when runs are [tracked](#tracked-work), and how
     far down a team task may go). It can't hold the
     usual mistakes: a task proves claims only once it has a check, a step can't wait for
@@ -2053,6 +2062,12 @@ proofkin --name me --providers copilot --serve --ui
   is closed (running reopens it) or doesn't exist (the plan would run untracked). Run plan
   and Schedule… ask for the number when it's missing. "What is a
   plan?" stays folded until you open it.
+- **Knowledge**: the knowledge base's topics and TSGs. **Import from Microsoft 365** does
+  what `proofkin kb import workiq` does: you name the topic, say what to look for and where
+  (all of your Microsoft 365, or your mail, meetings, files, Teams messages, people or
+  connectors) and whether to replace a topic of that name, and the dialog says how many
+  results were kept, with their labels, and how many were withheld. The topic keeps where
+  it came from, so it goes only to peers whose Microsoft 365 grant covers its labels.
 - **Schedules**: each schedule in plain words, its next run, its last run's result (with
   a link to the evidence run), and Run now, Pause/Resume, Edit and Delete.
 - **Plugins & tools**: import [plugins](#plugins-skills-agents-and-mcp-servers-packaged-together)
@@ -2080,7 +2095,10 @@ proofkin --name me --providers copilot --serve --ui
   (`proofkin runs verify --file`). Its work can go in a pull request from there
   ([after the run](#pull-request-steps-opening-the-pull-request-from-the-plan)), or a new
   plan can start from it before it is merged (**Build on it…**, `base=RUN:STEP`). Results
-  that carry valid signed evidence show **Signed ✓**.
+  that carry valid signed evidence show **Signed ✓**. A step that searched Microsoft 365
+  (`workiq=`) or asked it (`@workiq`) shows where its work context came from: how many
+  results were kept, with their labels, and withheld, and each source's title, kind, label
+  and link, never what it said.
 - **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
 - **Get started**: a new agent (nobody on its allowlist yet) shows its first steps in
   place of the empty conversation: share your ticket, add a teammate's, or create a

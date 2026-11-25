@@ -59,6 +59,8 @@ const cases = [
   ["workiq sources add up", part("a @x workiq=email Do| it", "workiq=files,teams"),
     "a @x workiq=email,files,teams Do it[]"],
   ["the same workiq source again", part("a @x workiq=email Do| it", "workiq=email"), "a @x workiq=email Do it[]"],
+  ["workiq=all replaces the sources", part("a @x workiq=email,files Do| it", "workiq=all"), "a @x workiq=all Do it[]"],
+  ["a source replaces workiq=all", part("a @x workiq=all Do| it", "workiq=email"), "a @x workiq=email Do it[]"],
   ["workiq in a plan comes back as it was",
     planText.formatPlan(planText.parsePlan("a @x workiq=email,files verify=test Do it")).text,
     "a @x workiq=email,files verify=test Do it"],
@@ -150,6 +152,15 @@ const edit = (change) => {
   change(plan);
   return text(plan);
 };
+/// The plan `line` after the builder's `change` to its step.
+const onStep = (line, change) => {
+  const plan = planText.parsePlan(line);
+  change(plan.steps[0]);
+  return text(plan);
+};
+/// The builder's Microsoft 365 checkbox for `source`, turned on or off on step `s`.
+const checkSource = (source, on) => (s) =>
+  planText.setValues(s, "workiq", planText.toggleSource(planText.valuesOf(s, "workiq"), source, on));
 const needs = (plan) => planText.needs(plan).map((n) => `${n.kind}${n.index}.${n.field}: ${n.message}`).join(" | ");
 const broken = planText.parsePlan("skill=adr skill=api-contract");
 const placeholders = planText.parsePlan(
@@ -178,6 +189,38 @@ cases.push(
   ["an emptied option goes", edit((p) => planText.setValues(step(p, "build"), "verify", [])).split("\n").at(-2),
     "build @worker:repo skill=build-run-discovery claims=KB-2 save=build-and-run Find out how to build it."],
   ["no waiting in circles", [...planText.dependents(model(), "architecture")].join(","), "confirm"],
+  // Microsoft 365 in the builder: a step's workiq= sources are checkboxes (all goes alone),
+  // and Microsoft 365 Copilot (@workiq) runs a step with a Work IQ agent; each edit changes
+  // only its own option.
+  ["the builder reads a step's sources",
+    planText.valuesOf(planText.parsePlan("a @x workiq=email,files Do it").steps[0], "workiq").join(","), "email,files"],
+  ["a source checked changes only workiq=", onStep("a after b @x timeout=1h workiq=email save=t Do it", checkSource("files", true)),
+    "a after b @x timeout=1h workiq=email,files save=t Do it"],
+  ["all checked clears the other sources", onStep("a @x workiq=email,files save=t Do it", checkSource("all", true)),
+    "a @x workiq=all save=t Do it"],
+  ["another source checked clears all", planText.toggleSource(["all"], "teams").join(","), "teams"],
+  ["a source unchecked", planText.toggleSource(["email", "files"], "email", false).join(","), "files"],
+  ["the last source unchecked takes workiq= out", onStep("a @x workiq=email save=t Do it", checkSource("email", false)),
+    "a @x save=t Do it"],
+  ["the builder reads a @workiq step and its Work IQ agent", (() => {
+    const s = planText.parsePlan("a @workiq agent=x Do it").steps[0];
+    return `${planText.isWorkiq(s.target)} ${planText.valuesOf(s, "agent").join(",")}`;
+  })(), "true x"],
+  ["another Work IQ agent changes only agent=",
+    onStep("ask after dates @workiq agent=x save=launch timeout=1h What changed?", (s) => planText.setValues(s, "agent", "sales:1")),
+    "ask after dates @workiq agent=sales:1 save=launch timeout=1h What changed?"],
+  ["no Work IQ agent: Microsoft 365 Copilot answers",
+    onStep("ask @workiq agent=x save=launch What changed?", (s) => planText.setValues(s, "agent", null)),
+    "ask @workiq save=launch What changed?"],
+  ["@workiq takes out what it can't have and keeps the rest",
+    onStep("a after b @x using claude skill=adr verify=test attempts=2 claims=C-1 mcp=docs workiq=email context=t model=m"
+      + " effort=max levels=2 apply=b base=r:s agent=dev save=s timeout=1h issue=#3 Do it", (s) => planText.setTarget(s, "@workiq")),
+    "a after b @workiq save=s timeout=1h issue=#3 Do it"],
+  ["the builder's @workiq has no folder", onStep("a @x Do it", (s) => planText.setTarget(s, "@workiq:app")), "a @workiq Do it"],
+  ["a Work IQ agent goes when a peer does the step",
+    onStep("a @workiq agent=sales:1 save=t Ask", (s) => planText.setTarget(s, "@bob:app")), "a @bob:app save=t Ask"],
+  ["your agent stays when another peer does the step",
+    onStep("a @x agent=dev Do it", (s) => planText.setTarget(s, "@y")), "a @y agent=dev Do it"],
   // A team step: the lead's team plan does and proves it.
   ["a team step comes back as it was", text(planText.parsePlan("claim: C-1 x\nbuild after spec team @alice:app levels=2 timeout=2h claims=C-1 Build it")),
     "claim: C-1 x\n\nbuild after spec team @alice:app levels=2 timeout=2h claims=C-1 Build it"],
