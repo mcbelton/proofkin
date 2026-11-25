@@ -58,6 +58,9 @@ What the Work IQ CLI 1.0.1 returned in a Microsoft tenant (seven queries, 36 res
   nothing in this sample). People results have no `contentProtection`, so they are withheld.
 - `ask` gives its answer twice: as the text `content` and as `structuredContent.answer`, with
   the `conversationId`. It has no citations, so an answer has no labels and stays local.
+  Work IQ's [tool reference](https://learn.microsoft.com/microsoft-365/copilot/extensibility/work-iq/mcp/tool-reference)
+  documents the text as a JSON object with the answer in `response`: without a structured
+  answer, Proofkin reads that, else the text as it is.
 - `list_agents` gives no `structuredContent`: the agents are a JSON array in the text
   `content`, each `{agentId, name, provider}`.
 - `initialize` names no user: Proofkin names the account from `--account`, else the CLI's
