@@ -1,9 +1,15 @@
-"""A fake `workiq mcp` (stdio, newline-delimited JSON-RPC) for tests/workiq_cli.rs.
+"""A fake Work IQ CLI (`workiq mcp`: stdio, newline-delimited JSON-RPC) for tests/workiq_cli.rs.
 
-Usage: workiq_cli_mcp.py <state dir> <mode> [--tenant-id <id>]
+Usage: workiq_cli_mcp.py <state dir> <mode> mcp [--account <email>]
+       workiq_cli_mcp.py <state dir> <mode> config show
+
+Like the real CLI (1.0.1), `mcp` takes `--account`, `--endpoint` and `--log-level` and refuses
+any other option (`--tenant-id` among them), and `config show` prints `key=value` lines with
+the default account (none in mode `bare`).
 
 Modes:
   ok            answers everything
+  bare          like ok, but `config show` names no default account
   user          like ok, and says who is signed in in the initialize reply
   crash         exits without answering on the first tools/call of the whole test (a marker
                 file in the state dir says it did)
@@ -33,6 +39,23 @@ def send(message):
     sys.stdout.write(json.dumps(message) + "\n")
     sys.stdout.flush()
 
+
+if ARGV[:2] == ["config", "show"]:
+    log("config show")
+    if MODE != "bare":
+        print("defaultAccount=bob@contoso.example")
+    print("isMSITTenant=false")
+    sys.exit(0)
+
+if ARGV[:1] != ["mcp"]:
+    sys.stderr.write("Unrecognized command or argument '%s'.\n" % " ".join(ARGV))
+    sys.exit(1)
+OPTIONS = ARGV[1:]
+while OPTIONS:
+    if OPTIONS[0] not in ("--account", "--endpoint", "-e", "--log-level", "-l") or len(OPTIONS) < 2:
+        sys.stderr.write("Unrecognized command or argument '%s'.\n" % OPTIONS[0])
+        sys.exit(1)
+    OPTIONS = OPTIONS[2:]
 
 log("start")
 

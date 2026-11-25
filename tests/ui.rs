@@ -4124,3 +4124,50 @@ async fn the_workiq_import_route_writes_nothing_when_every_result_was_withheld()
     assert!(profile.knowledge().list().is_empty());
     agent.shutdown().await;
 }
+
+/// The owner signs in to Work IQ while the agent runs (`proofkin auth login workiq` in
+/// another process): the web UI's plan check, plans and imports use the sign-in at once.
+#[tokio::test]
+async fn a_workiq_sign_in_made_while_the_agent_runs_counts_at_once() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, agent, port, token) = ui_with_work_results(home.path(), Vec::new()).await;
+    let check = || async {
+        let host = format!("127.0.0.1:{port}");
+        let body = serde_json::json!({ "text": "decisions @workiq What did we decide?" });
+        request(
+            port,
+            "POST",
+            "/api/plans/check",
+            &host,
+            Some(&token),
+            Some(&body.to_string()),
+        )
+        .await
+        .json()
+    };
+    let before = check().await;
+    assert_eq!(before["ok"], false, "{before}");
+    assert!(
+        before["problems"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("needs this profile's Work IQ sign-in"),
+        "{before}"
+    );
+
+    let mut signed_in = Profile::open_in(home.path(), "owner").unwrap();
+    signed_in.config.workiq = Some(proofkin::profile::WorkIqAccount {
+        connection: proofkin::profile::WorkIqConnection::Cli {
+            account: Some("ada@contoso.example".into()),
+            program: None,
+        },
+        upn: "ada@contoso.example".into(),
+        display_name: "ada@contoso.example".into(),
+        tenant_id: "unknown".into(),
+        added: 0,
+    });
+    signed_in.save().unwrap();
+    let after = check().await;
+    assert_eq!(after["ok"], true, "{after}");
+    agent.shutdown().await;
+}

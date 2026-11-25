@@ -97,10 +97,13 @@ with one of two connections:
     challenge (Continuous Access Evaluation) or `invalid_grant` asks the owner to sign in
     again.
 - **CLI**: Proofkin starts Microsoft's Work IQ CLI (`workiq mcp`, else `npx -y
-  @microsoft/workiq mcp`) and speaks MCP to it over stdio; the CLI signs in by itself. For
-  tenants that approved the Work IQ CLI app: `proofkin auth login workiq --cli [--tenant
-  <id>]`. Proofkin never accepts the CLI's EULA for the owner; it tells them to run `workiq
-  accept-eula`.
+  @microsoft/workiq mcp`) and speaks MCP to it over stdio; the CLI signs in by itself and
+  picks the tenant from its account. For tenants that approved the Work IQ CLI app:
+  `proofkin auth login workiq --cli [--account <email>] [--cli-path <path>]`. The sign-in
+  finds the CLI (on the PATH, else in npm's global folder, which a Node version manager keeps
+  off the PATH) and saves where it is, so agents start the same one; `--account` is passed
+  to `workiq mcp --account`. Proofkin never accepts the CLI's EULA for the owner; it tells
+  them to run `workiq accept-eula`.
 
 `proofkin auth status` shows the account (user, tenant, connection, token expiry) and
 `proofkin auth logout workiq` deletes its token. A digital worker gets its owner's Work IQ

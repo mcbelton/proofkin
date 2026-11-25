@@ -66,9 +66,12 @@ pub fn connect_at(profile: &Profile, endpoints: &Endpoints) -> Result<Connection
                 tokens: Some(tokens),
             })
         }
-        WorkIqConnection::Cli { tenant } => Ok(Connection {
+        WorkIqConnection::Cli { account, program } => Ok(Connection {
             client: Client::with_transport(
-                Arc::new(stdio::StdioTransport::new(tenant.as_deref())),
+                Arc::new(stdio::StdioTransport::new(
+                    program.as_deref(),
+                    account.as_deref(),
+                )),
                 Arc::new(stdio::NoToken),
             ),
             tokens: None,

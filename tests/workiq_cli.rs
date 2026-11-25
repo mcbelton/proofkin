@@ -7,6 +7,7 @@ use std::sync::{Arc, Once};
 
 use proofkin::Profile;
 use proofkin::profile::{INHERITED_CREDENTIAL_VARS, WorkIqAccount, WorkIqConnection};
+use proofkin::workiq::account::account_line;
 use proofkin::workiq::login::CliLogin;
 use proofkin::workiq::stdio::{NoToken, StdioTransport};
 use proofkin::workiq::{
@@ -40,19 +41,19 @@ fn python() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
 }
 
-fn fake(state: &Path, mode: &str, tenant: Option<&str>) -> Arc<StdioTransport> {
+fn fake(state: &Path, mode: &str, account: Option<&str>) -> Arc<StdioTransport> {
     setup();
     let state = state.to_str().unwrap();
     Arc::new(StdioTransport::with_command(
         python(),
         &[SCRIPT, state, mode],
-        tenant,
+        account,
     ))
 }
 
-fn cli_login(tenant: Option<&str>, state: &Path, mode: &str) -> CliLogin {
+fn cli_login(account: Option<&str>, state: &Path, mode: &str) -> CliLogin {
     let state = state.to_str().unwrap();
-    CliLogin::new(tenant).with_command(python(), &[SCRIPT, state, mode])
+    CliLogin::new(account).with_command(python(), &[SCRIPT, state, mode])
 }
 
 fn client(transport: Arc<StdioTransport>) -> Client {
@@ -91,10 +92,11 @@ fn call(id: u64, tool: &str) -> Outgoing {
     }
 }
 
-fn cli_account(tenant: Option<&str>) -> WorkIqAccount {
+fn cli_account(account: Option<&str>) -> WorkIqAccount {
     WorkIqAccount {
         connection: WorkIqConnection::Cli {
-            tenant: tenant.map(str::to_string),
+            account: account.map(str::to_string),
+            program: None,
         },
         upn: "Work IQ CLI".into(),
         display_name: "Work IQ CLI".into(),
@@ -104,9 +106,9 @@ fn cli_account(tenant: Option<&str>) -> WorkIqAccount {
 }
 
 #[tokio::test]
-async fn initialize_list_tools_and_call_tool_run_over_stdio_with_the_tenant() {
+async fn initialize_list_tools_and_call_tool_run_over_stdio_with_the_account() {
     let state = tempfile::tempdir().unwrap();
-    let client = client(fake(state.path(), "ok", Some("contoso")));
+    let client = client(fake(state.path(), "ok", Some("alice@contoso.example")));
 
     let tools = client.list_tools().await.unwrap();
     let inspected = client
@@ -117,7 +119,11 @@ async fn initialize_list_tools_and_call_tool_run_over_stdio_with_the_tenant() {
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
     assert_eq!(names, ["retrieve", "send_mail", "inspect"]);
     let seen: Value = serde_json::from_str(&text(&inspected)).unwrap();
-    assert_eq!(seen["argv"], json!(["--tenant-id", "contoso"]));
+    assert_eq!(
+        seen["argv"],
+        json!(["mcp", "--account", "alice@contoso.example"]),
+        "the CLI's own options: it has no tenant option"
+    );
     assert_eq!(
         log(state.path()).join(" "),
         "start initialize notifications/initialized tools/list tools/call"
@@ -212,7 +218,7 @@ async fn a_cli_account_has_no_token_and_connect_builds_its_client() {
     setup();
     let root = tempfile::tempdir().unwrap();
     let mut alice = Profile::open_in(root.path(), "alice").unwrap();
-    alice.config.workiq = Some(cli_account(Some("contoso")));
+    alice.config.workiq = Some(cli_account(Some("alice@contoso.example")));
 
     assert_eq!(NoToken.token().await.unwrap(), "");
     assert!(connect(&alice).is_ok());
@@ -224,35 +230,137 @@ async fn the_cli_sign_in_saves_a_cli_account_without_a_token() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let mut alice = Profile::open_in(root.path(), "alice").unwrap();
+    let saved = || Profile::open_in(root.path(), "alice").unwrap();
 
-    let who = cli_login(Some("contoso"), state.path(), "ok")
+    // The CLI's initialize names no user: its default account does (`config show`).
+    let who = cli_login(None, state.path(), "ok")
         .run(&mut alice)
         .await
         .unwrap();
 
-    assert_eq!(who, "Work IQ CLI");
-    let saved = Profile::open_in(root.path(), "alice").unwrap();
-    let account = saved.config.workiq.clone().unwrap();
-    let WorkIqConnection::Cli { tenant } = account.connection else {
-        panic!("not a CLI account");
-    };
-    assert_eq!(tenant.as_deref(), Some("contoso"));
-    assert_eq!(account.upn, "Work IQ CLI");
-    assert!(saved.workiq_refresh_token().is_err(), "no token is kept");
+    assert_eq!(who, "bob@contoso.example");
+    let account = saved().config.workiq.clone().unwrap();
+    assert_eq!(
+        account.connection,
+        WorkIqConnection::Cli {
+            account: None,
+            program: None
+        }
+    );
+    assert_eq!(account.upn, "bob@contoso.example");
+    assert_eq!(
+        account_line(&account),
+        "bob@contoso.example through the Work IQ CLI"
+    );
+    assert!(saved().workiq_refresh_token().is_err(), "no token is kept");
     assert_eq!(
         count(state.path(), "tools/list"),
         1,
         "the sign-in was checked"
     );
 
-    let who = cli_login(Some("contoso"), state.path(), "user")
+    // A user the CLI reports comes first; an account given, before both.
+    let who = cli_login(None, state.path(), "user")
         .run(&mut alice)
         .await
         .unwrap();
-
     assert_eq!(who, "alice@contoso.example");
+    let who = cli_login(Some("carol@contoso.example"), state.path(), "user")
+        .run(&mut alice)
+        .await
+        .unwrap();
+    assert_eq!(who, "carol@contoso.example");
+    let account = saved().config.workiq.unwrap();
+    assert_eq!(
+        account.connection,
+        WorkIqConnection::Cli {
+            account: Some("carol@contoso.example".into()),
+            program: None
+        }
+    );
+
+    // A CLI that names no one: the account is the CLI's default one.
+    let who = cli_login(None, state.path(), "bare")
+        .run(&mut alice)
+        .await
+        .unwrap();
+    assert_eq!(who, "Work IQ CLI");
+    assert_eq!(
+        account_line(&saved().config.workiq.unwrap()),
+        "through the Work IQ CLI, as its default account"
+    );
+}
+
+/// A command that starts the fake CLI as the real one starts, at a path of its own (not on
+/// the PATH): `workiq.cmd` on Windows, `workiq` elsewhere.
+fn fake_cli_at(dir: &Path, state: &Path) -> std::path::PathBuf {
+    let (script, state) = (SCRIPT, state.display());
+    if cfg!(windows) {
+        let path = dir.join("workiq.cmd");
+        let text = format!("@{} \"{script}\" \"{state}\" ok %*\r\n", python());
+        std::fs::write(&path, text).unwrap();
+        path
+    } else {
+        let path = dir.join("workiq");
+        let text = format!(
+            "#!/bin/sh\nexec {} '{script}' '{state}' ok \"$@\"\n",
+            python()
+        );
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+}
+
+#[tokio::test]
+async fn the_cli_sign_in_keeps_where_the_cli_is_and_its_account_is_used_from_there() {
+    setup();
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let cli = fake_cli_at(bin.path(), state.path());
+    let mut alice = Profile::open_in(root.path(), "alice").unwrap();
+
+    let missing = CliLogin::new(None)
+        .with_cli_path(bin.path().join("nowhere"))
+        .run(&mut alice)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{missing:#}").contains("there is no Work IQ CLI at"),
+        "{missing:#}"
+    );
+
+    let who = CliLogin::new(Some("dave@contoso.example"))
+        .with_cli_path(&cli)
+        .run(&mut alice)
+        .await
+        .unwrap();
+    assert_eq!(who, "dave@contoso.example");
     let saved = Profile::open_in(root.path(), "alice").unwrap();
-    assert_eq!(saved.config.workiq.unwrap().upn, "alice@contoso.example");
+    assert_eq!(
+        saved.config.workiq.clone().unwrap().connection,
+        WorkIqConnection::Cli {
+            account: Some("dave@contoso.example".into()),
+            program: Some(cli.clone())
+        }
+    );
+
+    // An agent whose PATH has no CLI starts the one the sign-in found, with the account.
+    let inspected = connect(&saved)
+        .unwrap()
+        .call_tool("inspect", json!({ "names": [] }))
+        .await
+        .unwrap();
+    let seen: Value = serde_json::from_str(&text(&inspected)).unwrap();
+    assert_eq!(
+        seen["argv"],
+        json!(["mcp", "--account", "dave@contoso.example"])
+    );
 }
 
 #[tokio::test]

@@ -167,8 +167,15 @@ pub enum WorkIqConnection {
     Hosted { tenant: String, client_id: String },
     /// Microsoft's Work IQ CLI over stdio; it signs in by itself.
     Cli {
+        /// The account the CLI signs in with (`workiq mcp --account`); none: the CLI's own
+        /// default account.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        tenant: Option<String>,
+        account: Option<String>,
+        /// Where the CLI is, as found when the profile signed in: an agent's PATH may not
+        /// have it (npm keeps global commands in its own folder, which a Node version manager
+        /// leaves off the PATH). None: looked for when it starts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<PathBuf>,
     },
 }
 

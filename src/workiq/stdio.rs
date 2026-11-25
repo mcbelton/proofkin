@@ -4,7 +4,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -23,6 +23,9 @@ use crate::profile::INHERITED_CREDENTIAL_VARS;
 
 /// The longest Proofkin waits for the CLI to answer one message.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// The longest Proofkin waits for npm or the CLI to say where the CLI is or whose account it
+/// uses.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long Proofkin waits for a stopped CLI to finish, to read what it said on stderr.
 const EXIT_WAIT: Duration = Duration::from_secs(2);
 const STDERR_KEPT: usize = 600;
@@ -66,37 +69,55 @@ struct Failure {
 /// transport is dropped.
 pub struct StdioTransport {
     program: OsString,
-    args: Vec<OsString>,
-    tenant: Option<String>,
+    /// What comes before the CLI's own arguments (`-y @microsoft/workiq` for npx).
+    base: Vec<OsString>,
+    account: Option<String>,
     state: Mutex<State>,
 }
 
 impl StdioTransport {
-    /// `workiq mcp`, or `npx -y @microsoft/workiq mcp` when `workiq` isn't on the PATH, with
-    /// `--tenant-id` when the account has a tenant.
-    pub fn new(tenant: Option<&str>) -> Self {
-        match find_on_path("workiq") {
-            Some(path) => Self::with_command(path, &["mcp"], tenant),
-            None => {
-                let npx = find_on_path("npx").unwrap_or_else(|| PathBuf::from("npx"));
-                Self::with_command(npx, &["-y", "@microsoft/workiq", "mcp"], tenant)
-            }
-        }
+    /// The Work IQ CLI (see [`cli_command`]) running `mcp`, with `--account` when the account
+    /// is given.
+    pub fn new(program: Option<&Path>, account: Option<&str>) -> Self {
+        let (program, base) = cli_command(program);
+        Self::with_command(program, &base, account)
     }
 
-    /// Starts `program` with `args` instead of the CLI, for tests. `--tenant-id` follows the
-    /// arguments when there is a tenant.
+    /// Starts `program` with `args` in place of the CLI, for tests: then `mcp` and
+    /// `--account`, as for the CLI.
     pub fn with_command(
         program: impl Into<OsString>,
         args: &[&str],
-        tenant_id: Option<&str>,
+        account: Option<&str>,
     ) -> Self {
         StdioTransport {
             program: program.into(),
-            args: args.iter().map(OsString::from).collect(),
-            tenant: tenant_id.map(str::to_string),
+            base: args.iter().map(OsString::from).collect(),
+            account: account.map(str::to_string),
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// The account the CLI signs in with when it is given none: `defaultAccount` in what
+    /// `workiq config show` prints, if it says (best effort).
+    pub async fn default_account(&self) -> Option<String> {
+        let mut command = Command::new(&self.program);
+        command.args(&self.base).args(["config", "show"]);
+        for var in INHERITED_CREDENTIAL_VARS {
+            command.env_remove(var);
+        }
+        command
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(LOOKUP_TIMEOUT, command.output())
+            .await
+            .ok()?
+            .ok()?;
+        out.status
+            .success()
+            .then(|| default_account_in(&String::from_utf8_lossy(&out.stdout)))
+            .flatten()
     }
 
     /// The user the CLI reported in its `initialize` reply (`serverInfo.user`, else
@@ -114,9 +135,9 @@ impl StdioTransport {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
-        command.args(&self.args);
-        if let Some(tenant) = &self.tenant {
-            command.arg("--tenant-id").arg(tenant);
+        command.args(&self.base).arg("mcp");
+        if let Some(account) = &self.account {
+            command.arg("--account").arg(account);
         }
         for var in INHERITED_CREDENTIAL_VARS {
             command.env_remove(var);
@@ -320,7 +341,8 @@ async fn read_tail(stderr: ChildStderr) -> String {
 fn start_error(program: &OsStr, error: &io::Error) -> String {
     format!(
         "could not start the Work IQ CLI ({}): {error}; install it with `npm install -g \
-         @microsoft/workiq`, or install Node.js so that `npx` works",
+         @microsoft/workiq` and sign in again (`proofkin auth login workiq --cli`, with \
+         `--cli-path` if it isn't found), or install Node.js so that `npx` works",
         program.to_string_lossy()
     )
 }
@@ -383,4 +405,102 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The command that runs the Work IQ CLI, and what comes before its own arguments: the CLI
+/// at `program` if it is still there, else `workiq` on the PATH, else `npx -y
+/// @microsoft/workiq` (which fetches it from the npm registry).
+pub fn cli_command(program: Option<&Path>) -> (OsString, Vec<&'static str>) {
+    let found = program
+        .filter(|path| path.is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| find_on_path("workiq"));
+    match found {
+        Some(path) => (path.into_os_string(), Vec::new()),
+        None => {
+            let npx = find_on_path("npx").unwrap_or_else(|| PathBuf::from("npx"));
+            (npx.into_os_string(), vec!["-y", "@microsoft/workiq"])
+        }
+    }
+}
+
+/// Where the Work IQ CLI is: `workiq` on the PATH, else where npm installs global commands
+/// (`npm prefix -g`), which a Node version manager may keep off the PATH.
+pub async fn find_cli() -> Option<PathBuf> {
+    if let Some(path) = find_on_path("workiq") {
+        return Some(path);
+    }
+    let npm = find_on_path("npm")?;
+    let mut command = Command::new(npm);
+    command
+        .args(["prefix", "-g"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(LOOKUP_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !prefix.is_empty())
+        .then(|| in_npm_prefix(Path::new(&prefix)))
+        .flatten()
+}
+
+/// The Work IQ CLI npm installed globally under `prefix`, if it is there: `workiq.cmd` in
+/// it on Windows, `bin/workiq` elsewhere.
+pub fn in_npm_prefix(prefix: &Path) -> Option<PathBuf> {
+    let path = if cfg!(windows) {
+        prefix.join("workiq.cmd")
+    } else {
+        prefix.join("bin").join("workiq")
+    };
+    path.is_file().then_some(path)
+}
+
+/// The `defaultAccount` that `workiq config show` printed (`key=value` lines), if any.
+pub fn default_account_in(shown: &str) -> Option<String> {
+    shown
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("defaultAccount="))
+        .map(str::trim)
+        .filter(|account| {
+            !account.is_empty() && account.len() <= 256 && !account.contains(char::is_whitespace)
+        })
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cli_is_found_where_npm_installs_it_and_names_its_default_account() {
+        let prefix = tempfile::tempdir().unwrap();
+        assert_eq!(in_npm_prefix(prefix.path()), None);
+        let cli = if cfg!(windows) {
+            prefix.path().join("workiq.cmd")
+        } else {
+            std::fs::create_dir(prefix.path().join("bin")).unwrap();
+            prefix.path().join("bin").join("workiq")
+        };
+        std::fs::write(&cli, "").unwrap();
+        assert_eq!(in_npm_prefix(prefix.path()), Some(cli.clone()));
+        // A CLI found before is used while it is there.
+        assert_eq!(cli_command(Some(&cli)), (cli.into_os_string(), Vec::new()));
+
+        let shown = "isMSITTenant=true\r\ndefaultAccount=alice@contoso.example\r\n";
+        assert_eq!(
+            default_account_in(shown).as_deref(),
+            Some("alice@contoso.example")
+        );
+        for none in [
+            "",
+            "isMSITTenant=true",
+            "defaultAccount=",
+            "defaultAccount=a b",
+        ] {
+            assert_eq!(default_account_in(none), None, "{none:?}");
+        }
+    }
 }

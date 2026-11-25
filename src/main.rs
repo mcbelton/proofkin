@@ -1375,7 +1375,7 @@ examples:
   proofkin auth login codex   --profile worker1                 (browser sign-in)
   proofkin auth login codex   --profile worker2 --api-key
   proofkin auth login workiq  --profile worker1 --tenant contoso.com --client-id <app-id> [--device-code]
-  proofkin auth login workiq  --profile worker1 --cli [--tenant <id>]   (Microsoft's Work IQ CLI)
+  proofkin auth login workiq  --profile worker1 --cli [--account <email>] [--cli-path <path>]   (Microsoft's Work IQ CLI)
 Secrets are read from a hidden prompt, or from stdin when piped.")]
     Login {
         #[arg(value_enum)]
@@ -1391,9 +1391,17 @@ Secrets are read from a hidden prompt, or from stdin when piped.")]
         /// Work IQ: sign in with a device code instead of the browser.
         #[arg(long)]
         device_code: bool,
-        /// Work IQ: use Microsoft's Work IQ CLI, which signs in by itself.
-        #[arg(long, conflicts_with_all = ["client_id", "device_code"])]
+        /// Work IQ: use Microsoft's Work IQ CLI, which signs in by itself (and picks the
+        /// tenant from its account).
+        #[arg(long, conflicts_with_all = ["client_id", "device_code", "tenant"])]
         cli: bool,
+        /// Work IQ CLI: the account it signs in with (the email of an account the CLI has
+        /// signed in; default: the CLI's own default account).
+        #[arg(long, requires = "cli")]
+        account: Option<String>,
+        /// Work IQ CLI: where it is, when it isn't on the PATH or in npm's global folder.
+        #[arg(long, requires = "cli")]
+        cli_path: Option<PathBuf>,
         /// Copilot: use this GitHub CLI account's token (add accounts with `gh auth login`).
         #[arg(long, conflicts_with_all = ["token", "api_key"])]
         gh_user: Option<String>,
@@ -4335,6 +4343,8 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             client_id,
             device_code,
             cli,
+            account,
+            cli_path,
             profile,
             gh_user,
             host,
@@ -4346,11 +4356,20 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
                 if cli {
                     let mut profile = Profile::open(&profile.name)?;
                     profile.check_can_sign_in()?;
-                    let who = proofkin::workiq::login::CliLogin::new(tenant.as_deref())
-                        .run(&mut profile)
-                        .await?;
+                    let mut login = proofkin::workiq::login::CliLogin::new(account.as_deref());
+                    if let Some(path) = cli_path {
+                        login = login.with_cli_path(path);
+                    }
+                    let who = login.run(&mut profile).await?;
+                    let at = match profile.config.workiq.as_ref().map(|a| &a.connection) {
+                        Some(proofkin::profile::WorkIqConnection::Cli {
+                            program: Some(program),
+                            ..
+                        }) => format!(" ({})", program.display()),
+                        _ => String::new(),
+                    };
                     println!(
-                        "profile '{}': Work IQ signed in through the Work IQ CLI as {who}",
+                        "profile '{}': Work IQ signed in through the Work IQ CLI{at} as {who}",
                         profile.name
                     );
                     return Ok(());
