@@ -653,6 +653,52 @@ fn python() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_work_iq_sign_in_made_while_the_agent_runs_counts_for_its_next_plan() {
+    let (_fake, base) = Fake::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let env = Env::new(home.path())
+        .with(TEST_WORKIQ_URL, &base)
+        .with(TEST_ENTRA_URL, &base);
+    let plan = home.path().join("ask.plan");
+    std::fs::write(&plan, "a @workiq What changed in the launch?\n").unwrap();
+    let mut boss = Repl::start(
+        &env,
+        &[
+            "--name",
+            "boss",
+            "--network",
+            "local",
+            "--listen",
+            "127.0.0.1:0",
+        ],
+    );
+    boss.until("ticket:").await;
+
+    // Signed in from another terminal while the agent runs: its next plan uses it.
+    env.ok(&[
+        "auth",
+        "login",
+        "workiq",
+        "--tenant",
+        "contoso",
+        "--client-id",
+        "app-1",
+        "--device-code",
+        "--profile",
+        "boss",
+    ])
+    .await;
+    boss.send(&format!("/plan {}", plan.display())).await;
+    let finished = boss.until("=== plan finished").await;
+    assert!(
+        finished.contains("1/1 steps done"),
+        "{}",
+        boss.seen.join("\n")
+    );
+    boss.quit().await;
+}
+
 /// The fake CLI in mode `full`, started as the real one is: `workiq.cmd` on Windows, `workiq`
 /// elsewhere, in a folder of its own (not on the PATH).
 fn fake_cli_at(dir: &Path, state: &Path) -> PathBuf {
