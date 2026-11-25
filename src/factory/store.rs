@@ -6,9 +6,11 @@
 //!   agents/<name>/state.json    its lifecycle: state, active version, deployments, and the history of every change
 //!   agents/<name>/fixtures/     files its eval cases work on
 //!   agents/<name>/builds/<hash>/  its builds, by hash (see crate::factory::build)
+//!   agents/<name>/evaluations/<id>.json  its evaluations: each one's journal while it runs, its signed report when it ends
+//!   evaluation/                 the evaluation that runs (one at a time): its folder, and the one next to it
 //! ```
 //!
-//! Evaluations and releases go next to the state as the factory grows
+//! Releases go next to the state as the factory grows
 //! (docs/agent-factory/design/data-dictionary.md). Files are written atomically, and
 //! changes to an agent hold its lock ([`crate::store`]), so the CLI, the web UI and an
 //! agent can work at once without losing a change. A file that can't be read is
@@ -22,9 +24,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::factory::build::Build;
+use crate::factory::report::{self, Evaluation};
 use crate::llm::Provider;
 use crate::profile::{Profile, validate_name};
 use crate::store::{FileLock, write_atomic};
+
+/// The lock of the evaluation that runs (see [`FactoryStore::lock_evaluation`]).
+#[derive(Debug)]
+pub struct EvaluationLock {
+    _file: std::fs::File,
+}
 
 /// An agent's draft: its blueprint, which may still have problems, and how it was
 /// first written.
@@ -270,6 +279,99 @@ impl FactoryStore {
             .collect();
         hashes.sort();
         Ok(hashes)
+    }
+
+    /// Where the evaluation that runs works (see [`crate::factory::runner`]).
+    pub fn evaluation_dir(&self) -> PathBuf {
+        self.root.join("evaluation")
+    }
+
+    /// Takes the lock only one running evaluation holds at a time, released when dropped
+    /// (or when its process ends, however it ends). Fails while another one holds it.
+    pub fn lock_evaluation(&self) -> Result<EvaluationLock> {
+        self.prepare()?;
+        let dir = self.evaluation_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join("lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(EvaluationLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                bail!("another evaluation is running; wait for it to end, or cancel it")
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+
+    /// Whether an evaluation runs now, in any process.
+    pub fn evaluation_running(&self) -> bool {
+        std::fs::File::open(self.evaluation_dir().join("lock"))
+            .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+    }
+
+    pub fn evaluations_dir(&self, name: &str) -> PathBuf {
+        self.agent_dir(name).join("evaluations")
+    }
+
+    pub fn evaluation_path(&self, name: &str, id: &str) -> PathBuf {
+        self.evaluations_dir(name).join(format!("{id}.json"))
+    }
+
+    /// Keeps `evaluation`: its journal while it runs, its report when it ends.
+    pub fn save_evaluation(&self, evaluation: &Evaluation) -> Result<()> {
+        validate_agent_name(&evaluation.agent)?;
+        if report::agent_of(&evaluation.id) != Some(evaluation.agent.as_str()) {
+            bail!(
+                "{:?} isn't an id of an evaluation of {}",
+                evaluation.id,
+                evaluation.agent
+            );
+        }
+        self.prepare()?;
+        write_json(
+            &self.evaluation_path(&evaluation.agent, &evaluation.id),
+            evaluation,
+        )
+    }
+
+    /// Evaluation `id` (its agent is in its id), if it is kept. The outputs of an ended
+    /// one's runs go after [`report::OUTPUT_DAYS`] days, when it is read; their hashes stay.
+    pub fn evaluation(&self, id: &str) -> Result<Option<Evaluation>> {
+        let agent = report::agent_of(id)
+            .ok_or_else(|| anyhow::anyhow!("{id:?} isn't an evaluation's id (ev-...)"))?;
+        let path = self.evaluation_path(agent, id);
+        let Some(mut evaluation) = read_json::<Evaluation>(&path)? else {
+            return Ok(None);
+        };
+        if evaluation.state != report::EvalState::Running
+            && evaluation.prune_outputs(chrono::Utc::now())
+        {
+            write_json(&path, &evaluation)?;
+        }
+        Ok(Some(evaluation))
+    }
+
+    /// Agent `name`'s evaluations, newest first.
+    pub fn evaluations(&self, name: &str) -> Result<Vec<Evaluation>> {
+        validate_agent_name(name)?;
+        let mut ids: Vec<String> = read_dir(&self.evaluations_dir(name))?
+            .into_iter()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter_map(|f| f.strip_suffix(".json").map(str::to_owned))
+            .filter(|id| report::agent_of(id) == Some(name))
+            .collect();
+        // Ids sort by when they started.
+        ids.sort_by(|a, b| b.cmp(a));
+        ids.iter()
+            .filter_map(|id| self.evaluation(id).transpose())
+            .collect()
     }
 
     /// Agent `name`'s draft, if it has one.

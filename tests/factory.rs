@@ -685,3 +685,98 @@ fn a_workers_memory_copies_its_topics_with_their_marks_from_its_owner() {
         "{out}"
     );
 }
+
+/// AC-8: evaluating says first what it would run (its cases with the built-in attacks, the
+/// runs on each candidate) and runs nothing until it is confirmed with --yes.
+#[test]
+fn an_evaluation_shows_its_estimate_and_runs_nothing_until_it_is_confirmed() {
+    let home = Home::new();
+    home.ok(&[
+        "new",
+        "rev",
+        "--template",
+        "code-reviewer",
+        "--profile",
+        "alice",
+    ]);
+    let cases = home.blueprint("rev")["evals"]["cases"]
+        .as_array()
+        .unwrap()
+        .len();
+    let out = home.ok(&["evaluate", "rev", "--profile", "alice"]);
+    let runs = (cases + 7) * 3;
+    for part in [
+        "candidates: codex (its default model)".to_owned(),
+        format!(
+            "estimate: {} cases (7 built-in adversarial) x 3 runs x 1 candidate = {runs} runs",
+            cases + 7
+        ),
+        "nothing ran: run it with --yes (its tasks go to your evaluation worker alice-eval)"
+            .to_owned(),
+    ] {
+        assert!(out.contains(&part), "{part:?} isn't in:\n{out}");
+    }
+    assert!(out.contains("rev: build "), "it is of a build: {out}");
+    // Nothing was sent: there is no evaluation worker and no evaluation.
+    let profiles = home.path().join("profiles");
+    assert!(!profiles.join("alice-eval").exists());
+    let agent = profiles
+        .join("alice")
+        .join("factory")
+        .join("agents")
+        .join("rev");
+    assert!(!agent.join("evaluations").exists());
+    assert!(
+        !home
+            .ok(&["show", "rev", "--profile", "alice"])
+            .contains("evaluations")
+    );
+
+    // On other models, fewer times.
+    let out = home.ok(&[
+        "evaluate",
+        "rev",
+        "--candidate",
+        "codex:gpt-5:high",
+        "--candidate",
+        "codex:gpt-5-mini",
+        "--repetitions",
+        "1",
+        "--profile",
+        "alice",
+    ]);
+    assert!(
+        out.contains("candidates: codex gpt-5 (high reasoning); codex gpt-5-mini"),
+        "{out}"
+    );
+    assert!(out.contains("x 1 run x 2 candidates"), "{out}");
+    for (args, why) in [
+        (vec!["--repetitions", "9"], "repetitions is 1 to 5"),
+        (
+            vec!["--candidate", "copilot:gpt-5"],
+            "it can't be evaluated on copilot gpt-5: copilot isn't one of its providers",
+        ),
+        (vec!["--candidate", "codex"], "names no model"),
+        (vec!["--candidate", "nobody:gpt-5"], "isn't a candidate"),
+    ] {
+        let mut all = vec!["evaluate", "rev", "--profile", "alice"];
+        all.extend(args);
+        let out = home.fails(&all);
+        assert!(out.contains(why), "{why:?} isn't in:\n{out}");
+    }
+    // A draft with an error isn't evaluated.
+    let mut blueprint = home.blueprint("rev");
+    blueprint["skills"] = json!(["no-such-skill"]);
+    let edit = ["edit", "rev", "--from", "-", "--profile", "alice"];
+    assert!(home.run_with_stdin(&edit, &blueprint.to_string()).ok);
+    let out = home.fails(&["evaluate", "rev", "--profile", "alice"]);
+    assert!(
+        out.contains("rev's draft has 1 error: fix it before it is evaluated"),
+        "{out}"
+    );
+    let out = home.fails(&["report", "ev-20261124-091500-rev", "--profile", "alice"]);
+    assert!(
+        out.contains("there is no evaluation ev-20261124-091500-rev"),
+        "{out}"
+    );
+}

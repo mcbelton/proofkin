@@ -7,14 +7,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
+use crate::agent::{Agent, AgentConfig, MAX_CONCURRENT_TASKS, Network};
 use crate::factory::blueprint::{
     Blueprint, Catalog, Problem, check_value, from_value, has_errors, name_problem, summary,
 };
 use crate::factory::evals::check_fixtures;
+use crate::factory::report::{EvalState, Evaluation, RunState};
+use crate::factory::runner::{self, Judges, Planned, Request, Runner};
 use crate::factory::store::{Draft, FactoryStore, Provenance, now};
 use crate::factory::{capabilities, draft, routing, templates};
 use crate::llm::{ExecutorConfig, Provider, SdkExecutor};
 use crate::profile::Profile;
+use crate::workers::{Launch, Supervisor};
 
 #[derive(Args, Debug)]
 pub struct ProfileOpt {
@@ -109,6 +113,49 @@ error naming the command that offers it. Checking never shares, offers or grants
         #[command(flatten)]
         profile: ProfileOpt,
     },
+    /// Evaluate a draft: its build's eval cases and the built-in adversarial ones, on each
+    /// candidate model, a few times each, as real tasks of your evaluation worker
+    /// (<profile>-eval, made the first time) at the access the agent asks for. Without
+    /// --yes it only says what it would run.
+    #[command(after_help = "\
+examples:
+  proofkin factory evaluate fin-analyst --profile alice
+  proofkin factory evaluate fin-analyst --candidate copilot:gpt-5:high --candidate copilot:claude-sonnet-4.5 --repetitions 3 --yes --profile alice
+Each run is graded by its deterministic expectations; a judge of another model family
+scores rubrics and never decides. The release gate needs 90% of the agent's own runs, 2 of
+3 of each requirement's and every adversarial run to pass. Run it again to go on with an
+evaluation of the same build that didn't end; Ctrl+C cancels it.")]
+    Evaluate {
+        name: String,
+        /// A model to evaluate it on: provider:model[:effort] (repeat it; default: those its
+        /// blueprint lists, else its providers' defaults).
+        #[arg(long = "candidate", value_name = "PROVIDER:MODEL[:EFFORT]")]
+        candidates: Vec<String>,
+        /// Runs per case and candidate, 1 to 5 (default: its suite's, else 3).
+        #[arg(long)]
+        repetitions: Option<u32>,
+        /// Run it: give the tasks the estimate counts to your evaluation worker.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+        /// Node bridge script for the Claude and Codex SDKs (default: the one `setup` installed).
+        #[arg(long, env = "PROOFKIN_BRIDGE")]
+        bridge: Option<PathBuf>,
+    },
+    /// An evaluation's report: what ran, the release gate, each candidate's results and
+    /// the failing runs with their outputs; --json prints the signed record.
+    Report {
+        /// The evaluation's id (ev-...), as `factory show` lists them.
+        id: String,
+        #[arg(long)]
+        json: bool,
+        /// Write it to this file instead.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
     /// Delete an agent's draft and records (not an agent with releases: their records
     /// are kept).
     Delete {
@@ -166,6 +213,30 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
             folders,
         )?,
         FactoryCommand::Build { name, profile } => build(&Profile::open(&profile.name)?, &name)?,
+        FactoryCommand::Evaluate {
+            name,
+            candidates,
+            repetitions,
+            yes,
+            profile,
+            bridge,
+        } => {
+            evaluate(
+                &Profile::open(&profile.name)?,
+                &name,
+                &candidates,
+                repetitions,
+                yes,
+                bridge,
+            )
+            .await?
+        }
+        FactoryCommand::Report {
+            id,
+            json,
+            out,
+            profile,
+        } => report(&Profile::open(&profile.name)?, &id, json, out.as_deref())?,
         FactoryCommand::Delete { name, profile } => {
             let profile = Profile::open(&profile.name)?;
             if !FactoryStore::of(&profile).delete(&name)? {
@@ -289,12 +360,7 @@ fn problems_of(
     blueprint: &Value,
     catalog: &Catalog,
 ) -> Vec<Problem> {
-    let mut problems = check_value(blueprint, catalog);
-    if let Ok(parsed) = from_value(blueprint) {
-        problems.extend(check_fixtures(&parsed.evals, &store.fixtures_dir(name)));
-        problems.sort_by_key(|p| !p.error);
-    }
-    problems
+    crate::factory::runner::draft_problems(store, name, blueprint, catalog)
 }
 
 fn list(profile: &Profile) -> Result<()> {
@@ -393,6 +459,17 @@ fn show(profile: &Profile, name: &str, json: bool) -> Result<()> {
     if !builds.is_empty() {
         let short: Vec<&str> = builds.iter().map(|h| &h[..12]).collect();
         println!("  builds: {}", short.join(", "));
+    }
+    let evaluations = store.evaluations(name)?;
+    if !evaluations.is_empty() {
+        let running = store.evaluation_running();
+        println!(
+            "  evaluations (proofkin factory report ID --profile {}):",
+            profile.name
+        );
+        for e in evaluations.iter().take(5) {
+            println!("    {}  {}", e.id, evaluation_line(e, running));
+        }
     }
     if let Some(state) = &state {
         println!("  history:");
@@ -706,6 +783,327 @@ fn build(profile: &Profile, name: &str) -> Result<()> {
     }
     println!("hash: {}", built.hash);
     println!("in: {}", dir.display());
+    Ok(())
+}
+
+/// An evaluation in a line: its build and verdict, or how far it got. `running`: an
+/// evaluation runs now (only one does at a time).
+fn evaluation_line(e: &Evaluation, running: bool) -> String {
+    let build = &e.build[..12.min(e.build.len())];
+    match e.state {
+        EvalState::Running if running => {
+            format!(
+                "build {build}: running, {} of {} runs done",
+                e.done(),
+                e.runs.len()
+            )
+        }
+        EvalState::Running => format!(
+            "build {build}: stopped with {} of {} runs done (evaluate it again to go on)",
+            e.done(),
+            e.runs.len()
+        ),
+        EvalState::Passed => format!(
+            "build {build}: passed{}",
+            e.recommended
+                .as_ref()
+                .map(|r| format!(", recommended {r}"))
+                .unwrap_or_default()
+        ),
+        EvalState::Failed => format!(
+            "build {build}: failed ({})",
+            e.gate.reasons.first().map(String::as_str).unwrap_or("")
+        ),
+        EvalState::Cancelled => format!(
+            "build {build}: cancelled{}",
+            e.error
+                .as_deref()
+                .map(|why| format!(" ({why})"))
+                .unwrap_or_default()
+        ),
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Evaluates draft `name`: says what it would run, and runs it with `yes`.
+async fn evaluate(
+    profile: &Profile,
+    name: &str,
+    candidates: &[String],
+    repetitions: Option<u32>,
+    yes: bool,
+    bridge: Option<PathBuf>,
+) -> Result<()> {
+    let asked = candidates
+        .iter()
+        .map(|c| runner::parse_candidate(c))
+        .collect::<Result<Vec<_>>>()?;
+    let planned = runner::plan(profile, name, &asked, repetitions, None).map_err(|refused| {
+        print_problems(&refused.problems);
+        anyhow!("{}", refused.message)
+    })?;
+    let store = FactoryStore::of(profile);
+    let resumable = runner::unfinished(&store, name, &planned.build.hash)?;
+    let estimate = runner::estimate(
+        &planned.blueprint,
+        planned.candidates.len(),
+        planned.repetitions,
+        MAX_CONCURRENT_TASKS,
+    );
+    println!("{name}: build {}", planned.build.short_hash());
+    let listed: Vec<String> = planned.candidates.iter().map(|c| c.to_string()).collect();
+    println!("  candidates: {}", listed.join("; "));
+    for out in &planned.left_out {
+        println!("    left out: {}: {}", out.route, out.why);
+    }
+    println!(
+        "  estimate: {} ({} built-in adversarial) x {} x {} = {}{}: about {} on {}",
+        plural(estimate.cases, "case", "cases"),
+        estimate.adversarial,
+        plural(estimate.repetitions as usize, "run", "runs"),
+        plural(estimate.candidates, "candidate", "candidates"),
+        plural(estimate.runs, "run", "runs"),
+        if estimate.judge_calls > 0 {
+            format!(
+                ", and {} by judges",
+                plural(estimate.judge_calls, "score", "scores")
+            )
+        } else {
+            String::new()
+        },
+        plural(estimate.minutes as usize, "minute", "minutes"),
+        plural(estimate.slots, "task slot", "task slots"),
+    );
+    if let Some(e) = &resumable {
+        println!(
+            "  {} of this build didn't end ({} of {} runs done): it goes on from there",
+            e.id,
+            e.done(),
+            e.runs.len()
+        );
+    }
+    let worker = runner::worker_name(&profile.name);
+    if !yes {
+        println!(
+            "nothing ran: run it with --yes (its tasks go to your evaluation worker {worker})"
+        );
+        return Ok(());
+    }
+    let _instance = profile.lock_instance().map_err(|_| {
+        anyhow!(
+            "profile '{}' runs in a proofkin agent: evaluate {name} in its web UI (Agent factory), or stop that agent first",
+            profile.name
+        )
+    })?;
+    let _running = store.lock_evaluation()?;
+    let key = profile.identity()?;
+    // The owner's agent, on this machine only: it gives the runs to its evaluation worker.
+    let mut config = AgentConfig::new(profile.name.clone(), key.clone());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse()?);
+    config.trust = profile.trust()?;
+    config.task_ids = Some(profile.task_ids_path());
+    config.worktrees_dir = profile.worktrees_dir();
+    let (agent, _events) = Agent::bind(config).await?;
+    let bridge = crate::setup::resolve_bridge(
+        bridge.or_else(|| crate::profile::env_setting_os("BRIDGE").map(PathBuf::from)),
+    );
+    let result = run_evaluation(profile, &agent, &key, planned, resumable, bridge).await;
+    agent.shutdown().await;
+    result
+}
+
+/// Runs `planned` (or goes on with `resumable`) with the owner's `agent` on its evaluation
+/// worker, which it starts and stops; prints each run as it ends, then the report's summary.
+async fn run_evaluation(
+    profile: &Profile,
+    agent: &Agent,
+    key: &iroh::SecretKey,
+    planned: Planned,
+    resumable: Option<Evaluation>,
+    bridge: PathBuf,
+) -> Result<()> {
+    let store = FactoryStore::of(profile);
+    let catalog = Catalog::of(profile)?;
+    let mut providers: Vec<Provider> = planned.candidates.iter().map(|c| c.provider).collect();
+    providers.sort();
+    providers.dedup();
+    let worker = runner::eval_worker(profile, agent.addr(), &agent.trusted(), &providers)?;
+    if let Some(entry) = &worker.entry {
+        agent.allow(entry.clone());
+        let mut trust = profile.trust()?;
+        trust.allow(entry.clone());
+        trust.save(&profile.trust_path())?;
+    }
+    let folders = profile.shares()?;
+    let setup = match resumable {
+        Some(e) => runner::resume(&store, e, &planned.blueprint, &folders)?,
+        None => runner::prepare(
+            &store,
+            Request {
+                blueprint: &planned.blueprint,
+                build: &planned.build,
+                candidates: planned.candidates.clone(),
+                repetitions: planned.repetitions,
+                by: profile.name.clone(),
+                worker: worker.profile.name.clone(),
+                worker_id: worker.id,
+                folders: &folders,
+            },
+        )?,
+    };
+    runner::install(&worker.profile, &setup.share)?;
+    let supervisor = Supervisor::new(
+        profile.clone(),
+        agent.clone(),
+        Launch {
+            exe: std::env::current_exe()?,
+            network: Network::Local,
+            ip: None,
+            bridge: Some(bridge.clone()),
+        },
+    );
+    println!("starting your evaluation worker {}", worker.profile.name);
+    runner::start_worker(&supervisor, agent, &worker).await?;
+    // Judges score rubrics: the profile's models of another family than the candidate's.
+    let rubrics = setup
+        .evaluation
+        .cases
+        .iter()
+        .any(|c| c.expect.iter().any(|e| e.get("judge").is_some()));
+    let executor = if rubrics {
+        Some(
+            SdkExecutor::start(ExecutorConfig {
+                providers: catalog.providers.iter().copied().collect(),
+                bridge_script: bridge,
+                profile: profile.clone(),
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
+    let judges = match &executor {
+        Some(e) => Judges::of(e.clone(), &catalog, None),
+        None => Judges::default(),
+    };
+    let runner = Runner {
+        agent: agent.clone(),
+        key: key.clone(),
+        signer: profile.name.clone(),
+        worker: worker.id,
+        store: store.clone(),
+        judges,
+        ready_wait: runner::READY_WAIT,
+    };
+    let id = setup.evaluation.id.clone();
+    let name = setup.evaluation.agent.clone();
+    println!(
+        "evaluating {name} ({id}): {} (Ctrl+C cancels it)",
+        plural(setup.evaluation.runs.len(), "run", "runs")
+    );
+    let printed = std::sync::Mutex::new(std::collections::HashSet::new());
+    let on_change = |e: &Evaluation| {
+        let mut printed = printed.lock().unwrap();
+        for (i, run) in e.runs.iter().enumerate() {
+            if run.state != RunState::Done || !printed.insert(i) {
+                continue;
+            }
+            let why = run.error.clone().or_else(|| {
+                run.grades
+                    .iter()
+                    .find(|g| g.passed == Some(false))
+                    .map(|g| g.note.clone())
+            });
+            println!(
+                "  [{}/{}] {} on {}, run {}: {} ({:.0}s){}",
+                printed.len(),
+                e.runs.len(),
+                run.case,
+                e.candidates[run.candidate],
+                run.repetition,
+                if run.passed { "passed" } else { "FAILED" },
+                run.secs,
+                why.map(|w| format!(": {w}")).unwrap_or_default()
+            );
+        }
+    };
+    let outcome = tokio::select! {
+        result = runner.run(setup.evaluation, &setup.share, on_change) => result,
+        _ = tokio::signal::ctrl_c() => runner::cancel(
+            &store,
+            &id,
+            &format!("{} cancelled it (Ctrl+C)", profile.name),
+            &profile.name,
+            key,
+        ),
+    };
+    supervisor.stop(&worker.profile.name).await;
+    if let Some(executor) = executor {
+        executor.stop().await;
+    }
+    let evaluation = outcome?;
+    runner::clean(&store, Some(&worker.profile))?;
+    println!("{name}: {} ({id})", evaluation_line(&evaluation, false));
+    for r in &evaluation.results {
+        let requirements: Vec<String> = r
+            .requirements
+            .iter()
+            .map(|(k, v)| format!("{k} {:.0}%", v * 100.0))
+            .collect();
+        println!(
+            "  {}: {}; {:.0}% of its runs passed ({}); adversarial {}/{}; p95 {:.0}s; {:.1} attempts; cost {}; judge {}",
+            r.candidate,
+            if r.gate.passed { "passed" } else { "failed" },
+            r.pass_rate * 100.0,
+            requirements.join(", "),
+            r.adversarial.passed,
+            r.adversarial.total,
+            r.p95_secs,
+            r.attempts,
+            r.multiplier.as_deref().unwrap_or("unknown"),
+            r.judge_score
+                .map(|s| format!("{s:.1}"))
+                .unwrap_or_else(|| "none".into())
+        );
+        for why in &r.gate.reasons {
+            println!("    {why}");
+        }
+    }
+    println!(
+        "report: proofkin factory report {id} --profile {}",
+        profile.name
+    );
+    if !evaluation.gate.passed {
+        bail!("{name} didn't pass its evaluation");
+    }
+    Ok(())
+}
+
+/// Prints (or writes to `out`) evaluation `id`'s report, in Markdown or as its signed JSON.
+fn report(profile: &Profile, id: &str, json: bool, out: Option<&Path>) -> Result<()> {
+    let store = FactoryStore::of(profile);
+    let evaluation = store.evaluation(id)?.ok_or_else(|| {
+        anyhow!(
+            "there is no evaluation {id} (proofkin factory show NAME --profile {} lists an agent's)",
+            profile.name
+        )
+    })?;
+    let text = if json {
+        serde_json::to_string_pretty(&evaluation)? + "\n"
+    } else {
+        evaluation.markdown()
+    };
+    match out {
+        Some(path) => {
+            std::fs::write(path, &text).with_context(|| format!("writing {}", path.display()))?;
+            println!("wrote {id}'s report to {}", path.display());
+        }
+        None => print!("{text}"),
+    }
     Ok(())
 }
 
