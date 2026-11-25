@@ -340,6 +340,9 @@ textarea { resize: vertical; }
 .factory-template .t-title { font-weight: 600; }
 .factory-template .t-purpose { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
 .factory-panel h3 { font-size: 13px; margin: 0; }
+/* On a phone its four tabs take two lines rather than run past the dialog. */
+#factory-agent-dialog .tabs { flex-wrap: wrap; }
+#factory-new-progress:empty { display: none; }
 .factory-panel .card-head { margin: 0; }
 .factory-requirements { margin: 0; padding-left: 20px; font-size: 13px; display: grid; gap: 4px; }
 .factory-problems, .factory-failing, .factory-grants { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; font-size: 13px; }

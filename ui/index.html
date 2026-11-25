@@ -676,10 +676,13 @@
         <textarea id="factory-description" rows="4" maxlength="4000" placeholder="e.g. Analyze quarterly reports, extract key metrics, flag risks and write an executive summary…" aria-describedby="factory-description-hint"></textarea>
         <span class="muted small" id="factory-description-hint">Your model writes the draft from your words, read-only in an empty folder; it takes a minute. Without words, the template is the draft.</span>
       </label>
-      <p class="form-error" id="factory-new-error" role="alert"></p>
-      <div class="dialog-actions">
-        <button type="button" class="btn" id="factory-new-cancel">Cancel</button>
-        <button type="submit" class="btn primary" id="factory-new-submit">Create draft</button>
+      <div class="dialog-footer">
+        <p class="muted small" id="factory-new-progress" role="status"></p>
+        <p class="form-error" id="factory-new-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn" id="factory-new-cancel">Cancel</button>
+          <button type="submit" class="btn primary" id="factory-new-submit">Create draft</button>
+        </div>
       </div>
     </form>
   </dialog>

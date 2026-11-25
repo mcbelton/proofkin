@@ -450,6 +450,15 @@ impl Evaluation {
         self.results = (0..self.candidates.len())
             .map(|i| self.result(i, multipliers.get(i).copied().flatten()))
             .collect();
+        // Cancelled: what ran decides nothing, for any candidate.
+        if cancelled.is_some() {
+            for r in &mut self.results {
+                r.gate = Gate {
+                    passed: false,
+                    reasons: vec!["it was cancelled before its runs ended".into()],
+                };
+            }
+        }
         let outcomes: Vec<Outcome> = self
             .results
             .iter()
@@ -1040,6 +1049,10 @@ pub(crate) mod tests {
         assert_eq!(
             stopped.gate.reasons,
             ["it was cancelled: cancelled by alice"]
+        );
+        assert!(
+            stopped.results.iter().all(|r| !r.gate.passed),
+            "what ran decides no candidate's gate"
         );
         let report = attacked.markdown();
         for part in [

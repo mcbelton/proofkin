@@ -54,7 +54,10 @@ function renderFactory() {
       el("strong", { text: "New agent" }), " starts one from a template or your words."));
     return;
   }
+  // Redrawn as evaluations move on: focus stays on the agent it was on.
+  const focused = document.activeElement?.closest?.("#factory-list [data-agent]")?.dataset.agent;
   list.replaceChildren(...factoryState.agents.map(factoryNode));
+  if (focused) list.querySelector(`[data-agent="${CSS.escape(focused)}"] button`)?.focus();
 }
 
 /// The agent's latest evaluation, in a line.
@@ -132,6 +135,7 @@ async function submitFactoryNew(e) {
   const button = $("#factory-new-submit");
   button.disabled = true;
   button.textContent = description ? "Your model is drafting it…" : "Creating…";
+  $("#factory-new-progress").textContent = description ? "Your model reads your words and writes the blueprint, read-only in an empty folder." : "";
   try {
     const body = { name };
     if (template) body.template = template;
@@ -150,6 +154,7 @@ async function submitFactoryNew(e) {
   } finally {
     button.disabled = false;
     button.textContent = "Create draft";
+    $("#factory-new-progress").textContent = "";
   }
 }
 
@@ -170,9 +175,14 @@ async function openFactoryAgent(name, opener) {
   $("#ftab-overview").focus();
 }
 
-async function refreshFactoryAgent() {
+async function refreshFactoryAgent(force = true) {
   const name = factoryState.open;
   const enc = encodeURIComponent(name);
+  const before = {
+    draft: JSON.stringify(factoryState.draft),
+    evaluations: JSON.stringify(factoryState.agent?.evaluations ?? []),
+    running: factoryRunning()?.id ?? null,
+  };
   const [agent, draft] = await Promise.all([
     api(`/api/factory/agents/${enc}`),
     api(`/api/factory/drafts/${enc}`).catch(() => null),
@@ -181,10 +191,15 @@ async function refreshFactoryAgent() {
   factoryState.agent = agent;
   factoryState.draft = draft;
   $("#factory-agent-h").textContent = agent.title ? `${agent.name} · ${agent.title}` : agent.name;
-  renderFactoryOverview();
-  renderFactoryBlueprint();
-  renderFactoryEvaluate();
-  await renderFactoryReports();
+  // Only what changed is drawn again: what the owner typed, picked or was shown stays.
+  const draftChanged = force || JSON.stringify(draft) !== before.draft;
+  const runningChanged = force || (factoryRunning()?.id ?? null) !== before.running;
+  if (draftChanged) {
+    renderFactoryOverview();
+    if (force || !factoryState.jsonEdited) renderFactoryBlueprint();
+  }
+  if (runningChanged || (draftChanged && !factoryRunning())) renderFactoryEvaluate();
+  if (force || JSON.stringify(agent.evaluations) !== before.evaluations) await renderFactoryReports();
 }
 
 function selectFactoryTab(name, focus = false) {
@@ -260,6 +275,8 @@ async function checkFactoryFolders(button, result) {
   } finally {
     button.disabled = false;
     button.textContent = "Check in its folders";
+    // A disabled button loses focus: back on it.
+    if (document.activeElement === document.body) button.focus();
   }
 }
 
@@ -275,6 +292,8 @@ function renderFactoryBlueprint() {
     "aria-label": `Blueprint of ${factoryState.open} (JSON)`, "aria-describedby": "factory-json-hint",
   });
   area.value = JSON.stringify(draft.blueprint, null, 2);
+  factoryState.jsonEdited = false;
+  area.addEventListener("input", () => { factoryState.jsonEdited = true; });
   const status = el("div", { id: "factory-save-result", role: "status" });
   const error = el("p", { class: "form-error", id: "factory-save-error", role: "alert" });
   const save = el("button", { type: "button", class: "btn primary", id: "factory-save" }, "Save changes");
@@ -300,13 +319,11 @@ async function saveFactoryBlueprint(area, button, error, status) {
   button.textContent = "Saving…";
   try {
     const res = await api(`/api/factory/drafts/${encodeURIComponent(factoryState.open)}`, { method: "PUT", body: JSON.stringify(blueprint) });
-    status.replaceChildren(el("h3", { text: res.passed ? "Saved: no errors" : "Saved, with errors to fix" }), factoryProblems(res.problems));
-    toast(`Saved ${factoryState.open}`);
-    const kept = area.value;
+    factoryState.jsonEdited = false;
     await refreshFactoryAgent();
-    // Back where the owner was, with what they typed.
-    $("#factory-json").value = kept;
-    $("#factory-save-result").replaceChildren(...status.childNodes);
+    $("#factory-save-result").replaceChildren(
+      el("h3", { text: res.passed ? "Saved: no errors" : "Saved, with errors to fix" }), factoryProblems(res.problems));
+    toast(`Saved ${factoryState.open}`);
     $("#factory-save").focus();
   } catch (err) {
     error.textContent = err.message;
@@ -532,6 +549,11 @@ function factoryFailing(e) {
 // ---------- live updates ----------
 let factoryTimer = null;
 function onFactoryEvent(msg) {
+  // What the owner's model is doing while it writes a draft.
+  if (msg.progress) {
+    if ($("#factory-new-dialog").open) $("#factory-new-progress").textContent = msg.progress;
+    return;
+  }
   // Many runs end close together: one refresh for them.
   clearTimeout(factoryTimer);
   factoryTimer = setTimeout(async () => {
@@ -547,11 +569,18 @@ function onFactoryEvent(msg) {
       return;
     }
     const focused = document.activeElement?.id;
-    await refreshFactoryAgent().catch(() => {});
-    if (msg.state && msg.state !== "running" && msg.evaluation) {
+    const inDialog = dialog.contains(document.activeElement);
+    await refreshFactoryAgent(false).catch(() => {});
+    // Who cancelled it was told already; an evaluation that ended on its own is news.
+    if (msg.state === "passed" || msg.state === "failed") {
       toast(`Evaluation of ${msg.agent} ${msg.state}`);
     }
-    if (focused && document.getElementById(focused)) document.getElementById(focused).focus();
+    const again = focused ? document.getElementById(focused) : null;
+    if (again) again.focus();
+    // What had focus went (e.g. Cancel, once it ended): its panel's first action, or its tab.
+    else if (inDialog) {
+      (document.querySelector(`#fpanel-${factoryState.tab} button:not([disabled])`) ?? $(`#ftab-${factoryState.tab}`)).focus();
+    }
   }, 250);
 }
 

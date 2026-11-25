@@ -287,12 +287,17 @@ fn check_blueprint(dir: &Path, report: &mut Report) {
     let problems = crate::factory::blueprint::validate(&bp, &catalog(&bp, dir));
     add(report, problems.into_iter().filter(|p| !suite.contains(p)));
     report.notes.push(format!(
-        "{BLUEPRINT}: agent {} ({}), {} requirements, {} access",
+        "{BLUEPRINT}: agent {} ({}), {}, {} access",
         bp.name,
         bp.title,
-        bp.requirements.len(),
+        plural(bp.requirements.len(), "requirement", "requirements"),
         bp.capabilities.access
     ));
+}
+
+/// `n` and the word for it, agreeing: "1 case", "2 cases".
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// The suite: a case for every requirement with a deterministic expectation, and fixtures
@@ -313,9 +318,9 @@ fn check_evals(dir: &Path, report: &mut Report) {
         .map(|c| c.requirement.as_str())
         .collect();
     report.notes.push(format!(
-        "{EVALS}: {} cases, {} runs each, proving {}",
-        bp.evals.cases.len(),
-        bp.evals.repetitions(),
+        "{EVALS}: {}, {} each, proving {}",
+        plural(bp.evals.cases.len(), "case", "cases"),
+        plural(bp.evals.repetitions() as usize, "run", "runs"),
         requirements.into_iter().collect::<Vec<_>>().join(", ")
     ));
 }
