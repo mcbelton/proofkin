@@ -1544,7 +1544,11 @@ is tracked on GitHub, where your team already tracks work:
   (`Todo`/`Ready`/`Backlog`, `In progress`/`Doing`, `In review`/`Review`, `Done`, with or
   without emoji); without a review column, work waiting for review stays in progress;
 - results and failures are **commented** on the issues with their signed evidence (signer,
-  checks, commit and branch), and the run's issue gets the run's verdict and claims;
+  checks, commit and branch), and the run's issue gets the run's verdict and claims. What a
+  step that may hold Microsoft 365 content ended with stays off GitHub (a `workiq=` or
+  `@workiq` step, one with `mcp=workiq` or a Microsoft 365 knowledge topic, one whose
+  evidence names labels, and the steps after them): its comment says it is in the run's
+  record instead. A sign-off's note, its approver's own words, is posted as written;
 - each step's task carries its issue (and those of the steps whose work it applies). The
   worker's commit references them (`Refs: acme/shop#15` trailers), `repo branches` and the
   web UI show them, and a pull request from the branch **closes** them (`Closes #15`), so

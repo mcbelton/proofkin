@@ -581,8 +581,8 @@ const planText = (() => {
       : null;
     const who = tracker.login ? `, assigned to ${tracker.login}` : "";
     const after = [
-      ...(board ? [" They move on the ", board, " as the steps run, and each result is commented on its issue."]
-        : [" Each step's result is commented on its issue."]),
+      ...(board ? [" They move on the ", board, " as the steps run, and each result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub)."]
+        : [" Each step's result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub)."]),
       ...(tracker.visibility === "public" ? [" The repository is public: anyone can read them."]
         : tracker.visibility === "internal" ? [" The repository is internal: everyone in its enterprise can read them."]
           : []),
