@@ -316,8 +316,8 @@ cases.push(
       return `${warn ? "! " : ""}${parts.map((p) => (typeof p === "string" ? p : `[${p.text}](${p.href})`)).join("")}`;
     };
     const issue = (open) => ({ issue: { number: 12, title: "Customers export orders", url: "https://github.com/acme/shop/issues/12", open } });
-    const after = " They move on the [Shop board](https://github.com/users/alice/projects/4) as the steps run, and each result is commented on its issue."
-      + " The repository is public: anyone can read them.";
+    const after = " They move on the [Shop board](https://github.com/users/alice/projects/4) as the steps run, and each result is commented on its issue"
+      + " (one that may hold Microsoft 365 content stays off GitHub). The repository is public: anyone can read them.";
     return [
       ["a new issue: where, who, the board and who can read them", say(planText.trackOf("a @x Do it")),
         `Running it opens an issue in [acme/shop](https://github.com/acme/shop/issues), with a sub-issue per step, assigned to alice.${after}`],
@@ -338,7 +338,7 @@ cases.push(
       ["a private repository without a board says neither", say({ kind: "new", title: "" }, null,
         { repo: "acme/shop", host: "github.com", login: "alice", visibility: "private" }),
         "Running it opens an issue in [acme/shop](https://github.com/acme/shop/issues), with a sub-issue per step, assigned to alice."
-        + " Each step's result is commented on its issue."],
+        + " Each step's result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub)."],
     ];
   })(),
 );

@@ -1993,6 +1993,13 @@ impl Run {
         }
     }
 
+    /// The agent that keeps what `step` ended with, when it may hold Microsoft 365 content
+    /// (`m365`) and so stays off GitHub. A sign-off's note (its approver's own words) and a
+    /// pull request step's result (Proofkin's own) are posted as they are.
+    fn keeper(&self, step: &Step, m365: bool) -> Option<&str> {
+        (m365 && !step.approve && !step.pr).then_some(self.agent.as_str())
+    }
+
     /// Sets up the run's issues (see the module docs).
     async fn begin(
         tracker: Tracker,
@@ -2188,8 +2195,9 @@ impl Run {
             .await;
     }
 
-    /// Follows step `step` to `state` on its issue.
-    async fn update(&mut self, step: &Step, state: &StepState) {
+    /// Follows step `step` to `state` on its issue. When what it ended with may hold
+    /// Microsoft 365 content (`m365`, see [`holds_m365`]), its comment leaves that out.
+    async fn update(&mut self, step: &Step, state: &StepState, m365: bool) {
         let Some(issue) = self.steps.get(&step.id).cloned() else {
             return;
         };
@@ -2257,6 +2265,7 @@ impl Run {
                     *verified,
                     &self.run_id,
                     model.as_deref(),
+                    self.keeper(step, m365),
                 )));
                 if to_merge {
                     (Status::InReview, who, true)
@@ -2284,6 +2293,7 @@ impl Run {
                     *verified,
                     &self.run_id,
                     model.as_deref(),
+                    self.keeper(step, m365),
                 )));
                 (Status::Todo, who, issue.open)
             }
@@ -2612,6 +2622,9 @@ fn evidence_line(e: &Evidence, verified: bool) -> String {
     )
 }
 
+/// A done step's comment; its result stays off GitHub when it may hold Microsoft 365
+/// content (`kept_by`: the agent whose run record has it).
+#[allow(clippy::too_many_arguments)]
 fn done_comment(
     step: &Step,
     who: &str,
@@ -2620,6 +2633,7 @@ fn done_comment(
     verified: bool,
     run_id: &str,
     model: Option<&str>,
+    kept_by: Option<&str>,
 ) -> String {
     if step.approve {
         let mut md = format!(
@@ -2658,10 +2672,15 @@ fn done_comment(
         }
         _ => md += "\n\nIt changed no files, so this issue is done.",
     }
-    md += &format!(
-        "\n\n<details><summary>Result</summary>\n\n{}\n\n</details>",
-        fenced(&safe(output, MAX_RESULT))
-    );
+    md += &match kept_by {
+        Some(agent) => format!(
+            "\n\nIts result may hold Microsoft 365 content, so it stays off GitHub: it is in run `{run_id}`'s record with **{agent}**."
+        ),
+        None => format!(
+            "\n\n<details><summary>Result</summary>\n\n{}\n\n</details>",
+            fenced(&safe(output, MAX_RESULT))
+        ),
+    };
     md
 }
 
@@ -2675,6 +2694,9 @@ fn with_model(model: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// A failed step's comment; why it failed stays off GitHub when it may hold Microsoft 365
+/// content (`kept_by`: the agent whose run record has it).
+#[allow(clippy::too_many_arguments)]
 fn failed_comment(
     step: &Step,
     who: Option<&str>,
@@ -2683,6 +2705,7 @@ fn failed_comment(
     verified: bool,
     run_id: &str,
     model: Option<&str>,
+    kept_by: Option<&str>,
 ) -> String {
     let mut md = if step.approve {
         format!(
@@ -2701,10 +2724,15 @@ fn failed_comment(
     if let Some(e) = evidence {
         md += &format!("\n\n{}", evidence_line(e, verified));
     }
-    md += &format!(
-        "\n\n<details><summary>Why</summary>\n\n{}\n\n</details>",
-        fenced(&safe(error, MAX_RESULT))
-    );
+    md += &match kept_by {
+        Some(agent) => format!(
+            "\n\nWhy may hold Microsoft 365 content, so it stays off GitHub: it is in run `{run_id}`'s record with **{agent}**."
+        ),
+        None => format!(
+            "\n\n<details><summary>Why</summary>\n\n{}\n\n</details>",
+            fenced(&safe(error, MAX_RESULT))
+        ),
+    };
     md
 }
 
@@ -2992,18 +3020,20 @@ fn follow(mut run: Run, plan: &Plan) -> Tracking {
     let refs = issue_refs(plan, &run);
     let texts = run.texts.clone();
     let tracked = run.tracked();
-    let steps: HashMap<String, Step> = plan
-        .steps
-        .iter()
-        .map(|s| (s.id.clone(), s.clone()))
-        .collect();
+    let plan = plan.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
+        // The steps whose results held Microsoft 365 content, as they ended.
+        let mut held = HashSet::new();
         while let Some(msg) = rx.recv().await {
             match msg {
                 Msg::Step(id, state) => {
-                    if let Some(step) = steps.get(&id) {
-                        run.update(step, &state).await;
+                    if let Some(step) = plan.steps.iter().find(|s| s.id == id) {
+                        let m365 = holds_m365(&plan, step, &state, &held);
+                        if m365 && state.finished() {
+                            held.insert(id);
+                        }
+                        run.update(step, &state, m365).await;
                     }
                 }
                 Msg::Finish(record) => run.finish(&record).await,
@@ -3018,6 +3048,21 @@ fn follow(mut run: Run, plan: &Plan) -> Tracking {
         texts,
         tracked,
     }
+}
+
+/// Whether what `step` ends with (its result, or why it failed) may hold Microsoft 365
+/// content, which never goes on GitHub: the tracker's repository may be public, and no grant
+/// covers it. So it may if the step brings some (`workiq=`, `@workiq`), its model may read
+/// some (`mcp=workiq`), it is marked with some (a `context=` topic from Microsoft 365), its
+/// peer's signed evidence names labels, or a step it waits for held some (`held`, as those
+/// ended).
+fn holds_m365(plan: &Plan, step: &Step, state: &StepState, held: &HashSet<String>) -> bool {
+    let brings = |s: &Step| s.brings_m365() || s.uses_workiq_tools() || s.m365.is_some();
+    brings(step)
+        || crate::plan::result_labels(state).is_some()
+        || crate::plan::ancestors(plan, &step.id)
+            .iter()
+            .any(|id| held.contains(id) || plan.steps.iter().any(|s| &s.id == id && brings(s)))
 }
 
 #[cfg(test)]
@@ -3621,6 +3666,88 @@ mod tests {
         assert_eq!(tracker.settle().await.unwrap(), [1]);
         assert!(tracker.config.open_runs.is_empty());
         assert!(!fake.open(1) && fake.status(1).as_deref() == Some("Done"));
+    }
+
+    /// What a step that may hold Microsoft 365 content ends with stays off GitHub, whose
+    /// repository may be public: a `workiq=` step's result, an `@workiq` answer, the work of a
+    /// step after one, of a step whose evidence names labels, and why a step that read Work
+    /// IQ itself failed. Other steps' results, and a sign-off's note (its approver's own
+    /// words), are posted as before.
+    #[tokio::test]
+    async fn microsoft_365_content_stays_off_github() {
+        let fake = Fake::with(&[]);
+        let text = "find @worker:app workiq=files Summarize the launch\n\
+                    ask @workiq What changed?\n\
+                    notes after find @worker:app Write the notes\n\
+                    other @worker:app Fix the parser\n\
+                    memo @worker:app Recall the plan\n\
+                    lost @worker:app mcp=workiq Look it up\n\
+                    ok after notes approve @me Approve the notes";
+        let plan = Plan::parse(text).unwrap();
+        let tracking = start_with(fake.clone(), config(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        let secret = "The budget is four million";
+        let ended = |peer: &str, evidence: Option<Evidence>| StepState::Done {
+            peer: peer.into(),
+            output: secret.into(),
+            evidence,
+            verified: true,
+            patch: None,
+            model: None,
+        };
+        // A worker's memory put labeled knowledge in its task: its signed evidence says so.
+        let mut labeled = evidence(None);
+        labeled.context.push(crate::evidence::ContextUse {
+            source: "memory".into(),
+            sha256: "0".repeat(64),
+            results: 1,
+            labels: vec!["General".into()],
+        });
+        let lost = StepState::Failed {
+            peer: Some("worker".into()),
+            error: secret.into(),
+            evidence: None,
+            verified: false,
+            model: None,
+        };
+        let mut states = BTreeMap::new();
+        for (id, state) in [
+            ("find", ended("worker", None)),
+            ("ask", ended("workiq", None)),
+            ("notes", ended("worker", None)),
+            ("other", ended("worker", None)),
+            ("memo", ended("worker", Some(labeled))),
+            ("lost", lost),
+            ("ok", ended("you", None)),
+        ] {
+            tracking.update(id, &state);
+            states.insert(id.to_owned(), state);
+        }
+        let mut record = RunRecord::new("boss", "id", text, &plan, &states, 0);
+        record.id = "r1".into();
+        tracking.finish(&record).await;
+
+        let comments: Vec<String> = fake
+            .calls("addComment")
+            .iter()
+            .map(|c| c["body"].as_str().unwrap().to_owned())
+            .collect();
+        let of = |step: &str| {
+            let key = format!("`{step}` of run `r1`");
+            comments.iter().find(|c| c.contains(&key)).unwrap().clone()
+        };
+        let kept = "may hold Microsoft 365 content, so it stays off GitHub: it is in run `r1`'s record with **boss**.";
+        for step in ["find", "ask", "notes", "memo", "lost"] {
+            let comment = of(step);
+            assert!(
+                !comment.contains(secret) && comment.contains(kept),
+                "{step}: {comment}"
+            );
+        }
+        assert!(of("lost").contains("Why may hold"), "{}", of("lost"));
+        assert!(of("other").contains(secret), "{}", of("other"));
+        assert!(of("ok").contains(secret), "{}", of("ok"));
     }
 
     #[tokio::test]

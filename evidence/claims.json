@@ -1339,6 +1339,15 @@
       ]
     },
     {
+      "id": "WIQ-26",
+      "area": "work-iq",
+      "claim": "Microsoft 365 content never goes on GitHub through a tracked run (issue #250): the tracker comments each step's result, or why it failed, on its issue, and the repository may be public, so what a step that may hold Microsoft 365 content ended with stays in the run's record, and its comment says so and names the agent that has it. A step may hold it if it brings some (workiq=, @workiq), its model may read some (mcp=workiq), it is marked with some (a context= topic from Microsoft 365), its signed evidence names labels, or a step it waits for held some. Other steps' results, and a sign-off's note (its approver's own words), are posted as before. The plan editor's tracking note says so.",
+      "tests": [
+        "lib::tracker::microsoft_365_content_stays_off_github",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
+    },
+    {
       "id": "WIQ-24",
       "area": "work-iq",
       "claim": "A live check against a real tenant's Work IQ, behind PROOFKIN_LIVE_WORKIQ=cli|hosted (scripts/live_workiq.py; python scripts/evidence.py --live runs it when that is set), only reads: a fresh profile signs in to Work IQ (through the Work IQ CLI, or with Proofkin's device code sign-in), its doctor passes every check with one retrieve, proofkin workiq agents reads the agents list Work IQ gives (only how many is shown), and its agent runs a plan whose workiq= step goes to the profile's own digital worker on real Copilot and whose @workiq step gets Microsoft 365 Copilot's answer. The run's signed evidence verifies, the step's evidence records the Work IQ context by its hash and nothing else, and every call in the profile's Work IQ audit file was a read tool. Step outputs stay out of its log and email addresses are masked. Without PROOFKIN_LIVE_WORKIQ the check is not run and fails nothing.",
