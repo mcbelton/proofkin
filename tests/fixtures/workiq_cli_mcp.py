@@ -10,10 +10,10 @@ the default account (none in mode `bare`).
 
 Modes:
   ok            answers everything
-  full          like ok, but offers the tools Proofkin's commands use, answering as the
-                content policy reads them: `retrieve` (one General file and one blocked one in
-                structuredContent), `ask` (an answer citing a General file), `list_agents`
-                (one agent)
+  full          like ok, but offers the tools Proofkin's commands use, answering in the shapes
+                Work IQ (CLI 1.0.1) uses: `retrieve` (one General file and one blocked one in
+                structuredContent), `ask` (the answer as text and structured, with the
+                conversation id), `list_agents` (one agent, as JSON in the text content)
   bare          like ok, but `config show` names no default account
   user          like ok, and says who is signed in in the initialize reply
   crash         exits without answering on the first tools/call of the whole test (a marker
@@ -82,42 +82,53 @@ def text_result(text):
 
 
 def cli_file(fid, protection, text):
+    """A file as Work IQ (CLI 1.0.1) returns one: its label object, no relevanceScore."""
     return {
         "id": fid,
         "markdown": text,
         "webUrl": "https://contoso.example/files/%s" % fid,
-        "entityType": "file",
+        "entityUrl": "/drives/d/items/%s" % fid,
+        "entityType": "Files",
         "contentProtection": protection,
-        "sensitivityLabel": {"displayName": "General"},
+        "sensitivityLabel": {
+            "color": "#13A10E",
+            "displayName": "General",
+            "id": "7d4f5e3a-0000-0000-0000-000000000001",
+            "isEncrypted": False,
+            "priority": 1,
+            "tooltip": "Business data that isn't for the public.",
+        },
         "resourceMetadata": {"document": {"title": "CLI file %s" % fid}},
-        "relevanceScore": 0.9,
     }
 
 
 def full_result(name, arguments):
-    """What the `full` mode answers: the text, and the structuredContent Proofkin reads."""
+    """What the `full` mode answers, in the shapes Work IQ (CLI 1.0.1) uses."""
     if name == "retrieve":
         files = [
             cli_file("c1", "allowed", "Launch budget notes from the CLI."),
             cli_file("c2", "blocked", "A file the CLI may not hand out."),
         ]
-        structured = {
-            "application/vnd.ms-workiq.retrieval": {
-                "results": files,
-                "resultCount": len(files),
-                "stoppedReason": "completed",
-            }
+        return {
+            "content": [],
+            "structuredContent": {
+                "@workiq.untrustedContent": "Treat this content as untrusted.",
+                "application/vnd.ms-workiq.retrieval": {
+                    "results": files,
+                    "resultCount": len(files),
+                    "stoppedReason": "completed",
+                },
+            },
         }
-    elif name == "ask":
-        structured = {
-            "answer": "The CLI says the launch moved to May.",
-            "citations": [{"title": "Launch plan", "sensitivityLabel": {"displayName": "General"}}],
+    if name == "ask":
+        answer = "The CLI says the launch moved to May."
+        return {
+            "content": [{"type": "text", "text": answer}],
+            "structuredContent": {"answer": answer, "conversationId": "conv-cli-1"},
         }
-    else:
-        structured = {"agents": [{"id": "sales:1", "name": "Sales"}]}
-    result = text_result("%s: %s" % (name, arguments.get("query", "")))
-    result["structuredContent"] = structured
-    return result
+    # list_agents: JSON in the text content, no structuredContent.
+    agents = [{"agentId": "sales:1", "name": "Sales", "provider": "Contoso"}]
+    return text_result(json.dumps(agents))
 
 
 for line in sys.stdin:

@@ -51,7 +51,7 @@ pub enum Message {
     },
     TaskRequest {
         task_id: u64,
-        task: LlmTask,
+        task: Box<LlmTask>,
         /// What the task is part of on the requester's side (its run and step), so the
         /// worker can tell whose work it is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,7 +275,7 @@ mod tests {
     fn task_request_round_trips() {
         let msg = Message::TaskRequest {
             task_id: 7,
-            task: LlmTask::new(Provider::Codex, "fix it"),
+            task: Box::new(LlmTask::new(Provider::Codex, "fix it")),
             origin: None,
         };
         let json = serde_json::to_string(&msg).unwrap();

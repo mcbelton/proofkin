@@ -443,6 +443,19 @@ of its log), with **Start**/**Stop**, **Starts with this agent** and **Delete**.
   stops.
 - Work stays private unless shared: a peer reaches only the folders the worker or owner
   explicitly shares with that peer.
+- **Memory:** `proofkin worker memory tester --context glossary,architecture --lessons
+  tester-lessons` copies those topics of alice's knowledge base (`proofkin kb`, with their
+  Microsoft 365 marks) to the worker and puts them in front of every task it serves (at
+  most 24,000 characters, as external content). A topic made from Microsoft 365 content
+  goes only into the tasks of requesters who may have its labels (alice, known by her key,
+  or a peer whose grant names them). The task's signed result records the knowledge by
+  hash, and its evidence the labels, so the requester's plan marks what it does with the
+  result: a later step to a peer without the grant is refused and `save=` marks the topic.
+  A task whose checks passed adds a lesson to the `--lessons` topic, once, marked with the
+  labels of what the task was given (what its plan says the task holds, and `unknown` if
+  its model read Work IQ itself, so no peer gets it); lessons older than `--retention-days`
+  (90) are removed. With no options it shows the memory; `--off` clears it. It takes
+  effect when the worker next starts.
 
 ## Internet P2P
 
@@ -799,6 +812,11 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
   labels are only known once it runs, so a later step for a peer gets a plan check
   **warning**, and is checked again when it is sent: it is refused if what was found has
   labels beyond the peer's grant.
+- Work IQ labels files and mail, but gives meetings, Teams chats and people no label
+  information, so those go only to your own workers, never to a peer. People results also
+  come without Work IQ's decision on whether they may be handed out, so they are withheld
+  (`people` finds nothing usable for now, [#241](https://github.com/mcbelton/proofkin/issues/241);
+  see [docs/work-iq.md](docs/work-iq.md#what-work-iq-offers)).
 - Searches are audited and held to the profile's Work IQ budgets. A Work IQ error or a budget
   refusal fails the step with its one-line message.
 - The run record keeps, for each step, the sources (title, type, label, link), how many
@@ -1330,9 +1348,11 @@ offers and your grants decide what its tasks get.
 proofkin factory templates                                              # code-reviewer, implementer, researcher...: purpose, most access, eval cases
 proofkin factory new reviewer --template code-reviewer --profile alice  # a draft from a template, with no model
 proofkin factory new fin-analyst --describe "Analyze quarterly reports, extract key metrics, flag risks, write an executive summary" --profile alice
-proofkin factory show fin-analyst --profile alice    # what it asks for, how it is tested, its problems, who wrote it
+proofkin factory show fin-analyst --profile alice    # what it asks for, the models it is evaluated on, its builds, problems, who wrote it
 proofkin factory edit fin-analyst --profile alice    # in VISUAL or EDITOR; --from FILE (or -) replaces it
 proofkin factory check fin-analyst --profile alice   # fails while it has errors; --file checks a blueprint file
+proofkin factory check fin-analyst --folders reports,ledger --profile alice   # what its tasks would get in each folder
+proofkin factory build fin-analyst --profile alice   # the files it is made of, kept by their hash
 proofkin factory list --profile alice                # delete NAME removes a draft
 ```
 
@@ -1346,10 +1366,25 @@ proofkin factory list --profile alice                # delete NAME removes a dra
   (`/skills/0`). Errors (a skill, folder or model the profile doesn't have, a requirement
   no case proves) must be fixed; warnings flag asking for more than it needs (full access
   with no check, every tool of a server, all of Microsoft 365, delegation).
+- `check` resolves what it asks for in its deploy folders (or `--folders`): each folder's
+  access, the MCP servers and tools it offers tasks, and its checks. What a folder doesn't
+  offer is an error naming the command that offers it (`share add`, `mcp add`, `mcp
+  resume`, `plugin enable`); checking never shares, offers or grants anything.
+- `build` makes the files the agent is made of: `agent.md` (no tools or model: the folder
+  and the release decide those, and a request outside its purpose gets one
+  `OUT_OF_SCOPE: <reason>` line), `blueprint.json`, `evals.json`, its skills under its own
+  names (`skills/<agent>.<skill>.md`) and its `team.plan` if it leads a team. The same
+  blueprint builds the same bytes on Windows and Linux; a build is kept by the hash of its
+  files and checked against it when it is read.
+- It is evaluated on the blueprint's `model.candidates`, else its providers' defaults;
+  `show` lists them, and those left out with why (a model your settings don't allow, a
+  provider you aren't signed in to, Codex for an agent that needs MCP servers, Microsoft
+  365 content off your own workers).
 - Eval cases expect `contains`, `not-contains`, `regex`, `json-schema`, `max-words`,
   `files-changed` or a folder `check`, and a `judge` rubric is scored by a model. Their
   fixtures are files in the agent's `fixtures/` folder.
-- Drafts, and each agent's state and history, are kept in the profile's `factory/` folder.
+- Drafts and builds, and each agent's state and history, are kept in the profile's
+  `factory/` folder.
 
 **Plan check.** Before a plan runs, it is checked against what exists now:
 
@@ -1863,9 +1898,9 @@ proofkin playbook show rehearse --set peer=alice --set folder=shop --set change=
 
 Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|remove`,
 `proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
-`proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
+`proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove|memory`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
-`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin factory templates|new|list|show|edit|check|delete`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin factory templates|new|list|show|edit|check|build|delete`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
@@ -2225,10 +2260,11 @@ ask @workiq What changed in the launch plan this week?
 
 `$env:PROOFKIN_LIVE_WORKIQ = "cli"` (or `hosted`, with `PROOFKIN_LIVE_WORKIQ_TENANT` and
 `PROOFKIN_LIVE_WORKIQ_CLIENT_ID`), then `python scripts/live_workiq.py`. It runs the live
-check: a fresh profile signs in, passes the doctor, runs a plan with a `workiq=` step for its
-own digital worker (real Copilot, on your GitHub CLI sign-in) and an `@workiq` step, then
-verifies the evidence and that every call only read. Your Microsoft 365 content stays out of
-its log. `python scripts/evidence.py --live` runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
+check: a fresh profile signs in, passes the doctor, lists the Work IQ agents (only how many
+is shown), runs a plan with a `workiq=` step for its own digital worker (real Copilot, on your
+GitHub CLI sign-in) and an `@workiq` step, then verifies the evidence and that every call only
+read. Your Microsoft 365 content stays out of its log. `python scripts/evidence.py --live`
+runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
 
 ### Work IQ troubleshooting
 
@@ -2264,7 +2300,8 @@ its log. `python scripts/evidence.py --live` runs it too while `PROOFKIN_LIVE_WO
   maximum (`share add ... --access <level>`). Your own tasks get `--access` in `--workspace`.
 - Microsoft 365 content is off for every peer until you grant it:
   `peers allow ... --m365 General,Public,unlabeled` lets a peer receive Work IQ context
-  with only those sensitivity labels (`unlabeled` allows content without a label), and
+  with only those sensitivity labels (`unlabeled` allows content Work IQ says has no label;
+  content with no label information, such as meetings and chats, goes to no peer), and
   `--m365-tools` also lets its tasks use your Work IQ, read only. `--m365 off` removes the
   grant; allowing the peer again without `--m365` keeps it. Your own digital workers get
   everything you can read.
@@ -2443,7 +2480,8 @@ draft @my-worker:app mcp=workiq Write the launch FAQ from what my mail and files
   uses its owner's, when the owner turned that on), so the model never sees a token and a long
   task keeps working as tokens are refreshed.
 - Only tools that read: `retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
-  `list_agents` (`--tool` offers fewer). A change tool is refused, and never reaches Work IQ.
+  `list_agents` (`--tool` offers fewer), and never one Work IQ's own annotations say changes
+  things. A change tool is refused, and never reaches Work IQ.
 - Every result goes through the [content policy](#4-what-keeps-your-work-data-yours): only
   results marked `allowed`, secrets redacted, in the external-content envelope. Every call is
   audited (purpose `gateway`) and held to the daily budget.
@@ -2652,7 +2690,7 @@ Workflow for a change:
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text) with the usage providers reported, summed per peer and provider
-- [src/factory/](src/factory) and [factory/templates/](factory/templates): the agent factory: blueprints checked against the profile and linted for least privilege (`blueprint.rs`), eval suites and their graders (`evals.rs`), the profile's factory store (`store.rs`), the built-in templates (`templates.rs`), drafts written by the owner's model (`draft.rs`) and `proofkin factory` (`cli.rs`)
+- [src/factory/](src/factory) and [factory/templates/](factory/templates): the agent factory: blueprints checked against the profile and linted for least privilege (`blueprint.rs`), eval suites and their graders (`evals.rs`), the profile's factory store, with builds kept by their hash (`store.rs`), the built-in templates (`templates.rs`), drafts written by the owner's model (`draft.rs`), builds (`build.rs`), capabilities resolved against the owner's folders (`capabilities.rs`), the models an agent is evaluated and runs on (`routing.rs`), a worker's memory and lessons (`memory.rs`) and `proofkin factory` (`cli.rs`)
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.proofkin-data` folder, named shares with a maximum access, their checks and MCP servers)
 - [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config), MCP configuration files and server templates with placeholders
 - [src/plugins.rs](src/plugins.rs): plugins (sources, fetching for review, the Copilot CLI, Claude Code and Agent Plugins layouts, marketplaces, the profile's plugin store, offers made from templates)
@@ -2688,7 +2726,7 @@ Workflow for a change:
 - [docs/agent-factory.md](docs/agent-factory.md) and [docs/agent-factory/](docs/agent-factory): the design for the agent factory: agents described in plain words, evaluated, released signed and deployed as digital workers, with its spec, API contract, architecture, threat model and test plan (being built, tracked in [#175](https://github.com/mcbelton/proofkin/issues/175))
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
-- [scripts/live_workiq.py](scripts/live_workiq.py): live Work IQ check against your tenant (`PROOFKIN_LIVE_WORKIQ=cli|hosted`): sign-in, doctor, a `workiq=` step on real Copilot and an `@workiq` step, evidence and read-only audit
+- [scripts/live_workiq.py](scripts/live_workiq.py): live Work IQ check against your tenant (`PROOFKIN_LIVE_WORKIQ=cli|hosted`): sign-in, doctor, the agents list, a `workiq=` step on real Copilot and an `@workiq` step, evidence and read-only audit
 - [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server and [tests/fixtures/plugin/](tests/fixtures/plugin) a Claude Code style plugin (a skill, an MCP server, a hook that must never run), [tests/fixtures/speckit/](tests/fixtures/speckit) and [tests/fixtures/openspec/](tests/fixtures/openspec) a Spec Kit feature and an OpenSpec change for the tests; [tests/connect.rs](tests/connect.rs) drives the MCP and A2A endpoints like other agents do
 - [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)
 

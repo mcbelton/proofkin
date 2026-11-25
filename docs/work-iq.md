@@ -38,6 +38,37 @@ Retrieval results are in `structuredContent["application/vnd.ms-workiq.retrieval
 value is not. A call failed if it has `isError: true` or `stoppedReason: "error"`, possibly
 with `errorCode`, `recoveryAction` and `retryAfterSeconds`. Policy denials must not be retried.
 
+What the Work IQ CLI 1.0.1 returned in a Microsoft tenant (seven queries, 36 results;
+[#94](https://github.com/mcbelton/proofkin/issues/94)):
+
+| Result | `entityType` | `resourceMetadata` | `sensitivityLabel` | `contentProtection` |
+| --- | --- | --- | --- | --- |
+| Files | `Files` | `document.title` | an object: `displayName`, `id`, `color`, `priority`, `isEncrypted`, `tooltip` | `allowed` |
+| Mail | `Emails` | `email.subject`, `email.sentTime` | the same object | `allowed` |
+| Meetings | `Meetings` | `meeting.title`, `meeting.startTime` | none (no key) | `allowed` |
+| Teams messages | `Chats` | `chat.title` | none | `allowed` |
+| People | `People` | `web.title` | none | none |
+
+- No result had a `relevanceScore`: results keep Work IQ's order. Every one had `webUrl`,
+  `entityUrl` and `resourceId`.
+- `structuredContent` also has `@workiq.untrustedContent`, a notice (a string) that the
+  content is untrusted. Proofkin treats all of it that way anyway.
+- No result had an empty or null `sensitivityLabel`: meetings, chats and people have none at
+  all, so their sensitivity isn't known and they go to no peer (the `unlabeled` grant matched
+  nothing in this sample). People results have no `contentProtection`, so they are withheld.
+- `ask` gives its answer twice: as the text `content` and as `structuredContent.answer`, with
+  the `conversationId`. It has no citations, so an answer has no labels and stays local.
+- `list_agents` gives no `structuredContent`: the agents are a JSON array in the text
+  `content`, each `{agentId, name, provider}`.
+- `initialize` names no user: Proofkin names the account from `--account`, else the CLI's
+  default account (`workiq config show`).
+
+Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`): in the CLI 1.0.1,
+`retrieve`, `fetch`, `fetch_blob`, `search_paths`, `get_schema`, `discover` and
+`call_function` are read only, `create_entity` isn't, and `update_entity`, `delete_entity`
+and `do_action` are destructive. `ask` and `list_agents` have none. The CLI also offers
+`accept_eula` and `get_debug_link`, which need the user's own confirmation.
+
 ## Principles
 
 1. **Delegated, per person.** Work IQ runs as the profile's owner, signed in with their work
@@ -140,16 +171,18 @@ has a class, a fix (what to do and who can do it) and the ids, and its message i
 
 Every result goes through one function before it reaches a prompt (`src/workiq/content.rs`):
 
-1. Read `structuredContent`, never the `content` array.
+1. Read `structuredContent`, never the `content` array, except where Work IQ gives what was
+   asked for only there: an `ask` answer without a structured one, and the `list_agents` list.
 2. Keep only `contentProtection: "allowed"`. Count the rest as withheld, by reason.
 3. Filter by the audience's labels. The owner's own agent and digital workers get every label;
    a peer gets only the labels the owner allowed for it (`unlabeled` is one of the choices).
    Labels are names each tenant defines, so the rule is an allowlist, not a ranking. A
-   result without label information (no `sensitivityLabel`) has an unknown sensitivity, so
-   it goes to no peer; Work IQ marks unlabeled content with an empty one.
-4. Redact secrets (`redact`), cap the size (highest relevance first, 16 000 characters by
-   default) and wrap each result in the external-content envelope (`boundary`) with its
-   source: title, type, date, label and link.
+   result without label information (no `sensitivityLabel`: meetings, chats and people, as
+   Work IQ returns them) has an unknown sensitivity, so it goes to no peer; `unlabeled`
+   allows a result whose label is empty.
+4. Redact secrets (`redact`), cap the size (highest relevance first when Work IQ scores the
+   results, else in its order; 16 000 characters by default) and wrap each result in the
+   external-content envelope (`boundary`) with its source: title, type, date, label and link.
 
 The prompt section says what it is: *Work context from Microsoft 365 (Work IQ). Cited and
 unverified: use it to understand intent, not as proof.* `ask` answers are handled the same
@@ -171,6 +204,12 @@ local.
 - **Checked twice**: the plan check fails a step that would send marked content to a peer
   without a grant, or above its labels, naming the step, the peer and the grant to add. The
   runner checks again when it sends each task, and filters by labels then.
+- **Results that hold it**: a worker's own memory can put a marked topic in a task (see
+  [Digital workers](../README.md#digital-workers)). Its signed evidence then names the
+  labels, and the runner marks that step's result with them: later steps go only to peers
+  granted them, `save=` marks the topic, and a lead's team results go back only to a
+  requester granted what any of its steps held. Each task the runner sends names the labels
+  of what it holds (`LlmTask.m365`), so a worker marks the lessons it learns from it.
 
 ### 5. Work context in plans
 
@@ -214,7 +253,8 @@ token:
   gateway adds the owner's fresh token, so long tasks keep working and the model never sees
   the token.
 - Only read tools by default (`retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
-  `list_agents`). Every result goes through the content policy for the task's audience;
+  `list_agents`), and never one whose annotations say it changes things, whatever its name.
+  Every result goes through the content policy for the task's audience;
   every call is audited and metered; sizes are capped.
 - The server is called `workiq`, so a plan knows a step with `mcp=workiq` reads Microsoft
   365 content whose labels it never learns: the step is marked `unknown`, and nothing made
@@ -300,9 +340,10 @@ The step-by-step guide, with a check after each step and troubleshooting, is in 
   loopback address. The CLI connection is tested the same way with `--cli-path`.
 - A `WIQ-*` claim in `evidence/claims.json` for each behavior above.
 - A live check behind `PROOFKIN_LIVE_WORKIQ=hosted|cli` (`scripts/live_workiq.py`), for a
-  tenant with Work IQ: sign-in, doctor (one `retrieve`), a `workiq=` step sent to the owner's
-  own worker on real Copilot and an `@workiq` step, then the evidence and an audit that shows
-  only reads. It never prints Microsoft 365 content.
+  tenant with Work IQ: sign-in, doctor (one `retrieve`), the agents list (only its size is
+  shown), a `workiq=` step sent to the owner's own worker on real Copilot and an `@workiq`
+  step, then the evidence and an audit that shows only reads. It never prints Microsoft 365
+  content.
 
 ## Work items
 
@@ -344,7 +385,10 @@ one release and one live check for the batch. The items marked later come after 
 
 - `contentProtection` may be missing on many results today, and failing closed can then
   withhold most of them. We start strict and show withheld counts, and revisit with
-  Microsoft's guidance rather than add an override.
+  Microsoft's guidance rather than add an override. In the
+  [#94](https://github.com/mcbelton/proofkin/issues/94) sample only People results
+  lacked it, so `workiq=people` finds nothing usable
+  ([#241](https://github.com/mcbelton/proofkin/issues/241)).
 - `@workiq` steps start with MCP `ask`. A2A (streaming, `contextId` conversations) may suit
   long answers better.
 - Whether peers should share their Work IQ tenant id, so the web UI can say "same

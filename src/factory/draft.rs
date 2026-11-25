@@ -212,11 +212,18 @@ fn catalog_text(catalog: &Catalog) -> String {
                 set.iter().cloned().collect::<Vec<_>>().join(", ")
             }
         };
+        // Only the servers tasks are offered now.
+        let servers = folder
+            .mcp
+            .iter()
+            .filter(|(_, offer)| offer.live())
+            .map(|(server, _)| server.clone())
+            .collect();
         text += &format!(
             "- {name}: {} access; checks {}; MCP servers {}\n",
             folder.access,
             list(&folder.checks),
-            list(&folder.mcp)
+            list(&servers)
         );
     }
     text += none(folders.is_empty());

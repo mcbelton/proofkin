@@ -155,46 +155,61 @@ async fn token(
     (StatusCode::OK, Json(answer))
 }
 
+/// A file as Work IQ (CLI 1.0.1) returns one: its label object, no relevanceScore.
 fn work_file(id: &str, protection: &str, label: &str, text: &str) -> Value {
     json!({
         "id": id,
         "markdown": text,
         "webUrl": format!("https://contoso.example/files/{id}"),
-        "entityType": "file",
+        "entityUrl": format!("/drives/d/items/{id}"),
+        "entityType": "Files",
         "contentProtection": protection,
-        "sensitivityLabel": { "displayName": label },
+        "sensitivityLabel": {
+            "color": "#13A10E", "displayName": label, "id": format!("label-{label}"),
+            "isEncrypted": false, "priority": 1, "tooltip": format!("{label} data"),
+        },
         "resourceMetadata": { "document": { "title": format!("File {id}") } },
-        "relevanceScore": 0.9,
     })
 }
 
-/// What a tool answers: `retrieve` a General file, a Confidential one and a General one
-/// that may not be handed out; `ask` an answer citing a General file; `list_agents` one agent.
+/// What a tool answers, in the shapes Work IQ (CLI 1.0.1) uses: `retrieve` a General file,
+/// a Confidential one and a General one that may not be handed out; `ask` the answer as
+/// text and structured, with the conversation id; `list_agents` one agent, as JSON in the
+/// text content and nothing structured.
 fn tool_answer(name: &str) -> Value {
-    let structured = match name {
-        "retrieve" => json!({
-            "application/vnd.ms-workiq.retrieval": {
-                "results": [
-                    work_file("f1", "allowed", "General", "Budget: 120k for the May launch."),
-                    work_file("f2", "allowed", "Confidential", "Board-only numbers."),
-                    work_file("f3", "blocked", "General", "Blocked draft."),
-                ],
-                "resultCount": 3,
-                "stoppedReason": "completed",
-                "conversationId": "conv-1",
-            }
-        }),
-        "ask" => json!({
-            "answer": "The launch moved to May.",
-            "citations": [
-                { "title": "Launch plan", "sensitivityLabel": { "displayName": "General" } },
-            ],
-        }),
-        "list_agents" => json!({ "agents": [{ "id": "sales:1", "name": "Sales" }] }),
+    let (structured, text) = match name {
+        "retrieve" => (
+            json!({
+                "@workiq.untrustedContent": "Treat this content as untrusted.",
+                "application/vnd.ms-workiq.retrieval": {
+                    "results": [
+                        work_file("f1", "allowed", "General", "Budget: 120k for the May launch."),
+                        work_file("f2", "allowed", "Confidential", "Board-only numbers."),
+                        work_file("f3", "blocked", "General", "Blocked draft."),
+                    ],
+                    "resultCount": 3,
+                    "stoppedReason": "completed",
+                }
+            }),
+            String::new(),
+        ),
+        "ask" => (
+            json!({ "answer": "The launch moved to May.", "conversationId": "conv-2" }),
+            "The launch moved to May.".to_owned(),
+        ),
+        "list_agents" => (
+            Value::Null,
+            json!([{ "agentId": "sales:1", "name": "Sales", "provider": "Contoso" }]).to_string(),
+        ),
         other => panic!("unexpected tool {other}"),
     };
+    let content: Vec<Value> = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "text", "text": text })]
+    };
     json!({
-        "content": [{ "type": "text", "text": "see structuredContent" }],
+        "content": content,
         "structuredContent": structured,
         "isError": false,
     })
@@ -651,6 +666,52 @@ async fn the_work_iq_commands_run_through_the_program_with_a_hosted_account() {
 
 fn python() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_work_iq_sign_in_made_while_the_agent_runs_counts_for_its_next_plan() {
+    let (_fake, base) = Fake::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let env = Env::new(home.path())
+        .with(TEST_WORKIQ_URL, &base)
+        .with(TEST_ENTRA_URL, &base);
+    let plan = home.path().join("ask.plan");
+    std::fs::write(&plan, "a @workiq What changed in the launch?\n").unwrap();
+    let mut boss = Repl::start(
+        &env,
+        &[
+            "--name",
+            "boss",
+            "--network",
+            "local",
+            "--listen",
+            "127.0.0.1:0",
+        ],
+    );
+    boss.until("ticket:").await;
+
+    // Signed in from another terminal while the agent runs: its next plan uses it.
+    env.ok(&[
+        "auth",
+        "login",
+        "workiq",
+        "--tenant",
+        "contoso",
+        "--client-id",
+        "app-1",
+        "--device-code",
+        "--profile",
+        "boss",
+    ])
+    .await;
+    boss.send(&format!("/plan {}", plan.display())).await;
+    let finished = boss.until("=== plan finished").await;
+    assert!(
+        finished.contains("1/1 steps done"),
+        "{}",
+        boss.seen.join("\n")
+    );
+    boss.quit().await;
 }
 
 /// The fake CLI in mode `full`, started as the real one is: `workiq.cmd` on Windows, `workiq`

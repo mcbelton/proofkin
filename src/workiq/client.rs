@@ -656,6 +656,23 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Value,
+    /// MCP's hints about what it does (`readOnlyHint`, `destructiveHint`, ...).
+    #[serde(default)]
+    pub annotations: Option<Value>,
+}
+
+impl Tool {
+    /// Whether Work IQ says the tool changes things: not read only, or destructive. A tool
+    /// without hints says nothing either way.
+    pub fn says_it_changes(&self) -> bool {
+        let hint = |name: &str| {
+            self.annotations
+                .as_ref()
+                .and_then(|a| a.get(name))
+                .and_then(Value::as_bool)
+        };
+        hint("readOnlyHint") == Some(false) || hint("destructiveHint") == Some(true)
+    }
 }
 
 /// The answer to `tools/call`.

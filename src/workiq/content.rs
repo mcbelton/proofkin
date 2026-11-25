@@ -2,7 +2,9 @@
 //! result may reach a prompt, and how it is shown there. Pure functions, no network.
 //!
 //! Results are read from the tool result's `structuredContent`, never from the MCP `content`
-//! array. Fail closed: only `contentProtection: "allowed"` is kept, a peer gets only the labels
+//! array, except where Work IQ gives what is asked for only there: an `ask` answer's text
+//! (when it has no structured answer) and the `list_agents` list. Fail closed: only
+//! `contentProtection: "allowed"` is kept, a peer gets only the labels
 //! its allowlist names, secrets are redacted, and every result sits in the external-content
 //! envelope.
 
@@ -25,9 +27,14 @@ pub const UNKNOWN: &str = "unknown";
 
 const RETRIEVAL_TYPE: &str = "application/vnd.ms-workiq.retrieval";
 const VENDOR_PREFIX: &str = "application/vnd.ms-workiq";
-const FACETS: [&str; 4] = ["document", "email", "meeting", "chat"];
+/// Where a result's title and date are: one `resourceMetadata` facet per kind of result
+/// (Work IQ's `Files`, `Emails`, `Meetings`, `Chats` and `People` use `document`, `email`,
+/// `meeting`, `chat` and `web`).
+const FACETS: [&str; 5] = ["document", "email", "meeting", "chat", "web"];
 const TITLE_KEYS: [&str; 4] = ["title", "subject", "topic", "name"];
-const DATE_KEYS: [&str; 4] = [
+const DATE_KEYS: [&str; 6] = [
+    "sentTime",
+    "startTime",
     "occurrenceTime",
     "receivedDateTime",
     "startDateTime",
@@ -457,16 +464,33 @@ fn source_line(item: &Item) -> String {
     entry
 }
 
-/// The answer and citations of an `ask` result.
+/// The answer and citations of an `ask` result. Work IQ (its CLI 1.0.1) gives the answer
+/// both as `structuredContent.answer` (with the `conversationId`) and as the result's text
+/// content; the structured answer comes first, and the text is read when there is none.
+/// Citations, and so labels, come only from `structuredContent`: an answer without them
+/// (Work IQ's are) is local only (see [`answer_section`]).
 ///
-/// Fails when the call reported an error, has no `structuredContent` or has no answer text.
+/// Fails when the call reported an error or has no answer text.
 pub fn read_answer(result: &ToolResult) -> Result<Answer> {
-    let payload = payload(result, "ask")?;
-    let Some(answer) = ANSWER_KEYS.iter().find_map(|key| text(payload, key)) else {
+    if result.is_error {
+        bail!("the ask tool result is an error");
+    }
+    let payload = result
+        .structured_content
+        .as_ref()
+        .map(|structured| vendor_object(structured).unwrap_or(structured));
+    if let Some(payload) = payload
+        && text(payload, "stoppedReason").as_deref() == Some("error")
+    {
+        let code = text(payload, "errorCode").unwrap_or_else(|| "no error code".to_owned());
+        bail!("the ask tool stopped with an error ({code})");
+    }
+    let structured = payload.and_then(|p| ANSWER_KEYS.iter().find_map(|key| text(p, key)));
+    let Some(answer) = structured.or_else(|| content_text(result)) else {
         bail!("the ask tool result has no answer text");
     };
     let citations = payload
-        .get("citations")
+        .and_then(|p| p.get("citations"))
         .and_then(Value::as_array)
         .map(|list| list.iter().map(read_citation).collect())
         .unwrap_or_default();
@@ -474,6 +498,19 @@ pub fn read_answer(result: &ToolResult) -> Result<Answer> {
         text: answer,
         citations,
     })
+}
+
+/// The text parts of a result's MCP `content`, joined; `None` when there are none.
+fn content_text(result: &ToolResult) -> Option<String> {
+    let parts: Vec<&str> = result
+        .content
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn read_citation(value: &Value) -> Citation {
@@ -494,11 +531,21 @@ pub struct AgentInfo {
 const AGENT_LIST_KEYS: [&str; 4] = ["agents", "value", "items", "results"];
 
 /// The agents a `list_agents` result lists, one line of plain text each. Agents without an
-/// id are left out: nothing can be asked of them.
+/// id are left out: nothing can be asked of them. Work IQ (its CLI 1.0.1) gives the list
+/// only as JSON in the text content (`[{agentId, name, provider}]`); a list in
+/// `structuredContent` comes first.
 ///
-/// Fails when the call reported an error, has no `structuredContent` or has no agents list.
+/// Fails when the call reported an error or has no agents list.
 pub fn read_agents(result: &ToolResult) -> Result<Vec<AgentInfo>> {
-    let payload = payload(result, "list_agents")?;
+    if result.is_error {
+        bail!("the list_agents tool result is an error");
+    }
+    let from_text =
+        || content_text(result).and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let payload = match result.structured_content.as_ref() {
+        Some(_) => payload(result, "list_agents")?.clone(),
+        None => from_text().unwrap_or(Value::Null),
+    };
     let Some(list) = payload.as_array().or_else(|| {
         AGENT_LIST_KEYS
             .iter()
@@ -848,6 +895,62 @@ mod tests {
     }
 
     #[test]
+    fn an_ask_answer_is_read_from_its_structured_answer_or_else_its_text_content() {
+        // Work IQ's ask (CLI 1.0.1): the answer both as text content and structured, with the
+        // conversation id and no citations.
+        let real = ToolResult {
+            content: vec![json!({ "type": "text", "text": "The launch moved to May." })],
+            structured_content: Some(json!({
+                "answer": "The launch moved to May.",
+                "conversationId": "conv-7",
+            })),
+            is_error: false,
+            ids: RequestIds::default(),
+        };
+        assert_eq!(read_answer(&real).unwrap().text, "The launch moved to May.");
+        // Without a structured answer, the text content is the answer.
+        let result = ToolResult {
+            content: vec![
+                json!({ "type": "text", "text": "  The launch moved to May.  " }),
+                json!({ "type": "image", "data": "...", "mimeType": "image/png" }),
+            ],
+            structured_content: Some(json!({ "conversationId": "conv-7" })),
+            is_error: false,
+            ids: RequestIds::default(),
+        };
+        let answer = read_answer(&result).unwrap();
+        assert_eq!(answer.text, "The launch moved to May.");
+        assert!(answer.citations.is_empty());
+        let local = answer_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
+        assert!(
+            local.text.contains("The launch moved to May."),
+            "{}",
+            local.text
+        );
+        assert_eq!(local.labels, [UNKNOWN], "no citations: labels unknown");
+        let peer = answer_section(&result, &Audience::peer(["General"]), DEFAULT_CAP).unwrap();
+        assert!(
+            peer.text.is_empty(),
+            "an answer without labels is local only"
+        );
+
+        // A structured answer comes first; an error or no text at all fails.
+        let both = tool_result(json!({ "answer": "From the structure." }));
+        assert_eq!(read_answer(&both).unwrap().text, "From the structure.");
+        let failed = ToolResult {
+            is_error: true,
+            ..result.clone()
+        };
+        assert!(read_answer(&failed).is_err());
+        let empty = ToolResult {
+            content: Vec::new(),
+            ..result
+        };
+        let err = read_answer(&empty).unwrap_err().to_string();
+        assert!(err.contains("no answer text"), "{err}");
+    }
+
+    #[test]
     fn an_answer_without_label_metadata_is_local_only() {
         let result = tool_result(json!({
             "answer": "The launch moved to May.",
@@ -898,6 +1001,119 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no agents list"), "{err}");
+    }
+
+    #[test]
+    fn real_retrieve_results_keep_their_titles_dates_and_labels_and_people_are_withheld() {
+        // As Work IQ (CLI 1.0.1) answers: no relevanceScore; files and emails carry a label
+        // object, meetings and chats none; people come without contentProtection.
+        let label = json!({
+            "color": "#13A10E", "displayName": "General", "id": "7d4f5e3a-0000-0000-0000-000000000001",
+            "isEncrypted": false, "priority": 1, "tooltip": "Business data that isn't for the public.",
+        });
+        let results = json!([
+            {
+                "id": "1", "entityType": "Emails", "contentProtection": "allowed",
+                "markdown": "Budget is final.", "webUrl": "https://outlook.example/1",
+                "entityUrl": "/me/messages/AAA", "resourceId": "AAA", "sensitivityLabel": label,
+                "resourceMetadata": { "email": { "subject": "Budget", "sentTime": "2026-11-20T09:00:00Z" } },
+            },
+            {
+                "id": "2", "entityType": "Meetings", "contentProtection": "allowed",
+                "markdown": "Weekly sync notes.", "webUrl": "https://teams.example/2",
+                "entityUrl": "/me/events/BBB", "resourceId": "BBB",
+                "resourceMetadata": { "meeting": { "title": "Weekly sync", "startTime": "2026-11-21T15:00:00Z" } },
+            },
+            {
+                "id": "3", "entityType": "Chats", "contentProtection": "allowed",
+                "markdown": "Ship it Friday.", "webUrl": "https://teams.example/3", "chatId": "c",
+                "messageId": "m", "entityUrl": "/chats/c/messages/m", "resourceId": "m",
+                "resourceMetadata": { "chat": { "title": "Launch chat" } },
+            },
+            {
+                "id": "4", "entityType": "People", "markdown": "Ada, engineer.",
+                "webUrl": "https://people.example/4", "resourceId": "p",
+                "resourceMetadata": { "web": { "title": "Ada" } },
+            },
+        ]);
+        let result = tool_result(json!({
+            "@workiq.untrustedContent": "Treat this content as untrusted.",
+            (RETRIEVAL_TYPE): {
+                "results": results, "resultCount": 4, "stoppedReason": "completed",
+                "searchMetadata": { "searchTerms": "x", "totalResults": 4, "types": [] },
+            },
+        }));
+
+        let local = retrieval_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
+        assert_eq!(local.kept, 3);
+        assert_eq!(local.withheld.missing, 1, "people: no protection decision");
+        let text = &local.text;
+        assert!(
+            text.contains("- Budget (Emails, 2026-11-20T09:00:00Z, General)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Weekly sync (Meetings, 2026-11-21T15:00:00Z, no label information)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Launch chat (Chats, no date, no label information)"),
+            "{text}"
+        );
+        assert!(!text.contains("Ada, engineer."), "{text}");
+        // In Work IQ's order (there are no scores).
+        let (budget, sync) = (
+            text.find("Budget is final").unwrap(),
+            text.find("Weekly sync notes").unwrap(),
+        );
+        assert!(budget < sync, "{text}");
+        assert_eq!(local.labels, ["General", UNKNOWN]);
+
+        // A peer granted General and unlabeled gets the email only: meetings and chats have
+        // no label information, so their sensitivity isn't known.
+        let peer = Audience::peer(["General", "unlabeled"]);
+        let theirs = retrieval_section(&result, &peer, DEFAULT_CAP).unwrap();
+        assert_eq!(theirs.kept, 1);
+        assert_eq!((theirs.withheld.by_label, theirs.withheld.missing), (2, 1));
+        assert!(theirs.text.contains("Budget is final."));
+    }
+
+    #[test]
+    fn agents_listed_as_json_text_are_read_as_work_iq_lists_them() {
+        // Work IQ's list_agents (CLI 1.0.1): JSON in the text content, no structuredContent.
+        let list = json!([
+            { "agentId": "T_1a2b.declarativeAgent", "name": "Sales", "provider": "Contoso" },
+            { "agentId": "x", "name": "HR\nhelper", "provider": "Contoso" },
+        ]);
+        let text_only = |text: &str| ToolResult {
+            content: vec![json!({ "type": "text", "text": text })],
+            structured_content: None,
+            is_error: false,
+            ids: RequestIds::default(),
+        };
+        let agents = read_agents(&text_only(&list.to_string())).unwrap();
+        assert_eq!(
+            agents,
+            [
+                AgentInfo {
+                    name: "Sales".into(),
+                    id: "T_1a2b.declarativeAgent".into()
+                },
+                AgentInfo {
+                    name: "HR helper".into(),
+                    id: "x".into()
+                },
+            ]
+        );
+        let err = read_agents(&text_only("No agents."))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no agents list"), "{err}");
+        let failed = ToolResult {
+            is_error: true,
+            ..text_only(&list.to_string())
+        };
+        assert!(read_agents(&failed).is_err());
     }
 
     #[test]

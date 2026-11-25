@@ -1197,7 +1197,7 @@
     {
       "id": "WIQ-7",
       "area": "work-iq",
-      "claim": "The Work IQ content policy (src/workiq/content.rs, docs/work-iq.md section 3) reads retrieve results from structuredContent under application/vnd.ms-workiq.retrieval, never from the MCP content array, and fails on isError, stoppedReason error or a missing structuredContent. Only results whose contentProtection is exactly allowed (after trimming) are kept; the rest, a missing value included, are withheld and counted as missing, blocked or other. A Local audience gets every label; a Peer gets only the labels in its allowlist (compared without case), and unlabeled allows results without a label; results withheld by label are counted too. Markdown, titles and links are redacted, results are kept by relevance up to a character cap (16000 by default), and each result is wrapped in the external-content envelope, followed by a Sources list (also wrapped) and a line with the withheld counts, under the heading saying the context is cited and unverified. An ask answer and its citations are read the same way; an answer whose citations have no label metadata is local only, and a Peer gets nothing from it.",
+      "claim": "The Work IQ content policy (src/workiq/content.rs, docs/work-iq.md section 3) reads retrieve results from structuredContent under application/vnd.ms-workiq.retrieval, never from the MCP content array, and fails on isError, stoppedReason error or a missing structuredContent. Only results whose contentProtection is exactly allowed (after trimming) are kept; the rest, a missing value included, are withheld and counted as missing, blocked or other. A Local audience gets every label; a Peer gets only the labels in its allowlist (compared without case), and unlabeled allows results without a label; results withheld by label are counted too. Markdown, titles and links are redacted, a result's title and date come from its resourceMetadata facet (document, email, meeting, chat or web; dates from sentTime, startTime and the Graph date names), results are kept by relevance when Work IQ scores them, else in Work IQ's order, up to a character cap (16000 by default), and each result is wrapped in the external-content envelope, followed by a Sources list (also wrapped) and a line with the withheld counts, under the heading saying the context is cited and unverified. Real results (Work IQ CLI 1.0.1: Files and Emails with a label object, Meetings and Chats without one, People without contentProtection) are read as such: labeled ones keep their displayName, unlabeled ones count as unknown and go to no peer, and People are withheld. An ask answer is read from structuredContent (answer, text, markdown or response), as Work IQ gives it, else from the result's text content; its citations come only from structuredContent, and an answer whose citations have no label metadata, or that has none, is local only: a Peer gets nothing from it.",
       "tests": [
         "lib::workiq::content::allowed_results_are_kept_and_shown_with_their_sources",
         "lib::workiq::content::results_that_are_not_exactly_allowed_are_withheld_and_counted",
@@ -1209,6 +1209,8 @@
         "lib::workiq::content::the_cap_keeps_the_most_relevant_results",
         "lib::workiq::content::secrets_are_redacted_in_results_titles_and_answers",
         "lib::workiq::content::content_cannot_close_the_envelope_early",
+        "lib::workiq::content::an_ask_answer_is_read_from_its_structured_answer_or_else_its_text_content",
+        "lib::workiq::content::real_retrieve_results_keep_their_titles_dates_and_labels_and_people_are_withheld",
         "lib::workiq::content::an_answer_without_label_metadata_is_local_only",
         "lib::workiq::content::an_answer_goes_to_a_peer_when_every_citation_has_an_allowed_label"
       ]
@@ -1253,12 +1255,13 @@
     {
       "id": "WIQ-11",
       "area": "work-iq",
-      "claim": "The workiq= step option (all, or a comma list of email, meetings, files, teams, people and connectors) is parsed, refused for unknown sources (naming the known ones) and on approve steps, and taught to the plan editor (option list and round trip). all uses the copilot strategy with no capabilities, a list with connectors uses copilot with those capabilities, any other list uses grounding. The plan check needs the plan profile's Work IQ account (naming proofkin auth login workiq) and a target that is the owner's digital worker or a peer with a Microsoft 365 grant (naming the grant command); the step is marked, a peer gets at most its grant's labels, and a later step after a workiq= step on the owner's own worker gets a warning, not an error. When the step is sent, after its peer is picked, the agent searches Work IQ with the step's own words through the audited client (a call context for the run and step, so budgets apply), builds the retrieval section for that peer's audience and puts it before Your task: in the guarded prompt; the kept results' labels are the step's actual labels, which the send-time check of a later step uses. A Work IQ error or a budget refusal fails the step with its one-line message. The run record keeps per step the sources, labels, kept and withheld counts and request ids. The web UI's plan check, the plans it starts and its Work IQ import read the profile's settings when they run, so a Work IQ sign-in made while the agent runs (proofkin auth login workiq in another process) counts at once.",
+      "claim": "The workiq= step option (all, or a comma list of email, meetings, files, teams, people and connectors) is parsed, refused for unknown sources (naming the known ones) and on approve steps, and taught to the plan editor (option list and round trip). all uses the copilot strategy with no capabilities, a list with connectors uses copilot with those capabilities, any other list uses grounding. The plan check needs the plan profile's Work IQ account (naming proofkin auth login workiq) and a target that is the owner's digital worker or a peer with a Microsoft 365 grant (naming the grant command); the step is marked, a peer gets at most its grant's labels, and a later step after a workiq= step on the owner's own worker gets a warning, not an error. When the step is sent, after its peer is picked, the agent searches Work IQ with the step's own words through the audited client (a call context for the run and step, so budgets apply), builds the retrieval section for that peer's audience and puts it before Your task: in the guarded prompt; the kept results' labels are the step's actual labels, which the send-time check of a later step uses. A Work IQ error or a budget refusal fails the step with its one-line message. The run record keeps per step the sources, labels, kept and withheld counts and request ids. The web UI's plan check, the plans it starts and its Work IQ import, and the agent's /plan command, read the profile's settings when they run, so a Work IQ sign-in made while the agent runs (proofkin auth login workiq in another process) counts at once.",
       "tests": [
         "lib::plan::workiq_sources_pick_the_strategy_and_capabilities_and_bad_ones_are_refused",
         "lib::plan::a_workiq_step_is_marked_and_its_grant_labels_go_to_the_steps_after",
         "lib::plan::the_plan_check_needs_a_sign_in_and_a_recipient_for_workiq_steps",
         "ui::a_workiq_sign_in_made_while_the_agent_runs_counts_at_once",
+        "workiq_e2e::a_work_iq_sign_in_made_while_the_agent_runs_counts_for_its_next_plan",
         "ui::the_plan_editor_keeps_plans_valid",
         "agents::a_local_step_gets_the_work_iq_section_in_front_of_its_task",
         "agents::a_granted_peer_gets_only_the_work_iq_results_its_grant_allows",
@@ -1270,12 +1273,13 @@
     {
       "id": "WIQ-12",
       "area": "work-iq",
-      "claim": "A step whose target is @workiq is run by the plan's own agent, never sent to a peer: it calls Work IQ's ask tool through the audited client with the step's own words plus the results of the steps it runs after (capped like other steps), and agent=<id> (letters, digits and - _ . : @, at most 200 characters) is sent as agentId. Its output is the answer and its cited sources for the local audience; the step is marked as Microsoft 365 content with its citations' labels, and a citation without label information adds the label unknown, which no peers allow --m365 grant can include, so no peer gets that output (a later step on a peer without a grant, or with a narrower one, is refused). The answer reaches later steps through after, and save= writes the mark and a source note saying it was a Work IQ answer. Plan errors say an answer is context and never proof for claims=, verify=, apply=, mcp=, skill=, attempts=, levels=, team and approve on a @workiq step. The plan check needs the profile's Work IQ account. The run shows it as done by workiq (or workiq:<agent id>), with no evidence and not verified. proofkin workiq agents lists the agents list_agents returns (name and id). The plan editor knows the @workiq target.",
+      "claim": "A step whose target is @workiq is run by the plan's own agent, never sent to a peer: it calls Work IQ's ask tool through the audited client with the step's own words plus the results of the steps it runs after (capped like other steps), and agent=<id> (letters, digits and - _ . : @, at most 200 characters) is sent as agentId. Its output is the answer and its cited sources for the local audience; the step is marked as Microsoft 365 content with its citations' labels, and a citation without label information adds the label unknown, which no peers allow --m365 grant can include, so no peer gets that output (a later step on a peer without a grant, or with a narrower one, is refused). The answer reaches later steps through after, and save= writes the mark and a source note saying it was a Work IQ answer. Plan errors say an answer is context and never proof for claims=, verify=, apply=, mcp=, skill=, attempts=, levels=, team and approve on a @workiq step. The plan check needs the profile's Work IQ account. The run shows it as done by workiq (or workiq:<agent id>), with no evidence and not verified. proofkin workiq agents lists the agents list_agents returns (name and id), from structuredContent or, as Work IQ gives them, from the JSON list in the text content. The plan editor knows the @workiq target.",
       "tests": [
         "lib::plan::a_workiq_step_parses_and_everything_that_would_make_an_answer_proof_is_refused",
         "lib::plan::a_workiq_step_is_marked_and_save_keeps_the_mark_and_says_it_was_an_answer",
         "lib::plan::the_plan_check_needs_the_work_iq_account_for_workiq_steps",
         "lib::workiq::content::agents_are_read_from_the_common_list_shapes_and_ones_without_an_id_are_left_out",
+        "lib::workiq::content::agents_listed_as_json_text_are_read_as_work_iq_lists_them",
         "lib::trust::m365_off_removes_the_grant_and_bad_specs_are_refused",
         "ui::the_plan_editor_keeps_plans_valid",
         "agents::a_workiq_step_asks_for_its_words_and_hands_its_answer_to_later_steps",
@@ -1320,7 +1324,7 @@
     {
       "id": "WIQ-24",
       "area": "work-iq",
-      "claim": "A live check against a real tenant's Work IQ, behind PROOFKIN_LIVE_WORKIQ=cli|hosted (scripts/live_workiq.py; python scripts/evidence.py --live runs it when that is set), only reads: a fresh profile signs in to Work IQ (through the Work IQ CLI, or with Proofkin's device code sign-in), its doctor passes every check with one retrieve, and its agent runs a plan whose workiq= step goes to the profile's own digital worker on real Copilot and whose @workiq step gets Microsoft 365 Copilot's answer. The run's signed evidence verifies, the step's evidence records the Work IQ context by its hash and nothing else, and every call in the profile's Work IQ audit file was a read tool. Step outputs stay out of its log and email addresses are masked. Without PROOFKIN_LIVE_WORKIQ the check is not run and fails nothing.",
+      "claim": "A live check against a real tenant's Work IQ, behind PROOFKIN_LIVE_WORKIQ=cli|hosted (scripts/live_workiq.py; python scripts/evidence.py --live runs it when that is set), only reads: a fresh profile signs in to Work IQ (through the Work IQ CLI, or with Proofkin's device code sign-in), its doctor passes every check with one retrieve, proofkin workiq agents reads the agents list Work IQ gives (only how many is shown), and its agent runs a plan whose workiq= step goes to the profile's own digital worker on real Copilot and whose @workiq step gets Microsoft 365 Copilot's answer. The run's signed evidence verifies, the step's evidence records the Work IQ context by its hash and nothing else, and every call in the profile's Work IQ audit file was a read tool. Step outputs stay out of its log and email addresses are masked. Without PROOFKIN_LIVE_WORKIQ the check is not run and fails nothing.",
       "live": [
         {
           "check": "workiq: *",
@@ -1331,7 +1335,7 @@
     {
       "id": "WIQ-16",
       "area": "work-iq",
-      "claim": "A folder can offer Work IQ to its owner's tasks as its MCP server workiq (proofkin mcp add <folder> workiq --workiq [--tool ...]; the name is workiq, it has no command or URL, only tools that read: retrieve, ask, fetch, search_paths, get_schema, list_agents, and any task access may use it). A task that asks for mcp=workiq gets, for that task only, http://127.0.0.1:<port>/mcp/workiq/<session> with a random bearer; the agent calls Work IQ itself through the profile's audited client, so the model's MCP config holds no token. The session lists only the allowed tools Work IQ offers, refuses any other tool before it reaches Work IQ, puts every result through the content policy for the task's audience (a peer audience gets only retrieve and ask, within its labels), audits each call with purpose gateway, needs its bearer, refuses requests with an Origin header, and closes when the task ends. A digital worker's owner's tasks see what Work IQ allows (peers: WIQ-17). A plan marks a step with mcp=workiq, and the steps after it, with the label unknown, so nothing made from what its model read goes to a peer.",
+      "claim": "A folder can offer Work IQ to its owner's tasks as its MCP server workiq (proofkin mcp add <folder> workiq --workiq [--tool ...]; the name is workiq, it has no command or URL, only tools that read: retrieve, ask, fetch, search_paths, get_schema, list_agents, and any task access may use it). A task that asks for mcp=workiq gets, for that task only, http://127.0.0.1:<port>/mcp/workiq/<session> with a random bearer; the agent calls Work IQ itself through the profile's audited client, so the model's MCP config holds no token. The session lists only the allowed tools Work IQ offers, never one whose MCP annotations say it changes things (readOnlyHint false or destructiveHint true), refuses any other tool before it reaches Work IQ, puts every result through the content policy for the task's audience (a peer audience gets only retrieve and ask, within its labels), audits each call with purpose gateway, needs its bearer, refuses requests with an Origin header, and closes when the task ends. A digital worker's owner's tasks see what Work IQ allows (peers: WIQ-17). A plan marks a step with mcp=workiq, and the steps after it, with the label unknown, so nothing made from what its model read goes to a peer.",
       "tests": [
         "workiq_gateway::a_tasks_session_offers_only_read_tools_and_its_model_never_gets_the_token",
         "workiq_gateway::what_a_session_sees_goes_through_the_content_policy_for_its_audience_and_is_audited",
@@ -1776,6 +1780,60 @@
         "factory::drafting_needs_a_provider_the_profile_is_signed_in_to"
       ],
       "live": ["worker1's model drafted an agent from a description that passes the factory check"]
+    },
+    {
+      "id": "FAC-7",
+      "area": "agent-factory",
+      "claim": "proofkin factory build turns a draft without errors into the files an agent is made of: its agent file (front matter with its name, purpose, skills and MCP servers, never tools or a model; then its instructions, the requirements its answers must meet and the rules every factory agent follows, a request outside its purpose answered with one OUT_OF_SCOPE line), its blueprint, its eval suite, the skills it follows under its own names and its team plan, which must be a valid team plan and needs delegation. The same blueprint builds the same bytes on every platform (keys sorted, LF line endings), and changing any field changes the build's hash, the SHA-256 of its files' sha256sum listing. A build is kept once by its hash, written whole, and checked against its hash whenever it is read: one changed after it was built is refused. proofkin factory show lists an agent's builds.",
+      "tests": [
+        "lib::factory::build::the_same_blueprint_builds_the_same_bytes_on_every_platform",
+        "lib::factory::build::changing_any_field_changes_the_hash",
+        "lib::factory::build::the_agent_file_reads_as_an_agent_without_tools_or_model",
+        "lib::factory::store::builds_are_kept_by_hash_and_checked_when_read",
+        "lib::factory::blueprint::a_team_plan_is_a_valid_team_plan_and_needs_delegation",
+        "lib::factory::blueprint::a_skill_kept_under_the_agents_name_must_fit_a_name",
+        "factory::a_draft_is_built_into_the_same_files_each_time_and_kept_by_their_hash"
+      ],
+      "live": ["worker1 built the drafted agent into the same files twice, kept by their hash"]
+    },
+    {
+      "id": "FAC-8",
+      "area": "agent-factory",
+      "claim": "What a blueprint asks for is resolved against what its owner offers in each folder it is deployed to (proofkin factory check, its deploy folders or --folders): its tasks get at most the folder's access, the MCP servers it offers to tasks with that access, with the tools asked for, and the checks it has. What isn't offered is an error naming the command that offers it (share add keeping the folder's checks and worktrees, mcp add, mcp resume, plugin enable), and a server that offers fewer tools than every tool asked for is a warning. Resolving never shares a folder, offers a server or grants a peer anything: the shares and the allowlist are byte-identical after it (AC-5). What one blueprint asks for beyond another (more access, servers or tools, checks, Microsoft 365 sources, delegation, a new or changed team plan) is listed, for a release's sign-off.",
+      "tests": [
+        "lib::factory::capabilities::an_agent_gets_what_each_folder_offers_and_no_more",
+        "lib::factory::capabilities::what_isnt_offered_is_an_error_with_the_command_that_offers_it",
+        "lib::factory::capabilities::increases_are_what_a_blueprint_asks_beyond_another",
+        "factory::check_resolves_what_an_agent_asks_for_in_each_folder_and_grants_nothing"
+      ]
+    },
+    {
+      "id": "FAC-9",
+      "area": "agent-factory",
+      "claim": "An agent is evaluated on its blueprint's candidate models, else on its providers' defaults in the profile's model settings. A candidate is left out, with the reason, when the profile isn't signed in to its provider or doesn't allow its model or effort, the account doesn't offer it or its policy disables it, it is over max_multiplier or has no multiplier, it can't use the MCP servers the agent needs (Codex), or the agent's Microsoft 365 content would go outside the owner's own workers; proofkin factory show lists both. Among the candidates an evaluation passed, the recommendation follows the blueprint's prefer (cost, latency or quality; what isn't known counts as worst, and ties go to the first listed), and pinning it gives the model settings that keep a deployment's tasks to the models that passed.",
+      "tests": [
+        "lib::factory::routing::candidates_the_profile_or_the_agent_rules_out_are_left_out_with_the_reason",
+        "lib::factory::routing::the_recommendation_follows_prefer_among_the_candidates_that_passed",
+        "lib::factory::routing::pinned_settings_keep_tasks_to_the_models_that_passed",
+        "factory::a_draft_is_built_into_the_same_files_each_time_and_kept_by_their_hash"
+      ]
+    },
+    {
+      "id": "FAC-10",
+      "area": "agent-factory",
+      "claim": "A digital worker's memory (proofkin worker memory) puts its context topics, copied with their Microsoft 365 marks from its owner's knowledge, in front of every task it serves, as external content, at most 24,000 characters; a marked topic only for a requester who may have its labels (its owner, known by its endpoint id, or a peer whose grant names them). The task's signed output records that knowledge by hash, and its evidence the labels of marked knowledge, never its text; the requester marks what it does with the result with them: a later step goes only to a peer granted them (one done again for a sign-off too), what it saves is marked, a mark without labels still counts as unlabeled, and a lead's team results go back only to a requester who may have what any of its steps held (their evidence, failed steps included, and the lead's own Microsoft 365 content), their labels in its evidence (AC-30). Each task names the labels of what it holds, which its worker's evidence repeats. A task whose checks passed adds a lesson to the worker's lessons topic, once, capped, marked with the labels of what the task was given (unknown if its model read Work IQ itself); one whose checks failed adds none, and lessons older than the retention are removed (AC-31).",
+      "tests": [
+        "lib::factory::memory::context_topics_go_in_front_of_a_task_for_whoever_may_have_their_labels",
+        "lib::factory::memory::knowledge_in_front_of_a_task_is_cut_to_the_limit",
+        "lib::factory::memory::lessons_are_kept_once_marked_capped_and_pruned",
+        "lib::factory::memory::a_worker_learns_into_its_lessons_topic_and_only_there",
+        "lib::plan::what_a_result_holds_marks_what_is_sent_after_it_and_a_mark_without_labels_stays",
+        "factory::a_workers_memory_copies_its_topics_with_their_marks_from_its_owner",
+        "agents::a_workers_memory_goes_in_front_of_tasks_for_whoever_may_have_it",
+        "agents::a_task_its_checks_verified_teaches_its_worker_a_lesson_once",
+        "agents::a_teams_results_go_back_only_to_a_requester_who_may_have_what_they_hold"
+      ],
+      "live": ["helper's memory put its owner's knowledge in front of boss's task, and its signed evidence says so"]
     }
   ]
 }
