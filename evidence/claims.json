@@ -1679,6 +1679,7 @@
         "lib::factory::evals::a_judge_rubric_is_scored_by_a_model_never_graded",
         "lib::factory::evals::glob_patterns_match_paths_as_documented",
         "lib::factory::evals::fixtures_must_be_files_in_the_agents_fixtures_folder",
+        {"test": "lib::factory::evals::fixtures_reached_through_symbolic_links_are_refused", "os": "unix"},
         "factory::a_blueprint_file_is_checked_with_the_fixtures_next_to_it"
       ]
     },
