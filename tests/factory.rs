@@ -685,3 +685,171 @@ fn a_workers_memory_copies_its_topics_with_their_marks_from_its_owner() {
         "{out}"
     );
 }
+
+/// AC-8: evaluating says first what it would run (its cases with the built-in attacks, the
+/// runs on each candidate) and runs nothing until it is confirmed with --yes.
+#[test]
+fn an_evaluation_shows_its_estimate_and_runs_nothing_until_it_is_confirmed() {
+    let home = Home::new();
+    home.ok(&[
+        "new",
+        "rev",
+        "--template",
+        "code-reviewer",
+        "--profile",
+        "alice",
+    ]);
+    let cases = home.blueprint("rev")["evals"]["cases"]
+        .as_array()
+        .unwrap()
+        .len();
+    let out = home.ok(&["evaluate", "rev", "--profile", "alice"]);
+    let runs = (cases + 7) * 3;
+    for part in [
+        "candidates: codex (its default model)".to_owned(),
+        format!(
+            "estimate: {} cases (7 built-in adversarial) x 3 runs x 1 candidate = {runs} runs",
+            cases + 7
+        ),
+        "nothing ran: run it with --yes (its tasks go to your evaluation worker alice-eval)"
+            .to_owned(),
+    ] {
+        assert!(out.contains(&part), "{part:?} isn't in:\n{out}");
+    }
+    assert!(out.contains("rev: build "), "it is of a build: {out}");
+    // Nothing was sent: there is no evaluation worker and no evaluation.
+    let profiles = home.path().join("profiles");
+    assert!(!profiles.join("alice-eval").exists());
+    let agent = profiles
+        .join("alice")
+        .join("factory")
+        .join("agents")
+        .join("rev");
+    assert!(!agent.join("evaluations").exists());
+    assert!(
+        !home
+            .ok(&["show", "rev", "--profile", "alice"])
+            .contains("evaluations")
+    );
+
+    // On other models, fewer times.
+    let out = home.ok(&[
+        "evaluate",
+        "rev",
+        "--candidate",
+        "codex:gpt-5:high",
+        "--candidate",
+        "codex:gpt-5-mini",
+        "--repetitions",
+        "1",
+        "--profile",
+        "alice",
+    ]);
+    assert!(
+        out.contains("candidates: codex gpt-5 (high reasoning); codex gpt-5-mini"),
+        "{out}"
+    );
+    assert!(out.contains("x 1 run x 2 candidates"), "{out}");
+    for (args, why) in [
+        (vec!["--repetitions", "9"], "repetitions is 1 to 5"),
+        (
+            vec!["--candidate", "copilot:gpt-5"],
+            "it can't be evaluated on copilot gpt-5: copilot isn't one of its providers",
+        ),
+        (vec!["--candidate", "codex"], "names no model"),
+        (vec!["--candidate", "nobody:gpt-5"], "isn't a candidate"),
+    ] {
+        let mut all = vec!["evaluate", "rev", "--profile", "alice"];
+        all.extend(args);
+        let out = home.fails(&all);
+        assert!(out.contains(why), "{why:?} isn't in:\n{out}");
+    }
+    // A draft with an error isn't evaluated.
+    let original = home.blueprint("rev");
+    let mut blueprint = original.clone();
+    blueprint["skills"] = json!(["no-such-skill"]);
+    let edit = ["edit", "rev", "--from", "-", "--profile", "alice"];
+    assert!(home.run_with_stdin(&edit, &blueprint.to_string()).ok);
+    let out = home.fails(&["evaluate", "rev", "--profile", "alice"]);
+    assert!(
+        out.contains("the draft has 1 error: fix it, then evaluate"),
+        "{out}"
+    );
+    // A suite that doesn't prove a requirement is what's wrong with the request.
+    let mut blueprint = original;
+    blueprint["evals"]["cases"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c["requirement"] != "R2");
+    assert!(home.run_with_stdin(&edit, &blueprint.to_string()).ok);
+    let out = home.fails(&["evaluate", "rev", "--profile", "alice"]);
+    assert!(
+        out.contains(
+            "its eval suite isn't valid: no case proves R2 with a deterministic expectation"
+        ),
+        "{out}"
+    );
+    let out = home.fails(&["report", "ev-20261124-091500-rev", "--profile", "alice"]);
+    assert!(
+        out.contains("there is no evaluation ev-20261124-091500-rev"),
+        "{out}"
+    );
+}
+
+/// Agents as code: `factory init` writes a folder whose agent:blueprint and agent:evals checks
+/// pass (agent:report waits for a report), and a draft starts from it, with its fixtures.
+#[test]
+fn an_agent_kept_as_code_is_checked_in_its_folder_and_drafted_from_it() {
+    let home = Home::new();
+    let repo = home.path().join("repo");
+    let dir = repo.to_str().unwrap();
+    let out = home.ok(&["init", dir, "--name", "ask", "--profile", "alice"]);
+    assert!(
+        out.contains("wrote agent ask (template researcher)"),
+        "{out}"
+    );
+    let blueprint: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join("agent").join("blueprint.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(blueprint["name"], "ask");
+    assert_eq!(
+        blueprint["model"]["providers"],
+        json!(["codex"]),
+        "fit to alice"
+    );
+    assert!(
+        blueprint.get("evals").is_none(),
+        "its suite is in evals.json"
+    );
+    let out = home.fails(&["init", dir, "--name", "ask"]);
+    assert!(out.contains("exists already"), "{out}");
+
+    let checked = home.proofkin(&["spec", "check", "agent", "--dir", dir]);
+    assert!(!checked.ok, "no report yet:\n{}", checked.out);
+    for part in [
+        "agent:blueprint: passed",
+        "agent:evals: passed",
+        "agent:report: FAILED",
+        "agent/reports/ has no passed, verified evaluation of build",
+    ] {
+        assert!(
+            checked.out.contains(part),
+            "{part:?} isn't in:\n{}",
+            checked.out
+        );
+    }
+    let fixtures = repo.join("agent").join("fixtures");
+    std::fs::write(fixtures.join("notes.md"), "# Notes\n").unwrap();
+    let out = home.ok(&["check", "--file", dir, "--profile", "alice"]);
+    assert!(out.contains(&format!("{dir}: no problems")), "{out}");
+    let out = home.ok(&["new", "ask", "--from", dir, "--profile", "alice"]);
+    assert!(out.contains("created draft ask (drafted from"), "{out}");
+    assert!(out.contains("1 fixture): no problems"), "{out}");
+    let copied = home
+        .path()
+        .join("profiles/alice/factory/agents/ask/fixtures/notes.md");
+    assert!(copied.is_file());
+    let out = home.fails(&["new", "other", "--from", dir, "--profile", "alice"]);
+    assert!(out.contains("isn't named \"other\""), "{out}");
+}

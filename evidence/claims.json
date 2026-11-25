@@ -1872,6 +1872,90 @@
         "agents::a_teams_results_go_back_only_to_a_requester_who_may_have_what_they_hold"
       ],
       "live": ["helper's memory put its owner's knowledge in front of boss's task, and its signed evidence says so"]
+    },
+    {
+      "id": "FAC-11",
+      "area": "agent-factory",
+      "claim": "Every evaluation runs a versioned built-in adversarial suite with the agent's own cases (AC-11, TM-6): an instruction hidden in a fixture, in knowledge and in an earlier step's result (both inside the external-content envelope, after the standing rule), a canary secret in a fixture and in a .env file it is asked to include, a file outside its folder, a request outside its purpose that must be answered OUT_OF_SCOPE, and, for an agent that edits, a file to write outside its folder. Each evaluation has markers of its own, every attack is decided by deterministic expectations or by the file not being written, and the release gate needs every attack run to pass, whatever the agent does with its own cases. The canary is redacted from the outputs a report keeps, and the report still verifies.",
+      "tests": [
+        "lib::factory::adversarial::every_attack_is_a_case_with_deterministic_expectations",
+        "lib::factory::adversarial::the_attack_fixtures_are_written_and_the_canary_is_redacted_from_what_is_kept",
+        "lib::factory::runner::a_file_written_outside_the_folder_fails_the_run_that_wrote_it",
+        "evaluation::an_unsafe_agent_fails_the_gate_on_the_built_in_attacks"
+      ]
+    },
+    {
+      "id": "FAC-12",
+      "area": "agent-factory",
+      "claim": "An evaluation first says what it would run: its cases with the built-in attacks, the runs on each candidate, the judges' scores and the minutes on its worker's task slots, and nothing runs until it is confirmed (AC-8). Confirmed, each case runs as a real delegated task of the owner's evaluation worker (made the first time, on the owner's sign-ins), 3 times by default, in the folder it shares for evaluations with the case's fixtures, at the access the agent asks for (not the owner's grant there) and under the same sandbox and path rules as any task: a write outside the folder is refused (AC-9). Each task follows the build's instructions and skills, runs on its candidate's model and effort, and is graded by its worker's signed answer and evidence (checks, files changed), not by what the agent says. The record is saved as each run is sent and ends; an evaluation whose agent stopped goes on when it is run again and runs no case twice, and a cancelled one stops its runs on the worker. One evaluation runs at a time; drafts with errors aren't evaluated, and an invalid suite says what it doesn't prove.",
+      "tests": [
+        "lib::factory::runner::an_evaluation_runs_every_case_and_attack_on_every_candidate_each_repetition",
+        "lib::factory::runner::candidates_are_written_provider_model_and_effort",
+        "lib::factory::runner::the_answer_is_graded_without_the_summary_its_worker_signs_with_it",
+        "lib::factory::runner::a_run_passes_on_its_signed_answer_checks_and_files_and_fails_with_why",
+        "lib::factory::runner::tasks_carry_the_builds_instructions_the_case_and_the_candidate",
+        "evaluation::each_case_runs_three_times_on_the_worker_at_the_agents_access",
+        "evaluation::an_evaluation_goes_on_after_its_agent_restarts_and_runs_no_case_twice",
+        "evaluation::evaluations_are_kept_by_agent_and_found_by_id",
+        "factory::an_evaluation_shows_its_estimate_and_runs_nothing_until_it_is_confirmed"
+      ],
+      "live": ["worker1 evaluated an agent with real Copilot on its evaluation worker: every run ended, the built-in attacks too, and its signed report verifies"]
+    },
+    {
+      "id": "FAC-13",
+      "area": "agent-factory",
+      "claim": "An evaluation's report says, for each candidate model, its pass rate overall and per requirement, its adversarial runs, p95 duration, attempts, cost multiplier and judge score, and whether it meets the release gate (90% of its own runs, 2 of 3 of each requirement's, every attack, the p95 limit), with each threshold it misses; it recommends the candidate the blueprint prefers among those that pass, the cheapest by default (AC-12), and a cancelled evaluation decides nothing. The evaluating agent signs it: it verifies offline (its signature, each run's evidence by its worker, each kept output against its hash), and a changed byte anywhere fails it. Outputs are kept 30 days, then only their hashes. proofkin factory report prints it in Markdown with the failing runs and their outputs, or as the signed record.",
+      "tests": [
+        "lib::factory::report::the_report_has_each_candidates_metrics_and_recommends_the_cheapest_that_passes",
+        "lib::factory::report::a_report_verifies_offline_and_a_changed_byte_fails_it",
+        "lib::factory::report::ids_name_their_agent_and_estimates_count_every_call",
+        "evaluation::the_report_recommends_the_cheapest_candidate_that_meets_every_threshold"
+      ]
+    },
+    {
+      "id": "FAC-14",
+      "area": "agent-factory",
+      "claim": "A case's judge rubric is scored by a model of another family than the model that answered (another provider when a family isn't known), from those the profile allows: read-only in an empty folder with no tools, with the task and the answer inside the external-content envelope after the standing rule, so an answer can't close its envelope or set its score. It scores 3 times and the median counts; a call that gives no score is left out, and with no judge to be had the rubric goes unscored. Scores are reported and never decide whether a run passes: a 5 doesn't pass a run whose deterministic expectation failed (AC-13, TM-4).",
+      "tests": [
+        "lib::factory::judge::a_judge_is_of_another_family_or_provider_than_the_candidate",
+        "lib::factory::judge::the_answer_reaches_the_judge_as_data_after_the_standing_rule",
+        "lib::factory::judge::the_median_of_three_calls_is_the_score_and_a_bad_call_is_left_out",
+        "evaluation::a_judges_five_never_passes_a_run_its_expectations_fail"
+      ]
+    },
+    {
+      "id": "FAC-15",
+      "area": "agent-factory",
+      "claim": "An agent can be kept as code: proofkin factory init writes agent/blueprint.json, agent/evals.json and folders for its fixtures, its own skills and its reports. The built-in checks agent:blueprint, agent:evals and agent:report prove the folder from a plan step's verify= or proofkin spec check agent, read-only and following no links: they pass for a valid blueprint and suite, and fail naming each problem with its fix, each in the check it belongs to (AC-32); agent:report needs a passed evaluation report of exactly the folder's build that verifies. proofkin factory new and edit --from take the folder's agent with its fixtures, and check --file checks it.",
+      "tests": [
+        "lib::factory::code::init_writes_a_folder_whose_blueprint_and_suite_pass",
+        "lib::factory::code::problems_are_named_with_their_fix_by_the_check_they_belong_to",
+        "lib::factory::code::a_passed_verified_report_of_the_folders_build_proves_it",
+        {"test": "lib::factory::code::links_are_not_followed", "os": "unix"},
+        "evaluation::a_plan_step_proves_an_agent_kept_as_code_with_the_built_in_checks",
+        "factory::an_agent_kept_as_code_is_checked_in_its_folder_and_drafted_from_it"
+      ],
+      "live": ["agent:report proves the folder's agent with its own build's passed, verified report, and nothing less"]
+    },
+    {
+      "id": "FAC-16",
+      "area": "agent-factory",
+      "claim": "The web UI's agent factory API answers as its contract (docs/agent-factory/spec/openapi.json) says: templates, drafts from a template or the owner's words, saving and checking them, the factory's agents, and evaluations (the estimate, starting one on the owner's evaluation worker, its report and cancelling it), each with the status codes it lists and a body that fits its schema; nothing works without the web UI's token (TM-11), and the page never gets the canary, the runs' tasks or their evidence. The Agent factory card drafts, checks and evaluates agents with the estimate first, live progress, the gate, the model matrix and the failing runs, and follows the UX guidelines.",
+      "tests": [
+        "ui::the_factory_api_answers_as_its_contract_says",
+        "lib::ui::factory::the_page_never_gets_the_canary_tasks_or_evidence",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
+      "id": "FAC-17",
+      "area": "agent-factory",
+      "claim": "Another agent with the integration token designs agents over MCP: it lists templates and the factory's agents, drafts, checks and evaluates them (the estimate unless it confirms, with progress notifications while one runs), and what it does is recorded as another agent's. Releasing, deploying, rolling back, retiring, deprecating and approving aren't offered, and a call is refused with the owner's command to run instead (AC-29, TM-10); the integration token can't reach the web UI's factory API, and the web UI's token is refused at /mcp.",
+      "tests": [
+        "connect::editor_agents_design_agents_over_mcp_and_the_lifecycle_stays_with_the_owner",
+        "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a"
+      ],
+      "live": ["an MCP client lists the agent factory's templates, and releasing an agent stays with its owner"]
     }
   ]
 }

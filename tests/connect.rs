@@ -401,7 +401,13 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
             "check_plan",
             "run_plan",
             "get_run",
-            "import_spec"
+            "import_spec",
+            "factory_templates",
+            "factory_list",
+            "factory_draft",
+            "factory_check",
+            "factory_evaluate",
+            "factory_status"
         ]
     );
     let peers = mcp(vec![], rpc("tools/call", json!({ "name": "list_peers" })))
@@ -1018,4 +1024,237 @@ async fn mcp_clients_follow_a_task_with_progress_notifications() {
     );
     boss.shutdown().await;
     worker.shutdown().await;
+}
+
+/// AC-29, TM-10: an editor agent with the integration token lists, drafts, checks and
+/// evaluates agents over MCP, and what it does is recorded as another agent's; releasing,
+/// deploying, rolling back, retiring, deprecating and approving are refused with the
+/// owner's command; neither token works where the other belongs.
+#[tokio::test]
+async fn editor_agents_design_agents_over_mcp_and_the_lifecycle_stays_with_the_owner() {
+    let home = shared_home();
+    let profiles = home.join("profiles");
+    std::fs::create_dir_all(profiles.join("owner")).unwrap();
+    std::fs::write(
+        profiles.join("owner").join("profile.json"),
+        r#"{"codex": {"source": "login"}}"#,
+    )
+    .unwrap();
+    let mut config = AgentConfig::new("owner", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let profile = Profile::open_in(&profiles, "owner").unwrap();
+    let info = UiInfo {
+        profile: profile.clone(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, ui_token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let ui_auth = format!("Bearer {ui_token}");
+    let on = request(
+        port,
+        "POST",
+        "/api/connect",
+        &[("Authorization", ui_auth.as_str())],
+        None,
+    )
+    .await
+    .json();
+    let auth = format!("Bearer {}", on["token"].as_str().unwrap());
+    let call = |name: &str, arguments: Value| {
+        let auth = auth.clone();
+        let body = rpc(
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        );
+        async move {
+            let headers = [
+                ("Authorization", auth.as_str()),
+                ("Accept", "application/json, text/event-stream"),
+            ];
+            let reply = request(port, "POST", "/mcp", &headers, Some(&body))
+                .await
+                .json();
+            reply["result"].clone()
+        }
+    };
+
+    let list = request(
+        port,
+        "POST",
+        "/mcp",
+        &[
+            ("Authorization", auth.as_str()),
+            ("Accept", "application/json, text/event-stream"),
+        ],
+        Some(&rpc("tools/list", json!({}))),
+    )
+    .await
+    .json();
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for tool in [
+        "factory_templates",
+        "factory_list",
+        "factory_draft",
+        "factory_check",
+        "factory_evaluate",
+        "factory_status",
+    ] {
+        assert!(names.contains(&tool), "{tool} isn't offered: {names:?}");
+    }
+    assert!(
+        !names.iter().any(|n| [
+            "release",
+            "deploy",
+            "rollback",
+            "retire",
+            "deprecate",
+            "approve"
+        ]
+        .iter()
+        .any(|v| n.contains(v))),
+        "{names:?}"
+    );
+
+    let templates = call("factory_templates", json!({})).await;
+    assert!(
+        templates["structuredContent"]["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "researcher")
+    );
+    let drafted = call(
+        "factory_draft",
+        json!({ "name": "ask", "template": "researcher" }),
+    )
+    .await;
+    assert_eq!(drafted["isError"], false, "{drafted}");
+    assert_eq!(
+        drafted["structuredContent"]["provenance"]["source"],
+        "template"
+    );
+    let state = proofkin::factory::FactoryStore::of(&profile)
+        .state("ask")
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.history.last().unwrap().by, "another agent (MCP)");
+    let listed = call("factory_list", json!({})).await;
+    assert_eq!(listed["structuredContent"]["agents"][0]["name"], "ask");
+    let checked = call("factory_check", json!({ "name": "ask" })).await;
+    assert_eq!(checked["structuredContent"]["passed"], true, "{checked}");
+    let estimate = call(
+        "factory_evaluate",
+        json!({ "name": "ask", "repetitions": 1, "candidates": ["codex:gpt-5:high"] }),
+    )
+    .await;
+    assert_eq!(estimate["isError"], false, "{estimate}");
+    assert_eq!(
+        estimate["structuredContent"]["runs"], 10,
+        "estimated, nothing ran"
+    );
+    let confirmed = call(
+        "factory_evaluate",
+        json!({ "name": "ask", "confirm": true, "wait_seconds": 0 }),
+    )
+    .await;
+    assert_eq!(confirmed["isError"], true);
+    assert!(
+        confirmed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("can't run your evaluation worker"),
+        "{confirmed}"
+    );
+    let unknown = call(
+        "factory_status",
+        json!({ "id": "ev-20261124-091500-ask", "wait_seconds": 0 }),
+    )
+    .await;
+    assert_eq!(unknown["isError"], true);
+
+    // The lifecycle stays with the owner.
+    for verb in [
+        "release",
+        "deploy",
+        "rollback",
+        "retire",
+        "deprecate",
+        "approve",
+    ] {
+        let refused = call(&format!("factory_{verb}"), json!({ "name": "ask" })).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        let text = refused["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.ends_with(&format!(
+                "stays with its owner, who runs: proofkin factory {verb} ask --profile owner"
+            )),
+            "{text}"
+        );
+    }
+    assert!(
+        proofkin::factory::FactoryStore::of(&profile)
+            .state("ask")
+            .unwrap()
+            .unwrap()
+            .versions
+            .is_empty()
+    );
+
+    // Each token only where it belongs.
+    for (method, path) in [
+        ("GET", "/api/factory/agents"),
+        ("POST", "/api/factory/agents/ask/evaluations"),
+    ] {
+        let got = request(
+            port,
+            method,
+            path,
+            &[("Authorization", auth.as_str())],
+            Some(r#"{"confirm":true}"#),
+        )
+        .await;
+        assert_eq!(got.status, 401, "{method} {path}");
+    }
+    let ui_on_mcp = request(
+        port,
+        "POST",
+        "/mcp",
+        &[("Authorization", ui_auth.as_str())],
+        Some(&rpc("tools/call", json!({ "name": "factory_list" }))),
+    )
+    .await;
+    assert_eq!(ui_on_mcp.status, 401);
+    // A2A runs tasks and plans on peers: its agent card offers nothing of the factory.
+    let card = request(port, "GET", "/.well-known/agent-card.json", &[], None)
+        .await
+        .json();
+    let skills = card["skills"].to_string().to_lowercase();
+    assert!(
+        !skills.contains("release") && !skills.contains("deploy"),
+        "{skills}"
+    );
+    agent.shutdown().await;
 }

@@ -62,7 +62,10 @@ and their checks. delegate: run a task on a peer (its result is signed by that p
 run_plan: run an evidence plan across peers (check it first with check_plan); its \
 claims are proven only by passing checks or sign-offs. get_task: wait for a result. \
 get_run: the evidence report. import_spec: turn a Spec Kit feature or OpenSpec change \
-into a plan.";
+into a plan. factory_*: design agents with the owner's agent factory: draft one \
+(factory_draft), check it (factory_check), and evaluate it (factory_evaluate: the estimate \
+first, then confirm) and follow it (factory_status); releasing, deploying and approving \
+agents stay with the owner.";
 
 /// Other agents' access and the work they started.
 #[derive(Default)]
@@ -454,6 +457,9 @@ async fn mcp_modern(
             if let Some(stream) = progress_stream(s, headers, id, params, true) {
                 return stream;
             }
+            if let Some(stream) = factory_stream(s, headers, id, params, true).await {
+                return stream;
+            }
             match call_tool(s, params).await {
                 Ok(result) => result,
                 Err(message) => return reply(StatusCode::OK, rpc_err(id, -32602, message, None)),
@@ -636,6 +642,9 @@ async fn mcp_legacy(
             if let Some(stream) = progress_stream(s, headers, id, params, false) {
                 return stream;
             }
+            if let Some(stream) = factory_stream(s, headers, id, params, false).await {
+                return stream;
+            }
             match call_tool(s, params).await {
                 Ok(result) => result,
                 Err(message) => return reply(StatusCode::OK, rpc_err(id, -32602, message, None)),
@@ -729,7 +738,280 @@ fn tools() -> Value {
                 "approver": text("Who signs it off (default: me, this agent's owner)"),
             }),
             &["path", "peer"], false),
+        tool("factory_templates", "List agent templates",
+            "The agent factory's built-in templates: what each agent is for, the most access it asks for and how many eval cases it starts with.",
+            json!({}), &[], true),
+        tool("factory_list", "List the factory's agents",
+            "The agents and drafts of this profile's agent factory: each one's state, its draft's errors and warnings, and its latest evaluation.",
+            json!({}), &[], true),
+        tool("factory_draft", "Draft an agent",
+            "Start a new agent: from a template, or written by the owner's model from a description (read-only, in an empty folder: it grants nothing), or both. Returns the draft: its blueprint, problems with their fixes, and how it was written. Releasing, deploying and approving stay with the owner.",
+            json!({
+                "name": text("The agent's name (letters, digits, '-', '_' and '.'); default: the template's"),
+                "description": text("What it should do, in plain words (at most 4000 characters)"),
+                "template": text("A template to start from (see factory_templates)"),
+                "provider": { "type": "string", "enum": ["copilot", "claude", "codex"], "description": "Whose model writes it (default: the first the profile is signed in to)" },
+            }),
+            &[], false),
+        tool("factory_check", "Check an agent's draft",
+            "Check a draft: each problem with its fix, least-privilege warnings, and what it asks for resolved in the folders it is deployed to (or those given). Checking grants nothing.",
+            json!({
+                "name": text("The draft's name"),
+                "folders": { "type": "array", "items": { "type": "string" }, "description": "Folders to resolve its capabilities in (default: its deploy folders)" },
+            }),
+            &["name"], true),
+        tool("factory_evaluate", "Evaluate an agent",
+            "Without confirm: the estimate of evaluating a draft (cases with the built-in attacks, runs, model calls, minutes); nothing runs. With confirm: runs it on the owner's evaluation worker, each case a few times on each candidate model, and returns the evaluation (wait_seconds waits for it; then call factory_status). With a progress token (_meta.progressToken) and Accept listing text/event-stream, it streams notifications/progress while it runs, then the result.",
+            json!({
+                "name": text("The draft's name"),
+                "candidates": { "type": "array", "items": { "type": "string" }, "description": "Models to evaluate it on, as provider:model[:effort] (default: those its blueprint lists, else its providers' defaults)" },
+                "repetitions": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Runs per case and model (default: its suite's, else 3)" },
+                "confirm": { "type": "boolean", "description": "Run it (default false: only the estimate)" },
+                "wait_seconds": wait,
+            }),
+            &["name"], false),
+        tool("factory_status", "Get an evaluation",
+            "An evaluation's state and report: its progress, the release gate with the reasons it failed, each model's results and the failing runs. Waits for it to end, up to wait_seconds. With a progress token (_meta.progressToken) and Accept listing text/event-stream, it streams notifications/progress while it runs, then the result.",
+            json!({ "id": text("The evaluation's id (ev-...)"), "wait_seconds": wait }),
+            &["id"], true),
     ]})
+}
+
+/// Who the factory records as having done what another agent asked over MCP.
+const BY_AGENT: &str = "another agent (MCP)";
+
+/// The agent factory's lifecycle stays with its owner: these tools aren't offered, and a
+/// call is refused with the owner's command (TM-10). Each tool, with what it would do and
+/// the owner's verb.
+const OWNER_ONLY: &[(&str, &str, &str)] = &[
+    ("factory_release", "Releasing an agent", "release"),
+    ("factory_deploy", "Deploying an agent", "deploy"),
+    ("factory_rollback", "Rolling an agent back", "rollback"),
+    ("factory_retire", "Retiring an agent", "retire"),
+    ("factory_deprecate", "Deprecating an agent", "deprecate"),
+    (
+        "factory_approve",
+        "Approving what an agent asks for",
+        "approve",
+    ),
+];
+
+/// Why lifecycle tool `name` is refused: what stays with the owner, and their command.
+fn owner_only(s: &Shared, name: &str, args: &Value) -> Option<String> {
+    let (_, what, verb) = OWNER_ONLY.iter().find(|(tool, ..)| *tool == name)?;
+    let agent = opt_text(args, "name").unwrap_or_else(|| "NAME".into());
+    Some(format!(
+        "{what} stays with its owner, who runs: proofkin factory {verb} {agent} --profile {}",
+        s.info.profile.name
+    ))
+}
+
+/// Candidates as tools name them: `provider:model[:effort]` text, or objects.
+fn candidates_arg(args: &Value) -> Result<Vec<crate::factory::routing::Route>, String> {
+    args.get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|c| match c.as_str() {
+            Some(text) => {
+                crate::factory::runner::parse_candidate(text).map_err(|e| format!("{e:#}"))
+            }
+            None => {
+                serde_json::from_value(c.clone()).map_err(|e| format!("a candidate isn't one: {e}"))
+            }
+        })
+        .collect()
+}
+
+async fn factory_draft(s: &AppState, args: &Value) -> Result<Value, String> {
+    let provider = match args.get("provider") {
+        None | Some(Value::Null) => None,
+        Some(p) => Some(
+            serde_json::from_value(p.clone())
+                .map_err(|_| "provider is copilot, claude or codex".to_owned())?,
+        ),
+    };
+    let body = super::factory::NewDraft {
+        description: args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        template: opt_text(args, "template"),
+        name: opt_text(args, "name"),
+        provider,
+    };
+    let draft = super::factory::new_draft(s, body, BY_AGENT)
+        .await
+        .map_err(api_error)?;
+    s.system(
+        "info",
+        format!(
+            "Another agent (MCP) drafted {}",
+            draft["blueprint"]["name"].as_str().unwrap_or("an agent")
+        ),
+    );
+    Ok(draft)
+}
+
+/// Starts (with `confirm`) or estimates evaluating draft `name`, as `args` say.
+async fn factory_start(s: &AppState, args: &Value) -> Result<Value, String> {
+    let name = text_arg(args, "name")?;
+    let body = super::factory::EvaluationBody {
+        candidates: candidates_arg(args)?,
+        repetitions: args
+            .get("repetitions")
+            .and_then(Value::as_u64)
+            .map(|n| n.min(u64::from(u32::MAX)) as u32),
+        peer: None,
+        confirm: args
+            .get("confirm")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    let (_, value) = super::factory::evaluate(s, &name, body, BY_AGENT)
+        .await
+        .map_err(api_error)?;
+    Ok(value)
+}
+
+async fn factory_evaluate(s: &AppState, args: &Value) -> Result<Value, String> {
+    let started = factory_start(s, args).await?;
+    match started["id"].as_str() {
+        Some(id) => {
+            wait_evaluation(s, id, wait_arg(args)).await;
+            super::factory::evaluation(s, id).map_err(api_error)
+        }
+        // The estimate: nothing ran.
+        None => Ok(started),
+    }
+}
+
+async fn factory_status(s: &AppState, args: &Value) -> Result<Value, String> {
+    let id = text_arg(args, "id")?;
+    super::factory::evaluation(s, &id).map_err(api_error)?;
+    wait_evaluation(s, &id, wait_arg(args)).await;
+    super::factory::evaluation(s, &id).map_err(api_error)
+}
+
+/// Whether evaluation `id` runs now.
+fn evaluating(s: &Shared, id: &str) -> bool {
+    s.evaluations.lock().unwrap().contains_key(id)
+}
+
+/// Waits until evaluation `id` ends, or `limit` is up.
+async fn wait_evaluation(s: &Shared, id: &str, limit: Duration) {
+    let mut changes = s.tx.subscribe();
+    let deadline = tokio::time::Instant::now() + limit;
+    while evaluating(s, id) {
+        tokio::select! {
+            _ = changes.recv() => {}
+            _ = tokio::time::sleep_until(deadline) => return,
+        }
+    }
+}
+
+/// Answers factory_evaluate (confirmed) or factory_status with a stream of progress
+/// notifications while the evaluation runs, then the result, when the client asks for one
+/// (see [`progress_stream`]). Other calls get `None`.
+async fn factory_stream(
+    s: &AppState,
+    headers: &HeaderMap,
+    id: &Value,
+    params: &Value,
+    modern: bool,
+) -> Option<Response> {
+    let token = progress_token(params)?;
+    let accepts_events = header(headers, "accept")
+        .is_some_and(|a| a.to_ascii_lowercase().contains("text/event-stream"));
+    let name = params.get("name").and_then(Value::as_str)?;
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let confirmed = args.get("confirm").and_then(Value::as_bool) == Some(true);
+    if !accepts_events
+        || !(name == "factory_status" || (name == "factory_evaluate" && confirmed))
+        || wait_arg(&args).is_zero()
+    {
+        return None;
+    }
+    // A call that can't start is answered with JSON, as its error.
+    let evaluation = if name == "factory_evaluate" {
+        factory_start(s, &args).await.ok()?["id"]
+            .as_str()?
+            .to_owned()
+    } else {
+        let id = opt_text(&args, "id")?;
+        super::factory::evaluation(s, &id).ok()?;
+        id
+    };
+    let (tx, rx) = mpsc::channel(16);
+    let (shared, id, limit) = (s.clone(), id.clone(), wait_arg(&args));
+    tokio::spawn(async move {
+        follow_evaluation(&shared, &id, &token, &evaluation, limit, modern, tx).await;
+    });
+    let events = ReceiverStream::new(rx)
+        .map(|event: Value| Ok::<_, Infallible>(SseEvent::default().data(event.to_string())));
+    Some(
+        Sse::new(events)
+            .keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
+            .into_response(),
+    )
+}
+
+/// Sends a `notifications/progress` each time evaluation `evaluation` moves on (a run
+/// ended), then the tool call's response when it ends or `limit` is up.
+async fn follow_evaluation(
+    s: &Shared,
+    id: &Value,
+    token: &Value,
+    evaluation: &str,
+    limit: Duration,
+    modern: bool,
+    tx: mpsc::Sender<Value>,
+) {
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut changes = s.tx.subscribe();
+    let mut seen = None;
+    let mut count = 0u64;
+    loop {
+        let Ok(view) = super::factory::evaluation(s, evaluation) else {
+            break;
+        };
+        let text = format!(
+            "{} of {} runs done ({})",
+            view["done"],
+            view["total"],
+            view["state"].as_str().unwrap_or("running")
+        );
+        if seen.as_ref() != Some(&text) {
+            seen = Some(text.clone());
+            count += 1;
+            let note = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": { "progressToken": token, "progress": count, "message": text },
+            });
+            if tx.send(note).await.is_err() {
+                return;
+            }
+        }
+        if !evaluating(s, evaluation) {
+            break;
+        }
+        tokio::select! {
+            _ = changes.recv() => {}
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tx.closed() => return,
+        }
+    }
+    let result = tool_result(super::factory::evaluation(s, evaluation).map_err(api_error));
+    let result = if modern {
+        modern_result(result)
+    } else {
+        result
+    };
+    let _ = tx.send(rpc_ok(id, result)).await;
 }
 
 fn text_arg(args: &Value, name: &str) -> Result<String, String> {
@@ -796,7 +1078,22 @@ async fn call_tool(s: &AppState, params: &Value) -> Result<Value, String> {
         "get_run" => text_arg(&args, "run_id")
             .and_then(|id| run_details(s, &id).map_err(|e| format!("{e:#}"))),
         "import_spec" => import_spec(s, &args).await,
-        _ => return Err(format!("Unknown tool: {name}")),
+        "factory_templates" => Ok(json!({ "templates": crate::factory::templates::list() })),
+        "factory_list" => super::factory::agents(s).map_err(api_error),
+        "factory_draft" => factory_draft(s, &args).await,
+        "factory_check" => text_arg(&args, "name").and_then(|name| {
+            let folders = args
+                .get("folders")
+                .is_some()
+                .then(|| text_list(args.get("folders")));
+            super::factory::checked(s, &name, folders).map_err(api_error)
+        }),
+        "factory_evaluate" => factory_evaluate(s, &args).await,
+        "factory_status" => factory_status(s, &args).await,
+        _ => match owner_only(s, name, &args) {
+            Some(refused) => Err(refused),
+            None => return Err(format!("Unknown tool: {name}")),
+        },
     };
     Ok(tool_result(outcome))
 }

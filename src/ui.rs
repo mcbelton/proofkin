@@ -35,6 +35,7 @@ use crate::runs::RunRecord;
 use crate::trust::{M365Grant, Ticket, TrustedPeer};
 
 mod connect;
+mod factory;
 mod models;
 mod tools;
 mod workers;
@@ -51,6 +52,7 @@ const BRANCHES_JS: &str = include_str!("../ui/branches.js");
 const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
 const WORKERS_JS: &str = include_str!("../ui/workers.js");
 const CONNECT_JS: &str = include_str!("../ui/connect.js");
+const FACTORY_JS: &str = include_str!("../ui/factory.js");
 const FEED_LIMIT: usize = 500;
 /// Most tasks kept for the page (and for other agents' lookups), besides running ones:
 /// the oldest finished ones go first, a plan's steps together once the plan has ended.
@@ -372,6 +374,9 @@ struct Shared {
     /// The plan runs in progress, by the plan's task id, kept in the profile as they go
     /// (see [`PlanProgress`]).
     plan_runs: Mutex<HashMap<u64, Arc<Mutex<PlanProgress>>>>,
+    /// The agent factory's evaluation that runs, by its id, to cancel it (see
+    /// [`factory::cancel`]).
+    evaluations: Mutex<HashMap<String, AbortHandle>>,
 }
 
 type AppState = Arc<Shared>;
@@ -822,6 +827,7 @@ pub async fn start_with_work(
         work,
         gh: crate::gh_auth::Flows::new(Arc::new(crate::gh_auth::GhCli::new())),
         plan_runs: Mutex::new(HashMap::new()),
+        evaluations: Mutex::new(HashMap::new()),
     });
     // Plan runs the agent stopped in the middle of go on: their tasks aren't cancelled.
     let stopped = stopped.saturating_sub(resume_plans(&shared));
@@ -1091,6 +1097,26 @@ pub async fn start_with_work(
         )
         .route("/api/trust", post(allow_peer))
         .route("/api/trust/{id}", delete(remove_peer).put(change_peer))
+        .route("/api/factory/templates", get(factory::list_templates))
+        .route("/api/factory/drafts", post(factory::create_draft))
+        .route(
+            "/api/factory/drafts/{name}",
+            get(factory::get_draft).put(factory::save_draft),
+        )
+        .route(
+            "/api/factory/drafts/{name}/check",
+            post(factory::check_draft),
+        )
+        .route("/api/factory/agents", get(factory::list_agents))
+        .route("/api/factory/agents/{name}", get(factory::get_agent))
+        .route(
+            "/api/factory/agents/{name}/evaluations",
+            post(factory::start_evaluation),
+        )
+        .route(
+            "/api/factory/evaluations/{id}",
+            get(factory::get_evaluation).delete(factory::cancel_evaluation),
+        )
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             require_token,
@@ -1152,6 +1178,10 @@ pub async fn start_with_work(
         .route(
             "/connect.js",
             get(|| async { asset("text/javascript; charset=utf-8", CONNECT_JS) }),
+        )
+        .route(
+            "/factory.js",
+            get(|| async { asset("text/javascript; charset=utf-8", FACTORY_JS) }),
         )
         // The A2A agent card is public (to this machine), like any agent's.
         .route("/.well-known/agent-card.json", get(connect::agent_card))

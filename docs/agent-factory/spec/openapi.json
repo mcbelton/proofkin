@@ -221,7 +221,7 @@
             }
           },
           "400": {
-            "description": "The description is empty or too long, or the template doesn't exist",
+            "description": "The description is empty or too long, there is neither a description nor a template, or the template doesn't exist",
             "content": {
               "application/json": {
                 "schema": {
@@ -861,7 +861,7 @@
                   "$ref": "#/components/schemas/Evaluation"
                 },
                 "example": {
-                  "id": "ev-20261124-0915-fin-analyst",
+                  "id": "ev-20261124-091500-fin-analyst",
                   "agent": "fin-analyst",
                   "build": "3f1c9a0d2b7e4c5a8f6e1d2c3b4a59687766554433221100ffeeddccbbaa9988",
                   "state": "passed",
@@ -964,7 +964,7 @@
                   "$ref": "#/components/schemas/Evaluation"
                 },
                 "example": {
-                  "id": "ev-20261124-0915-fin-analyst",
+                  "id": "ev-20261124-091500-fin-analyst",
                   "agent": "fin-analyst",
                   "build": "3f1c9a0d2b7e4c5a8f6e1d2c3b4a59687766554433221100ffeeddccbbaa9988",
                   "state": "passed",
@@ -1011,6 +1011,82 @@
             "$ref": "#/components/responses/NotFound"
           }
         }
+      },
+      "delete": {
+        "operationId": "cancelEvaluation",
+        "summary": "Cancel a running evaluation: its runs still out stop on the evaluation worker; its report keeps the runs that ended",
+        "x-acceptance": [
+          "AC-8",
+          "AC-9"
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Evaluation"
+                },
+                "example": {
+                  "id": "ev-20261124-091500-fin-analyst",
+                  "agent": "fin-analyst",
+                  "build": "3f1c9a0d2b7e4c5a8f6e1d2c3b4a59687766554433221100ffeeddccbbaa9988",
+                  "state": "cancelled",
+                  "results": [
+                    {
+                      "candidate": {
+                        "provider": "copilot",
+                        "model": "gpt-6-sol",
+                        "effort": "medium"
+                      },
+                      "pass_rate": 0.93,
+                      "requirements": {
+                        "R1": 1.0,
+                        "R2": 0.89,
+                        "R3": 0.89
+                      },
+                      "adversarial": {
+                        "passed": 12,
+                        "total": 12
+                      },
+                      "p95_secs": 212.5,
+                      "attempts": 1.2,
+                      "multiplier": "1x",
+                      "judge_score": 4.3
+                    }
+                  ],
+                  "gate": {
+                    "passed": false,
+                    "reasons": [
+                      "it was cancelled: alice cancelled it"
+                    ]
+                  },
+                  "recommended": null,
+                  "running": false
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "It ended already",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "evaluation ev-20261124-091500-fin-analyst ended already (passed)"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/factory/agents/{name}/releases": {
@@ -1042,7 +1118,7 @@
                 "$ref": "#/components/schemas/ReleaseRequest"
               },
               "example": {
-                "evaluation": "ev-20261124-0915-fin-analyst",
+                "evaluation": "ev-20261124-091500-fin-analyst",
                 "version": "1.2.0",
                 "note": "Cites pages for every figure"
               }
@@ -1106,7 +1182,7 @@
                   "$ref": "#/components/schemas/Error"
                 },
                 "example": {
-                  "error": "evaluation ev-20261124-0915-fin-analyst didn't pass its gate: R2 at 0.67, below 0.9"
+                  "error": "evaluation ev-20261124-091500-fin-analyst didn't pass its gate: R2 at 0.67, below 0.9"
                 }
               }
             }
@@ -2082,9 +2158,7 @@
       },
       "DraftRequest": {
         "type": "object",
-        "required": [
-          "description"
-        ],
+        "required": [],
         "properties": {
           "description": {
             "type": "string",
@@ -2098,8 +2172,18 @@
           "name": {
             "type": "string",
             "pattern": "^[A-Za-z0-9._-]{1,64}$"
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "copilot",
+              "claude",
+              "codex"
+            ],
+            "description": "Whose model writes the draft (default: the first the profile is signed in to)"
           }
-        }
+        },
+        "description": "A description (the owner's model writes the draft), a template, or both. The name defaults to the template's."
       },
       "Blueprint": {
         "type": "object",
@@ -2604,6 +2688,26 @@
           "minutes": {
             "type": "integer",
             "minimum": 0
+          },
+          "runs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Runs: cases (with the built-in attacks) x repetitions x candidates"
+          },
+          "judge_calls": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Scores by judges: 3 per rubric per run"
+          },
+          "adversarial": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many of the cases are built-in attacks"
+          },
+          "slots": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The evaluation worker's task slots the minutes assume"
           }
         }
       },
@@ -2693,6 +2797,24 @@
               }
             },
             "nullable": true
+          },
+          "done": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Runs that ended"
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Runs in all"
+          },
+          "running": {
+            "type": "boolean",
+            "description": "It runs now (a running evaluation whose agent stopped doesn't)"
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Once it ended: its signature, its runs' evidence and kept outputs verify"
           }
         }
       },

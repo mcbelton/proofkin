@@ -307,17 +307,17 @@ fn again_prompt(prompt: &str, answer: &str, problems: &[Problem]) -> String {
 }
 
 /// An empty folder for the model to work in, deleted when dropped.
-struct EmptyFolder(PathBuf);
+pub(crate) struct EmptyFolder(PathBuf);
 
 impl EmptyFolder {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let path =
             std::env::temp_dir().join(format!("proofkin-draft-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
         Ok(Self(path))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }

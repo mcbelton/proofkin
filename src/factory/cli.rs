@@ -7,14 +7,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
+use crate::agent::{Agent, AgentConfig, MAX_CONCURRENT_TASKS, Network};
 use crate::factory::blueprint::{
     Blueprint, Catalog, Problem, check_value, from_value, has_errors, name_problem, summary,
 };
 use crate::factory::evals::check_fixtures;
+use crate::factory::report::{EvalState, Evaluation, RunState};
+use crate::factory::runner::{self, Judges, Planned, Request, Runner};
 use crate::factory::store::{Draft, FactoryStore, Provenance, now};
-use crate::factory::{capabilities, draft, routing, templates};
+use crate::factory::{capabilities, code, draft, routing, templates};
 use crate::llm::{ExecutorConfig, Provider, SdkExecutor};
 use crate::profile::Profile;
+use crate::workers::{Launch, Supervisor};
 
 #[derive(Args, Debug)]
 pub struct ProfileOpt {
@@ -29,12 +33,14 @@ pub enum FactoryCommand {
     /// how many eval cases it starts with.
     Templates,
     /// Start an agent: a draft from a template, or one the profile's model writes
-    /// from your words (read-only, in an empty folder; it grants nothing).
+    /// from your words (read-only, in an empty folder; it grants nothing), or from a
+    /// folder made by `factory init`.
     #[command(after_help = "\
 examples:
   proofkin factory new reviewer --template code-reviewer --profile alice
   proofkin factory new fin-analyst --describe \"Analyze quarterly reports, extract key metrics, flag risks, write an executive summary\" --profile alice
-  proofkin factory new fin-analyst --template financial-analyst --describe \"...for our board, in euros\" --using claude --profile alice")]
+  proofkin factory new fin-analyst --template financial-analyst --describe \"...for our board, in euros\" --using claude --profile alice
+  proofkin factory new ask --from ./my-repo --profile alice")]
     New {
         /// The agent's name.
         name: String,
@@ -44,6 +50,10 @@ examples:
         /// What the agent should do, in your words: the profile's model writes the draft.
         #[arg(long)]
         describe: Option<String>,
+        /// Start from the agent kept as code in this folder (agent/blueprint.json and
+        /// agent/evals.json; its fixtures are copied), or a blueprint file.
+        #[arg(long, conflicts_with_all = ["template", "describe"])]
+        from: Option<PathBuf>,
         /// The provider whose model writes the draft (default: the first one the
         /// profile is signed in to).
         #[arg(long, value_enum)]
@@ -69,10 +79,11 @@ examples:
         profile: ProfileOpt,
     },
     /// Edit an agent's draft in your editor (VISUAL or EDITOR), or replace it from a
-    /// file (- for stdin). It is checked when saved and kept with its problems.
+    /// file (- for stdin) or a folder made by `factory init` (its fixtures are copied too).
+    /// It is checked when saved and kept with its problems.
     Edit {
         name: String,
-        /// Take the blueprint from this file instead of an editor.
+        /// Take the blueprint from this file, or this folder's agent/, instead of an editor.
         #[arg(long)]
         from: Option<PathBuf>,
         #[command(flatten)]
@@ -91,7 +102,8 @@ error naming the command that offers it. Checking never shares, offers or grants
     Check {
         /// The draft to check.
         name: Option<String>,
-        /// Check this blueprint file instead (its fixtures are in fixtures/ next to it).
+        /// Check this blueprint file instead (its fixtures are in fixtures/ next to it), or
+        /// the agent kept as code in this folder (agent/).
         #[arg(long, conflicts_with = "name")]
         file: Option<PathBuf>,
         /// The folders to resolve its capabilities in (comma-separated; default: its
@@ -108,6 +120,77 @@ error naming the command that offers it. Checking never shares, offers or grants
         name: String,
         #[command(flatten)]
         profile: ProfileOpt,
+    },
+    /// Evaluate a draft: its build's eval cases and the built-in adversarial ones, on each
+    /// candidate model, a few times each, as real tasks of your evaluation worker
+    /// (<profile>-eval, made the first time) at the access the agent asks for. Without
+    /// --yes it only says what it would run.
+    #[command(after_help = "\
+examples:
+  proofkin factory evaluate fin-analyst --profile alice
+  proofkin factory evaluate fin-analyst --candidate copilot:gpt-5:high --candidate copilot:claude-sonnet-4.5 --repetitions 3 --yes --profile alice
+Each run is graded by its deterministic expectations; a judge of another model family
+scores rubrics and never decides. The release gate needs 90% of the agent's own runs, 2 of
+3 of each requirement's and every adversarial run to pass. Run it again to go on with an
+evaluation of the same build that didn't end; Ctrl+C cancels it.")]
+    Evaluate {
+        name: String,
+        /// A model to evaluate it on: provider:model[:effort] (repeat it; default: those its
+        /// blueprint lists, else its providers' defaults).
+        #[arg(long = "candidate", value_name = "PROVIDER:MODEL[:EFFORT]")]
+        candidates: Vec<String>,
+        /// Runs per case and candidate, 1 to 5 (default: its suite's, else 3).
+        #[arg(long)]
+        repetitions: Option<u32>,
+        /// Run it: give the tasks the estimate counts to your evaluation worker.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+        /// Node bridge script for the Claude and Codex SDKs (default: the one `setup` installed).
+        #[arg(long, env = "PROOFKIN_BRIDGE")]
+        bridge: Option<PathBuf>,
+    },
+    /// An evaluation's report: what ran, the release gate, each candidate's results and
+    /// the failing runs with their outputs; --json prints the signed record.
+    Report {
+        /// The evaluation's id (ev-...), as `factory show` lists them.
+        id: String,
+        #[arg(long)]
+        json: bool,
+        /// Write it to this file instead.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Keep an agent as code: write its files into a folder under git, for plan steps to
+    /// prove with the built-in checks agent:blueprint, agent:evals and agent:report.
+    #[command(after_help = "\
+writes:
+  agent/blueprint.json   its blueprint, without its eval suite
+  agent/evals.json       its eval suite
+  agent/fixtures/        files its cases work on
+  agent/skills/          skills of its own (<name>.md), next to the built-in ones
+  agent/reports/         its evaluations' signed reports
+examples:
+  proofkin factory init . --name ask --template researcher
+  proofkin spec check agent --dir .
+  proofkin factory new ask --from . --profile alice
+  proofkin factory evaluate ask --yes --profile alice
+  proofkin factory report ev-20261124-091500-ask --json --out agent/reports/ev-20261124-091500-ask.json --profile alice")]
+    Init {
+        /// The folder (usually a repository).
+        dir: PathBuf,
+        /// The agent's name.
+        #[arg(long)]
+        name: String,
+        /// The template it starts from (proofkin factory templates lists them).
+        #[arg(long, default_value = "researcher")]
+        template: String,
+        /// Fit it to this profile: the providers it is signed in to.
+        #[arg(long = "profile")]
+        profile: Option<String>,
     },
     /// Delete an agent's draft and records (not an agent with releases: their records
     /// are kept).
@@ -139,10 +222,22 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
             name,
             template,
             describe,
+            from,
             using,
             profile,
             bridge,
-        } => new(&name, template, describe, using, &profile.name, bridge).await?,
+        } => {
+            new(
+                &name,
+                template,
+                describe,
+                from.as_deref(),
+                using,
+                &profile.name,
+                bridge,
+            )
+            .await?
+        }
         FactoryCommand::List { profile } => list(&Profile::open(&profile.name)?)?,
         FactoryCommand::Show {
             name,
@@ -166,6 +261,51 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
             folders,
         )?,
         FactoryCommand::Build { name, profile } => build(&Profile::open(&profile.name)?, &name)?,
+        FactoryCommand::Evaluate {
+            name,
+            candidates,
+            repetitions,
+            yes,
+            profile,
+            bridge,
+        } => {
+            evaluate(
+                &Profile::open(&profile.name)?,
+                &name,
+                &candidates,
+                repetitions,
+                yes,
+                bridge,
+            )
+            .await?
+        }
+        FactoryCommand::Report {
+            id,
+            json,
+            out,
+            profile,
+        } => report(&Profile::open(&profile.name)?, &id, json, out.as_deref())?,
+        FactoryCommand::Init {
+            dir,
+            name,
+            template,
+            profile,
+        } => {
+            let catalog = match &profile {
+                Some(profile) => Some(Catalog::of(&Profile::open(profile)?)?),
+                None => None,
+            };
+            let written = code::init(&dir, &name, &template, catalog.as_ref())?;
+            println!(
+                "wrote agent {name} (template {template}) in {}: {}",
+                dir.display(),
+                written.join(", ")
+            );
+            println!(
+                "next: proofkin spec check agent --dir {0}   (agent:blueprint, agent:evals)\n      proofkin factory new {name} --from {0} --profile PROFILE   (a draft to evaluate)",
+                dir.display()
+            );
+        }
         FactoryCommand::Delete { name, profile } => {
             let profile = Profile::open(&profile.name)?;
             if !FactoryStore::of(&profile).delete(&name)? {
@@ -184,12 +324,16 @@ async fn new(
     name: &str,
     template: Option<String>,
     describe: Option<String>,
+    from: Option<&Path>,
     using: Option<Provider>,
     profile: &str,
     bridge: Option<PathBuf>,
 ) -> Result<()> {
     let profile = Profile::open(profile)?;
     let catalog = Catalog::of(&profile)?;
+    if let Some(from) = from {
+        return new_from(&profile, &catalog, name, from);
+    }
     let (draft, problems, what) = match (describe, template) {
         (Some(words), template) => {
             let provider = match using {
@@ -265,7 +409,7 @@ async fn new(
             (draft, problems, format!("drafted from template {template}"))
         }
         (None, None) => bail!(
-            "give --template NAME (proofkin factory templates lists them) or --describe \"what the agent should do\""
+            "give --template NAME (proofkin factory templates lists them), --describe \"what the agent should do\" or --from FOLDER"
         ),
     };
     FactoryStore::of(&profile).create_draft(name, &draft, &profile.name, &what)?;
@@ -282,6 +426,64 @@ async fn new(
     Ok(())
 }
 
+/// The blueprint at `path` (a file, - for stdin, or a folder whose agent is kept as code),
+/// as text, and the folder its fixtures are in.
+fn blueprint_at(path: &Path) -> Result<(String, PathBuf)> {
+    if path.is_dir() {
+        let value = code::blueprint_value(path)?;
+        return Ok((
+            serde_json::to_string_pretty(&value)?,
+            path.join(code::FIXTURES),
+        ));
+    }
+    let fixtures = path.parent().unwrap_or(Path::new(".")).join("fixtures");
+    Ok((read_input(path)?, fixtures))
+}
+
+/// Starts draft `name` from the agent kept as code in folder `from` (or a blueprint file),
+/// with its fixtures.
+fn new_from(profile: &Profile, catalog: &Catalog, name: &str, from: &Path) -> Result<()> {
+    if let Some(problem) = name_problem(name, catalog) {
+        bail!("{problem}");
+    }
+    let (text, fixtures) = blueprint_at(from)?;
+    let blueprint: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| anyhow!("{} isn't JSON: {e}", from.display()))?;
+    if blueprint.get("name").and_then(Value::as_str) != Some(name) {
+        bail!(
+            "the agent in {} isn't named \"{name}\": give its name",
+            from.display()
+        );
+    }
+    let store = FactoryStore::of(profile);
+    let draft = Draft {
+        blueprint,
+        provenance: Provenance {
+            source: "file".into(),
+            at: now(),
+            ..Provenance::default()
+        },
+        tries: 0,
+    };
+    let what = format!("drafted from {}", from.display());
+    store.create_draft(name, &draft, &profile.name, &what)?;
+    let copied = code::copy_fixtures_from(&fixtures, &store.fixtures_dir(name))?;
+    let problems = problems_of(
+        &store,
+        name,
+        &draft.blueprint,
+        &catalog.clone().without(name),
+    );
+    println!(
+        "profile '{}': created draft {name} ({what}, {}): {}",
+        profile.name,
+        plural(copied, "fixture", "fixtures"),
+        summary(&problems)
+    );
+    print_problems(&problems);
+    Ok(())
+}
+
 /// The problems of agent `name`'s draft: the blueprint's, and its fixtures'.
 fn problems_of(
     store: &FactoryStore,
@@ -289,12 +491,7 @@ fn problems_of(
     blueprint: &Value,
     catalog: &Catalog,
 ) -> Vec<Problem> {
-    let mut problems = check_value(blueprint, catalog);
-    if let Ok(parsed) = from_value(blueprint) {
-        problems.extend(check_fixtures(&parsed.evals, &store.fixtures_dir(name)));
-        problems.sort_by_key(|p| !p.error);
-    }
-    problems
+    crate::factory::runner::draft_problems(store, name, blueprint, catalog)
 }
 
 fn list(profile: &Profile) -> Result<()> {
@@ -394,6 +591,17 @@ fn show(profile: &Profile, name: &str, json: bool) -> Result<()> {
         let short: Vec<&str> = builds.iter().map(|h| &h[..12]).collect();
         println!("  builds: {}", short.join(", "));
     }
+    let evaluations = store.evaluations(name)?;
+    if !evaluations.is_empty() {
+        let running = store.evaluation_running();
+        println!(
+            "  evaluations (proofkin factory report ID --profile {}):",
+            profile.name
+        );
+        for e in evaluations.iter().take(5) {
+            println!("    {}  {}", e.id, evaluation_line(e, running));
+        }
+    }
     if let Some(state) = &state {
         println!("  history:");
         for change in state.history.iter().rev().take(10) {
@@ -486,11 +694,14 @@ fn provenance_text(draft: &Draft) -> String {
 fn edit(profile: &Profile, name: &str, from: Option<&Path>) -> Result<()> {
     let store = FactoryStore::of(profile);
     let draft = draft_of(&store, profile, name)?;
-    let (text, edited) = match from {
-        Some(path) => (read_input(path)?, None),
+    let (text, edited, fixtures) = match from {
+        Some(path) => {
+            let (text, fixtures) = blueprint_at(path)?;
+            (text, None, path.is_dir().then_some(fixtures))
+        }
         None => {
             let (text, path) = in_editor(name, &draft.blueprint)?;
-            (text, Some(path))
+            (text, Some(path), None)
         }
     };
     let kept = || {
@@ -518,6 +729,10 @@ fn edit(profile: &Profile, name: &str, from: Option<&Path>) -> Result<()> {
     )?;
     if let Some(path) = edited {
         let _ = std::fs::remove_file(path);
+    }
+    // A folder's agent comes with its fixtures.
+    if let Some(fixtures) = fixtures {
+        code::copy_fixtures_from(&fixtures, &store.fixtures_dir(name))?;
     }
     let catalog = Catalog::of(profile)?.without(name);
     let problems = problems_of(&store, name, &blueprint, &catalog);
@@ -585,13 +800,12 @@ fn check(
         }
         (None, Some(path)) => {
             let label = path.display().to_string();
-            let text = read_input(path)?;
+            let (text, fixtures) = blueprint_at(path)?;
             match crate::factory::blueprint::parse(&text) {
                 Err(problem) => (label, None, vec![problem]),
                 Ok(blueprint) => {
                     let catalog = Catalog::of(profile)?.without(&blueprint.name);
                     let mut problems = crate::factory::blueprint::validate(&blueprint, &catalog);
-                    let fixtures = path.parent().unwrap_or(Path::new(".")).join("fixtures");
                     problems.extend(check_fixtures(&blueprint.evals, &fixtures));
                     (label, Some((blueprint, catalog)), problems)
                 }
@@ -706,6 +920,327 @@ fn build(profile: &Profile, name: &str) -> Result<()> {
     }
     println!("hash: {}", built.hash);
     println!("in: {}", dir.display());
+    Ok(())
+}
+
+/// An evaluation in a line: its build and verdict, or how far it got. `running`: an
+/// evaluation runs now (only one does at a time).
+fn evaluation_line(e: &Evaluation, running: bool) -> String {
+    let build = &e.build[..12.min(e.build.len())];
+    match e.state {
+        EvalState::Running if running => {
+            format!(
+                "build {build}: running, {} of {} runs done",
+                e.done(),
+                e.runs.len()
+            )
+        }
+        EvalState::Running => format!(
+            "build {build}: stopped with {} of {} runs done (evaluate it again to go on)",
+            e.done(),
+            e.runs.len()
+        ),
+        EvalState::Passed => format!(
+            "build {build}: passed{}",
+            e.recommended
+                .as_ref()
+                .map(|r| format!(", recommended {r}"))
+                .unwrap_or_default()
+        ),
+        EvalState::Failed => format!(
+            "build {build}: failed ({})",
+            e.gate.reasons.first().map(String::as_str).unwrap_or("")
+        ),
+        EvalState::Cancelled => format!(
+            "build {build}: cancelled{}",
+            e.error
+                .as_deref()
+                .map(|why| format!(" ({why})"))
+                .unwrap_or_default()
+        ),
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Evaluates draft `name`: says what it would run, and runs it with `yes`.
+async fn evaluate(
+    profile: &Profile,
+    name: &str,
+    candidates: &[String],
+    repetitions: Option<u32>,
+    yes: bool,
+    bridge: Option<PathBuf>,
+) -> Result<()> {
+    let asked = candidates
+        .iter()
+        .map(|c| runner::parse_candidate(c))
+        .collect::<Result<Vec<_>>>()?;
+    let planned = runner::plan(profile, name, &asked, repetitions, None).map_err(|refused| {
+        print_problems(&refused.problems);
+        anyhow!("{}", refused.message)
+    })?;
+    let store = FactoryStore::of(profile);
+    let resumable = runner::unfinished(&store, name, &planned.build.hash)?;
+    let estimate = runner::estimate(
+        &planned.blueprint,
+        planned.candidates.len(),
+        planned.repetitions,
+        MAX_CONCURRENT_TASKS,
+    );
+    println!("{name}: build {}", planned.build.short_hash());
+    let listed: Vec<String> = planned.candidates.iter().map(|c| c.to_string()).collect();
+    println!("  candidates: {}", listed.join("; "));
+    for out in &planned.left_out {
+        println!("    left out: {}: {}", out.route, out.why);
+    }
+    println!(
+        "  estimate: {} ({} built-in adversarial) x {} x {} = {}{}: about {} on {}",
+        plural(estimate.cases, "case", "cases"),
+        estimate.adversarial,
+        plural(estimate.repetitions as usize, "run", "runs"),
+        plural(estimate.candidates, "candidate", "candidates"),
+        plural(estimate.runs, "run", "runs"),
+        if estimate.judge_calls > 0 {
+            format!(
+                ", and {} by judges",
+                plural(estimate.judge_calls, "score", "scores")
+            )
+        } else {
+            String::new()
+        },
+        plural(estimate.minutes as usize, "minute", "minutes"),
+        plural(estimate.slots, "task slot", "task slots"),
+    );
+    if let Some(e) = &resumable {
+        println!(
+            "  {} of this build didn't end ({} of {} runs done): it goes on from there",
+            e.id,
+            e.done(),
+            e.runs.len()
+        );
+    }
+    let worker = runner::worker_name(&profile.name);
+    if !yes {
+        println!(
+            "nothing ran: run it with --yes (its tasks go to your evaluation worker {worker})"
+        );
+        return Ok(());
+    }
+    let _instance = profile.lock_instance().map_err(|_| {
+        anyhow!(
+            "profile '{}' runs in a proofkin agent: evaluate {name} in its web UI (Agent factory), or stop that agent first",
+            profile.name
+        )
+    })?;
+    let _running = store.lock_evaluation()?;
+    let key = profile.identity()?;
+    // The owner's agent, on this machine only: it gives the runs to its evaluation worker.
+    let mut config = AgentConfig::new(profile.name.clone(), key.clone());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse()?);
+    config.trust = profile.trust()?;
+    config.task_ids = Some(profile.task_ids_path());
+    config.worktrees_dir = profile.worktrees_dir();
+    let (agent, _events) = Agent::bind(config).await?;
+    let bridge = crate::setup::resolve_bridge(
+        bridge.or_else(|| crate::profile::env_setting_os("BRIDGE").map(PathBuf::from)),
+    );
+    let result = run_evaluation(profile, &agent, &key, planned, resumable, bridge).await;
+    agent.shutdown().await;
+    result
+}
+
+/// Runs `planned` (or goes on with `resumable`) with the owner's `agent` on its evaluation
+/// worker, which it starts and stops; prints each run as it ends, then the report's summary.
+async fn run_evaluation(
+    profile: &Profile,
+    agent: &Agent,
+    key: &iroh::SecretKey,
+    planned: Planned,
+    resumable: Option<Evaluation>,
+    bridge: PathBuf,
+) -> Result<()> {
+    let store = FactoryStore::of(profile);
+    let catalog = Catalog::of(profile)?;
+    let mut providers: Vec<Provider> = planned.candidates.iter().map(|c| c.provider).collect();
+    providers.sort();
+    providers.dedup();
+    let worker = runner::eval_worker(profile, agent.addr(), &agent.trusted(), &providers)?;
+    if let Some(entry) = &worker.entry {
+        agent.allow(entry.clone());
+        let mut trust = profile.trust()?;
+        trust.allow(entry.clone());
+        trust.save(&profile.trust_path())?;
+    }
+    let folders = profile.shares()?;
+    let setup = match resumable {
+        Some(e) => runner::resume(&store, e, &planned.blueprint, &folders)?,
+        None => runner::prepare(
+            &store,
+            Request {
+                blueprint: &planned.blueprint,
+                build: &planned.build,
+                candidates: planned.candidates.clone(),
+                repetitions: planned.repetitions,
+                by: profile.name.clone(),
+                worker: worker.profile.name.clone(),
+                worker_id: worker.id,
+                folders: &folders,
+            },
+        )?,
+    };
+    runner::install(&worker.profile, &setup.share)?;
+    let supervisor = Supervisor::new(
+        profile.clone(),
+        agent.clone(),
+        Launch {
+            exe: std::env::current_exe()?,
+            network: Network::Local,
+            ip: None,
+            bridge: Some(bridge.clone()),
+        },
+    );
+    println!("starting your evaluation worker {}", worker.profile.name);
+    runner::start_worker(&supervisor, agent, &worker).await?;
+    // Judges score rubrics: the profile's models of another family than the candidate's.
+    let rubrics = setup
+        .evaluation
+        .cases
+        .iter()
+        .any(|c| c.expect.iter().any(|e| e.get("judge").is_some()));
+    let executor = if rubrics {
+        Some(
+            SdkExecutor::start(ExecutorConfig {
+                providers: catalog.providers.iter().copied().collect(),
+                bridge_script: bridge,
+                profile: profile.clone(),
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
+    let judges = match &executor {
+        Some(e) => Judges::of(e.clone(), &catalog, None),
+        None => Judges::default(),
+    };
+    let runner = Runner {
+        agent: agent.clone(),
+        key: key.clone(),
+        signer: profile.name.clone(),
+        worker: worker.id,
+        store: store.clone(),
+        judges,
+        ready_wait: runner::READY_WAIT,
+    };
+    let id = setup.evaluation.id.clone();
+    let name = setup.evaluation.agent.clone();
+    println!(
+        "evaluating {name} ({id}): {} (Ctrl+C cancels it)",
+        plural(setup.evaluation.runs.len(), "run", "runs")
+    );
+    let printed = std::sync::Mutex::new(std::collections::HashSet::new());
+    let on_change = |e: &Evaluation| {
+        let mut printed = printed.lock().unwrap();
+        for (i, run) in e.runs.iter().enumerate() {
+            if run.state != RunState::Done || !printed.insert(i) {
+                continue;
+            }
+            let why = run.error.clone().or_else(|| {
+                run.grades
+                    .iter()
+                    .find(|g| g.passed == Some(false))
+                    .map(|g| g.note.clone())
+            });
+            println!(
+                "  [{}/{}] {} on {}, run {}: {} ({:.0}s){}",
+                printed.len(),
+                e.runs.len(),
+                run.case,
+                e.candidates[run.candidate],
+                run.repetition,
+                if run.passed { "passed" } else { "FAILED" },
+                run.secs,
+                why.map(|w| format!(": {w}")).unwrap_or_default()
+            );
+        }
+    };
+    let outcome = tokio::select! {
+        result = runner.run(setup.evaluation, &setup.share, on_change) => result,
+        _ = tokio::signal::ctrl_c() => runner::cancel(
+            &store,
+            &id,
+            &format!("{} cancelled it (Ctrl+C)", profile.name),
+            &profile.name,
+            key,
+        ),
+    };
+    supervisor.stop(&worker.profile.name).await;
+    if let Some(executor) = executor {
+        executor.stop().await;
+    }
+    let evaluation = outcome?;
+    runner::clean(&store, Some(&worker.profile))?;
+    println!("{name}: {} ({id})", evaluation_line(&evaluation, false));
+    for r in &evaluation.results {
+        let requirements: Vec<String> = r
+            .requirements
+            .iter()
+            .map(|(k, v)| format!("{k} {:.0}%", v * 100.0))
+            .collect();
+        println!(
+            "  {}: {}; {:.0}% of its runs passed ({}); adversarial {}/{}; p95 {:.0}s; {:.1} attempts; cost {}; judge {}",
+            r.candidate,
+            if r.gate.passed { "passed" } else { "failed" },
+            r.pass_rate * 100.0,
+            requirements.join(", "),
+            r.adversarial.passed,
+            r.adversarial.total,
+            r.p95_secs,
+            r.attempts,
+            r.multiplier.as_deref().unwrap_or("unknown"),
+            r.judge_score
+                .map(|s| format!("{s:.1}"))
+                .unwrap_or_else(|| "none".into())
+        );
+        for why in &r.gate.reasons {
+            println!("    {why}");
+        }
+    }
+    println!(
+        "report: proofkin factory report {id} --profile {}",
+        profile.name
+    );
+    if !evaluation.gate.passed {
+        bail!("{name} didn't pass its evaluation");
+    }
+    Ok(())
+}
+
+/// Prints (or writes to `out`) evaluation `id`'s report, in Markdown or as its signed JSON.
+fn report(profile: &Profile, id: &str, json: bool, out: Option<&Path>) -> Result<()> {
+    let store = FactoryStore::of(profile);
+    let evaluation = store.evaluation(id)?.ok_or_else(|| {
+        anyhow!(
+            "there is no evaluation {id} (proofkin factory show NAME --profile {} lists an agent's)",
+            profile.name
+        )
+    })?;
+    let text = if json {
+        serde_json::to_string_pretty(&evaluation)? + "\n"
+    } else {
+        evaluation.markdown()
+    };
+    match out {
+        Some(path) => {
+            std::fs::write(path, &text).with_context(|| format!("writing {}", path.display()))?;
+            println!("wrote {id}'s report to {}", path.display());
+        }
+        None => print!("{text}"),
+    }
     Ok(())
 }
 
