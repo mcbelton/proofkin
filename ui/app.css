@@ -169,7 +169,7 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 /* Half the line height: a pill on one line, a rounded box (not a blob) if it wraps. */
 .badge { display: inline-flex; align-items: center; padding: 0 7px; border-radius: 9px; font-size: 11.5px; font-weight: 600; background: var(--accent-soft); color: var(--accent); line-height: 18px; }
 .badge.neutral { background: var(--surface-3); color: var(--muted); }
-.trust-shares, .trust-github { overflow-wrap: anywhere; }
+.trust-shares, .trust-github, .trust-m365 { overflow-wrap: anywhere; }
 .badge.ok { background: var(--success-soft); color: var(--success); }
 
 .icon-btn { border: 0; background: transparent; color: var(--muted); padding: 6px; border-radius: var(--radius-sm); cursor: pointer; display: inline-grid; place-items: center; }
@@ -614,6 +614,9 @@ dialog h2 { font-size: 16px; }
 .team-by .check { font-weight: 400; }
 .team-sub { margin-left: 28px; }
 div.team-sub { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+/* A peer's Microsoft 365 grant: its labels and Work IQ tools sit under the checkbox that gives it. */
+.m365-grant .check { font-weight: 400; }
+.m365-sub { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 0 28px; }
 /* The error and buttons stay in view while a long dialog scrolls (e.g. on a phone). */
 dialog form > .dialog-footer {
   position: sticky; bottom: 0; z-index: 1; display: flex; flex-direction: column; gap: 12px;

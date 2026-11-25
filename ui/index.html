@@ -339,6 +339,24 @@
         <div id="add-shares" class="share-checks"></div>
         <span class="muted small">Share more folders with <span class="mono">proofkin share add</span>. Each folder caps the access above.</span>
       </fieldset>
+      <fieldset class="field m365-grant" id="m365-field">
+        <legend>Microsoft 365 work context</legend>
+        <label class="check">
+          <input id="add-m365" type="checkbox">
+          <span>Let this peer receive Microsoft 365 content (Work IQ)</span>
+        </label>
+        <div class="m365-sub" id="m365-grant-fields" hidden>
+          <label class="field">
+            <span>Sensitivity labels it may receive</span>
+            <input id="add-m365-labels" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="General, Public, unlabeled…" aria-describedby="m365-labels-hint">
+            <span class="muted small" id="m365-labels-hint">Your organization's label names, comma separated. <span class="mono">unlabeled</span> allows content with no label; content without label information never goes to a peer.</span>
+          </label>
+          <label class="check">
+            <input id="add-m365-tools" type="checkbox">
+            <span>Its tasks may also use this agent's Work IQ (read only)</span>
+          </label>
+        </div>
+      </fieldset>
       <p class="form-error" id="add-error" role="alert"></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="add-cancel">Cancel</button>

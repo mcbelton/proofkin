@@ -1216,7 +1216,7 @@
     {
       "id": "WIQ-8",
       "area": "work-iq",
-      "claim": "A peer's Microsoft 365 grant (docs/work-iq.md section 4) is the optional m365 field of its entry in peers.json, left out when absent, with labels (the label names it may receive; unlabeled allows content without a label) and tools (its tasks may use this agent's Work IQ gateway, read only). Absent means nothing is allowed. proofkin peers allow <peer> --m365 General,Public,unlabeled [--m365-tools] sets it (names trimmed and without duplicates), --m365 off removes it, and running peers allow again without --m365 keeps the current grant; peers list shows it, and the web UI's peer JSON includes it read-only. The audience for content sent to a peer is Local for the owner's own digital workers, a Peer audience with the grant's labels for a granted peer, and none (refuse) for any other peer.",
+      "claim": "A peer's Microsoft 365 grant (docs/work-iq.md section 4) is the optional m365 field of its entry in peers.json, left out when absent, with labels (the label names it may receive; unlabeled allows content without a label) and tools (its tasks may use this agent's Work IQ gateway, read only). Absent means nothing is allowed. proofkin peers allow <peer> --m365 General,Public,unlabeled [--m365-tools] sets it (names trimmed and without duplicates), --m365 off removes it, and running peers allow again without --m365 keeps the current grant; peers list shows it, and the web UI's allowlist shows and sets it too (WIQ-23). The audience for content sent to a peer is Local for the owner's own digital workers, a Peer audience with the grant's labels for a granted peer, and none (refuse) for any other peer.",
       "tests": [
         "lib::trust::nothing_is_allowed_by_default_and_absent_grants_stay_out_of_the_file",
         "lib::trust::m365_labels_are_stored_and_read_back",
@@ -1368,6 +1368,16 @@
       ]
     },
     {
+      "id": "WIQ-23",
+      "area": "work-iq",
+      "claim": "The web UI sets, changes and removes a peer's Microsoft 365 grant (labels, Work IQ tools) with the CLI's rules, and shows it. POST /api/trust and PUT /api/trust/{id} take m365 as proofkin peers allow takes --m365 and --m365-tools: left out, a change keeps the peer's grant and adding a peer again keeps the grant of the entry it replaces (else none); null gives no grant (like --m365 off); {labels, tools} gives that grant, built by M365Grant::parse, so it needs at least one label, never takes unknown and keeps each label once whatever its case. A grant it refuses is a 400 in its own words and leaves the peer's entry as it was. peers.json has the grant after each change, the allowlist in /api/state shows it (labels and tools, or null) and the change's activity line says it (Microsoft 365: General, Public, and that its tasks may use Work IQ). The allowlist dialog, for Add peer and Change…, offers it after the folders: a checkbox to let the peer receive Microsoft 365 content, the sensitivity labels it may receive, comma separated (unlabeled allows content with no label; content without label information never goes to a peer), and a checkbox to let its tasks use this agent's Work IQ, read only; Change… fills them from the peer's grant and sends null when the first is cleared, and every element the page's script looks up for them is in the dialog. The peers list shows a granted peer's grant (M365: General, Public · Work IQ tools).",
+      "tests": [
+        "ui::the_allowlist_sets_changes_and_removes_a_peers_microsoft_365_grant",
+        "ui::microsoft_365_grants_with_unknown_or_without_labels_are_refused",
+        "ui::the_allowlist_dialog_offers_the_microsoft_365_grant_after_the_folders"
+      ]
+    },
+    {
       "id": "MDL-1",
       "area": "models",
       "claim": "Every task result names the model that did the work, as its provider says: Copilot from the CLI's usage events of the session's own agent (else the model the task asked for), Claude from the Agent SDK's init message, Codex from the thread's model or the top-level model of the profile's own config.toml. A worker sends it with the result (a field older peers ignore) and names it in the signed output's evidence summary, so the record vouches for it and older requesters verify it as before; names are cleaned to the characters model names use before they are shown. The web UI's task and step cards (after the provider), the worker's audit log, run records and reports, the tracker's step comments and the CLI's printed results show it; without a model the result is as before.",
@@ -1418,7 +1428,7 @@
     {
       "id": "UI-5",
       "area": "web ui",
-      "claim": "The allowlist changes what a peer may do in place (Change…: whether it may delegate, its hourly limit, its access level and its folders), keeping its name, addresses and Microsoft 365 grant: saved to peers.json and applied at once, a connected peer stays connected and learns its folders; a folder this agent doesn't share, or a peer that isn't on the allowlist, is refused. Chat only says what it means when hovered.",
+      "claim": "The allowlist changes what a peer may do in place (Change…: whether it may delegate, its hourly limit, its access level and its folders), keeping its name and addresses, and its Microsoft 365 grant unless the change sets it (WIQ-23): saved to peers.json and applied at once, a connected peer stays connected and learns its folders; a folder this agent doesn't share, or a peer that isn't on the allowlist, is refused. Chat only says what it means when hovered.",
       "tests": [
         "ui::delegate_only_agents_allowlist_chat_peers_from_the_ui"
       ]
