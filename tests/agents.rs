@@ -3789,6 +3789,32 @@ async fn a_steps_signed_evidence_records_its_work_iq_context_by_hash_never_its_c
         "{failed:?}"
     );
 
+    // Saved, its run.json has only the hash (it is the file shared to be verified); the
+    // context is next to it, and checked from there.
+    let runs = tempfile::tempdir().unwrap();
+    run.save(runs.path()).unwrap();
+    let dir = runs.path().join(&run.id);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("run.json")).unwrap()).unwrap();
+    assert!(saved["workiq"]["a"].get("text").is_none(), "{saved:#}");
+    assert_eq!(saved["workiq"]["a"]["sha256"], kept.sha256.as_str());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.workiq.md")).unwrap(),
+        kept.text
+    );
+    let loaded = RunRecord::load(runs.path(), &run.id).unwrap();
+    assert!(loaded.workiq["a"].text.is_empty());
+    let checks = loaded.verify(Some(&dir));
+    assert!(checks.iter().all(|(_, r)| r.is_ok()), "{checks:?}");
+    let alone = loaded.verify(None);
+    assert!(alone.iter().all(|(_, r)| r.is_ok()), "{alone:?}");
+    std::fs::write(dir.join("a.workiq.md"), "## Other context\n").unwrap();
+    let failed = loaded.verify(Some(&dir));
+    assert!(
+        format!("{:#}", failed[0].1.as_ref().unwrap_err()).contains("doesn't have the hash"),
+        "{failed:?}"
+    );
+
     // A task that says its prompt has context it hasn't is refused.
     let partner = boss
         .peers()
