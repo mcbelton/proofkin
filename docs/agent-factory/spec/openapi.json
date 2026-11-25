@@ -1182,7 +1182,7 @@
                   "$ref": "#/components/schemas/Error"
                 },
                 "example": {
-                  "error": "evaluation ev-20261124-0915-fin-analyst didn't pass its gate: R2 at 0.67, below 0.9"
+                  "error": "evaluation ev-20261124-091500-fin-analyst didn't pass its gate: R2 at 0.67, below 0.9"
                 }
               }
             }

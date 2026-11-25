@@ -84,7 +84,7 @@ def cli(*args):
 ws = tempfile.mkdtemp(prefix="p2p-live-")
 svc = None
 agents = []
-PROFILES = ("worker1", "worker2", "boss", "intruder", "helper", "editor")
+PROFILES = ("worker1-eval", "worker1", "worker2", "boss", "intruder", "helper", "editor")
 try:
     accounts = gh_accounts()
     if not accounts:
@@ -663,6 +663,14 @@ try:
     print(f"  [a2a] SendMessage: {task.get('status', {}).get('state')} {text[:120]!r}")
     check("an A2A agent's task ran on a peer with real Copilot",
           task.get("status", {}).get("state") == "TASK_STATE_COMPLETED" and "A2A-LIVE-OK" in text, sent)
+    templates = mcp("factory_templates", {}).get("structuredContent", {}).get("templates", [])
+    refused = mcp("factory_release", {"name": "fin-analyst"})
+    said = " ".join(c.get("text", "") for c in refused.get("content", []))
+    print(f"  [mcp] factory_templates: {[t.get('name') for t in templates]}; factory_release: {said!r}")
+    check("an MCP client lists the agent factory's templates, and releasing an agent stays with its owner",
+          any(t.get("name") == "researcher" for t in templates) and refused.get("isError") is True
+          and "stays with its owner, who runs: proofkin factory release fin-analyst --profile editor" in said,
+          (templates, refused))
     editor.stop()
 
     print("== worker2 leaves")
@@ -730,6 +738,51 @@ try:
           all(code == 0 for code, _ in builds) and all(hashes) and hashes[0].group(1) == hashes[1].group(1)
           and f"builds: {hashes[0].group(1)[:12]}" in shown and "evaluated on: copilot" in shown,
           builds[0][1] + shown)
+
+    print("== worker1 evaluates an agent kept as code with real Copilot, on its evaluation worker")
+    notes = os.path.join(ws, "notes-agent")
+    _, out = cli("factory", "init", notes, "--name", "notes", "--profile", "worker1")
+    print(f"  {out.strip()}")
+    blueprint = {
+        "schema": "proofkin.agent-blueprint/v1", "name": "notes", "title": "Notes reader",
+        "purpose": "Answers questions about the team notes in its folder, quoting them",
+        "requirements": [{"id": "R1", "text": "Gives the code word the notes name, as they write it"}],
+        "instructions": "You answer questions about the team notes in your folder. Read the file the question "
+                        "names and answer from what it says, in one short sentence.",
+        "capabilities": {"access": "read-only", "delegate": False},
+        "model": {"providers": ["copilot"], "needs_mcp": False, "prefer": "cost"},
+        "budgets": {"timeout_secs": 300}, "approvers": ["me"],
+    }
+    suite = {"repetitions": 1, "cases": [{
+        "id": "E1", "requirement": "R1", "fixtures": ["notes.md"], "smoke": True, "timeout": "5m",
+        "input": "Which code word does notes.md give for the launch? Answer with the word.",
+        "expect": [{"contains": "PELICAN"}, {"max-words": 60}]}]}
+    for name, value in (("blueprint.json", blueprint), ("evals.json", suite)):
+        with open(os.path.join(notes, "agent", name), "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2)
+    with open(os.path.join(notes, "agent", "fixtures", "notes.md"), "w", encoding="utf-8") as f:
+        f.write("# Team notes\n\nThe code word for the launch is PELICAN.\n")
+    _, out = cli("factory", "new", "notes", "--from", notes, "--profile", "worker1")
+    print(f"  {out.strip()}")
+    evaluated = subprocess.run(
+        [EXE, "factory", "evaluate", "notes", "--yes", "--profile", "worker1"],
+        env=ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=1500, encoding="utf-8", errors="replace")
+    print(evaluated.stdout + evaluated.stderr)
+    found = re.search(r"report: proofkin factory report (ev-\S+)", evaluated.stdout)
+    eid = found.group(1) if found else "none"
+    _, report = cli("factory", "report", eid, "--profile", "worker1")
+    print(report)
+    check("worker1 evaluated an agent with real Copilot on its evaluation worker: every run ended, the built-in "
+          "attacks too, and its signed report verifies",
+          found and "8 of 8 runs done" in report and ": verified." in report and "suite adversarial/1" in report, report)
+    gate_passed = "**PASSED**" in report
+    cli("factory", "report", eid, "--json", "--out", os.path.join(notes, "agent", "reports", f"{eid}.json"),
+        "--profile", "worker1")
+    code, out = cli("spec", "check", "agent", "--dir", notes)
+    print(out)
+    check("agent:report proves the folder's agent with its own build's passed, verified report, and nothing less",
+          (code == 0 and "agent:report: passed" in out) if gate_passed
+          else (code != 0 and f"evaluation {eid} failed" in out), out)
 finally:
     for a in reversed(agents):
         a.stop()

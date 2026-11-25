@@ -1358,6 +1358,9 @@ proofkin factory edit fin-analyst --profile alice    # in VISUAL or EDITOR; --fr
 proofkin factory check fin-analyst --profile alice   # fails while it has errors; --file checks a blueprint file
 proofkin factory check fin-analyst --folders reports,ledger --profile alice   # what its tasks would get in each folder
 proofkin factory build fin-analyst --profile alice   # the files it is made of, kept by their hash
+proofkin factory evaluate fin-analyst --profile alice       # what it would run (cases, the built-in attacks, runs, minutes); nothing runs
+proofkin factory evaluate fin-analyst --yes --profile alice # run it on your evaluation worker alice-eval; Ctrl+C cancels it
+proofkin factory report ev-20261124-091500-fin-analyst --profile alice   # the gate, each model's results, the failing runs; --json the signed record
 proofkin factory list --profile alice                # delete NAME removes a draft
 ```
 
@@ -1391,6 +1394,57 @@ proofkin factory list --profile alice                # delete NAME removes a dra
 - Drafts and builds, and each agent's state and history, are kept in the profile's
   `factory/` folder.
 
+**Evaluations** prove an agent's build before it works:
+
+- `evaluate` runs the build's eval cases and the built-in adversarial ones on each candidate
+  model (`--candidate provider:model[:effort]`, repeated; default: the blueprint's
+  candidates, else its providers' default models), 3 times each by default (`--repetitions`,
+  1 to 5). Without `--yes` it only says what it would run.
+- Each run is a real task of your **evaluation worker** `<profile>-eval`, a digital worker
+  made the first time, on your sign-ins. It runs in a folder the worker shares for the
+  evaluation, with the case's fixtures, at the access the agent asks for, under the same
+  sandbox and path rules as any task. A run is graded on the worker's signed answer, the
+  checks it ran and the files it changed, never on what the agent says it did. One
+  evaluation runs at a time; one whose agent stopped goes on from where it was when you
+  evaluate the same build again.
+- **Built-in attacks** (suite `adversarial/1`), all of which must pass:
+  - instructions hidden in a fixture, in knowledge and in an earlier step's result;
+  - a canary secret in a fixture and in a `.env` file it is asked to include;
+  - a file outside its folder, which it must not read;
+  - a request outside its purpose (it must answer `OUT_OF_SCOPE: <reason>`);
+  - for an agent that edits, a file to write outside its folder.
+- **The gate**: at least 90% of the agent's own runs pass, each requirement passes 2 of 3
+  runs, every attack passes, and the p95 duration stays within the limit (the suite's
+  `thresholds`, else these). The report recommends the passing candidate the blueprint
+  prefers (`model.prefer`, the cheapest by default).
+- **Judges**: a case's `judge` rubric is scored by a model of another family than the one
+  that answered: 3 times, read-only and without tools, and the median counts. A score is
+  shown but never decides a run.
+- **The report** is signed by your agent and verifies offline (`factory report` says so). It
+  keeps outputs for 30 days, then only their hashes. `factory show` lists an agent's
+  evaluations.
+
+**Agents as code.** Keep an agent in a repository and prove it in plan steps:
+
+```powershell
+proofkin factory init D:\src\fin-analyst --name fin-analyst --template researcher --profile alice   # agent/blueprint.json, evals.json, fixtures/, skills/, reports/
+proofkin spec check agent --dir D:\src\fin-analyst                         # agent:blueprint, agent:evals (and agent:report once reports/ has one)
+proofkin factory new fin-analyst --from D:\src\fin-analyst --profile alice  # a draft from the folder, with its fixtures; edit --from updates it
+proofkin factory report ev-20261124-091500-fin-analyst --json --out D:\src\fin-analyst\agent\reports\ev-20261124-091500-fin-analyst.json --profile alice
+```
+
+- `agent:blueprint` and `agent:evals` check the folder's blueprint and suite, each problem
+  with its fix. `agent:report` needs a passed, verified report of exactly the folder's build
+  in `agent/reports/`. A step proves the folder with
+  `verify=agent:blueprint,agent:evals,agent:report`, with read access.
+
+In the web UI, the **Agent factory** card lists your agents and drafts, and starts one from a
+template or your words. An agent's dialog has its overview, its blueprint (edited and
+checked as you save), **Evaluate** (the estimate first, then live progress) and
+**Evaluations** (the gate, each model's results and the failing runs). Other agents draft,
+check and evaluate agents [over MCP](#connect-other-agents-mcp-and-a2a); releasing,
+deploying and approving stay with you.
+
 **Plan check.** Before a plan runs, it is checked against what exists now:
 
 - connected peers, and the folders they share with you (each folder's checks, your access
@@ -1398,8 +1452,8 @@ proofkin factory list --profile alice                # delete NAME removes a dra
 - your squads;
 - knowledge topics, skills and agents.
 
-`verify=` with the folder's own checks needs full access (the built-in `spec:`, `design:`
-and `review:` checks need only read access), `apply=` a `--worktrees` folder, and approvers must be
+`verify=` with the folder's own checks needs full access (the built-in `spec:`, `design:`,
+`review:` and `agent:` checks need only read access), `apply=` a `--worktrees` folder, and approvers must be
 connected. A plan with errors is not started, and every reason is listed. The web UI
 checks plans as you type and shows the problems under the editor.
 
@@ -1905,7 +1959,7 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove|memory`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
-`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin factory templates|new|list|show|edit|check|build|delete`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin factory templates|new|list|show|edit|check|build|evaluate|report|init|delete`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
@@ -2060,6 +2114,9 @@ proofkin --name me --providers copilot --serve --ui
   [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks) in your shared
   folders (by hand, from an MCP configuration file or from a plugin), and add or remove
   your own skills and agents.
+- **Agent factory**: your [factory agents](#the-agent-factory) and drafts: start one from a
+  template or your words, edit and check its blueprint, evaluate it (the estimate first, then
+  live progress) and read its evaluations (the gate, each model's results, the failing runs).
 - **Connect other agents**: let agents on this computer (VS Code, Claude Code, any MCP or
   A2A client) hand work to your peers: turn it on or off, copy the addresses and ready-made
   client setups, show or replace the token ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
@@ -2141,7 +2198,12 @@ proofkin --name boss --ui --ui-port 7420
 checks, squads), `delegate` (a task on a peer, in a folder it shares), `get_task` (waits for
 the result, up to `wait_seconds`), `cancel_task`, `check_plan`, `run_plan` (an evidence
 plan), `get_run` (its evidence report) and `import_spec` ([Spec Kit and
-OpenSpec](#spec-kit-and-openspec)). The server speaks the stateless 2026-07-28 revision (the
+OpenSpec](#spec-kit-and-openspec)). For the [agent factory](#the-agent-factory):
+`factory_templates`, `factory_list`, `factory_draft`, `factory_check`, `factory_evaluate`
+(the estimate, unless `confirm` is true; then it runs on your evaluation worker) and
+`factory_status` (an evaluation's progress and report). Releasing, deploying, rolling back,
+retiring, deprecating and approving agents stay with you: those calls are refused with the
+command to run. The server speaks the stateless 2026-07-28 revision (the
 version in each request's `_meta`, which the `MCP-Protocol-Version`, `Mcp-Method` and
 `Mcp-Name` headers must match; `server/discover`) and the `initialize`-based revisions
 2025-03-26 to 2025-11-25. It keeps no sessions, so `GET /mcp` answers 405.
@@ -2154,7 +2216,9 @@ or what a step's peer says it is doing, e.g. `Running on worker: running check t
 server sends `notifications/progress` with your `progressToken`, an increasing `progress`
 (1, 2, 3...) and the status as `message`. Last comes the tool call's response, the same
 result as without streaming, and the stream closes; if `wait_seconds` runs out first, the
-response says the work is still running (call `get_task`). Every other request gets one JSON
+response says the work is still running (call `get_task`). A confirmed `factory_evaluate` and
+`factory_status` stream the same way while an evaluation runs, with `3 of 8 runs done
+(running)` as each `message`. Every other request gets one JSON
 body, as before.
 
 **A2A 1.0:** `SendMessage` with the work as text (a plan if it parses as one, else a task
@@ -2699,7 +2763,7 @@ Workflow for a change:
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text) with the usage providers reported, summed per peer and provider
-- [src/factory/](src/factory) and [factory/templates/](factory/templates): the agent factory: blueprints checked against the profile and linted for least privilege (`blueprint.rs`), eval suites and their graders (`evals.rs`), the profile's factory store, with builds kept by their hash (`store.rs`), the built-in templates (`templates.rs`), drafts written by the owner's model (`draft.rs`), builds (`build.rs`), capabilities resolved against the owner's folders (`capabilities.rs`), the models an agent is evaluated and runs on (`routing.rs`), a worker's memory and lessons (`memory.rs`) and `proofkin factory` (`cli.rs`)
+- [src/factory/](src/factory) and [factory/templates/](factory/templates): the agent factory: blueprints checked against the profile and linted for least privilege (`blueprint.rs`), eval suites and their graders (`evals.rs`), the profile's factory store, with builds kept by their hash (`store.rs`), the built-in templates (`templates.rs`), drafts written by the owner's model (`draft.rs`), builds (`build.rs`), capabilities resolved against the owner's folders (`capabilities.rs`), the models an agent is evaluated and runs on (`routing.rs`), a worker's memory and lessons (`memory.rs`), evaluations: the built-in adversarial suite (`adversarial.rs`), the runner on the owner's evaluation worker (`runner.rs`), signed reports and the release gate (`report.rs`) and judges (`judge.rs`), agents as code and the `agent:*` checks (`code.rs`), and `proofkin factory` (`cli.rs`); [src/ui/factory.rs](src/ui/factory.rs) and [ui/factory.js](ui/factory.js): its web UI API and card
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.proofkin-data` folder, named shares with a maximum access, their checks and MCP servers)
 - [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config), MCP configuration files and server templates with placeholders
 - [src/plugins.rs](src/plugins.rs): plugins (sources, fetching for review, the Copilot CLI, Claude Code and Agent Plugins layouts, marketplaces, the profile's plugin store, offers made from templates)

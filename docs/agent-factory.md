@@ -7,6 +7,10 @@ Phase 1 (Foundation) is built: blueprints, the factory store and `proofkin facto
 suites, templates, drafts, and usage in task results and the audit. Phase 2 (Generation) is
 built: builds kept by their hash, capabilities resolved against the owner's folders, the
 model policy (candidates, recommendation, pinning) and a digital worker's memory and lessons.
+Phase 3 (Evaluation) is built: the built-in adversarial suite, the eval runner on the owner's
+evaluation worker, signed reports with the release gate and the recommendation, judges,
+agents as code with the `agent:*` checks, and the web UI, API and MCP tools for drafts and
+evaluations.
 
 The formal design package is in [agent-factory/](agent-factory/): the
 [spec](agent-factory/spec/SPEC.md) (14 user stories, 33 acceptance criteria), the
@@ -284,7 +288,7 @@ An eval case names the requirement it proves:
   out-of-scope request (must answer `OUT_OF_SCOPE`); for edit access, a request to change a
   file outside the folder.
 - **Where it runs:** each case is a real task on the owner's **evaluation worker** (a digital
-  worker made on first use) or a chosen peer, at the blueprint's access, with the fixtures in
+  worker made on first use; a chosen peer later) at the blueprint's access, with the fixtures in
   a folder shared for the evaluation and a worktree per run for edits.
 - **How much:** each case runs 3 times per candidate by default. The owner first sees the
   **estimate** (cases × repetitions × candidates, plus judge calls, and minutes from the task
@@ -301,8 +305,8 @@ An eval case names the requirement it proves:
 ([ADR-0004](agent-factory/design/adr/ADR-0004-signed-releases.md))
 
 ```powershell
-proofkin factory evaluate fin-analyst --candidates copilot:gpt-6-sol:medium,copilot:claude-sonnet-5.5:high
-proofkin factory release fin-analyst --evaluation ev-20261124-0915-fin-analyst --note "Cites pages for every figure"
+proofkin factory evaluate fin-analyst --candidate copilot:gpt-6-sol:medium --candidate copilot:claude-sonnet-5.5:high --yes
+proofkin factory release fin-analyst --evaluation ev-20261124-091500-fin-analyst --note "Cites pages for every figure"
 proofkin factory verify fin-analyst@1.2.0
 proofkin factory diff fin-analyst 1.1.0 1.2.0
 ```

@@ -24,9 +24,10 @@ Rules that apply to every field:
 | Template | access | string: read-only, workspace-write or full | Yes | Public | Show the most access it asks for | Ships with Proofkin | The most access its tasks need |
 | Template | eval_cases | integer | Yes | Public | Show how well it is tested | Ships with Proofkin | How many eval cases it starts with, adversarial ones not counted |
 | TemplateList | templates | array of Template | Yes | Public | List the templates | Not stored | Every built-in template, by name |
-| DraftRequest | description | string, 1 to 4,000 characters | Yes | Confidential | Tell the owner's model what agent to draft | Kept with the draft until it is deleted; only its SHA-256 goes into a release | What the agent should do, in the owner's words; may describe their business |
+| DraftRequest | description | string, 1 to 4,000 characters | No | Confidential | Tell the owner's model what agent to draft | Kept with the draft until it is deleted; only its SHA-256 goes into a release | What the agent should do, in the owner's words; may describe their business. A draft needs a description, a template or both |
 | DraftRequest | template | string, a template name | No | Public | Start the draft from a template | Kept with the draft's provenance | The template to start from |
 | DraftRequest | name | string, a profile name | No | Internal | Name the agent | As long as the agent | The agent's name; the model proposes one when it is missing |
+| DraftRequest | provider | string: copilot, claude or codex | No | Internal | Choose whose model writes the draft | Kept with the draft's provenance | The first provider the profile is signed in to by default |
 | Blueprint | schema | string | Yes | Public | Version the format | As long as the blueprint | Always proofkin.agent-blueprint/v1 |
 | Blueprint | name | string, a profile name | Yes | Internal | Name the agent in plans, workers and the registry | As long as the agent | Unique among the profile's agents, plugin agents and factory agents |
 | Blueprint | title | string, at most 80 characters | Yes | Internal | Show the agent | As long as the agent | A short title, e.g. Financial analyst |
@@ -74,13 +75,26 @@ Rules that apply to every field:
 | Estimate | candidates | integer | Yes | Internal | Show the work an evaluation is | Kept with the evaluation | Models compared |
 | Estimate | tasks | integer | Yes | Internal | Show the cost before it runs | Kept with the evaluation | cases x repetitions x candidates, plus judge calls |
 | Estimate | minutes | integer | Yes | Internal | Show how long it may take | Kept with the evaluation | From the worker's task slots and the cases' timeouts |
-| Evaluation | id | string | Yes | Internal | Name the evaluation | As long as the agent | e.g. ev-20261124-0915-fin-analyst |
+| Estimate | runs | integer | No | Internal | Show the work an evaluation is | Kept with the evaluation (its runs) | Cases (the built-in attacks included) x repetitions x candidates |
+| Estimate | judge_calls | integer | No | Internal | Show the cost before it runs | Not stored (computed) | 3 scores per judge rubric per run |
+| Estimate | adversarial | integer | No | Internal | Show the attacks it runs | Kept with the evaluation (its cases) | How many of the cases are built-in attacks |
+| Estimate | slots | integer | No | Internal | Explain the minutes | Not stored | The evaluation worker's task slots the minutes assume |
+| Evaluation | id | string | Yes | Internal | Name the evaluation | As long as the agent | ev-YYYYMMDD-HHMMSS-agent, e.g. ev-20261124-091500-fin-analyst |
 | Evaluation | agent | string | Yes | Internal | Say whose evaluation it is | As long as the agent | The agent's name |
 | Evaluation | build | string, SHA-256 | Yes | Internal | Tie results to exactly one build | As long as the agent | The build hash; a release needs a passing evaluation of the same hash |
 | Evaluation | state | string: running, passed, failed or cancelled | Yes | Internal | Show progress and the outcome | As long as the agent | passed means the gate passed for the recommended candidate |
 | Evaluation | results | array of CandidateResult | Yes | Internal | Compare candidates | As long as the agent (outputs 30 days) | One per candidate |
 | Evaluation | gate | object {passed, reasons} | Yes | Internal | Say whether it may be released, and why not | As long as the agent | Reasons name each threshold missed |
 | Evaluation | recommended | {provider, model, effort} or null | No | Internal | Suggest the model to release | As long as the agent | The cheapest passing candidate, or the preferred one; null when none passed |
+| Evaluation | done | integer | No | Internal | Show progress | Not stored (computed) | Runs that ended |
+| Evaluation | total | integer | No | Internal | Show progress | Not stored (computed) | Runs in all |
+| Evaluation | running | boolean | No | Internal | Say whether it runs now | Not stored (computed) | False for a running evaluation whose agent stopped: evaluating the same build again goes on from there |
+| Evaluation | verified | boolean | No | Internal | Show the report is intact | Not stored (computed) | Once it ended: its signature, its runs' evidence and kept outputs verify |
+| Evaluation | by | string | Yes | Personal | Record who started it | As long as the agent | The owner's profile name, or another agent (MCP) when an editor agent started it |
+| Evaluation | worker | string and endpoint id | Yes | Internal | Say where its runs ran | As long as the agent | The owner's evaluation worker (`<profile>-eval`); its key signed each run's evidence |
+| Evaluation | seeds | object {canary, marker} | Yes | Internal | Catch leaks and escapes in this evaluation's attacks | As long as the agent | Random for each evaluation; the canary is a made-up secret, redacted from kept outputs and never sent to the web page |
+| Evaluation | signer_id | string, an endpoint id | Yes | Personal | Verify who evaluated it | As long as the agent | The owner's public key (ed25519) |
+| Evaluation | signature | string, ed25519 signature | Yes | Internal | Prove the report is the owner's and unchanged | As long as the agent | Over the report with its runs' evidence and the hashes of their outputs; verifies offline |
 | CandidateResult | candidate | {provider, model, effort} | Yes | Internal | Name the model evaluated | As long as the agent | As the worker ran it |
 | CandidateResult | pass_rate | number, 0 to 1 | Yes | Internal | Measure quality | As long as the agent | Passed runs over all runs, adversarial ones included |
 | CandidateResult | requirements | object, requirement id to pass rate | Yes | Internal | Find weak requirements | As long as the agent | e.g. {"R1": 1.0, "R2": 0.67} |
@@ -153,7 +167,7 @@ Rules that apply to every field:
 | Imported | state | string: imported, evaluating or active | Yes | Internal | Show whether it can be used | Until removed | active only after a local evaluation passed, or the publisher's report was accepted |
 | ReleaseManifest | files | object, artifact path to SHA-256 | Yes | Internal | Verify every artifact | Until the agent is purged | release.json: the hash of the blueprint, agent file, skills, team plan, eval suite, reports and provenance |
 | ReleaseManifest | signature | string, ed25519 signature | Yes | Internal | Prove the release is the owner's and unchanged | Until the agent is purged | Over the manifest's canonical JSON |
-| EvalRun | output | string, at most 8,000 characters | Yes | Confidential | Grade the case and show failures | 30 days, then only its SHA-256 | The candidate's answer; redacted for secrets before it is stored |
+| EvalRun | output | string | Yes | Confidential | Grade the case and show failures | 30 days, then only its SHA-256 | The candidate's answer as its worker sent it (redacted for secrets there), so it verifies against the worker's signed evidence; the evaluation's canary is redacted from it before it is stored |
 | EvalRun | verdict | string: passed or failed, per expectation | Yes | Internal | Prove the requirement | As long as the agent | Each expectation's result |
 | EvalRun | evidence | object, signed evidence | Yes | Internal | Show the task ran as reported | As long as the agent | The worker's signed evidence of the task |
 | AuditEntry | agent | string, agent@version | No | Internal | Count tasks per agent and version | 90 days (the audit's) | Added to audit.jsonl; no prompt or output text |
@@ -207,6 +221,7 @@ erDiagram
 | `factory/drafts/<name>.json` | Draft blueprints with provenance | Until deleted |
 | `factory/agents/<name>/builds/<hash>/` | Built agent file, skills, team plan, suite | As long as a release or evaluation names them |
 | `factory/agents/<name>/evaluations/<id>.json` | Reports, runs and verdicts; outputs for 30 days | As long as the agent |
+| `factory/evaluation/` | The running evaluation's workspace: the folder its worker shares for evaluations, with the cases' fixtures and the attacks' files, and the lock that lets one evaluation run at a time | Until the evaluation ends |
 | `factory/agents/<name>/releases/<version>/release.json` | The signed manifest and approvals | Until the agent is purged |
 | `factory/agents/<name>/state.json` | Lifecycle state, active version, deployments, history | As long as the agent |
 | `factory/imported/<publisher>/<name>/<version>/` | Imported bundles | Until removed |
