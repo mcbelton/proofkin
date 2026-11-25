@@ -257,6 +257,14 @@ pub struct ProfileConfig {
     /// for (see [`crate::models`] and `proofkin models`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub models: crate::models::Models,
+    /// What this agent remembers when it serves tasks (see [`crate::factory::memory`]): the
+    /// knowledge topics put in front of each, the topic the lessons of its verified work
+    /// go to, and how many days they are kept.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::factory::memory::Memory::is_empty"
+    )]
+    pub memory: crate::factory::memory::Memory,
 }
 
 /// Held while an agent runs with a profile, so a profile runs in one agent at a

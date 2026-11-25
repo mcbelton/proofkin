@@ -4,7 +4,9 @@ Status: being built with Proofkin, phase by phase. Tracked in
 [#175](https://github.com/mcbelton/proofkin/issues/175), one sub-issue per piece of work (see
 [Work items](#work-items)). Until an item is closed, what it describes doesn't exist yet.
 Phase 1 (Foundation) is built: blueprints, the factory store and `proofkin factory`, eval
-suites, templates, drafts, and usage in task results and the audit.
+suites, templates, drafts, and usage in task results and the audit. Phase 2 (Generation) is
+built: builds kept by their hash, capabilities resolved against the owner's folders, the
+model policy (candidates, recommendation, pinning) and a digital worker's memory and lessons.
 
 The formal design package is in [agent-factory/](agent-factory/): the
 [spec](agent-factory/spec/SPEC.md) (14 user stories, 33 acceptance criteria), the

@@ -12,7 +12,7 @@ use crate::factory::blueprint::{
 };
 use crate::factory::evals::check_fixtures;
 use crate::factory::store::{Draft, FactoryStore, Provenance, now};
-use crate::factory::{draft, templates};
+use crate::factory::{capabilities, draft, routing, templates};
 use crate::llm::{ExecutorConfig, Provider, SdkExecutor};
 use crate::profile::Profile;
 
@@ -79,13 +79,33 @@ examples:
         profile: ProfileOpt,
     },
     /// Check a draft, or a blueprint file, against the profile: each problem with its
-    /// fix. Fails if any is an error.
+    /// fix, and what it would get in each folder it is deployed to. Fails if any problem
+    /// is an error.
+    #[command(after_help = "\
+examples:
+  proofkin factory check fin-analyst --profile alice
+  proofkin factory check fin-analyst --folders reports,ledger --profile alice
+  proofkin factory check --file fin-analyst.json --profile alice
+What it asks for is resolved against what each folder offers: what isn't offered is an
+error naming the command that offers it. Checking never shares, offers or grants anything.")]
     Check {
         /// The draft to check.
         name: Option<String>,
         /// Check this blueprint file instead (its fixtures are in fixtures/ next to it).
         #[arg(long, conflicts_with = "name")]
         file: Option<PathBuf>,
+        /// The folders to resolve its capabilities in (comma-separated; default: its
+        /// deploy folders).
+        #[arg(long, value_delimiter = ',')]
+        folders: Option<Vec<String>>,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Build a draft: the files the agent is made of (its agent file, blueprint, evals,
+    /// skills and team plan), the same bytes on every platform, kept by their hash. A
+    /// draft with an error isn't built.
+    Build {
+        name: String,
         #[command(flatten)]
         profile: ProfileOpt,
     },
@@ -137,12 +157,15 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
         FactoryCommand::Check {
             name,
             file,
+            folders,
             profile,
         } => check(
             &Profile::open(&profile.name)?,
             name.as_deref(),
             file.as_deref(),
+            folders,
         )?,
+        FactoryCommand::Build { name, profile } => build(&Profile::open(&profile.name)?, &name)?,
         FactoryCommand::Delete { name, profile } => {
             let profile = Profile::open(&profile.name)?;
             if !FactoryStore::of(&profile).delete(&name)? {
@@ -327,18 +350,56 @@ fn show(profile: &Profile, name: &str, json: bool) -> Result<()> {
         .as_ref()
         .map(|s| s.state.to_string())
         .unwrap_or_else(|| "draft".into());
+    let catalog = Catalog::of(profile)?.without(name);
     match from_value(&draft.blueprint) {
-        Ok(blueprint) => describe(&blueprint, &lifecycle),
+        Ok(blueprint) => {
+            describe(&blueprint, &lifecycle);
+            // Copilot's offers are known once it runs: its evaluation checks multipliers.
+            let routes = routing::candidates(&blueprint, &catalog, None, true);
+            let listed: Vec<String> = routes.candidates.iter().map(|r| r.to_string()).collect();
+            println!(
+                "  evaluated on: {}",
+                if listed.is_empty() {
+                    "no model (see below)".to_owned()
+                } else {
+                    listed.join("; ")
+                }
+            );
+            for out in &routes.left_out {
+                println!("    left out: {}: {}", out.route, out.why);
+            }
+            let memory = &blueprint.memory;
+            if !memory.is_empty() {
+                let mut text = if memory.context.is_empty() {
+                    "no knowledge in front of its tasks".to_owned()
+                } else {
+                    format!("reads {}", memory.context.join(", "))
+                };
+                if let Some(topic) = &memory.lessons {
+                    text += &format!(
+                        "; lessons go to '{topic}', kept {} days",
+                        memory
+                            .retention_days
+                            .unwrap_or(crate::factory::memory::DEFAULT_RETENTION_DAYS)
+                    );
+                }
+                println!("  memory: {text}");
+            }
+        }
         Err(_) => println!("{name} ({lifecycle})"),
     }
     println!("  written: {}", provenance_text(&draft));
+    let builds = store.builds(name)?;
+    if !builds.is_empty() {
+        let short: Vec<&str> = builds.iter().map(|h| &h[..12]).collect();
+        println!("  builds: {}", short.join(", "));
+    }
     if let Some(state) = &state {
         println!("  history:");
         for change in state.history.iter().rev().take(10) {
             println!("    {}  {}  {}", change.at, change.by, change.what);
         }
     }
-    let catalog = Catalog::of(profile)?.without(name);
     let problems = problems_of(&store, name, &draft.blueprint, &catalog);
     println!("problems: {}", summary(&problems));
     print_problems(&problems);
@@ -507,37 +568,62 @@ fn in_editor(name: &str, blueprint: &Value) -> Result<(String, PathBuf)> {
     Ok((text, path))
 }
 
-fn check(profile: &Profile, name: Option<&str>, file: Option<&Path>) -> Result<()> {
+fn check(
+    profile: &Profile,
+    name: Option<&str>,
+    file: Option<&Path>,
+    folders: Option<Vec<String>>,
+) -> Result<()> {
     let store = FactoryStore::of(profile);
-    let (label, problems) = match (name, file) {
+    let (label, parsed, mut problems) = match (name, file) {
         (Some(name), None) => {
             let draft = draft_of(&store, profile, name)?;
             let catalog = Catalog::of(profile)?.without(name);
-            (
-                name.to_owned(),
-                problems_of(&store, name, &draft.blueprint, &catalog),
-            )
+            let problems = problems_of(&store, name, &draft.blueprint, &catalog);
+            let parsed = from_value(&draft.blueprint).ok().map(|b| (b, catalog));
+            (name.to_owned(), parsed, problems)
         }
         (None, Some(path)) => {
             let label = path.display().to_string();
             let text = read_input(path)?;
-            let problems = match crate::factory::blueprint::parse(&text) {
-                Err(problem) => vec![problem],
+            match crate::factory::blueprint::parse(&text) {
+                Err(problem) => (label, None, vec![problem]),
                 Ok(blueprint) => {
                     let catalog = Catalog::of(profile)?.without(&blueprint.name);
                     let mut problems = crate::factory::blueprint::validate(&blueprint, &catalog);
                     let fixtures = path.parent().unwrap_or(Path::new(".")).join("fixtures");
                     problems.extend(check_fixtures(&blueprint.evals, &fixtures));
-                    problems.sort_by_key(|p| !p.error);
-                    problems
+                    (label, Some((blueprint, catalog)), problems)
                 }
-            };
-            (label, problems)
+            }
         }
         _ => bail!("give a draft's name, or --file with a blueprint"),
     };
+    // What it asks for, in the folders it would get it in.
+    let resolved = parsed.as_ref().map(|(blueprint, catalog)| {
+        let folders = folders
+            .clone()
+            .unwrap_or_else(|| blueprint.deploy.folders.clone());
+        let resolution = capabilities::resolve(blueprint, &folders, catalog);
+        (folders, resolution)
+    });
+    if let Some((_, resolution)) = &resolved {
+        for problem in &resolution.problems {
+            if !problems.contains(problem) {
+                problems.push(problem.clone());
+            }
+        }
+    }
+    problems.sort_by_key(|p| !p.error);
     println!("{label}: {}", summary(&problems));
     print_problems(&problems);
+    match &resolved {
+        Some((folders, _)) if folders.is_empty() => println!(
+            "no folders to resolve its capabilities in: it names no deploy folders (--folders A,B resolves them in some)"
+        ),
+        Some((_, resolution)) => print_resolution(resolution),
+        None => {}
+    }
     if has_errors(&problems) {
         let errors = problems.iter().filter(|p| p.error).count();
         bail!(
@@ -545,6 +631,81 @@ fn check(profile: &Profile, name: Option<&str>, file: Option<&Path>) -> Result<(
             if errors == 1 { "" } else { "s" }
         );
     }
+    Ok(())
+}
+
+/// What an agent's tasks would get, folder by folder.
+fn print_resolution(resolution: &capabilities::Resolution) {
+    println!("its tasks would get:");
+    for grant in &resolution.grants {
+        let mcp: Vec<String> = grant
+            .mcp
+            .iter()
+            .map(|(server, tools)| {
+                if tools.is_empty() {
+                    format!("{server} (every tool)")
+                } else {
+                    format!("{server} ({})", tools.join(", "))
+                }
+            })
+            .collect();
+        let or_none = |list: &[String]| {
+            if list.is_empty() {
+                "none".to_owned()
+            } else {
+                list.join(", ")
+            }
+        };
+        println!(
+            "  in {}: {} access; MCP servers {}; checks {}",
+            grant.folder,
+            grant.access,
+            or_none(&mcp),
+            or_none(&grant.checks)
+        );
+    }
+    if !resolution.workiq.is_empty() {
+        println!(
+            "  Microsoft 365 context: {} (your Work IQ account)",
+            resolution.workiq.join(", ")
+        );
+    }
+    if resolution.delegate {
+        println!("  delegation: to the peers you allow on its worker's allowlist");
+    }
+}
+
+/// Builds draft `name` and keeps the build by its hash.
+fn build(profile: &Profile, name: &str) -> Result<()> {
+    let store = FactoryStore::of(profile);
+    let draft = draft_of(&store, profile, name)?;
+    let catalog = Catalog::of(profile)?.without(name);
+    let problems = problems_of(&store, name, &draft.blueprint, &catalog);
+    if has_errors(&problems) {
+        println!("{name}: {}", summary(&problems));
+        print_problems(&problems);
+        bail!(
+            "{name} isn't built: its draft has errors (proofkin factory check {name} --profile {})",
+            profile.name
+        );
+    }
+    let blueprint = from_value(&draft.blueprint).map_err(|p| anyhow!("{p}"))?;
+    let built = crate::factory::build::build(&blueprint, &profile.skills())?;
+    let dir = store.save_build(&built)?;
+    println!(
+        "profile '{}': built {name}: {}",
+        profile.name,
+        built.short_hash()
+    );
+    for (path, text) in &built.files {
+        println!(
+            "  {}  {path} ({} bytes)",
+            &crate::evidence::sha256_hex(text.as_bytes())[..12],
+            text.len()
+        );
+    }
+    println!("hash: {}", built.hash);
+    println!("in: {}", dir.display());
     Ok(())
 }
 

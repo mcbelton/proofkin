@@ -54,17 +54,33 @@ impl Home {
         self.0.path()
     }
 
-    fn command(&self, args: &[&str]) -> Command {
+    /// `proofkin` in this home.
+    fn base(&self) -> Command {
         let mut command = Command::new(EXE);
         command
-            .arg("factory")
-            .args(args)
             .env("PROOFKIN_HOME", self.path())
             .env("PROOFKIN_SECRET_STORE", "file")
             .env_remove("VISUAL")
             .env_remove("EDITOR")
             .stdin(Stdio::null());
         command
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = self.base();
+        command.arg("factory").args(args);
+        command
+    }
+
+    /// Another proofkin command (not `factory`), and what it did.
+    fn proofkin(&self, args: &[&str]) -> Ran {
+        ran(self.base().args(args).output().unwrap())
+    }
+
+    fn proofkin_ok(&self, args: &[&str]) -> String {
+        let ran = self.proofkin(args);
+        assert!(ran.ok, "proofkin {} failed:\n{}", args.join(" "), ran.out);
+        ran.out
     }
 
     fn run(&self, args: &[&str]) -> Ran {
@@ -390,5 +406,282 @@ fn drafting_needs_a_provider_the_profile_is_signed_in_to() {
     assert!(
         home.ok(&["list", "--profile", "bob"])
             .contains("no agents yet")
+    );
+}
+#[test]
+fn a_draft_is_built_into_the_same_files_each_time_and_kept_by_their_hash() {
+    let home = Home::new();
+    home.ok(&[
+        "new",
+        "rev",
+        "--template",
+        "code-reviewer",
+        "--profile",
+        "alice",
+    ]);
+    let out = home.ok(&["build", "rev", "--profile", "alice"]);
+    for file in [
+        "agent.md",
+        "blueprint.json",
+        "evals.json",
+        "skills/rev.code-review.md",
+        "skills/rev.security-review.md",
+    ] {
+        assert!(
+            out.contains(&format!("  {file} (")),
+            "{file} isn't in:\n{out}"
+        );
+    }
+    let field = |out: &str, name: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no {name:?} in:\n{out}"))
+            .to_owned()
+    };
+    let hash = field(&out, "hash: ");
+    assert!(hash.len() == 64 && out.contains(&format!("built rev: {}", &hash[..12])));
+    let dir = std::path::PathBuf::from(field(&out, "in: "));
+    let agent = std::fs::read_to_string(dir.join("agent.md")).unwrap();
+    let front = agent.split("---").nth(1).unwrap();
+    assert!(
+        front.contains("name: rev")
+            && front.contains("skills: [rev.code-review, rev.security-review]"),
+        "{agent}"
+    );
+    assert!(
+        !front.contains("tools:") && !front.contains("model:"),
+        "{agent}"
+    );
+    assert!(agent.contains("OUT_OF_SCOPE"), "{agent}");
+
+    // The same draft builds the same bytes again, kept once.
+    let again = home.ok(&["build", "rev", "--profile", "alice"]);
+    assert_eq!(field(&again, "hash: "), hash);
+    let shown = home.ok(&["show", "rev", "--profile", "alice"]);
+    assert!(
+        shown.contains(&format!("builds: {}", &hash[..12])),
+        "{shown}"
+    );
+    // It is evaluated on what the profile runs: alice's Codex, at its default model.
+    assert!(
+        shown.contains("evaluated on: codex (its default model)"),
+        "{shown}"
+    );
+
+    // A build changed after it was made is refused, not used.
+    std::fs::write(
+        dir.join("agent.md"),
+        agent.replace("OUT_OF_SCOPE", "anything goes"),
+    )
+    .unwrap();
+    let out = home.fails(&["build", "rev", "--profile", "alice"]);
+    assert!(out.contains("doesn't match its hash"), "{out}");
+
+    // A draft with an error isn't built.
+    let mut blueprint = home.blueprint("rev");
+    blueprint["skills"] = json!(["no-such-skill"]);
+    let edit = ["edit", "rev", "--from", "-", "--profile", "alice"];
+    assert!(home.run_with_stdin(&edit, &blueprint.to_string()).ok);
+    let out = home.fails(&["build", "rev", "--profile", "alice"]);
+    assert!(
+        out.contains("rev isn't built: its draft has errors"),
+        "{out}"
+    );
+}
+
+#[test]
+fn check_resolves_what_an_agent_asks_for_in_each_folder_and_grants_nothing() {
+    let home = Home::new();
+    // Signed in to Claude: its tasks may use MCP servers (Codex's can't).
+    home.profile("alice", r#"{"claude": {"source": "login"}}"#);
+    let app = home.path().join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    let app = app.to_str().unwrap();
+    let share = |access: &str, checks: &[&str]| {
+        let mut args = vec!["share", "add", "app", app, "--access", access];
+        for check in checks {
+            args.extend(["--check", check]);
+        }
+        args.extend(["--profile", "alice"]);
+        home.proofkin_ok(&args);
+    };
+    let offer_pdf = |tools: &[&str]| {
+        let mut args = vec!["mcp", "add", "app", "pdf", "--access", "read-only"];
+        for tool in tools {
+            args.extend(["--tool", tool]);
+        }
+        args.extend(["--profile", "alice", "--", "pdf-server", "--stdio"]);
+        home.proofkin_ok(&args);
+    };
+    share("workspace-write", &[]);
+    offer_pdf(&["read_pdf"]);
+    // A peer on alice's allowlist, so there is one to leave as it is.
+    let out = home.proofkin_ok(&["peers", "id", "--profile", "bob"]);
+    let bob = out
+        .split("endpoint id: ")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .expect(&out)
+        .to_owned();
+    home.proofkin_ok(&[
+        "peers",
+        "allow",
+        &bob,
+        "--name",
+        "bob",
+        "--profile",
+        "alice",
+    ]);
+    home.ok(&[
+        "new",
+        "impl",
+        "--template",
+        "implementer",
+        "--profile",
+        "alice",
+    ]);
+    let mut blueprint = home.blueprint("impl");
+    blueprint["capabilities"]["mcp"] = json!([{
+        "server": "pdf",
+        "tools": ["read_pdf", "search_pdf"],
+        "why": "It reads the design documents it implements."
+    }]);
+    blueprint["model"]["needs_mcp"] = json!(true);
+    let edit = ["edit", "impl", "--from", "-", "--profile", "alice"];
+    assert!(home.run_with_stdin(&edit, &blueprint.to_string()).ok);
+    let alice = home.path().join("profiles").join("alice");
+    let stores = || ["shares.json", "peers.json"].map(|f| std::fs::read(alice.join(f)).unwrap());
+    let before = stores();
+
+    let out = home.ok(&["check", "impl", "--profile", "alice"]);
+    assert!(
+        out.contains("impl: no problems") && out.contains("no folders to resolve"),
+        "{out}"
+    );
+    let out = home.fails(&[
+        "check",
+        "impl",
+        "--folders",
+        "app,data,ledger",
+        "--profile",
+        "alice",
+    ]);
+    for part in [
+        "'app' gives tasks at most workspace-write access, and it asks for full",
+        "--access full --profile alice",
+        "'pdf' in 'app' doesn't offer search_pdf",
+        "fix: proofkin mcp add app pdf --access read-only --tool read_pdf --tool search_pdf --profile alice",
+        "'app' has no check 'test'",
+        "--check test=<command>",
+        "every deployed agent has its own data folder",
+        "you share no folder 'ledger'",
+        "fix: proofkin share add ledger <path> --profile alice",
+        "in app: workspace-write access; MCP servers none; checks none",
+    ] {
+        assert!(out.contains(part), "{part:?} isn't in:\n{out}");
+    }
+    assert_eq!(
+        stores(),
+        before,
+        "checking offers, shares and grants nothing"
+    );
+
+    // Once the folder offers what it asks for, as the fixes say, it resolves.
+    share("full", &["test=cargo test"]);
+    offer_pdf(&["read_pdf", "search_pdf"]);
+    let out = home.ok(&["check", "impl", "--folders", "app", "--profile", "alice"]);
+    assert!(
+        out.contains("impl: no problems")
+            && out.contains(
+                "in app: full access; MCP servers pdf (read_pdf, search_pdf); checks test"
+            ),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_workers_memory_copies_its_topics_with_their_marks_from_its_owner() {
+    let home = Home::new();
+    let knowledge = home.path().join("profiles").join("alice").join("knowledge");
+    std::fs::create_dir_all(&knowledge).unwrap();
+    std::fs::write(
+        knowledge.join("glossary.md"),
+        "# Glossary\n\nEBITDA: earnings before interest, taxes, depreciation and amortization.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        knowledge.join("q3-board.md"),
+        "---\norigin: workiq\nlabels: Confidential\n---\n# Q3 board\n\nRevenue was 12.\n",
+    )
+    .unwrap();
+    home.proofkin_ok(&["worker", "create", "analyst", "--owner", "alice"]);
+    let memory = |args: &[&str]| {
+        let mut all = vec!["worker", "memory", "analyst"];
+        all.extend(args);
+        home.proofkin(&all)
+    };
+
+    let out = memory(&[]).out;
+    assert!(
+        out.contains("in front of every task: no knowledge") && out.contains("lessons: none"),
+        "{out}"
+    );
+    let out = memory(&[
+        "--context",
+        "glossary,q3-board",
+        "--lessons",
+        "analyst-lessons",
+        "--retention-days",
+        "30",
+    ]);
+    assert!(out.ok, "{}", out.out);
+    for part in [
+        "copied from 'alice''s knowledge, with their marks: glossary, q3-board",
+        "in front of every task: glossary, q3-board",
+        "lessons: topic 'analyst-lessons', kept 30 days",
+        "it takes effect when 'analyst' next starts",
+    ] {
+        assert!(out.out.contains(part), "{part:?} isn't in:\n{}", out.out);
+    }
+    let worker = home.path().join("profiles").join("analyst");
+    let copied = std::fs::read_to_string(worker.join("knowledge").join("q3-board.md")).unwrap();
+    assert!(
+        copied.starts_with("---\norigin: workiq\nlabels: Confidential\n---\n")
+            && copied.contains("copied from alice's knowledge")
+            && copied.contains("Revenue was 12."),
+        "{copied}"
+    );
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(worker.join("profile.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        config["memory"],
+        json!({"context": ["glossary", "q3-board"], "lessons": "analyst-lessons", "retention_days": 30})
+    );
+
+    // Only its owner's topics, named one by one, and only on a digital worker.
+    let out = memory(&["--context", "nope"]);
+    assert!(
+        !out.ok && out.out.contains("no topic 'nope'"),
+        "{}",
+        out.out
+    );
+    let out = memory(&["--context", "all"]);
+    assert!(
+        !out.ok && out.out.contains("name the topics it reads"),
+        "{}",
+        out.out
+    );
+    let out = home.proofkin(&["worker", "memory", "alice", "--lessons", "x"]);
+    assert!(
+        !out.ok && out.out.contains("'alice' isn't a digital worker"),
+        "{}",
+        out.out
+    );
+
+    let out = memory(&["--off"]).out;
+    assert!(
+        out.contains("in front of every task: no knowledge") && out.contains("lessons: none"),
+        "{out}"
     );
 }

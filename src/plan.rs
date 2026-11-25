@@ -919,6 +919,18 @@ impl Recipients {
             }
             None => (Vec::new(), "it has no Microsoft 365 grant".to_owned()),
         };
+        let command = self.grant_command(id, name, &union_labels(&granted, &needed));
+        Some(format!(
+            "step '{}' gets Microsoft 365 content (labels: {}) that {name} may not receive: {why}. \
+             Grant it with: {command}",
+            step.id,
+            needed.join(", ")
+        ))
+    }
+
+    /// The command that grants the peer `name` (`id`) Microsoft 365 content with `labels`,
+    /// keeping the rest of its allowlist entry (`peers allow` replaces it).
+    pub fn grant_command(&self, id: &EndpointId, name: &str, labels: &[String]) -> String {
         let mut command = format!("proofkin peers allow {id} --name {name}");
         if let Some(profile) = &self.profile {
             command += &format!(" --profile {profile}");
@@ -932,23 +944,19 @@ impl Recipients {
                 peer.shares.join(",")
             );
         }
-        command += &format!(" --m365 {}", union_labels(&granted, &needed).join(","));
+        command += &format!(" --m365 {}", labels.join(","));
         if entry.and_then(|p| p.m365.as_ref()).is_some_and(|g| g.tools) {
             command += " --m365-tools";
         }
-        Some(format!(
-            "step '{}' gets Microsoft 365 content (labels: {}) that {name} may not receive: {why}. \
-             Grant it with: {command}",
-            step.id,
-            needed.join(", ")
-        ))
+        command
     }
 }
 
 /// Saves the result of every finished step with `save=` into `kb`, if its evidence
 /// was verified (or it ran locally); returns the topics written. A step with Microsoft 365
-/// content saves its topic marked as such, with the step's labels. A `@workiq` step's
-/// answer has no evidence to verify: it is saved as an answer from Work IQ, marked.
+/// content (its own, the steps' before it, or what its peer's evidence says its result
+/// holds) saves its topic marked as such, with those labels. A `@workiq` step's answer has
+/// no evidence to verify: it is saved as an answer from Work IQ, marked.
 pub fn save_knowledge(
     kb: &KnowledgeBase,
     plan: &Plan,
@@ -956,7 +964,7 @@ pub fn save_knowledge(
     run_id: &str,
 ) -> Vec<String> {
     let mut saved = Vec::new();
-    let plan = plan.marked(kb);
+    let plan = with_result_labels(plan, states).marked(kb);
     for step in &plan.steps {
         let (
             Some(topic),
@@ -3343,34 +3351,76 @@ fn fresh_recipients(agent: &Agent, ctx: &RunContext) -> Recipients {
 /// Why `step`'s Microsoft 365 content may not be sent to `name` (`id`) now, if it may not:
 /// the plan check's test again, against the allowlist as it is at this moment. A step that
 /// gets content from `workiq=` steps (its own, or those it waits for) is checked against the
-/// labels those found in this run, joined with the labels it was marked with.
+/// labels those found in this run, joined with the labels it was marked with; one that waits
+/// for results whose peers' signed evidence names labels (a worker's labeled knowledge), with
+/// those too.
 fn m365_refusal(
     agent: &Agent,
     ctx: &RunContext,
     plan: &Plan,
+    states: &BTreeMap<String, StepState>,
     step: &Step,
     name: &str,
     id: &EndpointId,
 ) -> Option<String> {
     let recipients = fresh_recipients(agent, ctx);
     let earlier = ancestors(plan, &step.id);
+    let mut delivered: Vec<String> = Vec::new();
+    for before in &earlier {
+        if let Some(labels) = states.get(before).and_then(result_labels) {
+            delivered = union_labels(&delivered, &labels);
+        }
+    }
     let via_workiq = step.brings_m365()
         || plan
             .steps
             .iter()
             .any(|s| s.brings_m365() && earlier.contains(&s.id));
-    if !via_workiq {
+    if !via_workiq && delivered.is_empty() {
         step.m365.as_ref()?;
         return recipients.refusal(step, name, id);
     }
     let found = ctx.work_log.records();
-    let mut labels = step.m365.clone().unwrap_or_default();
+    let mut labels = union_labels(step.m365.as_deref().unwrap_or_default(), &delivered);
     for before in &earlier {
         if let Some(record) = found.get(before) {
             labels = union_labels(&labels, &record.labels);
         }
     }
     recipients.refusal_for_labels(step, &labels, name, id)
+}
+
+/// The Microsoft 365 labels a finished step's result holds, as its peer's signed evidence
+/// says: those of the work context it was sent, and of the knowledge its worker's own memory
+/// put in its task (see [`crate::factory::memory`]). None if it names none.
+pub fn result_labels(state: &StepState) -> Option<Vec<String>> {
+    let StepState::Done {
+        evidence: Some(evidence),
+        ..
+    } = state
+    else {
+        return None;
+    };
+    let mut labels: Vec<String> = Vec::new();
+    for part in &evidence.context {
+        labels = union_labels(&labels, &part.labels);
+    }
+    (!labels.is_empty()).then_some(labels)
+}
+
+/// `plan` with each finished step marked with the labels its result holds (see
+/// [`result_labels`]), so the steps after it and what it saves as knowledge are marked too.
+pub fn with_result_labels(plan: &Plan, states: &BTreeMap<String, StepState>) -> Plan {
+    let mut plan = plan.clone();
+    for step in &mut plan.steps {
+        if let Some(labels) = states.get(&step.id).and_then(result_labels) {
+            step.m365 = Some(union_labels(
+                step.m365.as_deref().unwrap_or_default(),
+                &labels,
+            ));
+        }
+    }
+    plan
 }
 
 /// Searches Work IQ for `step` (which goes to `peer`) and returns the prompt section for
@@ -3666,8 +3716,9 @@ pub async fn run_plan_with(
                     .collect();
                     match choose_approver(step, &agent.peers()) {
                         Ok((approver, name)) => {
-                            let refused = approver
-                                .and_then(|id| m365_refusal(agent, ctx, plan, step, &name, &id));
+                            let refused = approver.and_then(|id| {
+                                m365_refusal(agent, ctx, plan, &states, step, &name, &id)
+                            });
                             if let Some(why) = refused {
                                 let state = fail(why);
                                 on_update(&step.id, &state);
@@ -3745,7 +3796,9 @@ pub async fn run_plan_with(
                             continue;
                         }
                     };
-                    if let Some(why) = m365_refusal(agent, ctx, plan, step, &peer.name, &peer.id) {
+                    if let Some(why) =
+                        m365_refusal(agent, ctx, plan, &states, step, &peer.name, &peer.id)
+                    {
                         let state = StepState::failed(Some(peer.name), why);
                         on_update(&step.id, &state);
                         states.insert(step.id.clone(), state);

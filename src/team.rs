@@ -343,6 +343,9 @@ pub struct TeamOutcome {
     pub git: Option<GitCommit>,
     /// Every step is done, and the run proves its claims (if it has any).
     pub ok: bool,
+    /// The Microsoft 365 labels its steps' results hold, as their peers' signed evidence
+    /// says (see [`crate::plan::result_labels`]): its output and record hold them too.
+    pub labels: Vec<String>,
 }
 
 /// Runs the team plans of team steps handed to a profile's agent, with the profile's
@@ -405,8 +408,13 @@ impl TeamRunner {
             squads: SquadStore::load(&self.profile.squads_path()).unwrap_or_default(),
             kb: self.profile.knowledge(),
             skills: self.profile.skills(),
-            recipients: Recipients::of(agent, &self.profile),
+            recipients: self.recipients(agent),
         }
+    }
+
+    /// Who may receive its team runs' content now (see [`Recipients::of`]).
+    pub fn recipients(&self, agent: &Agent) -> Recipients {
+        Recipients::of(agent, &self.profile)
     }
 
     /// The prompt that asks `agent`'s model for the team plan of team step `task` from
@@ -572,12 +580,20 @@ impl TeamRunner {
         let ok = finals.values().all(|s| matches!(s, StepState::Done { .. }))
             && (record.claims.is_empty() || record.passed());
         let (patch, git) = committed.map_or((None, None), |(p, g)| (Some(p), g));
+        // What its steps' results hold, as their peers' signed evidence says.
+        let mut labels: Vec<String> = Vec::new();
+        for state in finals.values() {
+            if let Some(found) = crate::plan::result_labels(state) {
+                labels = crate::knowledge::union_labels(&labels, &found);
+            }
+        }
         Ok(TeamOutcome {
             record,
             output,
             patch,
             git,
             ok,
+            labels,
         })
     }
 }
