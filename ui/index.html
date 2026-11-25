@@ -273,7 +273,10 @@
       <section class="runs-panel" aria-labelledby="kb-h">
         <div class="card-head panel-head">
           <h2 id="kb-h">Knowledge</h2>
-          <span class="count" id="kb-count">0</span>
+          <span class="head-actions">
+            <button type="button" class="btn small" id="kb-import-btn">Import from Microsoft 365</button>
+            <span class="count" id="kb-count">0</span>
+          </span>
         </div>
         <p class="muted small">What agents learned about your systems: saved by plan steps (<span class="mono">save=</span>), used by them (<span class="mono">context=</span>). TSGs fix incidents automatically.</p>
         <ul class="kb-list" id="kb-list"></ul>
@@ -721,6 +724,7 @@
       <ul id="run-signatures" class="signature-list"></ul>
       <div id="run-prototypes" class="task-actions"></div>
       <div id="run-pulls" class="run-pulls" hidden></div>
+      <div id="run-workiq" class="run-workiq" tabindex="0" hidden></div>
       <div id="run-report" class="result" tabindex="0"></div>
     </div>
   </dialog>
@@ -859,6 +863,41 @@
       <div class="dialog-actions">
         <button type="button" class="btn" id="workiq-budget-cancel">Cancel</button>
         <button type="submit" class="btn primary" id="workiq-budget-submit">Save budget</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="kb-import-dialog" aria-labelledby="kb-import-h">
+    <form method="dialog" id="kb-import-form" novalidate>
+      <h2 id="kb-import-h">Import from Microsoft 365</h2>
+      <p class="muted small">Searches your Microsoft 365 with this agent's Work IQ and keeps what it finds as a knowledge topic, which plan steps use with <span class="mono">context=</span>. The topic keeps where it came from: Microsoft 365, with the sensitivity labels of what it kept. So it goes only to peers whose Microsoft 365 grant covers those labels.</p>
+      <label class="field">
+        <span>Topic name</span>
+        <input id="kb-import-topic" type="text" maxlength="64" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="e.g. q3-budget…" aria-describedby="kb-import-topic-hint">
+        <span class="muted small" id="kb-import-topic-hint">Letters, digits, '-', '_' and '.'</span>
+      </label>
+      <label class="field">
+        <span>What to look for</span>
+        <textarea id="kb-import-query" rows="3" maxlength="1000" placeholder="e.g. what was decided about the Q3 budget…" aria-describedby="kb-import-query-hint"></textarea>
+        <span class="muted small" id="kb-import-query-hint">In your own words, as you would ask Microsoft 365 Copilot (at most 1,000 characters).</span>
+      </label>
+      <fieldset class="field">
+        <legend>Where to look</legend>
+        <div id="kb-import-sources" class="kb-import-sources"></div>
+      </fieldset>
+      <label class="check">
+        <input id="kb-import-replace" type="checkbox">
+        <span>Replace the topic if it exists</span>
+      </label>
+      <div class="dialog-footer">
+        <div class="kb-import-outcome">
+          <p class="small" id="kb-import-result" role="status"></p>
+          <p class="form-error" id="kb-import-error" role="alert"></p>
+        </div>
+        <div class="dialog-actions">
+          <button type="button" class="btn" id="kb-import-cancel">Cancel</button>
+          <button type="submit" class="btn primary" id="kb-import-submit">Import topic</button>
+        </div>
       </div>
     </form>
   </dialog>

@@ -375,6 +375,13 @@ textarea { resize: vertical; }
 .run-pulls h3 { font-size: 13px; margin: 0; }
 .run-pull { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
 .run-pull .mono { overflow-wrap: anywhere; }
+/* Where a run's steps' Microsoft 365 work context came from (never what it said); a long list
+   scrolls, so the report below stays in view. */
+.run-workiq { display: grid; gap: 6px; flex: none; max-height: 35vh; overflow: auto; padding: 2px; }
+.run-workiq h3 { font-size: 13px; margin: 0; }
+.run-workiq p { margin: 0; }
+.run-workiq-sources { margin: 2px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
+.run-workiq-sources li { overflow-wrap: anywhere; }
 .worker-log { margin-top: 6px; }
 .worker-log > summary { cursor: pointer; font-size: 12.5px; color: var(--accent); width: fit-content; }
 .worker-log pre {
@@ -652,6 +659,11 @@ div.team-sub { display: flex; flex-direction: column; gap: 4px; margin-top: 4px;
 /* A peer's Microsoft 365 grant: its labels and Work IQ tools sit under the checkbox that gives it. */
 .m365-grant .check { font-weight: 400; }
 .m365-sub { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 0 28px; }
+/* The Knowledge import from Microsoft 365: its sources read as text, and what it imported shows
+   above its error. */
+.kb-import-sources { display: flex; flex-direction: column; gap: 6px; }
+.kb-import-sources .check { font-weight: 400; }
+.kb-import-outcome p { margin: 0; }
 /* The error and buttons stay in view while a long dialog scrolls (e.g. on a phone). */
 dialog form > .dialog-footer {
   position: sticky; bottom: 0; z-index: 1; display: flex; flex-direction: column; gap: 12px;

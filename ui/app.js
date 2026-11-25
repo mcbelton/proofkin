@@ -1523,6 +1523,7 @@ async function openRun(id) {
       el("button", { type: "button", class: "btn small", onclick: (e) => openPreview({ run: id, step: p.step }, e.currentTarget) },
         `${previewText(p.label)} of step ${p.step}`)));
     renderRunPulls(id, run.pull_requests ?? []);
+    renderRunWorkiq(run.workiq ?? []);
     $("#run-report").replaceChildren(renderMarkdown(run.report));
     $("#run-dialog").showModal();
     $("#run-close").focus();
@@ -1577,6 +1578,48 @@ function renderRunPulls(runId, works) {
       el("span", { class: "muted small" }, `Step ${w.step}: branch `, el("span", { class: "mono", text: w.branch }),
         ` of ${w.peer}'s clone of `, el("span", { class: "mono", text: w.folder }),
         w.why ? `; no pull request now: ${w.why}.` : w.approval ? `; ${w.peer} approves a pull request first.` : "."))));
+}
+
+/** How many Microsoft 365 results were kept, with their labels, and how many were withheld
+ * ("3 results kept (General), 2 withheld"). */
+function workiqCounts(kept, labels, withheld) {
+  const named = labels?.length ? ` (${labels.join(", ")})` : "";
+  return `${nOf(kept, "result")} kept${named}, ${withheld ? `${withheld} withheld` : "none withheld"}`;
+}
+
+/** `link` if it is a web address (http or https), else null: a source's link is what Work IQ
+ * said, so nothing else (a script, or a Microsoft Graph path) becomes a link. */
+function webAddressOf(link) {
+  if (!link) return null;
+  try {
+    const url = new URL(link);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where the Microsoft 365 work context of a run's steps came from (`steps`, see
+ * GET /api/runs/ID): for each step that had some, how many results were kept, with their
+ * labels, and withheld, and its sources. Never what they said: the run doesn't answer it. */
+function renderRunWorkiq(steps) {
+  const box = $("#run-workiq");
+  box.hidden = !steps.length;
+  box.replaceChildren(...(steps.length ? [
+    el("h3", { text: "Microsoft 365 work context" }),
+    el("p", { class: "muted small", text: "Where each step's work context came from. What it said isn't shown here." }),
+  ] : []), ...steps.map((w) => el("div", { class: "run-workiq-step" },
+    el("p", { class: "small" }, el("strong", { text: `Step ${w.step}` }),
+      ` · Microsoft 365: ${workiqCounts(w.kept, w.labels, w.withheld)}`),
+    w.sources?.length ? el("ul", { class: "run-workiq-sources", "aria-label": `Step ${w.step}'s sources` },
+      ...w.sources.map((s) => {
+        const title = s.title || "Untitled";
+        const href = webAddressOf(s.link);
+        const about = [s.kind, s.label, href ? null : s.link].filter(Boolean).join(" · ");
+        return el("li", {},
+          href ? externalLink(href, title, `${title} in Microsoft 365`, { rel: "noopener noreferrer" }) : el("span", { text: title }),
+          about ? el("span", { class: "muted", text: ` · ${about}` }) : null);
+      })) : null)));
 }
 
 /** A plan whose step starts from the work of step `work.step` of run `runId` (base=),
@@ -2153,11 +2196,12 @@ function renderPalette() {
       ...(state.squads ?? []).map((s) => part(`#${s.name}`, `Any online member of squad ${s.name}`)),
       part("@workiq", "Your agent asks Microsoft 365 (Work IQ) itself: the answer is context, never proof"),
     ]),
-    section("Checks and MCP servers", "What those folders' owners offer", [
+    section("Checks and MCP servers", "What those folders' owners offer; workiq= searches your Microsoft 365 for the step's own words when it is sent", [
       ...[...new Set(shares.flatMap((s) => s.checks ?? []))].map((c) =>
         part(`verify=${c}`, `After the step, the peer's runtime runs its ${c} check`)),
       ...[...new Set(shares.flatMap((s) => s.mcp ?? []))].map((m) =>
         part(`mcp=${m}`, about(m) ? `${m}: ${about(m)}` : `Let the step use MCP server ${m}`)),
+      ...planText.WORKIQ_SOURCES.map(([name, what]) => part(`workiq=${name}`, `Searches ${what}`)),
     ]),
     section("Agents", "A role the step takes, with its instructions, skills and MCP servers", (state.agents ?? []).map((a) =>
       part(`agent=${a.name}`, [a.description, a.skills.length ? `skills: ${a.skills.join(", ")}` : "", a.mcp.length ? `MCP servers: ${a.mcp.join(", ")}` : ""].filter(Boolean).join(" · ") || a.name))),
@@ -2353,6 +2397,109 @@ async function submitMonitor(e) {
   }
 }
 
+// Whether the last import from Microsoft 365 worked: the dialog then opens empty, else with
+// what was typed.
+let kbImported = false;
+
+/** The import's sources, as a step's workiq= takes them: all of Microsoft 365 (the default),
+ * or some of it. */
+function renderKbImportSources() {
+  $("#kb-import-sources").replaceChildren(...planText.WORKIQ_SOURCES.map(([name, what]) =>
+    el("label", { class: "check" },
+      el("input", { type: "checkbox", value: name, checked: name === "all" }),
+      el("span", { text: `${what[0].toUpperCase()}${what.slice(1)}` }))));
+}
+
+/** Checking all clears the other sources, and checking another clears all (as in workiq=). */
+function onKbImportSource(e) {
+  const boxes = [...$("#kb-import-sources").querySelectorAll("input")];
+  const have = boxes.filter((b) => b !== e.target && b.checked).map((b) => b.value);
+  const now = planText.toggleSource(have, e.target.value, e.target.checked);
+  for (const b of boxes) b.checked = now.includes(b.value);
+}
+
+function openKbImport() {
+  if (kbImported) $("#kb-import-form").reset();
+  kbImported = false;
+  $("#kb-import-result").replaceChildren();
+  $("#kb-import-error").textContent = "";
+  $("#kb-import-cancel").textContent = "Cancel";
+  for (const id of ["#kb-import-topic", "#kb-import-query"]) $(id).removeAttribute("aria-invalid");
+  $("#kb-import-dialog").showModal();
+  $("#kb-import-topic").focus();
+}
+
+/** Imports what Work IQ finds in Microsoft 365 as a knowledge topic, marked with where it came
+ * from, and says how many results were kept, with their labels, and withheld. */
+async function submitKbImport(e) {
+  e.preventDefault();
+  const button = $("#kb-import-submit");
+  if (button.disabled) return;
+  const dialog = $("#kb-import-dialog");
+  const error = $("#kb-import-error");
+  const result = $("#kb-import-result");
+  const topicInput = $("#kb-import-topic");
+  const queryInput = $("#kb-import-query");
+  kbImported = false;
+  error.textContent = "";
+  result.replaceChildren();
+  topicInput.removeAttribute("aria-invalid");
+  queryInput.removeAttribute("aria-invalid");
+  const topic = topicInput.value.trim();
+  const query = queryInput.value.trim();
+  const from = [...$("#kb-import-sources").querySelectorAll("input:checked")].map((b) => b.value);
+  const replace = $("#kb-import-replace").checked;
+  const refuse = (input, text, invalid = true) => {
+    error.textContent = text;
+    if (invalid) input.setAttribute("aria-invalid", "true");
+    input.focus();
+  };
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/.test(topic)) {
+    refuse(topicInput, "Name the topic with letters, digits, '-', '_' and '.' (not starting with '.').");
+    return;
+  }
+  if (!replace && (state.knowledge ?? []).some((k) => k.name === topic)) {
+    refuse(topicInput, `There is a topic ${topic} already: check "Replace the topic if it exists" to overwrite it, or name another one.`);
+    return;
+  }
+  if (!query) {
+    refuse(queryInput, "Say what to look for in your Microsoft 365.");
+    return;
+  }
+  if (!from.length) {
+    refuse($("#kb-import-sources input"), "Check where to look: all of your Microsoft 365, or some of it.", false);
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "Importing…";
+  let imported = false;
+  try {
+    const res = await api("/api/kb/import/workiq", {
+      method: "POST",
+      body: JSON.stringify({ topic, query, from: from.join(","), replace }),
+    });
+    imported = true;
+    kbImported = true;
+    const counts = workiqCounts(res.kept, res.labels, res.withheld);
+    if (dialog.open) {
+      result.replaceChildren(el("strong", { text: `Imported ${res.topic}` }), `: ${counts}. Plan steps use it with `,
+        el("span", { class: "mono", text: `context=${res.topic}` }), ".");
+      $("#kb-import-cancel").textContent = "Close";
+    } else {
+      toast(`Imported ${res.topic} from Microsoft 365: ${counts}`);
+    }
+    await loadOps().catch((err) => toast(err.message, "error"));
+  } catch (err) {
+    // Closed while it ran: the error is the toast's.
+    if (dialog.open) error.textContent = err.message;
+    else toast(err.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Import topic";
+    if (dialog.open && focusLost()) (imported ? $("#kb-import-cancel") : button).focus();
+  }
+}
+
 async function loadSkills() {
   const res = await api("/api/skills");
   state.skills = res.skills;
@@ -2371,6 +2518,8 @@ function runDialogFor(title) {
   $("#run-verdict").textContent = "";
   $("#run-signatures").replaceChildren();
   $("#run-prototypes").replaceChildren();
+  $("#run-workiq").hidden = true;
+  $("#run-workiq").replaceChildren();
   $("#run-download").hidden = true;
 }
 
@@ -3945,6 +4094,15 @@ function init() {
   for (const id of ["#workiq-account", "#workiq-per-day", "#workiq-per-run"]) {
     $(id).addEventListener("input", (e) => e.target.removeAttribute("aria-invalid"));
   }
+  renderKbImportSources();
+  $("#kb-import-btn").addEventListener("click", openKbImport);
+  $("#kb-import-form").addEventListener("submit", submitKbImport);
+  $("#kb-import-cancel").addEventListener("click", () => $("#kb-import-dialog").close());
+  $("#kb-import-dialog").addEventListener("close", () => $("#kb-import-btn").focus());
+  $("#kb-import-sources").addEventListener("change", onKbImportSource);
+  for (const id of ["#kb-import-topic", "#kb-import-query"]) {
+    $(id).addEventListener("input", (e) => e.target.removeAttribute("aria-invalid"));
+  }
   $("#pr-form").addEventListener("submit", submitPr);
   $("#pr-cancel").addEventListener("click", () => $("#pr-dialog").close());
   // Monitors run in the background: refresh the health panel now and then.
@@ -4015,8 +4173,8 @@ function init() {
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog",
-    "#branch-dialog", "#pull-dialog", "#workiq-dialog", "#workiq-budget-dialog", "#factory-new-dialog",
-    "#factory-agent-dialog"]) guardDialog($(id));
+    "#branch-dialog", "#pull-dialog", "#workiq-dialog", "#workiq-budget-dialog", "#kb-import-dialog",
+    "#factory-new-dialog", "#factory-agent-dialog"]) guardDialog($(id));
   initModelsDialog();
   initBranchReview();
   $("#provider").addEventListener("change", renderTaskOptions);

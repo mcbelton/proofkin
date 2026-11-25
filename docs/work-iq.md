@@ -210,6 +210,11 @@ local.
   granted them, `save=` marks the topic, and a lead's team results go back only to a
   requester granted what any of its steps held. Each task the runner sends names the labels
   of what it holds (`LlmTask.m365`), so a worker marks the lessons it learns from it.
+- **Never on GitHub**: a tracked run comments its steps' results on their issues, and the
+  repository may be public, so what a step that may hold Microsoft 365 content ended with
+  (one that brings it, reads it through the gateway or is marked with it, one whose evidence
+  names labels, and the steps after them) stays in the run's record: its comment says so
+  ([#250](https://github.com/mcbelton/proofkin/issues/250)).
 
 ### 5. Work context in plans
 

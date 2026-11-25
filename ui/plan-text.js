@@ -23,6 +23,18 @@ const planText = (() => {
   // agent id; it has no skills, MCP servers, checks, claims, patches, folder, model or search of its own.
   const WORKIQ = "@workiq";
   const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq", "model", "effort", "base"]);
+  /// Whether `target` is Microsoft 365 Copilot (@workiq; with a folder, which it can't have).
+  const isWorkiq = (target) => target === WORKIQ || Boolean(target?.startsWith(`${WORKIQ}:`));
+  // What a step with workiq= searches in Microsoft 365, by source (src/plan.rs WORKIQ_SOURCES).
+  const WORKIQ_SOURCES = [
+    ["all", "all of your Microsoft 365: mail, meetings, files, Teams messages, people and connectors"],
+    ["email", "your mail"],
+    ["meetings", "your meetings"],
+    ["files", "your files in OneDrive and SharePoint"],
+    ["teams", "your Teams chats and channel messages"],
+    ["people", "people in your organization (their results are withheld for now)"],
+    ["connectors", "what Microsoft Graph connectors bring in from other systems"],
+  ];
   /// What a new step does until you say: selected, so typing replaces it (the plan
   /// check refuses to run it as is, see src/plan.rs).
   const TODO = "What to do";
@@ -203,7 +215,7 @@ const planText = (() => {
     const step = parseStep(kind === "step" ? at.line : "");
     if (isTarget(part)) {
       if (step.approve && part.startsWith("#")) return { error: ERRORS.squadSignoff };
-      const workiq = part === WORKIQ || part.startsWith(`${WORKIQ}:`);
+      const workiq = isWorkiq(part);
       if (workiq && (step.approve || step.team)) return { error: ERRORS.workiqKind };
       if (step.pr && !/^@[^:]+:.+/.test(part)) return { error: ERRORS.prTarget };
       if (workiq && step.options.some((o) => NOT_IN_WORKIQ.has(optionOf(o)))) return { error: ERRORS.workiqOption };
@@ -220,7 +232,12 @@ const planText = (() => {
       if (!step.pr && optionOf(part) === "reviewers") return { error: ERRORS.reviewersOption };
       if (!step.approve && optionOf(part) === "changes") return { error: ERRORS.changesOption };
       if (step.target === WORKIQ && NOT_IN_WORKIQ.has(optionOf(part))) return { error: ERRORS.workiqOption };
-      setOption(step, part);
+      if (optionOf(part) === "workiq") {
+        setValues(step, "workiq", valueOf(part).split(",").filter(Boolean)
+          .reduce((have, source) => toggleSource(have, source), valuesOf(step, "workiq")));
+      } else {
+        setOption(step, part);
+      }
     }
     step.id ??= nextStepId(text);
     step.target ??= target;
@@ -332,6 +349,28 @@ const planText = (() => {
     const word = `${at >= 0 ? keyOf(step.options[at]) : option}=${list.join(",")}`;
     if (at >= 0) step.options[at] = word;
     else step.options.push(word);
+  }
+
+  /// The workiq= sources `have` with `source` turned on or off: all searches everything,
+  /// so it clears the others, and another source clears all (src/plan.rs refuses both).
+  function toggleSource(have, source, on = true) {
+    if (!on) return have.filter((v) => v !== source);
+    if (source === "all") return ["all"];
+    const rest = have.filter((v) => v !== "all");
+    return rest.includes(source) ? rest : [...rest, source];
+  }
+
+  /// Sets who does a step. Microsoft 365 Copilot (@workiq) answers it: it has no folder,
+  /// provider, or options it can't have (see NOT_IN_WORKIQ). Its agent= is a Work IQ agent's
+  /// id, a peer's is one of your agents, so agent= goes when the step moves between them.
+  function setTarget(step, target) {
+    const workiq = isWorkiq(target);
+    if (workiq) {
+      for (const option of NOT_IN_WORKIQ) setValues(step, option, null);
+      step.using = null;
+    }
+    if (workiq !== isWorkiq(step.target)) setValues(step, "agent", null);
+    step.target = workiq ? WORKIQ : target;
   }
 
   /// The lines after the step line `all[index]` that continue its task text, without
@@ -484,7 +523,7 @@ const planText = (() => {
       if (!NAME.test(s.id) || KEYWORDS.has(s.id)) need("step", i, "id", badName);
       else if (plan.steps.findIndex((x) => x.id === s.id) < i) need("step", i, "id", `Another step is called ${s.id}`);
       if (!s.target) need("step", i, "target", s.approve ? "Choose who signs off" : "Choose who does it");
-      if (s.target === WORKIQ || s.target?.startsWith(`${WORKIQ}:`)) {
+      if (isWorkiq(s.target)) {
         if (s.approve || s.team) need("step", i, "target", ERRORS.workiqKind);
         else if (s.options.some((o) => NOT_IN_WORKIQ.has(optionOf(o)))) need("step", i, "target", ERRORS.workiqOption);
       }
@@ -542,8 +581,8 @@ const planText = (() => {
       : null;
     const who = tracker.login ? `, assigned to ${tracker.login}` : "";
     const after = [
-      ...(board ? [" They move on the ", board, " as the steps run, and each result is commented on its issue."]
-        : [" Each step's result is commented on its issue."]),
+      ...(board ? [" They move on the ", board, " as the steps run, and each result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub)."]
+        : [" Each step's result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub)."]),
       ...(tracker.visibility === "public" ? [" The repository is public: anyone can read them."]
         : tracker.visibility === "internal" ? [" The repository is internal: everyone in its enterprise can read them."]
           : []),
@@ -573,6 +612,6 @@ const planText = (() => {
     parsePlan, formatPlan, valuesOf, setValues, renameStep, removeStep, renameClaim, removeClaim,
     dependents, needs, isTodo: (text) => blank(text, TODO), isTodoClaim: (text) => blank(text, TODO_CLAIM),
     taskOf, setTask, lineKinds: (text) => linesOf(text).map((l) => ({ kind: l.kind, head: l.head })),
-    trackOf, setTrack, trackNote,
+    trackOf, setTrack, trackNote, WORKIQ, WORKIQ_SOURCES, isWorkiq, toggleSource, setTarget,
   };
 })();

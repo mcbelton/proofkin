@@ -2500,7 +2500,7 @@ fn approval_text(prompt: &str) -> String {
 }
 
 /// The steps `id` waits for, directly or through others.
-fn ancestors(plan: &Plan, id: &str) -> std::collections::BTreeSet<String> {
+pub fn ancestors(plan: &Plan, id: &str) -> std::collections::BTreeSet<String> {
     let mut found = std::collections::BTreeSet::new();
     let mut todo = vec![id.to_owned()];
     while let Some(current) = todo.pop() {
