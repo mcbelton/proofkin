@@ -32,7 +32,7 @@ use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext, Usage};
 use crate::plan::{Plan, SquadStore, StepState};
 use crate::profile::{Profile, validate_name};
 use crate::runs::RunRecord;
-use crate::trust::{Ticket, TrustedPeer};
+use crate::trust::{M365Grant, Ticket, TrustedPeer};
 
 mod connect;
 mod models;
@@ -4151,8 +4151,41 @@ struct AllowBody {
     access: Access,
     /// Folders the peer's tasks may use (default: the `data` share).
     shares: Option<Vec<String>>,
+    /// The peer's Microsoft 365 grant; absent keeps the one of the entry this replaces,
+    /// null gives none.
+    #[serde(default, deserialize_with = "nullable")]
+    m365: Option<Option<M365Body>>,
     /// The peer's GitHub account; absent keeps the one set, empty forgets it.
     github: Option<String>,
+}
+
+/// A peer's Microsoft 365 grant as the allowlist dialog sends it: `--m365`'s sensitivity
+/// labels and `--m365-tools`.
+#[derive(Deserialize)]
+struct M365Body {
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    tools: bool,
+}
+
+/// Reads a field that may be left out (`None`, with `#[serde(default)]`), `null`
+/// (`Some(None)`) or given (`Some(Some(_))`).
+fn nullable<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
+/// The grant `m365` gives (null: none) by the CLI's rules, through [`M365Grant::parse`]: at
+/// least one label, never `unknown`, each label once whatever its case.
+fn m365_grant(given: Option<M365Body>) -> Result<Option<M365Grant>, ApiError> {
+    match given {
+        Some(body) => M365Grant::parse(&body.labels.join(","), body.tools).map_err(bad_request),
+        None => Ok(None),
+    }
 }
 
 /// The GitHub account a peer's entry gets from `given` (see [`AllowBody::github`]), else
@@ -4188,12 +4221,15 @@ async fn allow_peer(
         return Err(bad_request("that is this agent's own ticket"));
     }
     let shares = granted_shares(&s, body.delegate, body.shares)?;
-    let m365 = s.agent.trusted().m365_of(&ticket.addr.id, &name);
+    let m365 = match body.m365 {
+        Some(given) => m365_grant(given)?,
+        None => s.agent.trusted().m365_of(&ticket.addr.id, &name),
+    };
     let github = github_account(
         body.github,
         s.agent.trusted().github_of(&ticket.addr.id, &name),
     )?;
-    s.agent.allow(TrustedPeer {
+    let peer = TrustedPeer {
         name: name.clone(),
         id: ticket.addr.id,
         addrs: ticket.addr.addrs,
@@ -4206,19 +4242,20 @@ async fn allow_peer(
         } else {
             Access::ReadOnly
         },
-        shares: shares.clone(),
+        shares,
         m365,
         github,
-    });
+    };
+    let words = grant_words(&peer);
+    s.agent.allow(peer);
     s.save_trust()?;
     s.system(
         "info",
-        format!(
-            "Allowlisted {name}{}",
-            grant_words(body.delegate, body.access, &shares)
-                .map(|w| format!(" ({w})"))
-                .unwrap_or_default()
-        ),
+        if words.is_empty() {
+            format!("Allowlisted {name}")
+        } else {
+            format!("Allowlisted {name} ({})", words.join("; "))
+        },
     );
     s.broadcast_peers();
     Ok(Json(json!({ "name": name })))
@@ -4241,14 +4278,30 @@ fn granted_shares(
     Ok(shares)
 }
 
-/// "may delegate tasks, full access, folders: data, repo" for a peer that may delegate.
-fn grant_words(delegate: bool, access: Access, shares: &[String]) -> Option<String> {
-    delegate.then(|| {
-        format!(
-            "may delegate tasks, {access} access, folders: {}",
-            shares.join(", ")
-        )
-    })
+/// What a peer's grant lets it do, for the activity feed: "may delegate tasks, full access,
+/// folders: data, repo" if it may delegate, and "Microsoft 365: General, Public (and its
+/// tasks may use Work IQ)" if it may receive Microsoft 365 content.
+fn grant_words(peer: &TrustedPeer) -> Vec<String> {
+    let mut words = Vec::new();
+    if peer.can_delegate {
+        words.push(format!(
+            "may delegate tasks, {} access, folders: {}",
+            peer.access,
+            peer.shares.join(", ")
+        ));
+    }
+    if let Some(grant) = &peer.m365 {
+        words.push(format!(
+            "Microsoft 365: {}{}",
+            grant.labels.join(", "),
+            if grant.tools {
+                " (and its tasks may use Work IQ)"
+            } else {
+                ""
+            }
+        ));
+    }
+    words
 }
 
 /// What an allowlisted peer may do, as the allowlist's Change… sets it.
@@ -4260,13 +4313,16 @@ struct PeerGrantBody {
     #[serde(default)]
     access: Access,
     shares: Option<Vec<String>>,
+    /// The peer's Microsoft 365 grant; absent keeps the one set, null removes it.
+    #[serde(default, deserialize_with = "nullable")]
+    m365: Option<Option<M365Body>>,
     /// The peer's GitHub account; absent keeps the one set, empty forgets it.
     github: Option<String>,
 }
 
-/// Changes what an allowlisted peer may do (and its GitHub account), keeping its name,
-/// addresses and Microsoft 365 grant: a connected peer stays connected and learns its
-/// folders at once.
+/// Changes what an allowlisted peer may do (with its Microsoft 365 grant and GitHub
+/// account, unless the change leaves them out), keeping its name and addresses: a
+/// connected peer stays connected and learns its folders at once.
 async fn change_peer(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -4285,6 +4341,9 @@ async fn change_peer(
         ));
     };
     let shares = granted_shares(&s, body.delegate, body.shares)?;
+    if let Some(given) = body.m365 {
+        peer.m365 = m365_grant(given)?;
+    }
     peer.github = github_account(body.github, peer.github.take())?;
     peer.can_delegate = body.delegate;
     peer.tasks_per_hour = body
@@ -4295,17 +4354,17 @@ async fn change_peer(
     } else {
         Access::ReadOnly
     };
-    peer.shares = shares.clone();
+    peer.shares = shares;
     let name = peer.name.clone();
+    let mut words = grant_words(&peer);
+    if !peer.can_delegate {
+        words.insert(0, "chat only (it may not delegate tasks)".to_owned());
+    }
     s.agent.allow(peer);
     s.save_trust()?;
     s.system(
         "info",
-        format!(
-            "Changed what {name} may do: {}",
-            grant_words(body.delegate, body.access, &shares)
-                .unwrap_or_else(|| "chat only (it may not delegate tasks)".to_owned())
-        ),
+        format!("Changed what {name} may do: {}", words.join("; ")),
     );
     s.broadcast_peers();
     Ok(Json(json!({ "name": name })))

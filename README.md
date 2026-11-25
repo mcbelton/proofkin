@@ -1928,6 +1928,15 @@ proofkin --name me --providers copilot --serve --ui
   ask to review), change what one may do or its GitHub account (**Change…**: it stays
   connected), or remove one; changes are saved to the profile's `peers.json` and take
   effect at once (removed peers are disconnected).
+
+  The same dialog sets a peer's Microsoft 365 grant, as `peers allow --m365` does: tick
+  **Let this peer receive Microsoft 365 content (Work IQ)** and enter the sensitivity labels
+  it may receive, comma separated (`unlabeled` allows content with no label; content without
+  label information never goes to a peer), and tick **Its tasks may also use this agent's
+  Work IQ (read only)** for `--m365-tools`. **Change…** shows the peer's grant, and clearing
+  the first box removes it; adding a peer again without ticking it keeps the one it had. The
+  list shows a granted peer's grant ("M365: General, Public · Work IQ tools"); see the
+  [Security model](#security-model).
 - **Digital workers**: create [digital workers](#digital-workers) that run on your
   sign-ins (sign in to Copilot right there with a GitHub CLI account), in the folders you
   pick; start and stop them, choose whether they start with this agent, set their

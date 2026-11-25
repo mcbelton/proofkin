@@ -4485,3 +4485,184 @@ async fn the_page_has_the_workiq_card_after_the_github_card_and_guards_its_dialo
     }
     agent.shutdown().await;
 }
+
+/// Calls the web UI, which must answer 200, then reads the Microsoft 365 grant of the
+/// allowlist's first peer as the page shows it (checking that `peers.json` keeps the same),
+/// and the activity's last line.
+async fn m365_after(
+    port: u16,
+    token: &str,
+    peers_file: &std::path::Path,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> (Value, String) {
+    let res = call_ui(port, Some(token), method, path, body).await;
+    assert_eq!(res.status, 200, "{method} {path}: {}", res.body);
+    let state = call_ui(port, Some(token), "GET", "/api/state", Value::Null)
+        .await
+        .json();
+    let shown = state["trusted"][0]["m365"].clone();
+    let text = std::fs::read_to_string(peers_file).unwrap();
+    let saved: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(saved["peers"][0]["m365"], shown, "peers.json: {saved}");
+    let said = state["feed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|i| i["kind"] == "system")
+        .and_then(|i| i["text"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    (shown, said)
+}
+
+/// The allowlist sets, changes and removes a peer's Microsoft 365 grant as `peers allow
+/// --m365 <labels> [--m365-tools]` does, and the page, `peers.json` and the activity say
+/// it: adding or changing the peer without `m365` keeps its grant, another grant replaces
+/// it (each label once, whatever its case), and null removes it.
+#[tokio::test]
+async fn the_allowlist_sets_changes_and_removes_a_peers_microsoft_365_grant() {
+    let home = tempfile::tempdir().unwrap();
+    let (agent, port, token) = ui_of(home.path(), "boss").await;
+    let profile = Profile::open_in(home.path(), "boss").unwrap();
+    let file = profile.trust_path();
+    let after = |method: &'static str, path: &str, body: Value| {
+        let (token, file, path) = (token.clone(), file.clone(), path.to_owned());
+        async move { m365_after(port, &token, &file, method, &path, body).await }
+    };
+    let peer = SecretKey::generate().public();
+    let change = format!("/api/trust/{peer}");
+    // Adding pal, with `m365` when given (null too).
+    let add = |m365: Option<Value>| {
+        let mut body = serde_json::json!({ "ticket": peer.to_string(), "name": "pal" });
+        if let Some(m365) = m365 {
+            body["m365"] = m365;
+        }
+        body
+    };
+    let chat = "Changed what pal may do: chat only (it may not delegate tasks)";
+
+    // Added with a grant: the page shows it, peers.json keeps it and the activity says it.
+    let general = serde_json::json!({ "labels": ["General", "Public"], "tools": true });
+    let words = "Microsoft 365: General, Public (and its tasks may use Work IQ)";
+    let added = (general.clone(), format!("Allowlisted pal ({words})"));
+    let first = after("POST", "/api/trust", add(Some(general.clone()))).await;
+    assert_eq!(first, added);
+    // Added again, or changed, without one: it keeps its grant.
+    assert_eq!(after("POST", "/api/trust", add(None)).await, added);
+    let kept = after("PUT", &change, serde_json::json!({ "delegate": false })).await;
+    assert_eq!(kept, (general, format!("{chat}; {words}")));
+
+    // Another grant replaces it, each label once whatever its case.
+    let labels = ["Confidential", " confidential ", "unlabeled", ""];
+    let body = serde_json::json!({ "m365": { "labels": labels } });
+    let other = after("PUT", &change, body).await;
+    let once = serde_json::json!({ "labels": ["Confidential", "unlabeled"], "tools": false });
+    let said = format!("{chat}; Microsoft 365: Confidential, unlabeled");
+    assert_eq!(other, (once, said));
+
+    // Null removes it, from peers.json too; so does adding pal again with null.
+    let removed = after("PUT", &change, serde_json::json!({ "m365": null })).await;
+    assert_eq!(removed, (Value::Null, chat.to_owned()));
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("m365"));
+    let public = serde_json::json!({ "labels": ["Public"] });
+    let again = after("POST", "/api/trust", add(Some(public))).await;
+    let granted = serde_json::json!({ "labels": ["Public"], "tools": false });
+    let said = "Allowlisted pal (Microsoft 365: Public)".to_owned();
+    assert_eq!(again, (granted, said));
+    let off = after("POST", "/api/trust", add(Some(Value::Null))).await;
+    assert_eq!(off, (Value::Null, "Allowlisted pal".to_owned()));
+    agent.shutdown().await;
+}
+
+/// The allowlist holds a Microsoft 365 grant to the CLI's rules: `unknown` (content with no
+/// label information) and a grant without labels are refused with a 400 in
+/// `M365Grant::parse`'s words, whether adding or changing the peer, which keeps the grant it
+/// had, in `peers.json` too.
+#[tokio::test]
+async fn microsoft_365_grants_with_unknown_or_without_labels_are_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let (agent, port, token) = ui_of(home.path(), "boss").await;
+    let call = |method: &'static str, path: &str, body: Value| {
+        let (token, path) = (token.clone(), path.to_owned());
+        async move { call_ui(port, Some(&token), method, &path, body).await }
+    };
+    let peer = SecretKey::generate().public();
+    let (ticket, change) = (peer.to_string(), format!("/api/trust/{peer}"));
+    let grant = serde_json::json!({ "labels": ["Public"], "tools": false });
+    let body = serde_json::json!({ "ticket": ticket, "name": "pal", "m365": grant });
+    let added = call("POST", "/api/trust", body).await;
+    assert_eq!(added.status, 200, "{}", added.body);
+    let profile = Profile::open_in(home.path(), "boss").unwrap();
+    let before = std::fs::read_to_string(profile.trust_path()).unwrap();
+    let cases: [&[&str]; 4] = [&["General", "unknown"], &["Unknown"], &[], &[" ", ""]];
+    for labels in cases {
+        let words = proofkin::M365Grant::parse(&labels.join(","), true)
+            .unwrap_err()
+            .to_string();
+        let m365 = serde_json::json!({ "labels": labels, "tools": true });
+        let add_body = serde_json::json!({ "ticket": ticket, "name": "pal", "m365": m365 });
+        let change_body = serde_json::json!({ "m365": m365 });
+        for (method, path, body) in [
+            ("POST", "/api/trust", add_body),
+            ("PUT", change.as_str(), change_body),
+        ] {
+            let refused = call(method, path, body).await;
+            assert_eq!(refused.status, 400, "{labels:?}: {}", refused.body);
+            assert_eq!(refused.json()["error"], words, "{method} {labels:?}");
+        }
+    }
+    let state = call("GET", "/api/state", Value::Null).await.json();
+    assert_eq!(state["trusted"][0]["m365"], grant);
+    let after = std::fs::read_to_string(profile.trust_path()).unwrap();
+    assert_eq!(after, before);
+    agent.shutdown().await;
+}
+
+/// The allowlist dialog offers a peer's Microsoft 365 grant after its folders: receiving
+/// Microsoft 365 content, the sensitivity labels it may receive (what `unlabeled` means, and
+/// that content without label information never goes to a peer) and Work IQ tools; each of
+/// those fields app.js looks up is there.
+#[tokio::test]
+async fn the_allowlist_dialog_offers_the_microsoft_365_grant_after_the_folders() {
+    let home = tempfile::tempdir().unwrap();
+    let (agent, port, _token) = solo_ui(home.path()).await;
+    let host = format!("127.0.0.1:{port}");
+    let page = request(port, "GET", "/", &host, None, None).await.body;
+    let at = |needle: &str| page.find(needle).expect(needle);
+    let folders = at(r#"id="shares-field""#);
+    let grant = at(r#"<fieldset class="field m365-grant" id="m365-field">"#);
+    let error = at(r#"id="add-error""#);
+    assert!(at(r#"<dialog id="add-dialog""#) < folders);
+    assert!(folders < grant && grant < error);
+    let fieldset = &page[grant..grant + page[grant..].find("</fieldset>").unwrap()];
+    for words in [
+        "Let this peer receive Microsoft 365 content (Work IQ)",
+        "<span>Sensitivity labels it may receive</span>",
+        r#"placeholder="General, Public, unlabeled…""#,
+        r#"<span class="mono">unlabeled</span> allows content with no label"#,
+        "content without label information never goes to a peer",
+        "Its tasks may also use this agent's Work IQ (read only)",
+    ] {
+        assert!(fieldset.contains(words), "{words}: {fieldset}");
+    }
+    // An element app.js looks up that isn't on the page stops it starting.
+    let app = request(port, "GET", "/app.js", &host, None, None)
+        .await
+        .body;
+    let ids = regex::Regex::new(r##""#((?:add-)?m365[\w-]*)""##)
+        .unwrap()
+        .captures_iter(&app)
+        .map(|c| c[1].to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(ids.len() >= 4, "{ids:?}");
+    for id in &ids {
+        assert!(
+            fieldset.contains(&format!(r#"id="{id}""#)),
+            "#{id} isn't in the grant's fields"
+        );
+    }
+    agent.shutdown().await;
+}

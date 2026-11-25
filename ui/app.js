@@ -396,6 +396,13 @@ function renderPeers() {
               // The folders as text: in the pill they wrap into a blob in a narrow column.
               el("span", { class: "trust-shares", text: `in ${(t.shares ?? []).join(", ") || "no folder"}` })]
             : el("span", { class: "badge neutral", title: "It can connect and chat, but can't run tasks on this agent's accounts", text: "Chat only" }),
+          t.m365
+            ? el("span", {
+              class: "trust-m365",
+              title: `It may receive Microsoft 365 content with these sensitivity labels${t.m365.tools ? ", and its tasks may use this agent's Work IQ (read only)" : ""}`,
+              text: `M365: ${(t.m365.labels ?? []).join(", ")}${t.m365.tools ? " · Work IQ tools" : ""}`,
+            })
+            : null,
           t.github
             ? el("span", { class: "trust-github", title: "Its GitHub account: pull request steps ask it to review", text: `GitHub ${t.github}` })
             : null)),
@@ -3635,6 +3642,11 @@ function syncDelegateFields() {
   $("#access-hint").textContent = hint.join(" ");
 }
 
+/** A Microsoft 365 grant's labels and Work IQ tools show while its checkbox is ticked. */
+function syncM365Fields() {
+  $("#m365-grant-fields").hidden = !$("#add-m365").checked;
+}
+
 /** Ticks the folders in `selected` (default: the data folder). */
 function renderShareChecks(selected = ["data"]) {
   const box = $("#add-shares");
@@ -3670,6 +3682,8 @@ function openAddDialog(endpoint) {
   grantOpener = null;
   renderShareChecks();
   syncDelegateFields();
+  syncM365Fields();
+  $("#add-m365-labels").removeAttribute("aria-invalid");
   $("#add-error").textContent = "";
   $("#add-dialog").showModal();
   if (typeof endpoint === "string") {
@@ -3689,7 +3703,12 @@ function openGrantDialog(peer, opener) {
   $("#add-rate").value = peer.tasks_per_hour ?? 20;
   $("#add-access").value = peer.can_delegate ? peer.access ?? "read-only" : "read-only";
   $("#add-github").value = peer.github ?? "";
+  $("#add-m365").checked = !!peer.m365;
+  $("#add-m365-labels").value = peer.m365?.labels?.join(", ") ?? "";
+  $("#add-m365-labels").removeAttribute("aria-invalid");
+  $("#add-m365-tools").checked = !!peer.m365?.tools;
   syncDelegateFields();
+  syncM365Fields();
   $("#add-error").textContent = "";
   $("#add-dialog").showModal();
   $("#add-delegate").focus();
@@ -3697,7 +3716,13 @@ function openGrantDialog(peer, opener) {
 
 async function submitAdd(e) {
   e.preventDefault();
+  const button = $("#add-submit");
+  if (button.disabled) return;
+  const dialog = $("#add-dialog");
   const errorBox = $("#add-error");
+  const labelsInput = $("#add-m365-labels");
+  errorBox.textContent = "";
+  labelsInput.removeAttribute("aria-invalid");
   const delegate = $("#add-delegate").checked;
   const grant = {
     delegate,
@@ -3707,32 +3732,49 @@ async function submitAdd(e) {
   };
   // Empty forgets a peer's account when changing it; adding a peer again keeps the one it had.
   const github = $("#add-github").value.trim().replace(/^@/, "");
-  if (grantPeer) {
-    const peer = grantPeer;
-    try {
-      await api(`/api/trust/${encodeURIComponent(peer.id)}`, { method: "PUT", body: JSON.stringify({ ...grant, github }) });
-      $("#add-dialog").close();
-      toast(`Saved what ${peer.name} may do`);
-    } catch (err) {
-      errorBox.textContent = err.message;
-    }
-    return;
-  }
+  const peer = grantPeer;
   const ticket = $("#add-ticket").value.trim();
-  if (!ticket) {
+  if (!peer && !ticket) {
     errorBox.textContent = "Paste the peer's ticket or endpoint id.";
     $("#add-ticket").focus();
     return;
   }
+  // Unticked, changing a peer removes its grant (null, like --m365 off), and adding a peer again
+  // keeps the one it had (left out, like no --m365).
+  let m365 = peer ? null : undefined;
+  if ($("#add-m365").checked) {
+    const labels = labelsInput.value.split(",").map((l) => l.trim()).filter(Boolean);
+    if (!labels.length) {
+      errorBox.textContent = "Enter the sensitivity labels it may receive, e.g. General, Public, unlabeled.";
+      labelsInput.setAttribute("aria-invalid", "true");
+      labelsInput.focus();
+      return;
+    }
+    m365 = { labels, tools: $("#add-m365-tools").checked };
+  }
+  button.disabled = true;
+  button.textContent = peer ? "Saving…" : "Adding…";
   try {
-    const res = await api("/api/trust", {
-      method: "POST",
-      body: JSON.stringify({ ticket, name: $("#add-name").value.trim() || null, github: github || null, ...grant }),
-    });
-    $("#add-dialog").close();
-    toast(`${res.name} added to the allowlist`);
+    if (peer) {
+      await api(`/api/trust/${encodeURIComponent(peer.id)}`, { method: "PUT", body: JSON.stringify({ ...grant, m365, github }) });
+      if (dialog.open) dialog.close();
+      toast(`Saved what ${peer.name} may do`);
+    } else {
+      const res = await api("/api/trust", {
+        method: "POST",
+        body: JSON.stringify({ ticket, name: $("#add-name").value.trim() || null, github: github || null, m365, ...grant }),
+      });
+      if (dialog.open) dialog.close();
+      toast(`${res.name} added to the allowlist`);
+    }
   } catch (err) {
-    errorBox.textContent = err.message;
+    // Closed while it ran: the error is the toast's.
+    if (dialog.open) errorBox.textContent = err.message;
+    else toast(err.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = grantPeer ? "Save" : "Add peer";
+    if (dialog.open && focusLost()) button.focus();
   }
 }
 
@@ -3998,6 +4040,7 @@ function init() {
   $("#add-form").addEventListener("submit", submitAdd);
   $("#add-delegate").addEventListener("change", syncDelegateFields);
   $("#add-access").addEventListener("change", syncDelegateFields);
+  $("#add-m365").addEventListener("change", syncM365Fields);
   setInterval(() => {
     for (const span of document.querySelectorAll(".elapsed[data-start]")) {
       span.textContent = `running ${duration(Date.now() - Number(span.dataset.start))}`;
