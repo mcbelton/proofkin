@@ -11,7 +11,8 @@
 //! What it asks for is resolved against what its owner offers where it works
 //! ([`capabilities`]); its model policy says which models it may run on and which one a
 //! release takes ([`routing`]); its [`memory`] says what knowledge it reads and where
-//! the lessons of its verified work go. [`cli`] is `proofkin factory`.
+//! the lessons of its verified work go. [`cli`] is `proofkin factory`; an agent may also be
+//! kept as code, in a folder under git ([`code`]).
 //!
 //! An evaluation runs a build's cases, with the built-in [`adversarial`] ones, on each
 //! candidate model, a few times each, on the owner's evaluation worker, and grades the
@@ -24,6 +25,7 @@ pub mod blueprint;
 pub mod build;
 pub mod capabilities;
 pub mod cli;
+pub mod code;
 pub mod draft;
 pub mod evals;
 pub mod judge;

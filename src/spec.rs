@@ -26,8 +26,8 @@ use serde_json::Value;
 /// The spec package's checks.
 pub const SPEC_CHECKS: &[&str] = &["spec:spec", "spec:api", "spec:ux", "spec:trace"];
 
-/// Every built-in check, by name: the spec package's, the design package's and the
-/// review pack's.
+/// Every built-in check, by name: the spec package's, the design package's, the review
+/// pack's and an agent's kept as code (see [`crate::factory::code`]).
 pub const BUILT_IN_CHECKS: &[&str] = &[
     "spec:spec",
     "spec:api",
@@ -40,6 +40,9 @@ pub const BUILT_IN_CHECKS: &[&str] = &[
     "design:ops",
     "review:decks",
     "review:rehearsal",
+    "agent:blueprint",
+    "agent:evals",
+    "agent:report",
 ];
 
 pub fn is_built_in(check: &str) -> bool {
@@ -92,6 +95,13 @@ pub fn about(check: &str) -> &'static str {
         "design:ops" => "design/operations.md has rollout, rollback, SLOs, alerts and runbooks",
         "review:decks" => "review/ has a document for each review audience in its own form",
         "review:rehearsal" => "review/rehearsal.md has each audience's likely verdict and answers",
+        "agent:blueprint" => "agent/blueprint.json is a valid agent blueprint, its skills there",
+        "agent:evals" => {
+            "agent/evals.json proves every requirement deterministically, with its fixtures"
+        }
+        "agent:report" => {
+            "agent/reports/ has a passed, verified evaluation of the folder's agent as built"
+        }
         _ => "",
     }
 }
@@ -135,6 +145,7 @@ pub fn run(name: &str, dir: &Path) -> Report {
         _ if name.starts_with("design:") || name.starts_with("review:") => {
             crate::design::run(name, dir)
         }
+        _ if name.starts_with("agent:") => crate::factory::code::run(name, dir),
         _ => Report {
             problems: vec![format!("unknown built-in check {name}")],
             notes: vec![],
@@ -223,6 +234,11 @@ pub(crate) const MAX_FILE: u64 = 2 * 1024 * 1024;
 /// Reads `rel` inside `dir` without following symbolic links (built-in checks run in
 /// this process, outside any sandbox, so a link must not lead them out of the folder).
 pub(crate) fn read_inside(dir: &Path, rel: &str) -> Result<String, String> {
+    read_inside_up_to(dir, rel, MAX_FILE)
+}
+
+/// [`read_inside`], for files up to `max` bytes.
+pub(crate) fn read_inside_up_to(dir: &Path, rel: &str, max: u64) -> Result<String, String> {
     let mut path = dir.to_path_buf();
     for part in Path::new(rel).components() {
         path.push(part);
@@ -237,7 +253,7 @@ pub(crate) fn read_inside(dir: &Path, rel: &str) -> Result<String, String> {
         }
     }
     match std::fs::metadata(&path) {
-        Ok(m) if m.len() > MAX_FILE => Err(format!("{rel} is larger than {MAX_FILE} bytes")),
+        Ok(m) if m.len() > max => Err(format!("{rel} is larger than {max} bytes")),
         _ => std::fs::read_to_string(&path).map_err(|e| format!("{rel} can't be read: {e}")),
     }
 }

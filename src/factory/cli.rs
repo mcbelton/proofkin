@@ -15,7 +15,7 @@ use crate::factory::evals::check_fixtures;
 use crate::factory::report::{EvalState, Evaluation, RunState};
 use crate::factory::runner::{self, Judges, Planned, Request, Runner};
 use crate::factory::store::{Draft, FactoryStore, Provenance, now};
-use crate::factory::{capabilities, draft, routing, templates};
+use crate::factory::{capabilities, code, draft, routing, templates};
 use crate::llm::{ExecutorConfig, Provider, SdkExecutor};
 use crate::profile::Profile;
 use crate::workers::{Launch, Supervisor};
@@ -33,12 +33,14 @@ pub enum FactoryCommand {
     /// how many eval cases it starts with.
     Templates,
     /// Start an agent: a draft from a template, or one the profile's model writes
-    /// from your words (read-only, in an empty folder; it grants nothing).
+    /// from your words (read-only, in an empty folder; it grants nothing), or from a
+    /// folder made by `factory init`.
     #[command(after_help = "\
 examples:
   proofkin factory new reviewer --template code-reviewer --profile alice
   proofkin factory new fin-analyst --describe \"Analyze quarterly reports, extract key metrics, flag risks, write an executive summary\" --profile alice
-  proofkin factory new fin-analyst --template financial-analyst --describe \"...for our board, in euros\" --using claude --profile alice")]
+  proofkin factory new fin-analyst --template financial-analyst --describe \"...for our board, in euros\" --using claude --profile alice
+  proofkin factory new ask --from ./my-repo --profile alice")]
     New {
         /// The agent's name.
         name: String,
@@ -48,6 +50,10 @@ examples:
         /// What the agent should do, in your words: the profile's model writes the draft.
         #[arg(long)]
         describe: Option<String>,
+        /// Start from the agent kept as code in this folder (agent/blueprint.json and
+        /// agent/evals.json; its fixtures are copied), or a blueprint file.
+        #[arg(long, conflicts_with_all = ["template", "describe"])]
+        from: Option<PathBuf>,
         /// The provider whose model writes the draft (default: the first one the
         /// profile is signed in to).
         #[arg(long, value_enum)]
@@ -73,10 +79,11 @@ examples:
         profile: ProfileOpt,
     },
     /// Edit an agent's draft in your editor (VISUAL or EDITOR), or replace it from a
-    /// file (- for stdin). It is checked when saved and kept with its problems.
+    /// file (- for stdin) or a folder made by `factory init` (its fixtures are copied too).
+    /// It is checked when saved and kept with its problems.
     Edit {
         name: String,
-        /// Take the blueprint from this file instead of an editor.
+        /// Take the blueprint from this file, or this folder's agent/, instead of an editor.
         #[arg(long)]
         from: Option<PathBuf>,
         #[command(flatten)]
@@ -95,7 +102,8 @@ error naming the command that offers it. Checking never shares, offers or grants
     Check {
         /// The draft to check.
         name: Option<String>,
-        /// Check this blueprint file instead (its fixtures are in fixtures/ next to it).
+        /// Check this blueprint file instead (its fixtures are in fixtures/ next to it), or
+        /// the agent kept as code in this folder (agent/).
         #[arg(long, conflicts_with = "name")]
         file: Option<PathBuf>,
         /// The folders to resolve its capabilities in (comma-separated; default: its
@@ -156,6 +164,34 @@ evaluation of the same build that didn't end; Ctrl+C cancels it.")]
         #[command(flatten)]
         profile: ProfileOpt,
     },
+    /// Keep an agent as code: write its files into a folder under git, for plan steps to
+    /// prove with the built-in checks agent:blueprint, agent:evals and agent:report.
+    #[command(after_help = "\
+writes:
+  agent/blueprint.json   its blueprint, without its eval suite
+  agent/evals.json       its eval suite
+  agent/fixtures/        files its cases work on
+  agent/skills/          skills of its own (<name>.md), next to the built-in ones
+  agent/reports/         its evaluations' signed reports
+examples:
+  proofkin factory init . --name ask --template researcher
+  proofkin spec check agent --dir .
+  proofkin factory new ask --from . --profile alice
+  proofkin factory evaluate ask --yes --profile alice
+  proofkin factory report ev-20261124-091500-ask --json --out agent/reports/ev-20261124-091500-ask.json --profile alice")]
+    Init {
+        /// The folder (usually a repository).
+        dir: PathBuf,
+        /// The agent's name.
+        #[arg(long)]
+        name: String,
+        /// The template it starts from (proofkin factory templates lists them).
+        #[arg(long, default_value = "researcher")]
+        template: String,
+        /// Fit it to this profile: the providers it is signed in to.
+        #[arg(long = "profile")]
+        profile: Option<String>,
+    },
     /// Delete an agent's draft and records (not an agent with releases: their records
     /// are kept).
     Delete {
@@ -186,10 +222,22 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
             name,
             template,
             describe,
+            from,
             using,
             profile,
             bridge,
-        } => new(&name, template, describe, using, &profile.name, bridge).await?,
+        } => {
+            new(
+                &name,
+                template,
+                describe,
+                from.as_deref(),
+                using,
+                &profile.name,
+                bridge,
+            )
+            .await?
+        }
         FactoryCommand::List { profile } => list(&Profile::open(&profile.name)?)?,
         FactoryCommand::Show {
             name,
@@ -237,6 +285,27 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
             out,
             profile,
         } => report(&Profile::open(&profile.name)?, &id, json, out.as_deref())?,
+        FactoryCommand::Init {
+            dir,
+            name,
+            template,
+            profile,
+        } => {
+            let catalog = match &profile {
+                Some(profile) => Some(Catalog::of(&Profile::open(profile)?)?),
+                None => None,
+            };
+            let written = code::init(&dir, &name, &template, catalog.as_ref())?;
+            println!(
+                "wrote agent {name} (template {template}) in {}: {}",
+                dir.display(),
+                written.join(", ")
+            );
+            println!(
+                "next: proofkin spec check agent --dir {0}   (agent:blueprint, agent:evals)\n      proofkin factory new {name} --from {0} --profile PROFILE   (a draft to evaluate)",
+                dir.display()
+            );
+        }
         FactoryCommand::Delete { name, profile } => {
             let profile = Profile::open(&profile.name)?;
             if !FactoryStore::of(&profile).delete(&name)? {
@@ -255,12 +324,16 @@ async fn new(
     name: &str,
     template: Option<String>,
     describe: Option<String>,
+    from: Option<&Path>,
     using: Option<Provider>,
     profile: &str,
     bridge: Option<PathBuf>,
 ) -> Result<()> {
     let profile = Profile::open(profile)?;
     let catalog = Catalog::of(&profile)?;
+    if let Some(from) = from {
+        return new_from(&profile, &catalog, name, from);
+    }
     let (draft, problems, what) = match (describe, template) {
         (Some(words), template) => {
             let provider = match using {
@@ -336,7 +409,7 @@ async fn new(
             (draft, problems, format!("drafted from template {template}"))
         }
         (None, None) => bail!(
-            "give --template NAME (proofkin factory templates lists them) or --describe \"what the agent should do\""
+            "give --template NAME (proofkin factory templates lists them), --describe \"what the agent should do\" or --from FOLDER"
         ),
     };
     FactoryStore::of(&profile).create_draft(name, &draft, &profile.name, &what)?;
@@ -350,6 +423,64 @@ async fn new(
         "next: proofkin factory show {name} --profile {0}   (what it asks for and how it is tested)\n      proofkin factory edit {name} --profile {0}   (change it: it is checked when you save)",
         profile.name
     );
+    Ok(())
+}
+
+/// The blueprint at `path` (a file, - for stdin, or a folder whose agent is kept as code),
+/// as text, and the folder its fixtures are in.
+fn blueprint_at(path: &Path) -> Result<(String, PathBuf)> {
+    if path.is_dir() {
+        let value = code::blueprint_value(path)?;
+        return Ok((
+            serde_json::to_string_pretty(&value)?,
+            path.join(code::FIXTURES),
+        ));
+    }
+    let fixtures = path.parent().unwrap_or(Path::new(".")).join("fixtures");
+    Ok((read_input(path)?, fixtures))
+}
+
+/// Starts draft `name` from the agent kept as code in folder `from` (or a blueprint file),
+/// with its fixtures.
+fn new_from(profile: &Profile, catalog: &Catalog, name: &str, from: &Path) -> Result<()> {
+    if let Some(problem) = name_problem(name, catalog) {
+        bail!("{problem}");
+    }
+    let (text, fixtures) = blueprint_at(from)?;
+    let blueprint: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| anyhow!("{} isn't JSON: {e}", from.display()))?;
+    if blueprint.get("name").and_then(Value::as_str) != Some(name) {
+        bail!(
+            "the agent in {} isn't named \"{name}\": give its name",
+            from.display()
+        );
+    }
+    let store = FactoryStore::of(profile);
+    let draft = Draft {
+        blueprint,
+        provenance: Provenance {
+            source: "file".into(),
+            at: now(),
+            ..Provenance::default()
+        },
+        tries: 0,
+    };
+    let what = format!("drafted from {}", from.display());
+    store.create_draft(name, &draft, &profile.name, &what)?;
+    let copied = code::copy_fixtures_from(&fixtures, &store.fixtures_dir(name))?;
+    let problems = problems_of(
+        &store,
+        name,
+        &draft.blueprint,
+        &catalog.clone().without(name),
+    );
+    println!(
+        "profile '{}': created draft {name} ({what}, {}): {}",
+        profile.name,
+        plural(copied, "fixture", "fixtures"),
+        summary(&problems)
+    );
+    print_problems(&problems);
     Ok(())
 }
 
@@ -563,11 +694,14 @@ fn provenance_text(draft: &Draft) -> String {
 fn edit(profile: &Profile, name: &str, from: Option<&Path>) -> Result<()> {
     let store = FactoryStore::of(profile);
     let draft = draft_of(&store, profile, name)?;
-    let (text, edited) = match from {
-        Some(path) => (read_input(path)?, None),
+    let (text, edited, fixtures) = match from {
+        Some(path) => {
+            let (text, fixtures) = blueprint_at(path)?;
+            (text, None, path.is_dir().then_some(fixtures))
+        }
         None => {
             let (text, path) = in_editor(name, &draft.blueprint)?;
-            (text, Some(path))
+            (text, Some(path), None)
         }
     };
     let kept = || {
@@ -595,6 +729,10 @@ fn edit(profile: &Profile, name: &str, from: Option<&Path>) -> Result<()> {
     )?;
     if let Some(path) = edited {
         let _ = std::fs::remove_file(path);
+    }
+    // A folder's agent comes with its fixtures.
+    if let Some(fixtures) = fixtures {
+        code::copy_fixtures_from(&fixtures, &store.fixtures_dir(name))?;
     }
     let catalog = Catalog::of(profile)?.without(name);
     let problems = problems_of(&store, name, &blueprint, &catalog);
@@ -662,13 +800,12 @@ fn check(
         }
         (None, Some(path)) => {
             let label = path.display().to_string();
-            let text = read_input(path)?;
+            let (text, fixtures) = blueprint_at(path)?;
             match crate::factory::blueprint::parse(&text) {
                 Err(problem) => (label, None, vec![problem]),
                 Ok(blueprint) => {
                     let catalog = Catalog::of(profile)?.without(&blueprint.name);
                     let mut problems = crate::factory::blueprint::validate(&blueprint, &catalog);
-                    let fixtures = path.parent().unwrap_or(Path::new(".")).join("fixtures");
                     problems.extend(check_fixtures(&blueprint.evals, &fixtures));
                     (label, Some((blueprint, catalog)), problems)
                 }

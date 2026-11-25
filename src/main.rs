@@ -757,16 +757,17 @@ skills with them, and the step's folder must offer its MCP servers.")]
 #[derive(Subcommand)]
 enum SpecCommand {
     /// Run built-in checks on a folder: a check (api, threats, review:decks, ...), a
-    /// group (spec, design, review) or all.
+    /// group (spec, design, review, agent) or all.
     #[command(after_help = "\
 checks:
   spec:spec spec:api spec:ux spec:trace              the spec package (spec/, prototype/, evidence/claims.json)
   design:arch design:data design:threats             the design package (design/)
   design:tests design:ops
   review:decks review:rehearsal                      the review pack (review/) and its rehearsal
-'all' (the default) runs the spec checks, and the design and review checks when
-design/ and review/ exist; name a check or a group (spec, design, review) to run it
-anyway. Short names work too: api, threats, decks.
+  agent:blueprint agent:evals agent:report           an agent kept as code (agent/, proofkin factory init)
+'all' (the default) runs the spec checks, and the design, review and agent checks when
+design/, review/ and agent/ exist; name a check or a group (spec, design, review, agent)
+to run it anyway. Short names work too: api, threats, decks.
 A spec package is:
   spec/SPEC.md          user stories (US-1: ...) and acceptance criteria (AC-1 (US-1): Given/When/Then)
   spec/openapi.json     the REST API contract; operations list their criteria in x-acceptance
@@ -777,7 +778,7 @@ examples:
   proofkin spec check api --dir D:\\src\\shop
   proofkin spec check design")]
     Check {
-        /// A check, a group (spec, design, review) or all.
+        /// A check, a group (spec, design, review, agent) or all.
         #[arg(default_value = "all")]
         part: String,
         /// The folder holding the package.
@@ -2967,9 +2968,23 @@ fn spec_checks(part: &str, dir: &std::path::Path) -> Result<Vec<&'static str>> {
             if !dir.join("review").join("rehearsal.md").exists() {
                 names.retain(|n| *n != "review:rehearsal");
             }
+            // An agent kept as code, with its report once it was evaluated.
+            if dir.join("agent").is_dir() {
+                names.extend(group("agent:"));
+                let reported = std::fs::read_dir(dir.join("agent").join("reports"))
+                    .map(|mut e| {
+                        e.any(|f| {
+                            f.is_ok_and(|f| f.file_name().to_string_lossy().ends_with(".json"))
+                        })
+                    })
+                    .unwrap_or(false);
+                if !reported {
+                    names.retain(|n| *n != "agent:report");
+                }
+            }
             names
         }
-        "design" | "review" => group(&format!("{part}:")),
+        "design" | "review" | "agent" => group(&format!("{part}:")),
         name if BUILT_IN_CHECKS.contains(&name) => {
             vec![
                 *BUILT_IN_CHECKS
@@ -2986,7 +3001,7 @@ fn spec_checks(part: &str, dir: &std::path::Path) -> Result<Vec<&'static str>> {
                 .collect();
             if found.len() != 1 {
                 bail!(
-                    "there is no check '{short}' (checks: {}; groups: spec, design, review, all)",
+                    "there is no check '{short}' (checks: {}; groups: spec, design, review, agent, all)",
                     BUILT_IN_CHECKS.join(", ")
                 );
             }

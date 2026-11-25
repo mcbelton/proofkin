@@ -915,3 +915,117 @@ async fn evaluations_are_kept_by_agent_and_found_by_id() {
         "its id names its agent"
     );
 }
+
+/// AC-32: a folder made by `factory init`, shared read-only: a plan step that verifies it with
+/// agent:blueprint and agent:evals passes; broken (a skill nobody has, R2's only
+/// deterministic case gone), the worker's signed evidence names each problem and its fix.
+#[tokio::test]
+async fn a_plan_step_proves_an_agent_kept_as_code_with_the_built_in_checks() {
+    use proofkin::plan::{Plan, SquadStore, StepState, run_plan};
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    proofkin::factory::code::init(&repo, "ask", "researcher", None).unwrap();
+    let mut boss = Node::new("boss", tmp.path());
+    let mut helper = Node::new("helper", tmp.path());
+    helper.executor = Some(Arc::new(Model::new(true)));
+    boss.trust.allow(TrustedPeer {
+        name: "helper".into(),
+        id: helper.key.public(),
+        addrs: BTreeSet::new(),
+        can_delegate: false,
+        tasks_per_hour: 0,
+        access: Access::ReadOnly,
+        shares: vec![DATA_SHARE.into()],
+        m365: None,
+        github: None,
+    });
+    helper.trust.allow(TrustedPeer {
+        name: "boss".into(),
+        id: boss.key.public(),
+        addrs: BTreeSet::new(),
+        can_delegate: true,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec![DATA_SHARE.into(), "repo".into()],
+        m365: None,
+        github: None,
+    });
+    let (helper, _he) = helper.start().await;
+    let mut shares = helper.shares();
+    shares
+        .add_with("repo", &repo, Access::ReadOnly, BTreeMap::new(), false)
+        .unwrap();
+    helper.set_shares(shares);
+    let (boss, _be) = boss.start().await;
+    boss.connect(helper.addr()).await.unwrap();
+    wait(|| {
+        boss.peers()
+            .iter()
+            .any(|p| p.shares.iter().any(|s| s.name == "repo"))
+    })
+    .await;
+    let plan =
+        Plan::parse("review @helper:repo verify=agent:blueprint,agent:evals Review the agent")
+            .unwrap();
+    let checks = |states: &BTreeMap<String, StepState>| match &states["review"] {
+        StepState::Done { evidence, .. } | StepState::Failed { evidence, .. } => {
+            evidence.clone().unwrap().checks
+        }
+        other => panic!("{other:?}"),
+    };
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert!(
+        matches!(&states["review"], StepState::Done { verified: true, .. }),
+        "{:?}",
+        states["review"]
+    );
+    let proven = checks(&states);
+    let names: Vec<&str> = proven.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["agent:blueprint", "agent:evals"]);
+    assert!(proven.iter().all(|c| c.passed), "{proven:?}");
+
+    // Broken: a skill nobody has, and R2's only case gone.
+    let edit = |file: &str, change: &dyn Fn(&mut Value)| {
+        let path = repo.join(file);
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        change(&mut value);
+        std::fs::write(&path, value.to_string()).unwrap();
+    };
+    edit("agent/blueprint.json", &|v| {
+        v["skills"] = json!(["no-such-skill"])
+    });
+    edit("agent/evals.json", &|v| {
+        v["cases"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c["requirement"] != "R2")
+    });
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert!(
+        matches!(&states["review"], StepState::Failed { verified: true, .. }),
+        "{:?}",
+        states["review"]
+    );
+    let failed = checks(&states);
+    assert!(failed.iter().all(|c| !c.passed), "{failed:?}");
+    for (check, parts) in [
+        (0, ["/skills/0", "no-such-skill", "(fix: "]),
+        (
+            1,
+            [
+                "no case proves R2 with a deterministic expectation",
+                "(fix: add a case for R2",
+                "PROBLEM",
+            ],
+        ),
+    ] {
+        for part in parts {
+            assert!(
+                failed[check].output.contains(part),
+                "{part:?} isn't in {}",
+                failed[check].output
+            );
+        }
+    }
+}

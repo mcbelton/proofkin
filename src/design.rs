@@ -1665,7 +1665,11 @@ mod tests {
     #[test]
     fn a_complete_design_package_passes_every_check() {
         let dir = package();
-        for name in crate::spec::BUILT_IN_CHECKS {
+        // An agent kept as code has checks of its own (crate::factory::code).
+        for name in crate::spec::BUILT_IN_CHECKS
+            .iter()
+            .filter(|n| !n.starts_with("agent:"))
+        {
             let report = crate::spec::run(name, dir.path());
             assert!(report.passed(), "{name}: {}", report.text());
         }

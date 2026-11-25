@@ -780,3 +780,61 @@ fn an_evaluation_shows_its_estimate_and_runs_nothing_until_it_is_confirmed() {
         "{out}"
     );
 }
+
+/// Agents as code: `factory init` writes a folder whose agent:blueprint and agent:evals checks
+/// pass (agent:report waits for a report), and a draft starts from it, with its fixtures.
+#[test]
+fn an_agent_kept_as_code_is_checked_in_its_folder_and_drafted_from_it() {
+    let home = Home::new();
+    let repo = home.path().join("repo");
+    let dir = repo.to_str().unwrap();
+    let out = home.ok(&["init", dir, "--name", "ask", "--profile", "alice"]);
+    assert!(
+        out.contains("wrote agent ask (template researcher)"),
+        "{out}"
+    );
+    let blueprint: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join("agent").join("blueprint.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(blueprint["name"], "ask");
+    assert_eq!(
+        blueprint["model"]["providers"],
+        json!(["codex"]),
+        "fit to alice"
+    );
+    assert!(
+        blueprint.get("evals").is_none(),
+        "its suite is in evals.json"
+    );
+    let out = home.fails(&["init", dir, "--name", "ask"]);
+    assert!(out.contains("exists already"), "{out}");
+
+    let checked = home.proofkin(&["spec", "check", "agent", "--dir", dir]);
+    assert!(!checked.ok, "no report yet:\n{}", checked.out);
+    for part in [
+        "agent:blueprint: passed",
+        "agent:evals: passed",
+        "agent:report: FAILED",
+        "agent/reports/ has no passed, verified evaluation of build",
+    ] {
+        assert!(
+            checked.out.contains(part),
+            "{part:?} isn't in:\n{}",
+            checked.out
+        );
+    }
+    let fixtures = repo.join("agent").join("fixtures");
+    std::fs::write(fixtures.join("notes.md"), "# Notes\n").unwrap();
+    let out = home.ok(&["check", "--file", dir, "--profile", "alice"]);
+    assert!(out.contains(&format!("{dir}: no problems")), "{out}");
+    let out = home.ok(&["new", "ask", "--from", dir, "--profile", "alice"]);
+    assert!(out.contains("created draft ask (drafted from"), "{out}");
+    assert!(out.contains("1 fixture): no problems"), "{out}");
+    let copied = home
+        .path()
+        .join("profiles/alice/factory/agents/ask/fixtures/notes.md");
+    assert!(copied.is_file());
+    let out = home.fails(&["new", "other", "--from", dir, "--profile", "alice"]);
+    assert!(out.contains("isn't named \"other\""), "{out}");
+}
