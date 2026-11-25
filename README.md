@@ -2569,6 +2569,9 @@ Claude's sandbox runtime (on Windows a separate low-rights user) for Claude:
   the one that runs its checks while it works) run outside the sandbox, with your rights,
   as the checks after the model do; so a check that builds into a folder outside the
   workspace (a shared `CARGO_TARGET_DIR`, say) works while the model works too.
+- **The same Node.js as the agent**: a Copilot model's shell finds the Node.js the agent's
+  own `node` runs, put first on its `PATH`, even when `node` is a version manager's shim
+  (nvm for Windows, Volta) that can't find which version to run inside the sandbox.
 
 On top of the sandbox, commands that name a URL, a path outside the workspace, the home
 folder (`~`, `$HOME`, `$env:USERPROFILE`, `%APPDATA%`, ...) or a credential file are refused
