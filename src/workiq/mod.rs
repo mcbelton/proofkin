@@ -16,6 +16,7 @@ pub mod client;
 pub mod content;
 pub mod context;
 pub mod doctor;
+pub mod gateway;
 pub mod import;
 pub mod login;
 pub mod stdio;

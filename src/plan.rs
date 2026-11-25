@@ -337,6 +337,12 @@ impl Step {
         self.is_workiq() || !self.workiq.is_empty()
     }
 
+    /// Whether the step's model may read Microsoft 365 content through a folder's Work IQ
+    /// server (`mcp=workiq`), whose labels its plan never learns.
+    pub fn uses_workiq_tools(&self) -> bool {
+        self.mcp.iter().any(|m| m == crate::workiq::gateway::SERVER)
+    }
+
     /// Who a `@workiq` step shows as having done it: `workiq`, or `workiq:<agent id>`.
     pub fn workiq_name(&self) -> String {
         match &self.agent {
@@ -774,10 +780,11 @@ impl Plan {
     }
 
     /// The plan with its Microsoft 365 marks set: a step is marked when it already is (the
-    /// `workiq=` option and `@workiq` steps set it) or when a `context=` topic is, with
-    /// the union of the labels, and a step is marked when a step it runs `after` is,
-    /// because it gets that step's output. Topics that don't exist are left out here;
-    /// the plan check reports them.
+    /// `workiq=` option and `@workiq` steps set it), when it asks for `mcp=workiq` (with the
+    /// label `unknown`: what its model reads there isn't known here), or when a `context=`
+    /// topic is, with the union of the labels, and a step is marked when a step it runs
+    /// `after` is, because it gets that step's output. Topics that don't exist are left out
+    /// here; the plan check reports them.
     pub fn marked(&self, kb: &KnowledgeBase) -> Plan {
         self.marked_with(kb, &HashMap::new())
     }
@@ -792,6 +799,15 @@ impl Plan {
             if step.brings_m365() {
                 let seed = seeds.get(&step.id).map(Vec::as_slice).unwrap_or_default();
                 labels = Some(union_labels(labels.as_deref().unwrap_or_default(), seed));
+            }
+            if step.uses_workiq_tools() {
+                // What its model reads through Work IQ has labels this plan never learns, so
+                // nothing made from it goes to a peer.
+                let unknown = [crate::workiq::content::UNKNOWN.to_owned()];
+                labels = Some(union_labels(
+                    labels.as_deref().unwrap_or_default(),
+                    &unknown,
+                ));
             }
             if let Some(labels) = labels {
                 step.m365 = Some(union_labels(
@@ -5931,6 +5947,14 @@ mod tests {
         let marked = plan.marked(&kb);
         assert_eq!(step_labels(&marked, "n"), list(&["Confidential"]));
         assert_eq!(step_labels(&marked, "m"), None);
+
+        // A step whose model reads Work IQ itself (mcp=workiq) has labels the plan never
+        // learns: it and the steps after it are marked unknown, which no peer may receive.
+        let plan = Plan::parse("t @x mcp=workiq do\nu after t @x do\nv @x mcp=docs do").unwrap();
+        let marked = plan.marked(&kb);
+        assert_eq!(step_labels(&marked, "t"), list(&["unknown"]));
+        assert_eq!(step_labels(&marked, "u"), list(&["unknown"]));
+        assert_eq!(step_labels(&marked, "v"), None, "another MCP server");
 
         // The plan that is sent carries the marks.
         let ready = Plan::parse("a @x context=hr do\nb after a @x do")

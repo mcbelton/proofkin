@@ -76,6 +76,9 @@ pub struct AgentConfig {
     /// The program that serves a task's checks to its model while it works (this program;
     /// see [`crate::checks_mcp`]). None: the model gets no such tool.
     pub task_checks: Option<PathBuf>,
+    /// Gives a task that asks for a folder's `workiq` MCP server Work IQ through a session
+    /// of its own (see [`crate::workiq::gateway`]). None: such tasks are refused.
+    pub workiq_gateway: Option<Arc<crate::workiq::gateway::Gateway>>,
     /// How long tasks wait for a dropped peer to come back (see [`TASK_GRACE`]).
     pub task_grace: Duration,
     /// Where the next id for the tasks it gives peers is kept, so ids go on after a
@@ -102,6 +105,7 @@ impl AgentConfig {
             team: None,
             pulls: None,
             task_checks: None,
+            workiq_gateway: None,
             task_grace: TASK_GRACE,
             task_ids: None,
         }
@@ -521,6 +525,7 @@ struct Inner {
     team: Option<Arc<crate::team::TeamRunner>>,
     pulls: Option<Arc<dyn crate::pulls::PullRequests>>,
     task_checks: Option<PathBuf>,
+    workiq_gateway: Option<Arc<crate::workiq::gateway::Gateway>>,
     task_grace: Duration,
     /// When peers that dropped were last seen, until they come back or are given up.
     left: Mutex<HashMap<EndpointId, Instant>>,
@@ -585,6 +590,7 @@ impl Agent {
             team: config.team,
             pulls: config.pulls,
             task_checks: config.task_checks,
+            workiq_gateway: config.workiq_gateway,
             task_grace: config.task_grace,
             left: Mutex::new(HashMap::new()),
         });
@@ -1871,6 +1877,38 @@ impl Inner {
         }
     }
 
+    /// Who Work IQ results through the gateway are for in a task from `id` (`name` on the
+    /// allowlist): its owner's own tasks see what Work IQ allows, a peer its owner granted
+    /// `--m365-tools` only its labels. Anyone else is refused, with the grant that would let
+    /// it.
+    fn workiq_audience(
+        &self,
+        id: &EndpointId,
+        name: &str,
+    ) -> Result<crate::workiq::audit::CallContext> {
+        use crate::workiq::audit::{CallContext, Purpose};
+        if self.owner.as_deref() == Some(name) {
+            return Ok(CallContext::local(Purpose::Gateway));
+        }
+        let grant = self
+            .trust
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|p| p.m365.clone());
+        match grant {
+            Some(grant) if grant.tools => {
+                Ok(CallContext::peer(name, grant.labels, Purpose::Gateway))
+            }
+            _ => bail!(
+                "{} gives Work IQ (mcp=workiq) only to its owner's own tasks and to peers granted \
+                 it, and {name} isn't: its owner can grant it with `proofkin peers allow {name} \
+                 --m365 <labels> --m365-tools`",
+                self.name
+            ),
+        }
+    }
+
     /// Checks the allowlist permission, the shared folder and the hourly quota for
     /// a task from `id`; returns where and with what access it may run.
     fn admit_task(&self, id: &EndpointId, task: &LlmTask) -> Result<(TaskContext, Share)> {
@@ -1971,6 +2009,17 @@ impl Inner {
                     share.name,
                     self.name
                 );
+            }
+            if def.workiq {
+                // Work IQ through this agent's gateway, with its owner's work data.
+                if self.workiq_gateway.is_none() {
+                    bail!(
+                        "MCP server '{server}' in '{}' is Work IQ, which {} doesn't serve",
+                        share.name,
+                        self.name
+                    );
+                }
+                self.workiq_audience(id, &name)?;
             }
             mcp.insert(server.clone(), def.clone());
         }
@@ -2883,6 +2932,23 @@ impl Inner {
                 crate::checks_mcp::SERVER.to_owned(),
                 crate::checks_mcp::server(program, &ctx.workspace, &commands),
             );
+        }
+        // A Work IQ server becomes this task's own address on this machine, with a bearer
+        // that stops working when the task ends: the model never gets the account's token.
+        // What it sees is for the task's requester (a grant revoked since counts).
+        let mut workiq_sessions = Vec::new();
+        for (name, def) in ctx.mcp.iter_mut().filter(|(_, def)| def.workiq) {
+            let gateway = self
+                .workiq_gateway
+                .as_ref()
+                .context("this agent doesn't serve Work IQ")?;
+            let context = self.workiq_audience(id, from)?;
+            let (server, session) = gateway
+                .open(def, context)
+                .await
+                .with_context(|| format!("MCP server '{name}'"))?;
+            *def = server;
+            workiq_sessions.push(session);
         }
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();

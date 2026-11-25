@@ -2166,6 +2166,7 @@ account, `proofkin auth logout workiq --profile me` removes it.
 | --- | --- | --- |
 | A step that starts from what Microsoft 365 has on its subject | `workiq=all` or `workiq=email,files,...` on the step | [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq) |
 | A step answered by Microsoft 365 Copilot or one of your organization's agents | `@workiq` as the step's target, `agent=<id>` from `proofkin workiq agents` | [Asking Microsoft 365 in a step](#asking-microsoft-365-in-a-step-workiq) |
+| A model that searches Microsoft 365 while it works | `mcp=workiq` on a step for your own worker, whose folder offers it (`proofkin mcp add <folder> workiq --workiq`) | [Work IQ as a tool for tasks](#work-iq-as-a-tool-for-tasks-mcpworkiq) |
 | Cited results kept as a knowledge topic for `context=` | `proofkin kb import workiq <topic> --query <text> [--from SOURCES]` | **Importing from Microsoft 365** under the knowledge base, and [the design](docs/work-iq.md#5-work-context-in-plans) |
 | A peer that may receive some of it | `proofkin peers allow <peer> --profile me --m365 General,Public,unlabeled` | [Security model](#security-model) |
 | What it cost and the limits | `proofkin workiq usage`, `proofkin workiq budget --per-day N --per-run N` | [Work IQ audit file and budgets](#work-iq-audit-file-and-budgets) |
@@ -2393,6 +2394,40 @@ look @alice:app mcp=browser Open http://localhost:3000 and report what the home 
 Servers run on your machine with your rights, outside the shell sandbox, so offer only
 servers you trust. Remote URLs must be `https://`, except `http://` on this machine.
 
+#### Work IQ as a tool for tasks (`mcp=workiq`)
+
+A digital worker's (or your own agent's) folder can offer **Work IQ** to tasks,
+so the model searches Microsoft 365 while it works instead of only at the start of the step
+(`workiq=`). The server is called `workiq` and has nothing to start:
+
+```powershell
+proofkin mcp add app workiq --workiq --profile my-worker              # every read tool
+proofkin mcp add app workiq --workiq --tool retrieve --tool ask --profile my-worker
+```
+
+```text
+draft @my-worker:app mcp=workiq Write the launch FAQ from what my mail and files say about the launch
+```
+
+- Each task gets an address of its own on this machine
+  (`http://127.0.0.1:<port>/mcp/workiq/<session>`) and a random bearer that stop working when
+  the task ends. The agent calls Work IQ itself with the profile's sign-in (a digital worker
+  uses its owner's, when the owner turned that on), so the model never sees a token and a long
+  task keeps working as tokens are refreshed.
+- Only tools that read: `retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
+  `list_agents` (`--tool` offers fewer). A change tool is refused, and never reaches Work IQ.
+- Every result goes through the [content policy](#4-what-keeps-your-work-data-yours): only
+  results marked `allowed`, secrets redacted, in the external-content envelope. Every call is
+  audited (purpose `gateway`) and held to the daily budget.
+- Your own tasks get it (a digital worker's owner's). A peer's task gets it only when you
+  granted that peer `--m365-tools` (`proofkin peers allow <peer> --m365 Public,General
+  --m365-tools`): then only `retrieve` and `ask`, and only results with the labels you
+  granted; its calls are audited under the peer's name. Any other task that asks for
+  `mcp=workiq` is refused, and the refusal names the grant. What such a step's model read
+  has labels its plan never learns, so the step is marked `unknown` and nothing made from it
+  goes to a peer.
+- A browser can't reach it: requests with an `Origin` header are refused.
+
 ### Plugins: skills, agents and MCP servers, packaged together
 
 A **plugin** bundles skills, agents and MCP servers, in the layouts GitHub Copilot CLI
@@ -2426,6 +2461,12 @@ proofkin plugin disable reviewer --profile alice  # enable / remove
   placeholders; values not given with `--set` come from environment variables of the same
   name). `${PLUGIN_ROOT}` (and the Claude and Copilot spellings) becomes the plugin's
   folder, `${PLUGIN_DATA}` a folder it may write to, `${workspaceFolder}` the shared folder.
+- **Microsoft's Work IQ plugin** (`proofkin plugin add microsoft/work-iq:plugins/workiq`)
+  keeps its skills, and its MCP server (the hosted Work IQ address with its own sign-in
+  settings, or the CLI's `@microsoft/workiq mcp`) becomes this agent's own
+  [Work IQ server](#work-iq-as-a-tool-for-tasks-mcpworkiq): offer it with `proofkin mcp
+  add app workiq --plugin workiq`, and tasks reach Work IQ through your sign-in and the
+  gateway, with only the tools that read.
 - **Turning a plugin off** withdraws its skills, agents and the servers it offered; turning it on
   offers them again. **Updating** keeps each offer's access, tools and values, and pauses
   servers that would now start differently until you look at them and resume them.
@@ -2607,7 +2648,7 @@ Workflow for a change:
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)
 - [src/pulls.rs](src/pulls.rs): pull request steps: the folder's agent opens the pull request with the work before it (only work it signed for the peer that asks) and follows it until it is merged or closed
 - [src/tracker.rs](src/tracker.rs): tracked work: plan runs as GitHub issues and sub-issues on a GitHub Project's board (GraphQL through `gh`)
-- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait, and the content policy (`content.rs`: only `allowed` results, label allowlist per audience, redaction, size cap, envelope); see [docs/work-iq.md](docs/work-iq.md)
+- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait, and the content policy (`content.rs`: only `allowed` results, label allowlist per audience, redaction, size cap, envelope), and the gateway (`gateway.rs`: a task's own MCP address on 127.0.0.1 for `mcp=workiq`, with a bearer that ends with the task); see [docs/work-iq.md](docs/work-iq.md)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
