@@ -84,7 +84,7 @@ def cli(*args):
 ws = tempfile.mkdtemp(prefix="p2p-live-")
 svc = None
 agents = []
-PROFILES = ("worker1-eval", "worker1", "worker2", "boss", "intruder", "helper", "editor")
+PROFILES = ("worker1", "worker2", "boss", "intruder", "helper", "editor")
 try:
     accounts = gh_accounts()
     if not accounts:
@@ -786,7 +786,8 @@ try:
 finally:
     for a in reversed(agents):
         a.stop()
-    for profile in PROFILES:
+    # worker1's evaluation worker first: deleting a digital worker updates its owner's allowlist.
+    for profile in ("worker1-eval", *PROFILES):
         cli("profile", "delete", "--profile", profile)
     shutil.rmtree(ws, ignore_errors=True)
     if svc:
