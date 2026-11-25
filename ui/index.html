@@ -97,6 +97,16 @@
         <div id="github"></div>
       </section>
 
+      <section class="card" aria-labelledby="workiq-h">
+        <div class="card-head">
+          <h2 id="workiq-h" tabindex="-1">Work IQ</h2>
+        </div>
+        <div>
+          <div id="workiq"></div>
+          <div id="workiq-checks" class="workiq-checks" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+
       <section class="card" aria-labelledby="tracker-h">
         <div class="card-head">
           <h2 id="tracker-h">Tracker</h2>
@@ -723,6 +733,57 @@
         <button type="button" class="btn" id="gh-flow-cancel">Cancel</button>
       </div>
     </div>
+  </dialog>
+
+  <dialog id="workiq-dialog" aria-labelledby="workiq-dialog-h">
+    <form method="dialog" id="workiq-form" novalidate>
+      <h2 id="workiq-dialog-h">Sign in to Work IQ</h2>
+      <p class="muted small">Through Microsoft's Work IQ CLI on this machine (install it with <span class="mono">npm install -g @microsoft/workiq</span>). The CLI signs in by itself, with its own app, which your organization's admin must have approved, so Proofkin keeps no token. Signing in checks the account with Work IQ right away.</p>
+      <label class="field">
+        <span>Account <span class="muted">(optional)</span></span>
+        <input id="workiq-account" type="email" maxlength="254" spellcheck="false" autocomplete="off" placeholder="e.g. ada@contoso.com…" aria-describedby="workiq-account-hint">
+        <span class="muted small" id="workiq-account-hint">An account the Work IQ CLI has signed in. Empty: its default account.</span>
+      </label>
+      <label class="field">
+        <span>CLI path <span class="muted">(optional)</span></span>
+        <input id="workiq-cli-path" type="text" spellcheck="false" autocomplete="off" aria-describedby="workiq-cli-path-hint">
+        <span class="muted small" id="workiq-cli-path-hint">Where the CLI is, when it isn't found on the PATH or in npm's global folder: the file itself (<span class="mono">workiq</span>, or <span class="mono">workiq.cmd</span> on Windows).</span>
+      </label>
+      <div class="workiq-hosted muted small">
+        <p>Your organization's own app (the hosted connection) signs in from a terminal instead, with its tenant and app id:</p>
+        <p class="workiq-command">
+          <code class="mono" id="workiq-hosted-command">proofkin auth login workiq --profile &lt;name&gt; --tenant &lt;id-or-domain&gt; --client-id &lt;app-id&gt; --device-code</code>
+          <button type="button" class="btn small" id="workiq-hosted-copy">Copy command</button>
+        </p>
+      </div>
+      <p class="form-error" id="workiq-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="workiq-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="workiq-submit">Sign in</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="workiq-budget-dialog" aria-labelledby="workiq-budget-h">
+    <form method="dialog" id="workiq-budget-form" novalidate>
+      <h2 id="workiq-budget-h">Work IQ budget</h2>
+      <p class="muted small">A Work IQ call over either budget isn't sent: it fails, saying which budget is used up, and the audit file records it as refused.</p>
+      <label class="field narrow">
+        <span>Calls a day</span>
+        <input id="workiq-per-day" type="number" min="1" step="1" inputmode="numeric" aria-describedby="workiq-per-day-hint">
+        <span class="muted small" id="workiq-per-day-hint">All the Work IQ calls this agent makes in one day (the local date). The default is 200.</span>
+      </label>
+      <label class="field narrow">
+        <span>Calls per run</span>
+        <input id="workiq-per-run" type="number" min="1" step="1" inputmode="numeric" aria-describedby="workiq-per-run-hint">
+        <span class="muted small" id="workiq-per-run-hint">The most one plan run may make. The default is 25.</span>
+      </label>
+      <p class="form-error" id="workiq-budget-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="workiq-budget-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="workiq-budget-submit">Save budget</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog id="repo-dialog" aria-labelledby="repo-h">

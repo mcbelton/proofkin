@@ -38,6 +38,7 @@ mod connect;
 mod models;
 mod tools;
 mod workers;
+mod workiq;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_CSS: &str = include_str!("../ui/app.css");
@@ -1077,6 +1078,10 @@ pub async fn start_with_work(
         )
         .route("/api/models", get(models::get_own).put(models::put_own))
         .route("/api/sign-in/copilot", post(workers::sign_in_copilot))
+        .route("/api/workiq", get(workiq::state).delete(workiq::sign_out))
+        .route("/api/workiq/doctor", post(workiq::doctor))
+        .route("/api/workiq/sign-in", post(workiq::sign_in))
+        .route("/api/workiq/budget", put(workiq::budget))
         .route(
             "/api/connect",
             get(connect::state)

@@ -1301,10 +1301,70 @@
     {
       "id": "WIQ-14",
       "area": "work-iq",
-      "claim": "A workiq= step's signed evidence records the Work IQ context its task had by hash, never its content: the plan's agent sends the task with where the Microsoft 365 section is in its prompt and how many results it held with their labels, and the worker refuses a task whose section isn't a whole part of its prompt, else signs context [{source workiq, sha256 of exactly that part, results, labels}] (a team step's lead too), and its result's summary says Work context from Microsoft 365 (Work IQ) with the count, labels and the start of the hash. The run record keeps the section and its SHA-256 on the plan's machine; runs verify fails a step whose evidence doesn't record the hash of the section the run kept for it, or whose kept section no longer has its hash. Records without context sign as before; claims never rest on Work IQ content.",
+      "claim": "A workiq= step's signed evidence records the Work IQ context its task had by hash, never its content: the plan's agent sends the task with where the Microsoft 365 section is in its prompt and how many results it held with their labels, and the worker refuses a task whose section isn't a whole part of its prompt, else signs context [{source workiq, sha256 of exactly that part, results, labels}] (a team step's lead too), and its result's summary says Work context from Microsoft 365 (Work IQ) with the count, labels and the start of the hash. The run record keeps the section's SHA-256, and the saved run keeps the section itself next to its run.json (<step>.workiq.md), never in it, so a run.json shared to be verified holds no Microsoft 365 content; runs verify fails a step whose evidence doesn't record the hash the run kept for it, or, given the run's folder, whose kept section no longer has its hash. Records without context sign as before; claims never rest on Work IQ content.",
       "tests": [
         "agents::a_steps_signed_evidence_records_its_work_iq_context_by_hash_never_its_content",
         "lib::evidence::work_context_is_recorded_by_the_hash_of_its_part_of_the_prompt"
+      ]
+    },
+    {
+      "id": "WIQ-25",
+      "area": "work-iq",
+      "claim": "The Work IQ commands work through the program itself, as a user runs them, against a fake Work IQ and Entra: auth login workiq --device-code signs in, workiq doctor passes its five checks, workiq agents lists the agents, kb import workiq saves what the content policy keeps (withheld counted), and an agent started with proofkin --name runs a plan's @workiq step itself and sends a workiq= step to a peer with only the results its Microsoft 365 grant allows; runs verify passes and the step's signed evidence records the context by the hash of the section the run kept; workiq usage counts every call; each run uses the refresh token the run before saved (Entra rotates them); after auth logout workiq the doctor fails. The same commands work through the Work IQ CLI given with --cli-path. The test-only settings PROOFKIN_TEST_WORKIQ_URL and PROOFKIN_TEST_ENTRA_URL that point the program at the fakes take only a root http(s) address on the loopback interface (localhost or a loopback IP); any other value is refused, never replaced by the real service, so no token goes elsewhere.",
+      "tests": [
+        "workiq_e2e::the_work_iq_commands_run_through_the_program_with_a_hosted_account",
+        "workiq_e2e::the_work_iq_commands_run_through_the_program_with_the_work_iq_cli",
+        "lib::workiq::the_test_settings_take_only_an_address_on_this_machine"
+      ]
+    },
+    {
+      "id": "WIQ-24",
+      "area": "work-iq",
+      "claim": "A live check against a real tenant's Work IQ, behind PROOFKIN_LIVE_WORKIQ=cli|hosted (scripts/live_workiq.py; python scripts/evidence.py --live runs it when that is set), only reads: a fresh profile signs in to Work IQ (through the Work IQ CLI, or with Proofkin's device code sign-in), its doctor passes every check with one retrieve, and its agent runs a plan whose workiq= step goes to the profile's own digital worker on real Copilot and whose @workiq step gets Microsoft 365 Copilot's answer. The run's signed evidence verifies, the step's evidence records the Work IQ context by its hash and nothing else, and every call in the profile's Work IQ audit file was a read tool. Step outputs stay out of its log and email addresses are masked. Without PROOFKIN_LIVE_WORKIQ the check is not run and fails nothing.",
+      "live": [
+        {
+          "check": "workiq: *",
+          "needs": "PROOFKIN_LIVE_WORKIQ"
+        }
+      ]
+    },
+    {
+      "id": "WIQ-16",
+      "area": "work-iq",
+      "claim": "A folder can offer Work IQ to its owner's tasks as its MCP server workiq (proofkin mcp add <folder> workiq --workiq [--tool ...]; the name is workiq, it has no command or URL, only tools that read: retrieve, ask, fetch, search_paths, get_schema, list_agents, and any task access may use it). A task that asks for mcp=workiq gets, for that task only, http://127.0.0.1:<port>/mcp/workiq/<session> with a random bearer; the agent calls Work IQ itself through the profile's audited client, so the model's MCP config holds no token. The session lists only the allowed tools Work IQ offers, refuses any other tool before it reaches Work IQ, puts every result through the content policy for the task's audience (a peer audience gets only retrieve and ask, within its labels), audits each call with purpose gateway, needs its bearer, refuses requests with an Origin header, and closes when the task ends. A digital worker's owner's tasks see what Work IQ allows (peers: WIQ-17). A plan marks a step with mcp=workiq, and the steps after it, with the label unknown, so nothing made from what its model read goes to a peer.",
+      "tests": [
+        "workiq_gateway::a_tasks_session_offers_only_read_tools_and_its_model_never_gets_the_token",
+        "workiq_gateway::what_a_session_sees_goes_through_the_content_policy_for_its_audience_and_is_audited",
+        "workiq_gateway::a_session_needs_its_bearer_takes_no_browser_and_closes_with_its_task",
+        "workiq_gateway::a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_only_with_its_grant",
+        "lib::plan::steps_with_microsoft_365_content_are_marked_through_context_and_after"
+      ]
+    },
+    {
+      "id": "WIQ-17",
+      "area": "work-iq",
+      "claim": "A peer's task gets Work IQ through the gateway (mcp=workiq) only when the agent's owner granted that peer --m365-tools: its session then offers only retrieve and ask, whose results carry labels, and the content policy gives it only results with the labels of its grant; every call is audited with the peer's name as its audience. Without the grant the task is refused before its model starts, and the refusal names the grant to add (proofkin peers allow <peer> --m365 <labels> --m365-tools). The grant is read again when the task starts. The requester's plan marks the step's output unknown (WIQ-16), so it goes no further to a peer.",
+      "tests": [
+        "workiq_gateway::a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_only_with_its_grant",
+        "workiq_gateway::what_a_session_sees_goes_through_the_content_policy_for_its_audience_and_is_audited"
+      ]
+    },
+    {
+      "id": "WIQ-19",
+      "area": "work-iq",
+      "claim": "Importing Microsoft's Work IQ plugin (the shape of microsoft/work-iq:plugins/workiq: .github/plugin/plugin.json, skills/, and a .mcp.json whose server is the hosted https://workiq.svc.cloud.microsoft/mcp with oauthClientId) keeps its skills and makes its MCP server a Work IQ template: its own connection and sign-in settings are dropped, the review notes that it is offered through this agent's own Work IQ sign-in and gateway with only its tools that read, and offering it in a folder gives the agent's workiq server (no URL, command or headers; it must be named workiq). The Work IQ CLI's server (npx @microsoft/workiq mcp, or workiq mcp) is recognized the same way; other servers are not.",
+      "tests": [
+        "lib::plugins::microsofts_work_iq_plugin_offers_work_iq_through_the_agents_own_gateway"
+      ]
+    },
+    {
+      "id": "WIQ-22",
+      "area": "work-iq",
+      "claim": "The web UI has a token-guarded API for the profile's Work IQ account, which reads the profile as its files are now, so a sign-in made in another process counts. GET /api/workiq answers whether the account the agent uses is signed in, its line, how it connects (hosted or cli), its user, the CLI's account and path for a CLI account, the profile it belongs to (a digital worker may use its owner's) and whether that is this profile, why a digital worker its owner didn't let use theirs has none (not_used), the sign-in command, and today's calls against the per-day and per-run budgets (with each run's calls). POST /api/workiq/doctor answers the doctor's checks with their results, details and fixes, always as 200. POST /api/workiq/sign-in (account, cli_path) signs the profile in through Microsoft's Work IQ CLI as proofkin auth login workiq --cli does and answers who signed in and the line; DELETE /api/workiq signs out, and is refused when not signed in; each adds a line to the activity. PUT /api/workiq/budget (per_day, per_run) sets the budgets. Errors are 400s in the sign-in's or set_budget's own words. A digital worker that uses its owner's account sees it but is refused signing in, signing out and budgets: its owner does those. The page's Work IQ card, after the GitHub card, shows this from GET /api/workiq and acts through these endpoints; every element its script looks up is on the page, and its sign-in and budget dialogs close with Escape and Cancel like the others.",
+      "tests": [
+        "ui::the_workiq_api_signs_in_through_the_cli_runs_the_doctor_sets_budgets_and_signs_out",
+        "ui::a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_the_owner",
+        "ui::the_page_has_the_workiq_card_after_the_github_card_and_guards_its_dialogs"
       ]
     },
     {

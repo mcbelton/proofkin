@@ -72,6 +72,10 @@ pub struct McpServer {
     /// The URL was filled in with a secret value: only its host is shown.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub secret_url: bool,
+    /// Work IQ through this agent's gateway (see [`crate::workiq::gateway`]): it has no
+    /// command or URL of its own; each task gets an address of its own on this machine.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workiq: bool,
 }
 
 /// The plugin server template an [`McpServer`] was made from, with the values its
@@ -111,6 +115,7 @@ impl McpServer {
             description: String::new(),
             secret_args: Vec::new(),
             secret_url: false,
+            workiq: false,
         }
     }
 
@@ -120,6 +125,18 @@ impl McpServer {
             command: None,
             url: Some(url.into()),
             sse,
+            ..Self::local("", Vec::new())
+        }
+    }
+
+    /// Work IQ through this agent's gateway, with these of its read tools (none: all of
+    /// [`crate::workiq::gateway::DEFAULT_TOOLS`]). Any task may use it: it runs nothing here.
+    pub fn workiq(tools: Vec<String>) -> Self {
+        Self {
+            command: None,
+            tools,
+            access: Access::ReadOnly,
+            workiq: true,
             ..Self::local("", Vec::new())
         }
     }
@@ -139,6 +156,9 @@ impl McpServer {
             bail!(
                 "invalid MCP server name {name:?}: use letters, digits and single '-' or '_' inside"
             );
+        }
+        if self.workiq {
+            return self.validate_workiq(name);
         }
         match (&self.command, &self.url) {
             (Some(c), None) if !c.trim().is_empty() => {
@@ -189,6 +209,47 @@ impl McpServer {
         access >= self.access
     }
 
+    /// [`McpServer::validate`] for a Work IQ server: it is called `workiq` (plans know a
+    /// step that asks for it brings Microsoft 365 content), has nothing to start or reach,
+    /// and offers only the gateway's read tools.
+    fn validate_workiq(&self, name: &str) -> Result<()> {
+        use crate::workiq::gateway::{DEFAULT_TOOLS, SERVER};
+        if name != SERVER {
+            bail!("a Work IQ MCP server is called '{SERVER}', not '{name}'");
+        }
+        if self.command.is_some()
+            || self.url.is_some()
+            || !self.args.is_empty()
+            || !self.env.is_empty()
+            || !self.headers.is_empty()
+            || self.sse
+        {
+            bail!(
+                "MCP server '{name}' is Work IQ through this agent: it takes no command, URL, \
+                 variables or headers"
+            );
+        }
+        if let Some(tool) = self
+            .tools
+            .iter()
+            .find(|t| !DEFAULT_TOOLS.contains(&t.as_str()))
+        {
+            bail!(
+                "MCP server '{name}': the Work IQ gateway offers only tools that read ({}), \
+                 not '{tool}'",
+                DEFAULT_TOOLS.join(", ")
+            );
+        }
+        if self.description.chars().count() > MAX_DESCRIPTION
+            || self.description.contains(['\n', '\r'])
+        {
+            bail!(
+                "MCP server '{name}': keep its description to one line of at most {MAX_DESCRIPTION} characters"
+            );
+        }
+        Ok(())
+    }
+
     /// Whether it is offered to a task at `access`: not paused, its plugin (if any)
     /// on, and enough access.
     pub fn offered(&self, access: Access) -> bool {
@@ -205,6 +266,7 @@ impl McpServer {
             &self.url,
             &self.headers,
             self.sse,
+            self.workiq,
         ) == (
             &other.command,
             &other.args,
@@ -212,6 +274,7 @@ impl McpServer {
             &other.url,
             &other.headers,
             other.sse,
+            other.workiq,
         )
     }
 
@@ -232,6 +295,11 @@ impl McpServer {
 
     /// How it starts or where it is, with secret values hidden (for listings).
     pub fn describe(&self) -> String {
+        if self.workiq {
+            return "Work IQ through this agent's gateway (each task gets its own address on \
+                    this machine)"
+                .to_owned();
+        }
         let mut text = match (&self.command, &self.url) {
             (Some(c), _) => std::iter::once(c.as_str())
                 .chain(self.args.iter().enumerate().map(|(i, a)| {
@@ -330,6 +398,34 @@ pub struct McpTemplate {
     /// The values its owner provides, in order of first use.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<McpInput>,
+    /// Microsoft's Work IQ server (its hosted address, or `@microsoft/workiq mcp`): offered
+    /// as this agent's own Work IQ, through its sign-in and gateway ([`McpServer::workiq`]),
+    /// never as a connection of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workiq: bool,
+}
+
+/// Whether a server is Microsoft's Work IQ: the hosted service, or its CLI's MCP server.
+fn is_workiq(t: &McpTemplate) -> bool {
+    let hosted = t
+        .url
+        .as_deref()
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .is_some_and(|url| url.host_str() == Some("workiq.svc.cloud.microsoft"));
+    let program = t
+        .command
+        .as_deref()
+        .and_then(|c| std::path::Path::new(c).file_stem())
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let has = |arg: &str| t.args.iter().any(|a| a == arg);
+    let cli = has("mcp")
+        && (program == "workiq"
+            || (program == "npx"
+                && t.args
+                    .iter()
+                    .any(|a| a == "@microsoft/workiq" || a.starts_with("@microsoft/workiq@"))));
+    hosted || cli
 }
 
 enum Placeholder {
@@ -446,6 +542,9 @@ impl McpTemplate {
     /// How it starts or where it is, for review: values are hidden unless they are
     /// only a placeholder, and arguments are scanned for secrets.
     pub fn describe(&self) -> String {
+        if self.workiq {
+            return "Work IQ through this agent's own sign-in and gateway".to_owned();
+        }
         let mut text = match (&self.command, &self.url) {
             (Some(c), _) => std::iter::once(c.as_str())
                 .chain(self.args.iter().map(String::as_str))
@@ -478,6 +577,9 @@ impl McpTemplate {
 
     /// The server to offer in `fill.folder`, with every placeholder filled in.
     pub fn instantiate(&self, fill: &Fill) -> Result<McpServer> {
+        if self.workiq {
+            return Ok(McpServer::workiq(self.tools.clone()));
+        }
         let mut missing: Vec<String> = Vec::new();
         for value in fill.values.values() {
             if value.contains(['\r', '\n']) {
@@ -591,6 +693,7 @@ impl McpTemplate {
             description: String::new(),
             secret_args,
             secret_url,
+            workiq: false,
         })
     }
 }
@@ -661,6 +764,24 @@ fn parse_server(
         if !tools.iter().any(|t| t == "*") {
             t.tools = tools;
         }
+    }
+    if is_workiq(&t) {
+        use crate::workiq::gateway::DEFAULT_TOOLS;
+        notes.push(format!(
+            "{name}: Work IQ, offered through this agent's own Work IQ sign-in (proofkin auth \
+             login workiq) and gateway, with only its tools that read; the server's own \
+             connection and sign-in settings aren't used"
+        ));
+        let tools = t
+            .tools
+            .into_iter()
+            .filter(|tool| DEFAULT_TOOLS.contains(&tool.as_str()))
+            .collect();
+        return Ok(McpTemplate {
+            tools,
+            workiq: true,
+            ..Default::default()
+        });
     }
     if obj.contains_key("cwd") {
         notes.push(format!("{name}: its working folder (cwd) isn't used"));
