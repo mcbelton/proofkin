@@ -2,7 +2,8 @@
 //! result may reach a prompt, and how it is shown there. Pure functions, no network.
 //!
 //! Results are read from the tool result's `structuredContent`, never from the MCP `content`
-//! array. Fail closed: only `contentProtection: "allowed"` is kept, a peer gets only the labels
+//! array, except an `ask` answer, which Work IQ gives only there. Fail closed: only
+//! `contentProtection: "allowed"` is kept, a peer gets only the labels
 //! its allowlist names, secrets are redacted, and every result sits in the external-content
 //! envelope.
 
@@ -457,16 +458,32 @@ fn source_line(item: &Item) -> String {
     entry
 }
 
-/// The answer and citations of an `ask` result.
+/// The answer and citations of an `ask` result. Work IQ gives the answer as the result's
+/// text content, with only the conversation id in `structuredContent`; an answer under one
+/// of [`ANSWER_KEYS`] there comes first. Citations, and so labels, come only from
+/// `structuredContent`: an answer without them is local only (see [`answer_section`]).
 ///
-/// Fails when the call reported an error, has no `structuredContent` or has no answer text.
+/// Fails when the call reported an error or has no answer text.
 pub fn read_answer(result: &ToolResult) -> Result<Answer> {
-    let payload = payload(result, "ask")?;
-    let Some(answer) = ANSWER_KEYS.iter().find_map(|key| text(payload, key)) else {
+    if result.is_error {
+        bail!("the ask tool result is an error");
+    }
+    let payload = result
+        .structured_content
+        .as_ref()
+        .map(|structured| vendor_object(structured).unwrap_or(structured));
+    if let Some(payload) = payload
+        && text(payload, "stoppedReason").as_deref() == Some("error")
+    {
+        let code = text(payload, "errorCode").unwrap_or_else(|| "no error code".to_owned());
+        bail!("the ask tool stopped with an error ({code})");
+    }
+    let structured = payload.and_then(|p| ANSWER_KEYS.iter().find_map(|key| text(p, key)));
+    let Some(answer) = structured.or_else(|| content_text(result)) else {
         bail!("the ask tool result has no answer text");
     };
     let citations = payload
-        .get("citations")
+        .and_then(|p| p.get("citations"))
         .and_then(Value::as_array)
         .map(|list| list.iter().map(read_citation).collect())
         .unwrap_or_default();
@@ -474,6 +491,19 @@ pub fn read_answer(result: &ToolResult) -> Result<Answer> {
         text: answer,
         citations,
     })
+}
+
+/// The text parts of a result's MCP `content`, joined; `None` when there are none.
+fn content_text(result: &ToolResult) -> Option<String> {
+    let parts: Vec<&str> = result
+        .content
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn read_citation(value: &Value) -> Citation {
@@ -845,6 +875,50 @@ mod tests {
         let closed = text.matches("</external_content>").count();
         assert_eq!(opened, 2, "one for the result, one for the sources: {text}");
         assert_eq!(closed, opened, "{text}");
+    }
+
+    #[test]
+    fn an_ask_answer_is_read_from_its_text_content_as_work_iq_gives_it() {
+        // Work IQ's ask: the answer is text content, the conversation id structured.
+        let result = ToolResult {
+            content: vec![
+                json!({ "type": "text", "text": "  The launch moved to May.  " }),
+                json!({ "type": "image", "data": "...", "mimeType": "image/png" }),
+            ],
+            structured_content: Some(json!({ "conversationId": "conv-7" })),
+            is_error: false,
+            ids: RequestIds::default(),
+        };
+        let answer = read_answer(&result).unwrap();
+        assert_eq!(answer.text, "The launch moved to May.");
+        assert!(answer.citations.is_empty());
+        let local = answer_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
+        assert!(
+            local.text.contains("The launch moved to May."),
+            "{}",
+            local.text
+        );
+        assert_eq!(local.labels, [UNKNOWN], "no citations: labels unknown");
+        let peer = answer_section(&result, &Audience::peer(["General"]), DEFAULT_CAP).unwrap();
+        assert!(
+            peer.text.is_empty(),
+            "an answer without labels is local only"
+        );
+
+        // An answer in structuredContent comes first; an error or no text at all fails.
+        let both = tool_result(json!({ "answer": "From the structure." }));
+        assert_eq!(read_answer(&both).unwrap().text, "From the structure.");
+        let failed = ToolResult {
+            is_error: true,
+            ..result.clone()
+        };
+        assert!(read_answer(&failed).is_err());
+        let empty = ToolResult {
+            content: Vec::new(),
+            ..result
+        };
+        let err = read_answer(&empty).unwrap_err().to_string();
+        assert!(err.contains("no answer text"), "{err}");
     }
 
     #[test]

@@ -37,6 +37,14 @@ Retrieval results are in `structuredContent["application/vnd.ms-workiq.retrieval
 `contentProtection: "allowed"` is an allow decision; a missing, failed, blocked or unknown
 value is not. A call failed if it has `isError: true` or `stoppedReason: "error"`, possibly
 with `errorCode`, `recoveryAction` and `retryAfterSeconds`. Policy denials must not be retried.
+`ask` is different: its answer is the text `content`, and `structuredContent` holds only the
+`conversationId` (the Work IQ CLI 1.0.1 says so in its tool list).
+
+Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`): in the CLI 1.0.1,
+`retrieve`, `fetch`, `fetch_blob`, `search_paths`, `get_schema`, `discover` and
+`call_function` are read only, `create_entity` isn't, and `update_entity`, `delete_entity`
+and `do_action` are destructive. `ask` and `list_agents` have none. The CLI also offers
+`accept_eula` and `get_debug_link`, which need the user's own confirmation.
 
 ## Principles
 
@@ -140,7 +148,8 @@ has a class, a fix (what to do and who can do it) and the ids, and its message i
 
 Every result goes through one function before it reaches a prompt (`src/workiq/content.rs`):
 
-1. Read `structuredContent`, never the `content` array.
+1. Read `structuredContent`, never the `content` array (except an `ask` answer's text,
+   which Work IQ gives only there).
 2. Keep only `contentProtection: "allowed"`. Count the rest as withheld, by reason.
 3. Filter by the audience's labels. The owner's own agent and digital workers get every label;
    a peer gets only the labels the owner allowed for it (`unlabeled` is one of the choices).
@@ -214,7 +223,8 @@ token:
   gateway adds the owner's fresh token, so long tasks keep working and the model never sees
   the token.
 - Only read tools by default (`retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
-  `list_agents`). Every result goes through the content policy for the task's audience;
+  `list_agents`), and never one whose annotations say it changes things, whatever its name.
+  Every result goes through the content policy for the task's audience;
   every call is audited and metered; sizes are capped.
 - The server is called `workiq`, so a plan knows a step with `mcp=workiq` reads Microsoft
   365 content whose labels it never learns: the step is marked `unknown`, and nothing made

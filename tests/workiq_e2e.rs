@@ -169,32 +169,37 @@ fn work_file(id: &str, protection: &str, label: &str, text: &str) -> Value {
 }
 
 /// What a tool answers: `retrieve` a General file, a Confidential one and a General one
-/// that may not be handed out; `ask` an answer citing a General file; `list_agents` one agent.
+/// that may not be handed out; `ask`, as Work IQ answers, its text as content and only the
+/// conversation id structured; `list_agents` one agent.
 fn tool_answer(name: &str) -> Value {
-    let structured = match name {
-        "retrieve" => json!({
-            "application/vnd.ms-workiq.retrieval": {
-                "results": [
-                    work_file("f1", "allowed", "General", "Budget: 120k for the May launch."),
-                    work_file("f2", "allowed", "Confidential", "Board-only numbers."),
-                    work_file("f3", "blocked", "General", "Blocked draft."),
-                ],
-                "resultCount": 3,
-                "stoppedReason": "completed",
-                "conversationId": "conv-1",
-            }
-        }),
-        "ask" => json!({
-            "answer": "The launch moved to May.",
-            "citations": [
-                { "title": "Launch plan", "sensitivityLabel": { "displayName": "General" } },
-            ],
-        }),
-        "list_agents" => json!({ "agents": [{ "id": "sales:1", "name": "Sales" }] }),
+    let (structured, text) = match name {
+        "retrieve" => (
+            json!({
+                "application/vnd.ms-workiq.retrieval": {
+                    "results": [
+                        work_file("f1", "allowed", "General", "Budget: 120k for the May launch."),
+                        work_file("f2", "allowed", "Confidential", "Board-only numbers."),
+                        work_file("f3", "blocked", "General", "Blocked draft."),
+                    ],
+                    "resultCount": 3,
+                    "stoppedReason": "completed",
+                    "conversationId": "conv-1",
+                }
+            }),
+            "see structuredContent",
+        ),
+        "ask" => (
+            json!({ "conversationId": "conv-2" }),
+            "The launch moved to May.",
+        ),
+        "list_agents" => (
+            json!({ "agents": [{ "id": "sales:1", "name": "Sales" }] }),
+            "see structuredContent",
+        ),
         other => panic!("unexpected tool {other}"),
     };
     json!({
-        "content": [{ "type": "text", "text": "see structuredContent" }],
+        "content": [{ "type": "text", "text": text }],
         "structuredContent": structured,
         "isError": false,
     })

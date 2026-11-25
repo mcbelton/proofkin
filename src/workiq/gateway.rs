@@ -288,7 +288,8 @@ async fn handle(
 }
 
 impl Session {
-    /// Work IQ's tools that this task may call.
+    /// Work IQ's tools that this task may call: allowed for the session, and not ones Work
+    /// IQ itself says change things (its annotations), whatever their name.
     async fn tools_list(&self) -> Result<Value, (i64, String)> {
         let tools = self
             .client
@@ -297,7 +298,7 @@ impl Session {
             .map_err(|e| (-32603, format!("{e:#}")))?;
         let offered: Vec<Value> = tools
             .iter()
-            .filter(|tool| self.tools.contains(&tool.name))
+            .filter(|tool| self.tools.contains(&tool.name) && !tool.says_it_changes())
             .map(|tool| {
                 json!({
                     "name": tool.name,
@@ -324,6 +325,15 @@ impl Session {
             return tool_error(format!(
                 "Work IQ's {name} isn't offered to this task; it may call: {}",
                 self.tools.join(", ")
+            ));
+        }
+        let changes = match self.client.list_tools().await {
+            Ok(tools) => tools.iter().any(|t| t.name == name && t.says_it_changes()),
+            Err(e) => return tool_error(format!("{e:#}")),
+        };
+        if changes {
+            return tool_error(format!(
+                "Work IQ says its {name} changes things, so it isn't offered to this task"
             ));
         }
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
