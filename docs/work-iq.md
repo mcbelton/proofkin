@@ -282,8 +282,8 @@ editor, an import in Knowledge, and the sources a step used in its run.
 5. For the CLI connection instead: grant admin consent to the Work IQ CLI app (see
    Microsoft's [Work IQ repository](https://github.com/microsoft/work-iq)).
 
-The docs item ([#65](https://github.com/mcbelton/proofkin/issues/65)) turns this into a
-step-by-step guide with a check after each step.
+The step-by-step guide, with a check after each step and troubleshooting, is in the README:
+[Microsoft 365 work context (Work IQ)](../README.md#microsoft-365-work-context-work-iq).
 
 ## Testing
 
@@ -295,8 +295,10 @@ step-by-step guide with a check after each step.
   `PROOFKIN_TEST_WORKIQ_URL` and `PROOFKIN_TEST_ENTRA_URL` point it at them; they take only a
   loopback address. The CLI connection is tested the same way with `--cli-path`.
 - A `WIQ-*` claim in `evidence/claims.json` for each behavior above.
-- A live check behind `PROOFKIN_LIVE_WORKIQ=hosted|cli`, for a tenant with Work IQ: sign-in,
-  doctor, one `retrieve`, one `workiq=` step sent to the owner's own worker. It only reads.
+- A live check behind `PROOFKIN_LIVE_WORKIQ=hosted|cli` (`scripts/live_workiq.py`), for a
+  tenant with Work IQ: sign-in, doctor (one `retrieve`), a `workiq=` step sent to the owner's
+  own worker on real Copilot and an `@workiq` step, then the evidence and an audit that shows
+  only reads. It never prints Microsoft 365 content.
 
 ## Work items
 

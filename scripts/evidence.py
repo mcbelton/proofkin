@@ -15,6 +15,11 @@ evidence has to prove a claim.
   python scripts/evidence.py           # fmt, clippy, tests (no credentials needed; used by CI)
   python scripts/evidence.py --live    # also the live internet test (real Copilot, gh sign-in)
   python scripts/evidence.py --no-gates  # skip fmt/clippy, e.g. while iterating
+
+With --live and PROOFKIN_LIVE_WORKIQ set (cli or hosted), it also runs the live Work IQ check
+(scripts/live_workiq.py) against your tenant. A claim's live entry is a check name (a trailing
+`*` matches its start), or {"check": ..., "needs": VAR} for a check that runs only when VAR
+is set: without VAR it is "not run", like every live check without --live.
 """
 import argparse
 import datetime
@@ -112,6 +117,11 @@ def evidence_id(evidence):
     return evidence["test"] if isinstance(evidence, dict) else evidence
 
 
+def live_entry(entry):
+    """A claim's live entry: its check name pattern, and the variable it needs, if any."""
+    return (entry["check"], entry.get("needs")) if isinstance(entry, dict) else (entry, None)
+
+
 def live_matches(pattern, name):
     return name.startswith(pattern[:-1]) if pattern.endswith("*") else name == pattern
 
@@ -165,6 +175,16 @@ def main():
         if os.path.exists(results_file):
             with open(results_file, encoding="utf-8") as f:
                 live = {r["check"]: r["ok"] for r in json.load(f)}
+        if os.environ.get("PROOFKIN_LIVE_WORKIQ"):
+            workiq_file = os.path.join(OUT, "live_workiq_results.json")
+            if os.path.exists(workiq_file):
+                os.remove(workiq_file)
+            workiq_ok, _ = run("live-workiq", [sys.executable, os.path.join("scripts", "live_workiq.py")],
+                               env={"P2P_LIVE_RESULTS": workiq_file})
+            gates.append(("live-workiq", workiq_ok))
+            if os.path.exists(workiq_file):
+                with open(workiq_file, encoding="utf-8") as f:
+                    live.update({r["check"]: r["ok"] for r in json.load(f)})
 
     # Match evidence to claims.
     used_tests, used_live, report_claims = set(), set(), []
@@ -179,9 +199,11 @@ def main():
             used_tests.add(test_id)
             items.append({"kind": "test", "id": test_id, "status": "pass" if status == "ok" else status.lower()})
             proven &= status == "ok"
-        for pattern in claim.get("live", []):
-            if live is None:
-                items.append({"kind": "live", "id": pattern, "status": "not run"})
+        for entry in claim.get("live", []):
+            pattern, needs = live_entry(entry)
+            if live is None or (needs and not os.environ.get(needs)):
+                status = "not run" if live is None else f"not run (needs {needs})"
+                items.append({"kind": "live", "id": pattern, "status": status})
                 pending = True
                 continue
             hits = [name for name in live if live_matches(pattern, name)]
