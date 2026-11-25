@@ -447,13 +447,15 @@ of its log), with **Start**/**Stop**, **Starts with this agent** and **Delete**.
   tester-lessons` copies those topics of alice's knowledge base (`proofkin kb`, with their
   Microsoft 365 marks) to the worker and puts them in front of every task it serves (at
   most 24,000 characters, as external content). A topic made from Microsoft 365 content
-  goes only into the tasks of requesters who may have its labels (alice, or a peer whose
-  grant names them), and the task's signed evidence records the knowledge by hash and
-  labels, so the requester's plan marks what it does with the result: a later step to a
-  peer without the grant is refused and `save=` marks the topic. A task whose checks
-  passed adds a lesson to the `--lessons` topic, once, marked with the labels of what the
-  task was given; lessons older than `--retention-days` (90) are removed. With no options it
-  shows the memory; `--off` clears it. It takes effect when the worker next starts.
+  goes only into the tasks of requesters who may have its labels (alice, known by her key,
+  or a peer whose grant names them). The task's signed result records the knowledge by
+  hash, and its evidence the labels, so the requester's plan marks what it does with the
+  result: a later step to a peer without the grant is refused and `save=` marks the topic.
+  A task whose checks passed adds a lesson to the `--lessons` topic, once, marked with the
+  labels of what the task was given (what its plan says the task holds, and `unknown` if
+  its model read Work IQ itself, so no peer gets it); lessons older than `--retention-days`
+  (90) are removed. With no options it shows the memory; `--off` clears it. It takes
+  effect when the worker next starts.
 
 ## Internet P2P
 

@@ -16,7 +16,9 @@
 //!   one.
 //!
 //! Knowledge stays with its owner: builds and releases carry only topic names, and a
-//! task's evidence records the knowledge it was given by hash.
+//! task's signed output records the knowledge it was given by hash (its evidence too, with
+//! the labels, when it holds Microsoft 365 content). A lesson from a task whose model read
+//! Work IQ itself is marked `unknown`: it never goes to a peer.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,10 +26,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 
 use crate::evidence::{ContextUse, sha256_hex};
+use crate::factory::blueprint::MAX_RETENTION_DAYS;
 pub use crate::factory::blueprint::Memory;
-use crate::factory::blueprint::{MAX_RETENTION_DAYS, labels_of_mark};
 use crate::knowledge::{
-    KnowledgeBase, MAX_CONTEXT_CHARS, check_topics, parse_mark, union_labels, with_mark,
+    KnowledgeBase, MAX_CONTEXT_CHARS, check_topics, labels_of_mark, parse_mark, union_labels,
+    with_mark,
 };
 use crate::profile::{Profile, name_ok};
 
@@ -247,11 +250,15 @@ impl WorkerMemory {
 
 /// Whether a peer granted the Microsoft 365 labels `granted` may have content with
 /// `labels` (`unlabeled` for such content without a label; names compare without case).
+/// Content whose labels aren't known (`unknown`) is never a peer's.
 pub fn may_have(granted: &[String], labels: &[String]) -> bool {
     labels.iter().all(|label| {
-        granted
-            .iter()
-            .any(|g| g.trim().eq_ignore_ascii_case(label.trim()))
+        !label
+            .trim()
+            .eq_ignore_ascii_case(crate::workiq::content::UNKNOWN)
+            && granted
+                .iter()
+                .any(|g| g.trim().eq_ignore_ascii_case(label.trim()))
     })
 }
 
@@ -387,8 +394,8 @@ pub fn add_lesson(
     let joined = join(head, &entries);
     let mark = parse_mark(&text);
     Some(if mark.is_some() || !lesson.labels.is_empty() {
-        let labels = union_labels(mark.as_deref().unwrap_or_default(), &lesson.labels);
-        with_mark(&joined, &labels)
+        let kept = mark.as_deref().map(labels_of_mark).unwrap_or_default();
+        with_mark(&joined, &union_labels(&kept, &lesson.labels))
     } else {
         joined
     })
@@ -516,6 +523,18 @@ mod tests {
         let general = memory.recall(|labels| labels.iter().all(|l| l == "General"));
         assert!(general.knowledge.contains("EBITDA") && !general.knowledge.contains("Contoso"));
         assert!(general.labels.is_empty() && general.used.unwrap().labels.is_empty());
+        // A grant names the labels it covers, in any case; content whose labels aren't
+        // known is no peer's, whatever its grant says.
+        let grant = |labels: &[&str]| labels.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        assert!(may_have(
+            &grant(&["confidential"]),
+            &grant(&["Confidential"])
+        ));
+        assert!(!may_have(
+            &grant(&["General"]),
+            &grant(&["General", "Confidential"])
+        ));
+        assert!(!may_have(&grant(&["unknown"]), &grant(&["unknown"])));
         // Nothing to give: the task as it is.
         let none = super::WorkerMemory::new(
             "x",

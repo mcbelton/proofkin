@@ -86,10 +86,11 @@ pub struct ContextRef {
 /// Work context a task's prompt had, as its worker found it there: where it came from, its
 /// SHA-256, how many results it held and their labels (as its requester said). Never its
 /// content, which stays with the requester (see [`crate::plan::WorkRecord`]). Its worker adds
-/// what it brought itself: with source [`crate::factory::memory::SOURCE`], the knowledge its
-/// own memory put in front of the task (topics, and the labels of those marked as Microsoft
-/// 365 content), which stays with the worker; with source `team`, what its team's results
-/// hold (steps, and their labels). A requester marks what it does with the result with them.
+/// what it brought itself when it holds Microsoft 365 labels: with source
+/// [`crate::factory::memory::SOURCE`], the knowledge its own memory put in front of the task
+/// (topics, and the labels of those marked as Microsoft 365 content), which stays with the
+/// worker; with source `team`, what its team's results hold (steps, and their labels). A
+/// requester marks what it does with the result with them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUse {
     pub source: String,
@@ -144,6 +145,30 @@ pub fn context_uses(prompt: &str, refs: &[ContextRef]) -> Result<Vec<ContextUse>
                 .map_err(|e| anyhow!("work context part {} of the task: {e}", i + 1))
         })
         .collect()
+}
+
+/// What a task's signed evidence calls the Microsoft 365 labels its requester marked it with
+/// (see [`crate::llm::LlmTask::m365`]).
+pub const MARKED: &str = "marked";
+
+/// The [`ContextUse`] of the Microsoft 365 labels `labels` a task's requester marked its
+/// prompt with (none without labels). Fails unless they are well-formed, and few enough.
+pub fn marked_use(prompt: &str, labels: &[String]) -> Result<Option<ContextUse>> {
+    if labels.is_empty() {
+        return Ok(None);
+    }
+    let ok = |s: &String| {
+        !s.trim().is_empty() && s.len() <= 100 && !s.chars().any(|c| c.is_control() || c == '`')
+    };
+    if labels.len() > MAX_CONTEXT_LABELS || !labels.iter().all(ok) {
+        bail!("the Microsoft 365 labels it is marked with aren't well-formed");
+    }
+    Ok(Some(ContextUse {
+        source: MARKED.to_owned(),
+        sha256: sha256_hex(prompt.as_bytes()),
+        results: 0,
+        labels: crate::knowledge::union_labels(&[], labels),
+    }))
 }
 
 /// A signed record of what an agent's runtime observed about one task or approval.
@@ -326,39 +351,43 @@ impl Evidence {
             }
         }
         for c in &self.context {
-            let plural = |n: usize| if n == 1 { "" } else { "s" };
-            let labels = if c.labels.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", c.labels.join(", "))
-            };
-            let sha = c.sha256.chars().take(12).collect::<String>();
-            text += &match c.source.as_str() {
-                crate::factory::memory::SOURCE => format!(
-                    "**Knowledge** from {}'s memory: {} topic{}{labels}, SHA-256 `{sha}…` (its content stays with {})\n",
-                    self.signer,
-                    c.results,
-                    plural(c.results),
-                    self.signer
-                ),
-                "team" => format!(
-                    "**Team results** with Microsoft 365 content: {} step{}{labels}, SHA-256 `{sha}…`\n",
-                    c.results,
-                    plural(c.results)
-                ),
-                source => format!(
-                    "**Work context** from {}: {} result{}{labels}, SHA-256 `{sha}…` (its content stays with the requester)\n",
-                    if source == "workiq" {
-                        "Microsoft 365 (Work IQ)"
-                    } else {
-                        source
-                    },
-                    c.results,
-                    plural(c.results)
-                ),
-            };
+            text += &context_line(&self.signer, c);
         }
         text
+    }
+}
+
+/// The summary line of work context `c` a task of `signer`'s had.
+pub fn context_line(signer: &str, c: &ContextUse) -> String {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let labels = if c.labels.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", c.labels.join(", "))
+    };
+    let sha = c.sha256.chars().take(12).collect::<String>();
+    match c.source.as_str() {
+        crate::factory::memory::SOURCE => format!(
+            "**Knowledge** from {signer}'s memory: {} topic{}{labels}, SHA-256 `{sha}…` (its content stays with {signer})\n",
+            c.results,
+            plural(c.results)
+        ),
+        "team" => format!(
+            "**Team results** with Microsoft 365 content: {} step{}{labels}, SHA-256 `{sha}…`\n",
+            c.results,
+            plural(c.results)
+        ),
+        MARKED => format!("**Microsoft 365 content** its requester marked in the task{labels}\n"),
+        source => format!(
+            "**Work context** from {}: {} result{}{labels}, SHA-256 `{sha}…` (its content stays with the requester)\n",
+            if source == "workiq" {
+                "Microsoft 365 (Work IQ)"
+            } else {
+                source
+            },
+            c.results,
+            plural(c.results)
+        ),
     }
 }
 

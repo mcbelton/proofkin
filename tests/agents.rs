@@ -259,6 +259,8 @@ struct Node {
     models: proofkin::models::Models,
     /// What it knows and learns (see [`worker_memory`]).
     memory: Option<Arc<proofkin::factory::memory::WorkerMemory>>,
+    /// For a digital worker: its owner's endpoint id.
+    owner_id: Option<EndpointId>,
 }
 
 impl Node {
@@ -278,6 +280,7 @@ impl Node {
             pulls: None,
             models: Default::default(),
             memory: None,
+            owner_id: None,
         }
     }
 
@@ -323,6 +326,7 @@ impl Node {
         config.team = self.team;
         config.pulls = self.pulls;
         config.memory = self.memory;
+        config.owner_id = self.owner_id;
         // The real program serves a task's checks to its model.
         config.task_checks = Some(env!("CARGO_BIN_EXE_proofkin").into());
         config.worktrees_dir = std::env::temp_dir()
@@ -5274,10 +5278,10 @@ fn worker_memory(
 }
 
 /// A digital worker's memory goes in front of each task it serves for a requester who may
-/// have it: its owner all of it, a peer the topics its grant's labels cover. The signed
-/// evidence carries the labels of what it held, so the requester marks what it does with
-/// the result: a later step to a peer without the grant is refused, and what it saves is
-/// marked.
+/// have it: its owner (known by its key, not its name) all of it, a peer the topics its
+/// grant's labels cover. The signed evidence carries the labels of what it held, so the
+/// requester marks what it does with the result: a later step goes only to a peer granted
+/// them, which its requester tells what the task holds, and what it saves is marked.
 #[tokio::test]
 async fn a_workers_memory_goes_in_front_of_tasks_for_whoever_may_have_it() {
     use proofkin::knowledge::{KnowledgeBase, parse_mark};
@@ -5292,15 +5296,16 @@ async fn a_workers_memory_goes_in_front_of_tasks_for_whoever_may_have_it() {
         None,
     );
     let mut analyst = Node::new("analyst").serving(vec![Provider::Copilot]);
-    analyst.owner = Some("boss".into());
-    analyst.memory = Some(memory);
     let mut boss = Node::new("boss");
+    analyst.owner = Some("boss".into());
+    analyst.owner_id = Some(boss.id());
+    analyst.memory = Some(memory);
     let mut partner = Node::new("partner");
     let mut reviewer = Node::new("reviewer").serving(vec![Provider::Copilot]);
     mutual(&mut analyst, &mut boss);
     mutual(&mut analyst, &mut partner);
     mutual(&mut boss, &mut reviewer);
-    let partner_id = partner.id();
+    let (partner_id, reviewer_id) = (partner.id(), reviewer.id());
     let (analyst, _ae) = analyst.start().await;
     let (boss, _be) = boss.start().await;
     let (partner, _pe) = partner.start().await;
@@ -5365,6 +5370,41 @@ async fn a_workers_memory_goes_in_front_of_tasks_for_whoever_may_have_it() {
         parse_mark(&kb.read("q3-summary").unwrap()),
         Some(vec!["Confidential".to_owned()])
     );
+    // Granted, the reviewer gets it, told what it holds; its signed evidence says so too.
+    boss.allow(TrustedPeer {
+        name: "reviewer".into(),
+        id: reviewer_id,
+        addrs: BTreeSet::new(),
+        can_delegate: true,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec![DATA_SHARE.to_owned()],
+        m365: Some(M365Grant {
+            labels: vec!["Confidential".into()],
+            tools: false,
+        }),
+        github: None,
+    });
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    let StepState::Done {
+        evidence: Some(e),
+        output,
+        ..
+    } = &states["b"]
+    else {
+        panic!("{:?}", states["b"]);
+    };
+    let marked = e
+        .context
+        .iter()
+        .find(|c| c.source == "marked")
+        .expect(output);
+    assert_eq!(marked.labels, ["Confidential"]);
+    assert!(
+        output
+            .contains("**Microsoft 365 content** its requester marked in the task (Confidential)"),
+        "{output}"
+    );
 
     // A peer without a grant gets what isn't Microsoft 365 content.
     let task = LlmTask::new(Provider::Copilot, "Summarize Q3");
@@ -5378,34 +5418,58 @@ async fn a_workers_memory_goes_in_front_of_tasks_for_whoever_may_have_it() {
         "{}",
         asked.output
     );
+    // Knowledge without labels is in its signed output only: requesters from before work
+    // context verify its record as before.
+    assert!(
+        asked
+            .output
+            .contains("**Knowledge** from analyst's memory: 1 topic, SHA-256"),
+        "{}",
+        asked.output
+    );
     let e = asked.evidence.unwrap();
-    assert_eq!(e.context[0].results, 1);
-    assert!(e.context[0].labels.is_empty(), "{:?}", e.context);
+    assert!(e.context.is_empty(), "{:?}", e.context);
 
     // Granted the label (names compare without case), it gets that topic too.
-    analyst.allow(TrustedPeer {
-        name: "partner".into(),
+    let entry = |name: &str, m365: Option<M365Grant>| TrustedPeer {
+        name: name.into(),
         id: partner_id,
         addrs: BTreeSet::new(),
         can_delegate: true,
         tasks_per_hour: 100,
         access: Access::ReadOnly,
         shares: vec![DATA_SHARE.to_owned()],
-        m365: Some(M365Grant {
+        m365,
+        github: None,
+    };
+    analyst.allow(entry(
+        "partner",
+        Some(M365Grant {
             labels: vec!["confidential".into()],
             tools: false,
         }),
-        github: None,
-    });
-    let asked = partner.delegate_verified(analyst.id(), task).await.unwrap();
+    ));
+    let asked = partner
+        .delegate_verified(analyst.id(), task.clone())
+        .await
+        .unwrap();
     assert!(asked.output.contains("Revenue was 12."), "{}", asked.output);
     assert_eq!(asked.evidence.unwrap().context[0].labels, ["Confidential"]);
+
+    // Allowlisted under its owner's name, a peer still isn't its owner.
+    analyst.allow(entry("boss", None));
+    let asked = partner.delegate_verified(analyst.id(), task).await.unwrap();
+    assert!(
+        asked.output.contains("EBITDA") && !asked.output.contains("Revenue was 12."),
+        "{}",
+        asked.output
+    );
     let _ = reviewer;
 }
 
 /// A task its checks verified teaches its worker a lesson, kept once in its lessons topic
-/// and marked with the labels of what the task was given; one whose checks failed teaches
-/// it nothing.
+/// and marked with the labels of what the task was given (its memory's, and what its
+/// requester says the task holds); one whose checks failed teaches it nothing.
 #[tokio::test]
 async fn a_task_its_checks_verified_teaches_its_worker_a_lesson_once() {
     use proofkin::knowledge::{KnowledgeBase, parse_mark};
@@ -5418,7 +5482,9 @@ async fn a_task_its_checks_verified_teaches_its_worker_a_lesson_once() {
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("ok.txt"), "ok").unwrap();
     let mut analyst = Node::new("analyst").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
     analyst.owner = Some("boss".into());
+    analyst.owner_id = Some(boss.id());
     analyst.memory = Some(memory);
     let checks = parse_checks(&[
         format!("ok={}", exists_check("ok.txt")),
@@ -5429,7 +5495,6 @@ async fn a_task_its_checks_verified_teaches_its_worker_a_lesson_once() {
         .shares
         .add_with("repo", repo.path(), Access::Full, checks, false)
         .unwrap();
-    let mut boss = Node::new("boss");
     mutual(&mut analyst, &mut boss);
     analyst.grant("boss", Access::Full, &["data", "repo"]);
     let (analyst, _ae) = analyst.start().await;
@@ -5438,14 +5503,14 @@ async fn a_task_its_checks_verified_teaches_its_worker_a_lesson_once() {
     wait_for_peers(&boss, 1).await;
     let kb = KnowledgeBase::new(knowledge.path());
     let lessons = || kb.read("analyst-lessons").unwrap_or_default();
-    let task = |check: &str| {
-        LlmTask::new(Provider::Copilot, "Summarize Q3")
+    let task = |prompt: &str, check: &str| {
+        LlmTask::new(Provider::Copilot, prompt)
             .in_share("repo")
             .with_checks(vec![check.into()], None)
     };
 
     let failed = boss
-        .delegate_verified(analyst.id(), task("missing"))
+        .delegate_verified(analyst.id(), task("Summarize Q3", "missing"))
         .await
         .unwrap();
     assert!(!failed.ok && failed.verified, "{}", failed.output);
@@ -5456,7 +5521,7 @@ async fn a_task_its_checks_verified_teaches_its_worker_a_lesson_once() {
     );
 
     let passed = boss
-        .delegate_verified(analyst.id(), task("ok"))
+        .delegate_verified(analyst.id(), task("Summarize Q3", "ok"))
         .await
         .unwrap();
     assert!(passed.ok && passed.verified, "{}", passed.output);
@@ -5473,21 +5538,46 @@ async fn a_task_its_checks_verified_teaches_its_worker_a_lesson_once() {
     }
     assert_eq!(parse_mark(&text), Some(vec!["Confidential".to_owned()]));
 
-    boss.delegate_verified(analyst.id(), task("ok"))
+    boss.delegate_verified(analyst.id(), task("Summarize Q3", "ok"))
         .await
         .unwrap();
     assert_eq!(lessons(), text, "the same lesson is kept once");
+
+    // A task its requester says holds HR content: its lesson is marked HR too.
+    let mut hr = task("Summarize the pay bands", "ok");
+    hr.m365 = vec!["HR".into()];
+    let passed = boss.delegate_verified(analyst.id(), hr).await.unwrap();
+    assert!(passed.ok, "{}", passed.output);
+    let e = passed.evidence.unwrap();
+    assert!(
+        e.context
+            .iter()
+            .any(|c| c.source == "marked" && c.labels == ["HR"]),
+        "{:?}",
+        e.context
+    );
+    let text = lessons();
+    assert_eq!(text.matches("<!-- lesson sha256=").count(), 2, "{text}");
+    assert_eq!(
+        parse_mark(&text),
+        Some(vec!["Confidential".to_owned(), "HR".to_owned()])
+    );
 }
 
-/// A lead's team results hold what its members' signed evidence says they do: they go
-/// back only to a requester who may have it, and the lead's own evidence then carries the
-/// labels.
+/// A lead's team results go back only to a requester who may have what they hold: what
+/// its members' signed evidence names, and the Microsoft 365 content the lead's own run
+/// gives its steps (here, its marked topic). Its own evidence then carries the labels.
 #[tokio::test]
 async fn a_teams_results_go_back_only_to_a_requester_who_may_have_what_they_hold() {
+    use proofkin::knowledge::with_mark;
     use proofkin::{M365Grant, TrustedPeer};
 
     let home = tempfile::tempdir().unwrap();
     let lead_profile = proofkin::Profile::open_in(home.path(), "lead").unwrap();
+    lead_profile
+        .knowledge()
+        .write("hr-notes", &with_mark("Pay bands", &["HR".into()]), "")
+        .unwrap();
     let app = tempfile::tempdir().unwrap();
     let (_knowledge, memory) = worker_memory(
         "helper",
@@ -5498,15 +5588,28 @@ async fn a_teams_results_go_back_only_to_a_requester_who_may_have_what_they_hold
     let mut lead = Node::new("lead").serving(vec![Provider::Copilot]);
     let mut helper = Node::new("helper").serving(vec![Provider::Copilot]);
     helper.owner = Some("lead".into());
+    helper.owner_id = Some(lead.id());
     helper.memory = Some(memory);
     lead.team = Some(Arc::new(proofkin::team::TeamRunner::new(lead_profile)));
-    lead.shares.add("app", app.path(), Access::Full).unwrap();
-    lead.shares
-        .set_team("app", Some("work @helper {task}".into()))
-        .unwrap();
+    for (folder, team) in [
+        ("app", "work @helper {task}"),
+        ("hr", "work @helper context=hr-notes {task}"),
+    ] {
+        lead.shares.add(folder, app.path(), Access::Full).unwrap();
+        lead.shares.set_team(folder, Some(team.into())).unwrap();
+    }
     mutual(&mut boss, &mut lead);
     mutual(&mut lead, &mut helper);
-    lead.grant("boss", Access::WorkspaceWrite, &["data", "app"]);
+    lead.grant("boss", Access::WorkspaceWrite, &["data", "app", "hr"]);
+    lead.trust
+        .peers
+        .iter_mut()
+        .find(|p| p.name == "helper")
+        .unwrap()
+        .m365 = Some(M365Grant {
+        labels: vec!["HR".into()],
+        tools: false,
+    });
     let boss_id = boss.id();
     let (helper, _he) = helper.start().await;
     let (lead, _le) = lead.start().await;
@@ -5516,24 +5619,28 @@ async fn a_teams_results_go_back_only_to_a_requester_who_may_have_what_they_hold
     wait_for_peers(&lead, 2).await;
     wait_for_peers(&boss, 1).await;
     wait_until(|| {
-        boss.peers()[0]
-            .shares
+        let shares = &boss.peers()[0].shares;
+        ["app", "hr"]
             .iter()
-            .any(|s| s.name == "app" && s.team)
+            .all(|f| shares.iter().any(|s| s.name == *f && s.team))
     })
     .await;
 
     let plan = Plan::parse("build team @lead:app Summarize Q3").unwrap();
-    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
-    let StepState::Failed { error, .. } = &states["build"] else {
-        panic!("{:?}", states["build"]);
+    let refused = |states: &std::collections::BTreeMap<String, StepState>, labels: &str| {
+        let StepState::Failed { error, .. } = &states["build"] else {
+            panic!("{:?}", states["build"]);
+        };
+        assert!(
+            error.contains(&format!(
+                "the team's results hold Microsoft 365 content (labels: {labels}) that boss may not receive"
+            )),
+            "{error}"
+        );
+        error.clone()
     };
-    assert!(
-        error.contains(
-            "the team's results hold Microsoft 365 content (labels: Confidential) that boss may not receive"
-        ) && error.contains("--m365 Confidential"),
-        "{error}"
-    );
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert!(refused(&states, "Confidential").contains("--m365 Confidential"));
 
     lead.allow(TrustedPeer {
         name: "boss".into(),
@@ -5542,7 +5649,7 @@ async fn a_teams_results_go_back_only_to_a_requester_who_may_have_what_they_hold
         can_delegate: true,
         tasks_per_hour: 100,
         access: Access::WorkspaceWrite,
-        shares: vec![DATA_SHARE.to_owned(), "app".into()],
+        shares: vec![DATA_SHARE.to_owned(), "app".into(), "hr".into()],
         m365: Some(M365Grant {
             labels: vec!["Confidential".into()],
             tools: false,
@@ -5569,5 +5676,11 @@ async fn a_teams_results_go_back_only_to_a_requester_who_may_have_what_they_hold
         (team.results, team.labels.clone()),
         (1, vec!["Confidential".to_owned()])
     );
+
+    // The lead's own HR topic is in that team's results too.
+    let hr = Plan::parse("build team @lead:hr Summarize the pay bands").unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &hr, |_, _| {}).await;
+    let error = refused(&states, "HR, Confidential");
+    assert!(error.contains("--m365 Confidential,HR"), "{error}");
     let _ = helper;
 }

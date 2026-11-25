@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::factory::evals::Suite;
+use crate::knowledge::labels_of_mark;
 use crate::llm::{Access, Provider};
 use crate::models::Models;
 use crate::profile::{Profile, name_ok};
@@ -315,14 +316,15 @@ pub struct Catalog {
     pub factory: BTreeSet<String>,
 }
 
-/// A shared folder: where it is, the most access it gives, its checks and the MCP
-/// servers it offers tasks.
+/// A shared folder: where it is, the most access it gives, its checks, the MCP servers it
+/// offers tasks and whether each editing task gets a worktree of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Folder {
     pub path: std::path::PathBuf,
     pub access: Access,
     pub checks: BTreeSet<String>,
     pub mcp: BTreeMap<String, Offer>,
+    pub worktrees: bool,
 }
 
 /// An MCP server a folder offers tasks: the least access they need, the tools they may
@@ -395,6 +397,7 @@ impl Catalog {
                         access: s.max_access,
                         checks: s.checks.keys().cloned().collect(),
                         mcp,
+                        worktrees: s.worktrees,
                     };
                     (s.name.clone(), folder)
                 })
@@ -419,16 +422,6 @@ impl Catalog {
     pub fn without(mut self, name: &str) -> Self {
         self.factory.remove(name);
         self
-    }
-}
-
-/// The labels of a Microsoft 365 mark as audiences are checked against: its labels, or
-/// `unlabeled` for content without one.
-pub fn labels_of_mark(labels: &[String]) -> Vec<String> {
-    if labels.is_empty() {
-        vec![crate::workiq::content::UNLABELED.to_owned()]
-    } else {
-        labels.to_vec()
     }
 }
 
@@ -1208,6 +1201,7 @@ pub(crate) mod tests {
             access,
             checks: ["test".to_owned()].into(),
             mcp: [("pdf".to_owned(), pdf.clone())].into(),
+            worktrees: false,
         };
         let mut models = Models::new();
         models.insert(

@@ -4661,6 +4661,10 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.bind = args.listen;
         config.trust = profile.trust()?;
         config.owner = profile.config.owner.clone();
+        // A digital worker knows its owner by key: names on its allowlist can change.
+        if profile.config.owner.is_some() {
+            config.owner_id = Some(profile.account_profile()?.identity()?.public());
+        }
         config.role = profile.config.role.clone();
         config.models = profile.models();
         config.worktrees_dir = profile.worktrees_dir();

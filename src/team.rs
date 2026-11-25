@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, PeerInfo};
 use crate::evidence::GitCommit;
-use crate::knowledge::KnowledgeBase;
+use crate::knowledge::{KnowledgeBase, labels_of_mark, union_labels};
 use crate::llm::LlmTask;
 use crate::plan::{Plan, Recipients, RunContext, SquadStore, Step, StepState};
 use crate::profile::Profile;
@@ -343,9 +343,10 @@ pub struct TeamOutcome {
     pub git: Option<GitCommit>,
     /// Every step is done, and the run proves its claims (if it has any).
     pub ok: bool,
-    /// The Microsoft 365 labels its steps' results hold, as their peers' signed evidence
-    /// says (see [`crate::plan::result_labels`]): its output and record hold them too.
+    /// The Microsoft 365 labels its steps' results hold (see [`TeamRunner::run`]): its
+    /// output and record hold them too. How many of its steps hold such content.
     pub labels: Vec<String>,
+    pub marked: usize,
 }
 
 /// Runs the team plans of team steps handed to a profile's agent, with the profile's
@@ -363,6 +364,29 @@ struct Kit {
     recipients: Recipients,
 }
 
+/// `plan` with each step marked with the Microsoft 365 labels of team step `task` (those its
+/// requester marked it with, and its work context's): a step's task holds the team step's,
+/// so it goes only where they may.
+fn seeded(mut plan: Plan, task: &LlmTask) -> Plan {
+    let mut given = task.m365.clone();
+    for part in &task.context {
+        given = union_labels(&given, &part.labels);
+    }
+    if given.is_empty() {
+        return plan;
+    }
+    for step in &mut plan.steps {
+        // A `workiq=` step's mark is the labels its results turn out to have.
+        let own = if step.brings_m365() {
+            step.m365.clone().unwrap_or_default()
+        } else {
+            step.m365.as_deref().map(labels_of_mark).unwrap_or_default()
+        };
+        step.m365 = Some(union_labels(&own, &given));
+    }
+    plan
+}
+
 /// `text` (a team plan) filled in for team step `task` (see [`fill`]), if it can run
 /// now: [`crate::plan::preflight`] finds no error in it on `agent`'s peers with `kit`.
 fn checked(
@@ -372,7 +396,7 @@ fn checked(
     task: &LlmTask,
     request: &TeamRequest,
 ) -> Result<Plan> {
-    let plan = fill(text, task, request)?;
+    let plan = seeded(fill(text, task, request)?, task);
     let errors: Vec<String> = crate::plan::preflight(
         &plan,
         &agent.peers(),
@@ -580,11 +604,25 @@ impl TeamRunner {
         let ok = finals.values().all(|s| matches!(s, StepState::Done { .. }))
             && (record.claims.is_empty() || record.passed());
         let (patch, git) = committed.map_or((None, None), |(p, g)| (Some(p), g));
-        // What its steps' results hold, as their peers' signed evidence says.
-        let mut labels: Vec<String> = Vec::new();
-        for state in finals.values() {
-            if let Some(found) = crate::plan::result_labels(state) {
-                labels = crate::knowledge::union_labels(&labels, &found);
+        // What its output and record hold: the results and errors of the steps that did
+        // work, with the Microsoft 365 content their peers' signed evidence names and that
+        // the run gave them (`workiq=` and `@workiq` steps, marked topics, the team step's
+        // own, and the steps after those).
+        let held = crate::plan::with_result_labels(
+            &crate::plan::with_actual_labels(&plan, &ctx.work_log),
+            &finals,
+        )
+        .marked(&kb);
+        let (mut labels, mut marked) = (Vec::new(), 0);
+        for step in &held.steps {
+            let worked = match finals.get(&step.id) {
+                Some(StepState::Done { .. }) => true,
+                Some(StepState::Failed { evidence, .. }) => evidence.is_some(),
+                _ => false,
+            };
+            if let (true, Some(mark)) = (worked, &step.m365) {
+                labels = union_labels(&labels, &labels_of_mark(mark));
+                marked += 1;
             }
         }
         Ok(TeamOutcome {
@@ -594,6 +632,7 @@ impl TeamRunner {
             git,
             ok,
             labels,
+            marked,
         })
     }
 }

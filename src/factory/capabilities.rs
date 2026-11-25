@@ -97,8 +97,9 @@ pub fn resolve(bp: &Blueprint, folders: &[String], catalog: &Catalog) -> Resolut
                     ),
                 )
                 .fix(format!(
-                    "proofkin share add {name} {path} --access {} --profile {profile}{} (or ask for {} access)",
+                    "proofkin share add {name} {path} --access {}{} --profile {profile}{} (or ask for {} access)",
                     caps.access,
+                    flags_again(folder),
                     checks_again(folder),
                     folder.access
                 )),
@@ -228,7 +229,8 @@ pub fn resolve(bp: &Blueprint, folders: &[String], catalog: &Catalog) -> Resolut
                         format!("'{name}' has no check '{check}'"),
                     )
                     .fix(format!(
-                        "proofkin share add {name} {path} --access full --check {check}=<command> --profile {profile}{}",
+                        "proofkin share add {name} {path} --access full{} --check {check}=<command> --profile {profile}{}",
+                        flags_again(folder),
                         checks_again(folder)
                     )),
                 );
@@ -252,6 +254,12 @@ fn checks_again(folder: &Folder) -> String {
         let names: Vec<&str> = folder.checks.iter().map(String::as_str).collect();
         format!(" (with its --check options again: {})", names.join(", "))
     }
+}
+
+/// The flags a fix that shares a folder again must keep: `share add` replaces the folder,
+/// and without `--worktrees` its tasks lose their worktrees and its pull request steps.
+fn flags_again(folder: &Folder) -> &'static str {
+    if folder.worktrees { " --worktrees" } else { "" }
 }
 
 fn tool_flags<'a>(tools: impl Iterator<Item = &'a String>) -> String {
@@ -363,10 +371,15 @@ mod tests {
             access,
             checks: checks.iter().map(|c| c.to_string()).collect(),
             mcp: mcp.into_iter().map(|(n, o)| (n.to_owned(), o)).collect(),
+            worktrees: false,
         };
         let paused = Offer {
             paused: true,
             ..offer(Access::Full, &[])
+        };
+        let app = Folder {
+            worktrees: true,
+            ..folder(Access::Full, &["test"], vec![("pdf", paused)])
         };
         catalog.folders = [
             (
@@ -377,10 +390,7 @@ mod tests {
                     vec![("pdf", offer(Access::ReadOnly, &["read_pdf", "search_pdf"]))],
                 ),
             ),
-            (
-                "app",
-                folder(Access::Full, &["test"], vec![("pdf", paused)]),
-            ),
+            ("app", app),
             ("notes", folder(Access::WorkspaceWrite, &[], vec![])),
         ]
         .into_iter()
@@ -474,7 +484,7 @@ mod tests {
         );
         assert_eq!(
             fix(&app, "check_not_offered"),
-            "proofkin share add app \"/srv/full\" --access full --check lint=<command> --profile alice (with its --check options again: test)"
+            "proofkin share add app \"/srv/full\" --access full --worktrees --check lint=<command> --profile alice (with its --check options again: test)"
         );
         assert_eq!(app.grants[0].checks, ["test"]);
 
