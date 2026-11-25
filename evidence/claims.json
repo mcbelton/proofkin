@@ -1331,13 +1331,22 @@
     {
       "id": "WIQ-16",
       "area": "work-iq",
-      "claim": "A folder can offer Work IQ to its owner's tasks as its MCP server workiq (proofkin mcp add <folder> workiq --workiq [--tool ...]; the name is workiq, it has no command or URL, only tools that read: retrieve, ask, fetch, search_paths, get_schema, list_agents, and any task access may use it). A task that asks for mcp=workiq gets, for that task only, http://127.0.0.1:<port>/mcp/workiq/<session> with a random bearer; the agent calls Work IQ itself through the profile's audited client, so the model's MCP config holds no token. The session lists only the allowed tools Work IQ offers, refuses any other tool before it reaches Work IQ, puts every result through the content policy for the task's audience (a peer audience gets only retrieve and ask, within its labels), audits each call with purpose gateway, needs its bearer, refuses requests with an Origin header, and closes when the task ends. Only the owner's own tasks are admitted (a digital worker's owner); anyone else's task asking for it is refused. A plan marks a step with mcp=workiq, and the steps after it, with the label unknown, so nothing made from what its model read goes to a peer.",
+      "claim": "A folder can offer Work IQ to its owner's tasks as its MCP server workiq (proofkin mcp add <folder> workiq --workiq [--tool ...]; the name is workiq, it has no command or URL, only tools that read: retrieve, ask, fetch, search_paths, get_schema, list_agents, and any task access may use it). A task that asks for mcp=workiq gets, for that task only, http://127.0.0.1:<port>/mcp/workiq/<session> with a random bearer; the agent calls Work IQ itself through the profile's audited client, so the model's MCP config holds no token. The session lists only the allowed tools Work IQ offers, refuses any other tool before it reaches Work IQ, puts every result through the content policy for the task's audience (a peer audience gets only retrieve and ask, within its labels), audits each call with purpose gateway, needs its bearer, refuses requests with an Origin header, and closes when the task ends. A digital worker's owner's tasks see what Work IQ allows (peers: WIQ-17). A plan marks a step with mcp=workiq, and the steps after it, with the label unknown, so nothing made from what its model read goes to a peer.",
       "tests": [
         "workiq_gateway::a_tasks_session_offers_only_read_tools_and_its_model_never_gets_the_token",
         "workiq_gateway::what_a_session_sees_goes_through_the_content_policy_for_its_audience_and_is_audited",
         "workiq_gateway::a_session_needs_its_bearer_takes_no_browser_and_closes_with_its_task",
-        "workiq_gateway::a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_is_refused",
+        "workiq_gateway::a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_only_with_its_grant",
         "lib::plan::steps_with_microsoft_365_content_are_marked_through_context_and_after"
+      ]
+    },
+    {
+      "id": "WIQ-17",
+      "area": "work-iq",
+      "claim": "A peer's task gets Work IQ through the gateway (mcp=workiq) only when the agent's owner granted that peer --m365-tools: its session then offers only retrieve and ask, whose results carry labels, and the content policy gives it only results with the labels of its grant; every call is audited with the peer's name as its audience. Without the grant the task is refused before its model starts, and the refusal names the grant to add (proofkin peers allow <peer> --m365 <labels> --m365-tools). The grant is read again when the task starts. The requester's plan marks the step's output unknown (WIQ-16), so it goes no further to a peer.",
+      "tests": [
+        "workiq_gateway::a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_only_with_its_grant",
+        "workiq_gateway::what_a_session_sees_goes_through_the_content_policy_for_its_audience_and_is_audited"
       ]
     },
     {

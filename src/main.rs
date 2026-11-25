@@ -1116,8 +1116,9 @@ URLs stay here (peers learn only the names they may use, and descriptions you gi
 Tasks call only the tools you list (default: all), and tool results reach the model
 marked as untrusted content. A plugin server's values not given with --set are
 taken from environment variables of the same name. A `workiq` server (--workiq) is
-Work IQ through this agent, for its owner's own tasks: each task gets an address of
-its own on this machine, never the account's token, and only tools that read.")]
+Work IQ through this agent, for its owner's tasks and peers granted --m365-tools: each
+task gets an address of its own on this machine, never the account's token, and only
+tools that read.")]
     Add {
         /// The shared folder whose tasks may use the server.
         share: String,
@@ -3785,7 +3786,7 @@ fn run_mcp(command: McpCommand) -> Result<()> {
                 tools_text(&server.tools),
                 if server.workiq {
                     format!(
-                        "Its owner's own tasks ask for it with mcp={name} in a plan step; it needs this profile's Work IQ sign-in (or its owner's, for a digital worker)."
+                        "Its owner's tasks ask for it with mcp={name} in a plan step, and peers' tasks once you grant them --m365-tools; it needs this profile's Work IQ sign-in (or its owner's, for a digital worker)."
                     )
                 } else {
                     format!("Peers ask for it with mcp={name} in a plan step.")

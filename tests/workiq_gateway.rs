@@ -20,8 +20,8 @@ use proofkin::workiq::Endpoints;
 use proofkin::workiq::audit::{CallContext, Purpose, read};
 use proofkin::workiq::gateway::{DEFAULT_TOOLS, Gateway};
 use proofkin::{
-    Access, Agent, AgentConfig, EndpointId, Executor, LlmTask, Network, Profile, Provider, Ran,
-    SecretKey, TaskContext, TrustStore, TrustedPeer,
+    Access, Agent, AgentConfig, EndpointId, Executor, LlmTask, M365Grant, Network, Profile,
+    Provider, Ran, SecretKey, TaskContext, TrustStore, TrustedPeer,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -556,7 +556,7 @@ async fn agent(name: &str, key: SecretKey, trust: TrustStore) -> Agent {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_is_refused() {
+async fn a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_only_with_its_grant() {
     use_file_secret_store();
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -644,13 +644,36 @@ async fn a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_is_refused(
         404
     );
 
-    let refused = partner.delegate(helper.id(), task).await.unwrap_err();
+    let refused = partner
+        .delegate(helper.id(), task.clone())
+        .await
+        .unwrap_err();
     assert!(
         refused
             .to_string()
-            .contains("gives Work IQ only to its owner's own tasks"),
+            .contains("only to its owner's own tasks and to peers granted it")
+            && refused.to_string().contains("--m365-tools"),
         "{refused:#}"
     );
+
+    // Granted --m365-tools for Public content only, the partner's task gets the tools whose
+    // results carry labels, and none of the General results.
+    let mut granted = helper.trusted().get(&partner.id()).unwrap().clone();
+    granted.m365 = Some(M365Grant {
+        labels: vec!["Public".into()],
+        tools: true,
+    });
+    helper.allow(granted);
+    let out = partner.delegate(helper.id(), task).await.unwrap();
+    assert!(out.starts_with("tools: retrieve, ask\n"), "{out}");
+    assert!(
+        !out.contains("Launch budget notes from the CLI."),
+        "General isn't granted: {out}"
+    );
+    assert!(out.contains("Withheld from this context"), "{out}");
+    let audited = read(&dir.path().join("profiles/helper/workiq-audit.jsonl")).unwrap();
+    let audiences: Vec<&str> = audited.iter().map(|e| e.audience.as_str()).collect();
+    assert_eq!(audiences, ["local", "partner"], "the peer is named");
     for agent in [&boss, &partner, &helper] {
         agent.shutdown().await;
     }

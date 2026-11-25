@@ -2166,7 +2166,7 @@ account, `proofkin auth logout workiq --profile me` removes it.
 | --- | --- | --- |
 | A step that starts from what Microsoft 365 has on its subject | `workiq=all` or `workiq=email,files,...` on the step | [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq) |
 | A step answered by Microsoft 365 Copilot or one of your organization's agents | `@workiq` as the step's target, `agent=<id>` from `proofkin workiq agents` | [Asking Microsoft 365 in a step](#asking-microsoft-365-in-a-step-workiq) |
-| A model that searches Microsoft 365 while it works | `mcp=workiq` on a step for your own worker, whose folder offers it (`proofkin mcp add <folder> workiq --workiq`) | [Work IQ as a tool for the owner's tasks](#work-iq-as-a-tool-for-the-owners-tasks-mcpworkiq) |
+| A model that searches Microsoft 365 while it works | `mcp=workiq` on a step for your own worker, whose folder offers it (`proofkin mcp add <folder> workiq --workiq`) | [Work IQ as a tool for tasks](#work-iq-as-a-tool-for-tasks-mcpworkiq) |
 | Cited results kept as a knowledge topic for `context=` | `proofkin kb import workiq <topic> --query <text> [--from SOURCES]` | **Importing from Microsoft 365** under the knowledge base, and [the design](docs/work-iq.md#5-work-context-in-plans) |
 | A peer that may receive some of it | `proofkin peers allow <peer> --profile me --m365 General,Public,unlabeled` | [Security model](#security-model) |
 | What it cost and the limits | `proofkin workiq usage`, `proofkin workiq budget --per-day N --per-run N` | [Work IQ audit file and budgets](#work-iq-audit-file-and-budgets) |
@@ -2394,9 +2394,9 @@ look @alice:app mcp=browser Open http://localhost:3000 and report what the home 
 Servers run on your machine with your rights, outside the shell sandbox, so offer only
 servers you trust. Remote URLs must be `https://`, except `http://` on this machine.
 
-#### Work IQ as a tool for the owner's tasks (`mcp=workiq`)
+#### Work IQ as a tool for tasks (`mcp=workiq`)
 
-A digital worker's (or your own agent's) folder can offer **Work IQ** to its owner's tasks,
+A digital worker's (or your own agent's) folder can offer **Work IQ** to tasks,
 so the model searches Microsoft 365 while it works instead of only at the start of the step
 (`workiq=`). The server is called `workiq` and has nothing to start:
 
@@ -2419,9 +2419,13 @@ draft @my-worker:app mcp=workiq Write the launch FAQ from what my mail and files
 - Every result goes through the [content policy](#4-what-keeps-your-work-data-yours): only
   results marked `allowed`, secrets redacted, in the external-content envelope. Every call is
   audited (purpose `gateway`) and held to the daily budget.
-- Only the owner's own tasks get it: a task from anyone else that asks for `mcp=workiq` is
-  refused. What such a step's model read has labels its plan never learns, so the step is
-  marked `unknown` and nothing made from it goes to a peer.
+- Your own tasks get it (a digital worker's owner's). A peer's task gets it only when you
+  granted that peer `--m365-tools` (`proofkin peers allow <peer> --m365 Public,General
+  --m365-tools`): then only `retrieve` and `ask`, and only results with the labels you
+  granted; its calls are audited under the peer's name. Any other task that asks for
+  `mcp=workiq` is refused, and the refusal names the grant. What such a step's model read
+  has labels its plan never learns, so the step is marked `unknown` and nothing made from it
+  goes to a peer.
 - A browser can't reach it: requests with an `Origin` header are refused.
 
 ### Plugins: skills, agents and MCP servers, packaged together
