@@ -2311,6 +2311,7 @@ runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
 | `the daily Work IQ budget ... is used up` | Wait for tomorrow, or raise it: `proofkin workiq budget --per-day N --profile P`. |
 | A step for a peer is refused for its Microsoft 365 content | The peer's grant doesn't cover those labels: `peers allow <peer> --m365 <labels>`, or send the step to your own worker. |
 | `kb import workiq` writes nothing | Every result was withheld because Work IQ didn't mark it `allowed`; try another query. |
+| `the retrieve tool reported an error: An error occurred invoking 'retrieve'` on a `workiq=all` step | Work IQ's `copilot` search (what `all` and `connectors` use) couldn't answer that query; its `grounding` search often can. Name the sources instead (`workiq=email,files,meetings,teams`), or ask it in other words. |
 
 ## Security model
 
