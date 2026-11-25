@@ -486,7 +486,8 @@ pub fn read_answer(result: &ToolResult) -> Result<Answer> {
         bail!("the ask tool stopped with an error ({code})");
     }
     let structured = payload.and_then(|p| ANSWER_KEYS.iter().find_map(|key| text(p, key)));
-    let Some(answer) = structured.or_else(|| content_text(result)) else {
+    let Some(answer) = structured.or_else(|| content_text(result).map(|shown| answer_in(&shown)))
+    else {
         bail!("the ask tool result has no answer text");
     };
     let citations = payload
@@ -498,6 +499,16 @@ pub fn read_answer(result: &ToolResult) -> Result<Answer> {
         text: answer,
         citations,
     })
+}
+
+/// The answer in an `ask` result's text content: as Work IQ documents it, a JSON object with the
+/// answer in `response` (and the `conversationId`); else the text itself.
+fn answer_in(shown: &str) -> String {
+    serde_json::from_str::<Value>(shown)
+        .ok()
+        .filter(Value::is_object)
+        .and_then(|object| ANSWER_KEYS.iter().find_map(|key| text(&object, key)))
+        .unwrap_or_else(|| shown.to_owned())
 }
 
 /// The text parts of a result's MCP `content`, joined; `None` when there are none.
@@ -921,6 +932,26 @@ mod tests {
         let answer = read_answer(&result).unwrap();
         assert_eq!(answer.text, "The launch moved to May.");
         assert!(answer.citations.is_empty());
+        // As Work IQ documents it, the text is a JSON object with the answer in `response`.
+        let documented = ToolResult {
+            content: vec![json!({
+                "type": "text",
+                "text": json!({ "response": "The launch moved to May.", "conversationId": "c1" }).to_string(),
+            })],
+            structured_content: None,
+            is_error: false,
+            ids: RequestIds::default(),
+        };
+        assert_eq!(
+            read_answer(&documented).unwrap().text,
+            "The launch moved to May."
+        );
+        // Text that is JSON but not such an object is the answer as it is.
+        let list = ToolResult {
+            content: vec![json!({ "type": "text", "text": "[1, 2]" })],
+            ..documented.clone()
+        };
+        assert_eq!(read_answer(&list).unwrap().text, "[1, 2]");
         let local = answer_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
         assert!(
             local.text.contains("The launch moved to May."),
