@@ -1621,6 +1621,21 @@
         "ui::any_peer_tasks_go_to_a_peer_that_allows_their_model",
         "lib::plan::squad_steps_pick_the_least_busy_capable_member"
       ]
+    },
+    {
+      "id": "FAC-2",
+      "area": "agent-factory",
+      "claim": "A task records the usage its provider reported: the Copilot session's tokens and premium requests, the Claude Agent SDK's tokens and cost estimate, and the tokens of Codex's turn. A provider that reports none records none, not zero. Usage adds up over a task's attempts, goes back to the requester with the result (older peers ignore it) and is kept in the worker's audit entry, which holds no prompt or output text. The web UI shows it on a finished task and in the audit, and proofkin audit sums it per peer and provider.",
+      "tests": [
+        "lib::llm::usage_keeps_only_what_providers_report_and_adds_up_runs",
+        "lib::llm::copilot::a_sessions_usage_is_its_models_tokens_and_its_premium_requests",
+        "bridge::sends_task_fields_and_returns_text",
+        "bridge::claude_tool_policy_confines_paths_and_tools",
+        "lib::protocol::progress_load_and_origins_keep_older_peers_working",
+        "lib::audit::usage_is_recorded_without_text_and_summed_per_peer_and_provider",
+        "agents::the_worker_reports_what_its_provider_said_the_work_used"
+      ],
+      "live": ["worker1 audited what Copilot said boss's tasks used"]
     }
   ]
 }

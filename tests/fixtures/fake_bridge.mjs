@@ -23,6 +23,16 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     process.stdout.write(JSON.stringify({ id, ok: true, text }) + "\n");
     return;
   }
+  if (prompt === "usage") {
+    const usage = { input_tokens: 1200, cached_input_tokens: 1000, output_tokens: 80, cost_usd: 0.0123 };
+    process.stdout.write(JSON.stringify({ id, ok: true, text: "used", usage }) + "\n");
+    return;
+  }
+  if (prompt === "bad usage") {
+    const usage = { input_tokens: -1, output_tokens: "lots", cost_usd: "free" };
+    process.stdout.write(JSON.stringify({ id, ok: true, text: "used", usage }) + "\n");
+    return;
+  }
   const delay = prompt === "slow" ? 200 : 0;
   setTimeout(() => {
     const reply = prompt === "fail"

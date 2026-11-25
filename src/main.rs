@@ -1632,7 +1632,7 @@ fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
         let access = e.access.map_or("-".to_owned(), |a| a.to_string());
         let outcome = serde_json::to_value(e.outcome)?;
         println!(
-            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}{}",
+            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}{}{}",
             format!(
                 "{} {:02}:{:02}:{:02}",
                 civil_date(days),
@@ -1660,7 +1660,25 @@ fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
                 .as_deref()
                 .map(|err| format!("\n{:>22}{err}", "error: "))
                 .unwrap_or_default(),
+            e.usage
+                .as_ref()
+                .map(|u| format!("\n{:>22}{}", "used: ", u.describe()))
+                .unwrap_or_default(),
         );
+    }
+    let totals = proofkin::audit::usage_totals(&entries);
+    if !totals.is_empty() {
+        println!("usage by peer and provider, as providers reported it:");
+        for t in &totals {
+            println!(
+                "  {:<14} {:<8} {:>5} task{}  {}",
+                t.peer,
+                t.provider,
+                t.tasks,
+                if t.tasks == 1 { " " } else { "s" },
+                t.usage.describe()
+            );
+        }
     }
     println!("log: {}", profile.audit_path().display());
     Ok(())

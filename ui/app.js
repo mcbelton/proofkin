@@ -592,6 +592,30 @@ function linkPullRequests(node) {
   return node;
 }
 
+/** What work used, as its provider reported it, in the browser's locale: "12,345 tokens
+ * in (10,000 cached), 678 tokens out, 1 premium request, $0.0123". Only what it reported. */
+function usageText(u) {
+  if (!u) return "";
+  const n = (x) => x.toLocaleString();
+  const parts = [];
+  if (u.input_tokens != null) {
+    parts.push(`${n(u.input_tokens)} tokens in${u.cached_input_tokens != null ? ` (${n(u.cached_input_tokens)} cached)` : ""}`);
+  } else if (u.cached_input_tokens != null) {
+    parts.push(`${n(u.cached_input_tokens)} cached tokens in`);
+  }
+  if (u.output_tokens != null) parts.push(`${n(u.output_tokens)} tokens out`);
+  if (u.premium_requests != null) {
+    const p = Number(u.premium_requests.toFixed(2));
+    parts.push(`${n(p)} premium request${p === 1 ? "" : "s"}`);
+  }
+  if (u.cost_usd != null) {
+    parts.push(new Intl.NumberFormat(undefined, {
+      style: "currency", currency: "USD", maximumFractionDigits: u.cost_usd < 1 ? 4 : 2,
+    }).format(u.cost_usd));
+  }
+  return parts.join(", ");
+}
+
 function taskNode(t) {
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
   // The model that did the work, after the provider, once its provider (or peer) said.
@@ -609,6 +633,8 @@ function taskNode(t) {
     : el("div", { class: "task-meta" }, `Started ${stamp(t.started_ms)}`,
       ran ? " · " : null,
       ran ? el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null }, ran) : null,
+      t.usage ? " · " : null,
+      t.usage ? el("span", { title: "What the work used, as its provider reported it" }, `used ${usageText(t.usage)}`) : null,
       t.after?.length ? ` · after ${t.after.join(", ")}` : null, via || null);
   const node = el("li", { class: `task ${t.status}`, "data-task": t.id, tabindex: "-1" },
     el("div", { class: "task-top" },
@@ -3065,6 +3091,7 @@ async function loadAudit() {
         el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${e.team ? "Team step" : providerLabel(e.provider)}${e.model ? ` · ${e.model}` : ""}` }),
         el("span", { class: `status ${OUTCOME_CLASS[e.outcome] ?? ""}`, text: OUTCOME_TEXT[e.outcome] ?? e.outcome })),
       el("div", { class: "task-meta", text: `${stamp(e.ts_ms)} · ${access} · ${duration(e.duration_ms)} · ${e.prompt_chars} chars, sha256 ${e.prompt_sha256.slice(0, 10)}` }),
+      e.usage ? el("div", { class: "task-meta", title: "As its provider reported it", text: `Used ${usageText(e.usage)}` }) : null,
       e.origin ? el("div", { class: "task-meta", text: `Part of ${e.origin} on ${e.peer}` }) : null,
       e.error ? el("div", { class: e.outcome === "cancelled" ? "audit-note" : "audit-error", text: e.error }) : null));
   }

@@ -48,6 +48,36 @@ async fn sends_task_fields_and_returns_text() {
         .await
         .unwrap();
     assert_eq!(older.model, None);
+    assert_eq!(older.usage, None, "no usage reported: none, not zero");
+    // The usage the SDK reported comes back; figures that aren't ones are dropped,
+    // and never fail the task.
+    let used = bridge
+        .run(
+            &LlmTask::new(Provider::Claude, "usage"),
+            Path::new("."),
+            Access::ReadOnly,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        used.usage,
+        Some(proofkin::Usage {
+            input_tokens: Some(1200),
+            cached_input_tokens: Some(1000),
+            output_tokens: Some(80),
+            premium_requests: None,
+            cost_usd: Some(0.0123),
+        })
+    );
+    let bad = bridge
+        .run(
+            &LlmTask::new(Provider::Codex, "bad usage"),
+            Path::new("."),
+            Access::ReadOnly,
+        )
+        .await
+        .unwrap();
+    assert_eq!((bad.output.as_str(), bad.usage), ("used", None));
 }
 
 #[tokio::test]

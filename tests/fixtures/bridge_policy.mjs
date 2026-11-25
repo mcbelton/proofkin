@@ -4,7 +4,28 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { pathRefusal, toolRefusal, claudeSandbox, claudeMcp, externalContent, wrapToolOutput, codexConfigModel, claudeEffort } = await import("../../bridge/index.mjs");
+const { pathRefusal, toolRefusal, claudeSandbox, claudeMcp, externalContent, wrapToolOutput, codexConfigModel, claudeEffort, claudeUsage, codexUsage } = await import("../../bridge/index.mjs");
+
+// Usage as the SDKs report it: Claude's over every model the query called (cache reads and
+// writes are input too), with its cost estimate; Codex's turn usage. None when they say nothing.
+assert.deepEqual(
+  claudeUsage({
+    total_cost_usd: 0.0123,
+    modelUsage: {
+      "claude-sonnet-5.5": { inputTokens: 300, outputTokens: 600, cacheReadInputTokens: 10000, cacheCreationInputTokens: 2000 },
+      "claude-haiku-5.5": { inputTokens: 45, outputTokens: 78, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    },
+  }),
+  { input_tokens: 12345, cached_input_tokens: 10000, output_tokens: 678, cost_usd: 0.0123 },
+);
+assert.equal(claudeUsage({ total_cost_usd: 0, modelUsage: {} }), undefined);
+assert.equal(claudeUsage({ result: "done" }), undefined);
+assert.equal(claudeUsage({ total_cost_usd: -1, modelUsage: { m: { inputTokens: 1, outputTokens: "x" } } }).cost_usd, undefined);
+assert.deepEqual(
+  codexUsage({ finalResponse: "ok", usage: { input_tokens: 1200, cached_input_tokens: 1000, cache_write_input_tokens: 0, output_tokens: 80, reasoning_output_tokens: 30 } }),
+  { input_tokens: 1200, cached_input_tokens: 1000, output_tokens: 80 },
+);
+assert.equal(codexUsage({ finalResponse: "ok", usage: null }), undefined);
 
 // A reasoning effort as the Claude Agent SDK takes it: it has no "minimal".
 assert.equal(claudeEffort("max"), "max");

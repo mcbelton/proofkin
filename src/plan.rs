@@ -3465,6 +3465,7 @@ fn ask_workiq(
             verified: false,
             refused: false,
             model: None,
+            usage: None,
         })
     }
 }
@@ -6502,6 +6503,7 @@ mod tests {
             verified: false,
             refused: false,
             model: None,
+            usage: None,
         };
         let StepState::Failed { error, .. } =
             StepState::from_delivered("w".into(), &step, delivered(false))

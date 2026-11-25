@@ -156,7 +156,7 @@ Rules that apply to every field:
 | EvalRun | verdict | string: passed or failed, per expectation | Yes | Internal | Prove the requirement | As long as the agent | Each expectation's result |
 | EvalRun | evidence | object, signed evidence | Yes | Internal | Show the task ran as reported | As long as the agent | The worker's signed evidence of the task |
 | AuditEntry | agent | string, agent@version | No | Internal | Count tasks per agent and version | 90 days (the audit's) | Added to audit.jsonl; no prompt or output text |
-| AuditEntry | usage | object {input_tokens, output_tokens, cost} | No | Internal | Show usage and cost | 90 days (the audit's) | Only what the provider reports |
+| AuditEntry | usage | object {input_tokens, cached_input_tokens, output_tokens, premium_requests, cost_usd} | No | Internal | Show usage and cost | 90 days (the audit's) | Only what the provider reports: none when it reports none, never zero; Copilot premium requests, the Claude Agent SDK's cost estimate in US dollars |
 | Lesson | text | string (Markdown) | Yes | Confidential | Keep what verified work taught the agent | The blueprint's retention_days (90 by default) | Saved only from verified results; keeps Microsoft 365 labels |
 
 ## Domain model

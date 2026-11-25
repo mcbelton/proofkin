@@ -17,7 +17,7 @@ use crate::evidence::{
     CHECK_TIMEOUT, Evidence, EvidenceKind, MAX_ATTEMPTS, retry_prompt, run_built_in, run_check,
     sha256_hex,
 };
-use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
+use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext, Usage};
 use crate::protocol::{ALPN, Message, Origin, Phase, Progress, write_message};
 use crate::shares::{DATA_SHARE, Share, ShareInfo, ShareStore, effective_access};
 use crate::trust::{TrustStore, TrustedPeer};
@@ -208,6 +208,8 @@ pub struct Delivered {
     pub refused: bool,
     /// The model that did the work, as the peer says (older peers don't).
     pub model: Option<String>,
+    /// What the work used, as the peer's provider reported it (older peers don't say).
+    pub usage: Option<Usage>,
 }
 
 /// The first id for the tasks an agent gives peers: the one kept at `path` (see
@@ -362,6 +364,8 @@ struct Served {
     ok: bool,
     /// The model that did the work, if the provider said (none for a team step).
     model: Option<String>,
+    /// What its model runs used, as the provider reported it (all its attempts').
+    usage: Option<Usage>,
 }
 
 /// A served task's place: waiting for a slot, or holding one (see
@@ -1335,6 +1339,7 @@ impl Agent {
                     verified: true,
                     refused: false,
                     model: None,
+                    usage: None,
                 }),
             );
         } else {
@@ -1346,6 +1351,7 @@ impl Agent {
                 patch: None,
                 refused: false,
                 model: None,
+                usage: None,
             };
             self.inner.deliver(request.requester, msg).await;
         }
@@ -1689,6 +1695,7 @@ impl Inner {
                         patch: None,
                         refused: true,
                         model: None,
+                        usage: None,
                     })
                     .is_ok();
             }
@@ -2058,6 +2065,7 @@ impl Inner {
         }
         entry.origin = origin.as_ref().and_then(Origin::describe);
         entry.model = result.as_ref().ok().and_then(|s| s.model.clone());
+        entry.usage = result.as_ref().ok().and_then(|s| s.usage.clone());
         if let Some(audit) = &self.audit {
             audit.record(&entry);
         }
@@ -2433,6 +2441,7 @@ impl Inner {
                 evidence,
                 patch: None,
                 model: None,
+                usage: None,
             })
         };
         tokio::select! {
@@ -2592,6 +2601,7 @@ impl Inner {
             patch: outcome.patch,
             ok: outcome.ok,
             model: None,
+            usage: None,
         })
     }
 
@@ -2888,8 +2898,8 @@ impl Inner {
         // The last attempt ended because the model's run stopped, not because checks failed.
         let mut stopped_before = false;
         // The model that did the work, and its effort: the latest attempt's, as its
-        // provider says.
-        let (mut model, mut effort) = (None, None);
+        // provider says. What the attempts used, added up.
+        let (mut model, mut effort, mut usage) = (None, None, None::<Usage>);
         while used < attempts {
             used += 1;
             let text = match (attempts, used) {
@@ -2952,6 +2962,7 @@ impl Inner {
             };
             model = ran.model.or(model);
             effort = ran.effort.or(effort);
+            usage = Usage::sum(usage.iter().chain(ran.usage.iter()));
             reports.push(ran.output);
             results.clear();
             for (i, (name, command)) in checks.iter().enumerate() {
@@ -3110,6 +3121,7 @@ impl Inner {
             patch,
             // Results name the model with its effort: every version shows it as it is.
             model: crate::models::with_effort(model, effort.as_deref()),
+            usage,
         })
     }
 }
@@ -3356,6 +3368,7 @@ async fn run_connection(
                                 patch: served.patch,
                                 refused: false,
                                 model: served.model,
+                                usage: served.usage,
                             },
                             Err(e) => Message::TaskResult {
                                 task_id,
@@ -3365,6 +3378,7 @@ async fn run_connection(
                                 patch: None,
                                 refused,
                                 model: None,
+                                usage: None,
                             },
                         };
                         {
@@ -3415,6 +3429,7 @@ async fn run_connection(
                             patch: None,
                             refused: true,
                             model: None,
+                            usage: None,
                         };
                         let _ = tx.send(msg);
                     }
@@ -3434,6 +3449,7 @@ async fn run_connection(
                     patch,
                     refused,
                     model,
+                    usage,
                 } => {
                     let verified = evidence.as_ref().is_some_and(|e| {
                         e.verify(&peer_id, &output).is_ok()
@@ -3464,6 +3480,7 @@ async fn run_connection(
                             model: model
                                 .map(|m| crate::llm::clean_model(&m))
                                 .filter(|m| !m.is_empty()),
+                            usage: usage.and_then(Usage::checked),
                         }),
                     );
                 }

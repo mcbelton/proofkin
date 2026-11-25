@@ -671,6 +671,12 @@ try:
     check("worker2 audited the refused request from worker1",
           any(e["peer"] == "worker1" and e["outcome"] == "refused" for e in a2), a2)
     check("audit logs hold no prompt text", not any("p2p_live" in json.dumps(e) for e in a1 + a2))
+    # What Copilot's session metrics said boss's tasks used: tokens and premium requests.
+    used = [e.get("usage") for e in a1
+            if e["peer"] == "boss" and e["outcome"] == "done" and e["provider"] == "copilot" and not e.get("team")]
+    check("worker1 audited what Copilot said boss's tasks used",
+          any(u and u.get("input_tokens", 0) > 0 and u.get("output_tokens", 0) > 0 and "premium_requests" in u
+              for u in used), used)
 
     print("== worker1 stops, and its digital worker helper with it; then helper is deleted")
     boss.cursor = len(boss.lines)

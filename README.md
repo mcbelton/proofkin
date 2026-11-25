@@ -589,14 +589,21 @@ refused, in the profile's `audit.jsonl`: peer name and key, provider (or `team` 
 [team step](#team-steps-handing-work-down-a-level)), the access the task got, outcome
 (`done`, `failed`, `cancelled`, `refused`), duration, any error, and what the task is part
 of on the peer's side (a step of one of its runs, or one of its tasks). The prompt is **not**
-stored, only its SHA-256 and length, so the log holds no peer content.
+stored, only its SHA-256 and length, so the log holds no peer content. It also keeps what
+the work used, as its provider reported it: tokens (input, the cached part, output), Copilot
+premium requests and the Claude Agent SDK's cost estimate. A provider that reports nothing
+records nothing, not zero. The requester gets it with the result, and the web UI shows it
+on the finished task.
 
 ```text
 > proofkin audit --profile worker
 time (UTC)           peer            task provider access           outcome   seconds  prompt
 2026-11-15 18:39:55  boss               1 copilot  read-only        done          7.0  43 chars, sha256 7a9139bee1be
+                used: 41,210 tokens in (36,864 cached), 512 tokens out, 1 premium request
 2026-11-21 05:50:18  boss               1 team     workspace-write  done          7.0  66 chars, sha256 f9c32289c1a4
              part of: step build of run 20261121-055018-74874
+usage by peer and provider, as providers reported it:
+  boss           copilot      1 task   41,210 tokens in (36,864 cached), 512 tokens out, 1 premium request
 ```
 
 `--limit N` shows more entries and `--json` prints the raw lines.
@@ -2429,7 +2436,7 @@ Workflow for a change:
 - [src/llm/bridge.rs](src/llm/bridge.rs): client for the Node bridge (multiplexed JSON lines over stdio)
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
-- [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
+- [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text) with the usage providers reported, summed per peer and provider
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.proofkin-data` folder, named shares with a maximum access, their checks and MCP servers)
 - [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config), MCP configuration files and server templates with placeholders
 - [src/plugins.rs](src/plugins.rs): plugins (sources, fetching for review, the Copilot CLI, Claude Code and Agent Plugins layouts, marketplaces, the profile's plugin store, offers made from templates)

@@ -1084,6 +1084,7 @@ mod tests {
             verified: true,
             refused: false,
             model: Some("claude-sonnet-5.5".into()),
+            usage: None,
         };
         assert!(RunRecord::worth_keeping(&task, &delivered));
         let mut run = RunRecord::for_task(
@@ -1136,6 +1137,7 @@ mod tests {
             verified: true,
             refused: false,
             model: None,
+            usage: None,
         };
         assert!(!RunRecord::worth_keeping(&question, &answer));
         // Without checks, a run's title is its task.
