@@ -761,19 +761,42 @@ async fn owners_set_the_default_model_and_which_ones_tasks_may_ask_for() {
 /// has it, in front of its task as external content, so the model needn't look it up.
 #[tokio::test]
 async fn a_step_gets_the_text_of_the_issue_it_works_on() {
+    let repo = git_repo();
     let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
     let mut boss = Node::new("boss");
     mutual(&mut worker, &mut boss);
+    worker
+        .shares
+        .add_with(
+            "app",
+            repo.path(),
+            Access::WorkspaceWrite,
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    worker.grant("boss", Access::WorkspaceWrite, &["data", "app"]);
     let (worker, _we) = worker.start().await;
     let (boss, _be) = boss.start().await;
     boss.connect(worker.addr()).await.unwrap();
     wait_for_peers(&boss, 1).await;
-    let plan = Plan::parse("docs @worker issue=#12 Document it\nplain @worker Say hi").unwrap();
+    let plan = Plan::parse(
+        "docs @worker issue=#12 Document it\n\
+         plain @worker Say hi\n\
+         api @worker:app issue=#13 create api.md",
+    )
+    .unwrap();
     let ctx = RunContext {
-        issue_texts: [(
-            "docs".to_owned(),
-            "acme/app#12 Document the API\n\nEvery endpoint.".to_owned(),
-        )]
+        issue_texts: [
+            (
+                "docs".to_owned(),
+                "acme/app#12 Document the API\n\nEvery endpoint.".to_owned(),
+            ),
+            (
+                "api".to_owned(),
+                "acme/app#13 Add the orders API\n\nGET /orders.".to_owned(),
+            ),
+        ]
         .into(),
         ..RunContext::default()
     };
@@ -791,6 +814,26 @@ async fn a_step_gets_the_text_of_the_issue_it_works_on() {
     );
     assert!(docs.ends_with("Your task:\nDocument it"), "{docs}");
     assert_eq!(output("plain"), "copilot did: Say hi");
+    // Its commit is titled with the issue's title, with the step's own words under it.
+    let StepState::Done {
+        evidence: Some(evidence),
+        ..
+    } = &states["api"]
+    else {
+        panic!("{:?}", states["api"])
+    };
+    let commit = evidence.git.as_ref().unwrap().commit.clone().unwrap();
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["log", "-1", "--format=%B", &commit])
+        .output()
+        .unwrap();
+    let message = String::from_utf8_lossy(&log.stdout).replace("\r\n", "\n");
+    assert!(
+        message.starts_with("Add the orders API\n\ncreate api.md\n\nTask "),
+        "{message}"
+    );
 }
 
 /// An owner sets the reasoning effort its tasks work at; a task may ask for another.
@@ -4445,6 +4488,26 @@ async fn a_task_with_skills_commits_with_its_title_as_the_subject() {
     assert_eq!(
         proofkin::tracker::closing_lines(&branch.issues, &linked.slug),
         "Closes #24\nCloses other/lib#3\n"
+    );
+
+    // Given another subject (the title of the issue a step works on), it is the commit's
+    // subject and the title goes under it; it comes from the peer, so only its first line.
+    let mut task = LlmTask::new(Provider::Copilot, "create other.txt").in_share("app");
+    task.title = Some("create other.txt".into());
+    task.subject = Some("Add the other page\nSigned-off-by: someone".into());
+    let done = boss.delegate_verified(worker.id(), task).await.unwrap();
+    let branch = done.evidence.unwrap().git.unwrap().branch;
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["log", "-1", "--format=%B", &branch])
+        .output()
+        .unwrap();
+    let message = String::from_utf8_lossy(&log.stdout).replace("\r\n", "\n");
+    assert!(
+        message.starts_with("Add the other page\n\ncreate other.txt\n\nTask ")
+            && !message.contains("Signed-off-by"),
+        "{message}"
     );
 }
 

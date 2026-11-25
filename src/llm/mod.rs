@@ -128,6 +128,11 @@ pub struct LlmTask {
     /// 100 characters); the worker uses it as the subject of its commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The subject of its commit when that isn't its title: the title of the issue a plan
+    /// step works on (`issue=#N`, see [`crate::tracker`]). The worker then puts the title
+    /// under it, in the commit's body. Older workers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     /// Issues the work is for (`owner/repo#N`, see [`crate::tracker`]): the worker's
     /// commit references them, and a pull request from its branch closes them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -191,6 +196,7 @@ impl LlmTask {
             mcp: Vec::new(),
             team: None,
             title: None,
+            subject: None,
             issues: Vec::new(),
             pull_request: None,
         }
