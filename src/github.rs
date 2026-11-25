@@ -1592,6 +1592,7 @@ mod tests {
                 origin: Some(origin.into()),
                 team: false,
                 model: None,
+                usage: None,
             };
         let entries = [
             entry("a", 7, 1_000_000, "step old of run r0"),

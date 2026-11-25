@@ -346,6 +346,14 @@ fn resolve<'a>(schema: &'a Value, root: &'a Value) -> &'a Value {
     s
 }
 
+/// Where `value` doesn't fit the JSON schema `schema` (types, required properties,
+/// enums, local `$ref`s), a line each; none when it fits.
+pub(crate) fn schema_mismatches(value: &Value, schema: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    mismatches(value, schema, schema, "$", 0, &mut out);
+    out
+}
+
 /// Where `value` doesn't match `schema` (types, required properties, enums).
 fn mismatches(
     value: &Value,

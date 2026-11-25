@@ -1,0 +1,43 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "data-analyst",
+  "title": "Data analyst",
+  "purpose": "Analyzes the data it is given and answers with the figures, how each was computed and what to trust",
+  "requirements": [
+    { "id": "R1", "text": "Gives the figures the question asks for, computed from the data" },
+    { "id": "R2", "text": "Shows how each figure was computed: the columns, filters and formula" },
+    { "id": "R3", "text": "Names data problems it notices, such as missing values and duplicate rows, and how it treated them" }
+  ],
+  "instructions": "You analyze data from the files and text you are given (CSV, JSON, tables).\n\nAnswer with the figures first. For each one, say how it was computed: the columns, filters and formula. Check the data before you trust it: say which rows have missing values or are duplicates, and how you treated them. Round only at the end, and give units.",
+  "capabilities": { "access": "read-only", "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "cost" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "sales.csv:\n\n```csv\nregion,month,revenue\nNorth,2026-09,1200\nSouth,2026-09,800\nNorth,2026-10,1500\nSouth,2026-10,700\n```\n\nWhat was the total revenue in 2026-10?",
+        "expect": [{ "regex": "2,?200" }],
+        "smoke": true,
+        "timeout": "10m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "sales.csv:\n\n```csv\nregion,month,revenue\nNorth,2026-09,1200\nSouth,2026-09,800\nNorth,2026-10,1500\nSouth,2026-10,700\n```\n\nWhat was the average monthly revenue of the North region?",
+        "expect": [{ "regex": "1,?350" }, { "regex": "(?i)\\b(average|mean)\\b" }],
+        "timeout": "10m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R3",
+        "input": "orders.csv:\n\n```csv\norder,customer,amount\n1001,acme,250\n1002,globex,\n1003,acme,400\n1003,acme,400\n```\n\nWhat is the total order amount?",
+        "expect": [{ "regex": "(?i)\\b(missing|empty|blank)\\b" }, { "regex": "(?i)duplicat" }],
+        "timeout": "10m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 2, "timeout_secs": 1800 },
+  "approvers": ["me"]
+}

@@ -30,7 +30,8 @@ meetings, files and Teams (`workiq=`). A step can also ask Microsoft 365 Copilot
 your organization's agents (`@workiq`), and `proofkin kb import workiq` keeps what it finds
 as knowledge. Work data stays with you: a peer gets it only with your grant and within the
 sensitivity labels you choose, and every call is audited. See
-[Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq).
+[Microsoft 365 work context (Work IQ)](#microsoft-365-work-context-work-iq) for setup, your
+admin's steps and a first plan.
 
 ## Install (no source code or Rust needed)
 
@@ -589,14 +590,21 @@ refused, in the profile's `audit.jsonl`: peer name and key, provider (or `team` 
 [team step](#team-steps-handing-work-down-a-level)), the access the task got, outcome
 (`done`, `failed`, `cancelled`, `refused`), duration, any error, and what the task is part
 of on the peer's side (a step of one of its runs, or one of its tasks). The prompt is **not**
-stored, only its SHA-256 and length, so the log holds no peer content.
+stored, only its SHA-256 and length, so the log holds no peer content. It also keeps what
+the work used, as its provider reported it: tokens (input, the cached part, output), Copilot
+premium requests and the Claude Agent SDK's cost estimate. A provider that reports nothing
+records nothing, not zero. The requester gets it with the result, and the web UI shows it
+on the finished task.
 
 ```text
 > proofkin audit --profile worker
 time (UTC)           peer            task provider access           outcome   seconds  prompt
 2026-11-15 18:39:55  boss               1 copilot  read-only        done          7.0  43 chars, sha256 7a9139bee1be
+                used: 41,210 tokens in (36,864 cached), 512 tokens out, 1 premium request
 2026-11-21 05:50:18  boss               1 team     workspace-write  done          7.0  66 chars, sha256 f9c32289c1a4
              part of: step build of run 20261121-055018-74874
+usage by peer and provider, as providers reported it:
+  boss           copilot      1 task   41,210 tokens in (36,864 cached), 512 tokens out, 1 premium request
 ```
 
 `--limit N` shows more entries and `--json` prints the raw lines.
@@ -794,7 +802,16 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
 - Searches are audited and held to the profile's Work IQ budgets. A Work IQ error or a budget
   refusal fails the step with its one-line message.
 - The run record keeps, for each step, the sources (title, type, label, link), how many
-  results were kept and withheld, and the request ids. It stays on this machine.
+  results were kept and withheld, the request ids, and the section of the prompt with what
+  was found and its SHA-256. It stays on this machine.
+- The step's signed evidence records the context by hash, never its content: the task says
+  where the section is in its prompt, and the worker signs `context: [{source: "workiq",
+  sha256, results, labels}]` for exactly that part of the prompt it got (a task whose
+  section isn't in its prompt is refused). The result's summary says so: **Work context**
+  from Microsoft 365 (Work IQ): 3 results (General), SHA-256 `…`. `proofkin runs verify`
+  checks that each such step's evidence records the hash of the section the run kept, and
+  that the kept section still has it. Claims never rest on it: only checks and sign-offs
+  prove them.
 
 ### Asking Microsoft 365 in a step (`@workiq`)
 
@@ -1296,6 +1313,41 @@ proofkin agent remove sec-reviewer --profile boss
 In the web UI, **Plugins & tools › Agents** adds one (pasted, or loaded from a file) and
 lists yours and your plugins' with what each uses and its instructions. In the plan editor,
 each task card has an **Agent** field, and the text view lists agents beside the plan.
+
+#### The agent factory
+
+The [agent factory](docs/agent-factory.md) turns your description into an agent that proves
+itself before it works (being built, tracked in
+[#175](https://github.com/mcbelton/proofkin/issues/175)). An agent is a **blueprint**: its
+whole definition as JSON (`proofkin.agent-blueprint/v1`): its requirements, instructions,
+skills, the access and tools it asks for, the models it may run on, and an eval suite with
+a case for every requirement. Asking grants nothing: the folders it works in, their MCP
+offers and your grants decide what its tasks get.
+
+```powershell
+proofkin factory templates                                              # code-reviewer, implementer, researcher...: purpose, most access, eval cases
+proofkin factory new reviewer --template code-reviewer --profile alice  # a draft from a template, with no model
+proofkin factory new fin-analyst --describe "Analyze quarterly reports, extract key metrics, flag risks, write an executive summary" --profile alice
+proofkin factory show fin-analyst --profile alice    # what it asks for, how it is tested, its problems, who wrote it
+proofkin factory edit fin-analyst --profile alice    # in VISUAL or EDITOR; --from FILE (or -) replaces it
+proofkin factory check fin-analyst --profile alice   # fails while it has errors; --file checks a blueprint file
+proofkin factory list --profile alice                # delete NAME removes a draft
+```
+
+- `--describe` has the profile's default model write the draft (`--using` picks another
+  provider it is signed in to): read-only, in an empty folder, given what the profile has
+  (skills, topics, folders, models) as data and your words with secrets redacted. The draft
+  is checked and its problems go back to the model, at most 3 tries in all; then you get
+  the last draft with its problems. It records the provider, model and effort that wrote it
+  and the SHA-256 of your words, not the words.
+- Each problem has a code, says what is wrong and how to fix it, and points at its field
+  (`/skills/0`). Errors (a skill, folder or model the profile doesn't have, a requirement
+  no case proves) must be fixed; warnings flag asking for more than it needs (full access
+  with no check, every tool of a server, all of Microsoft 365, delegation).
+- Eval cases expect `contains`, `not-contains`, `regex`, `json-schema`, `max-words`,
+  `files-changed` or a folder `check`, and a `judge` rubric is scored by a model. Their
+  fixtures are files in the agent's `fixtures/` folder.
+- Drafts, and each agent's state and history, are kept in the profile's `factory/` folder.
 
 **Plan check.** Before a plan runs, it is checked against what exists now:
 
@@ -1811,12 +1863,15 @@ Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|
 `proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
-`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin factory templates|new|list|show|edit|check|delete`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin tracker link|status|items|add|sync|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
 tasks wait for a peer that dropped off to come back (default 60, see
-[Cancelling tasks](#cancelling-tasks)). Each setting also works under its
+[Cancelling tasks](#cancelling-tasks)). For tests only, `PROOFKIN_TEST_WORKIQ_URL` and
+`PROOFKIN_TEST_ENTRA_URL` point Work IQ and its sign-in at fakes on this machine; they take
+only a loopback address such as `http://127.0.0.1:8080` and refuse anything else, so no token
+can go elsewhere. Each setting also works under its
 name from before the rename (`P2PAGENTS_HOME`, ...).
 
 ## Web UI
@@ -2078,6 +2133,111 @@ with `proofkin connect` while the agent runs. Agents with the token act with you
 trust in you: give it only to agents you would let delegate in your name. Digital workers
 can't be connected to; they take work from their owner only.
 
+## Microsoft 365 work context (Work IQ)
+
+Preview. [Work IQ](docs/work-iq.md) is Microsoft's MCP server for Microsoft 365: cited
+results from your mail, meetings, files, Teams and people, and answers from Microsoft 365
+Copilot or your organization's agents. This section goes from a tenant without it to a first
+plan. The sections it links to have the details.
+
+### 1. Your admin sets it up (once per tenant)
+
+Choose how agents connect:
+
+- **Through Microsoft's Work IQ CLI**: for tenants that approved the Work IQ CLI app. Nothing
+  to register: each user installs the CLI (`npm install -g @microsoft/workiq`, or from your
+  internal npm feed with `--registry`) and accepts its EULA once with `workiq accept-eula`.
+  Proofkin never accepts it for you.
+- **Proofkin's own sign-in (hosted)**: the tenant registers its own client app (not a
+  published plugin's or the CLI's), and Proofkin keeps the refresh token in the profile's
+  secret store.
+
+Each step has a check: after it, `proofkin workiq doctor` gets past that point (see
+[Checking the Work IQ connection](#checking-the-work-iq-connection)).
+
+| Step | Who | What | Check |
+| --- | --- | --- | --- |
+| 1. Turn Work IQ on in the tenant | Tenant admin | Create the Work IQ resource's service principal: `az ad sp create --id fdcc1f02-fc51-4226-8753-f668596af7f7` | Sign-in and the doctor no longer report AADSTS500011 or AADSTS650052 |
+| 2. Register the client app (hosted only) | App admin | Entra admin center, App registrations, New registration: single tenant; platform **Mobile and desktop applications** with the redirect `http://localhost`; under Authentication, **Allow public client flows** on (for `--device-code`); under API permissions, the delegated `WorkIQAgent.Ask` permission of Work IQ, then **Grant admin consent** | `proofkin auth login workiq --tenant <tenant> --client-id <app-id> --profile P` signs in (Proofkin explains AADSTS65001, 700016, 90002 and 7000218 when it doesn't) |
+| 3. Assign the users | App admin | Enterprise applications, the app, Properties: **Assignment required** on; Users and groups: add the users or a group | The sign-in no longer says AADSTS50105 (you are not assigned) |
+| 4. Billing | Billing admin | Usage-based billing, and a spending policy that covers those users and the Work IQ API | The doctor's **retrieve** check no longer reports a billing error |
+| 5. The Work IQ MCP policy | Microsoft 365 admin | Microsoft 365 admin center, Agents, Tools, Work IQ MCP: the read tools on (`retrieve`, `ask`, `fetch`, `list_agents`), changes off unless needed. A change takes up to 24 hours | The doctor's **tools** check finds `retrieve` |
+| 2. (CLI instead) | Tenant admin | Grant admin consent to the Work IQ CLI app, as Microsoft's [Work IQ repository](https://github.com/microsoft/work-iq) says | `proofkin auth login workiq --cli --profile P` signs in |
+
+### 2. Sign in and check
+
+```powershell
+# the Work IQ CLI (signed in by itself; Proofkin finds it on the PATH or in npm's global folder)
+proofkin auth login workiq --cli --profile me
+# or the hosted sign-in, with the app from step 2 (--device-code on a machine without a browser)
+proofkin auth login workiq --tenant contoso.onmicrosoft.com --client-id <app-id> --profile me
+proofkin workiq doctor --profile me      # five checks; a failure says the fix and who makes it
+```
+
+The options of each sign-in are in [Sign in](#sign-in). `proofkin auth status` shows the
+account, `proofkin auth logout workiq --profile me` removes it.
+
+### 3. Use it
+
+| What | How | Details |
+| --- | --- | --- |
+| A step that starts from what Microsoft 365 has on its subject | `workiq=all` or `workiq=email,files,...` on the step | [Microsoft 365 search in a step](#microsoft-365-search-in-a-step-workiq) |
+| A step answered by Microsoft 365 Copilot or one of your organization's agents | `@workiq` as the step's target, `agent=<id>` from `proofkin workiq agents` | [Asking Microsoft 365 in a step](#asking-microsoft-365-in-a-step-workiq) |
+| A model that searches Microsoft 365 while it works | `mcp=workiq` on a step for your own worker, whose folder offers it (`proofkin mcp add <folder> workiq --workiq`) | [Work IQ as a tool for tasks](#work-iq-as-a-tool-for-tasks-mcpworkiq) |
+| Cited results kept as a knowledge topic for `context=` | `proofkin kb import workiq <topic> --query <text> [--from SOURCES]` | **Importing from Microsoft 365** under the knowledge base, and [the design](docs/work-iq.md#5-work-context-in-plans) |
+| A peer that may receive some of it | `proofkin peers allow <peer> --profile me --m365 General,Public,unlabeled` | [Security model](#security-model) |
+| What it cost and the limits | `proofkin workiq usage`, `proofkin workiq budget --per-day N --per-run N` | [Work IQ audit file and budgets](#work-iq-audit-file-and-budgets) |
+
+A first plan to try (`/plan first.plan` in the agent, or the web UI's plan editor), with one
+of your own digital workers as `helper`:
+
+```text
+find @helper workiq=files,email What do my recent files and mail say about the launch? Answer in three sentences.
+ask @workiq What changed in the launch plan this week?
+```
+
+### 4. What keeps your work data yours
+
+- Only results Work IQ marks `allowed` are used; the rest are withheld and counted.
+- Your own agent and digital workers get what Work IQ allows. A peer gets nothing unless you
+  grant it sensitivity labels, and then only results with those labels. The plan check
+  stops a step that would send more, and the agent checks again when it sends.
+- What a step got from Microsoft 365 keeps its origin: later steps, knowledge topics and
+  outputs built from it are held to the same grants.
+- Every call is audited (`workiq-audit.jsonl`: the tool, purpose, audience, counts and ids,
+  never the query text) and held to the budgets. Signed evidence records the Work IQ context
+  a step had by its hash, never its content.
+- The hosted refresh token stays in the OS credential store; the CLI keeps its own sign-in.
+  Work IQ content is put in an external-content envelope that the model is told not to obey.
+
+### 5. Test it against your tenant
+
+`$env:PROOFKIN_LIVE_WORKIQ = "cli"` (or `hosted`, with `PROOFKIN_LIVE_WORKIQ_TENANT` and
+`PROOFKIN_LIVE_WORKIQ_CLIENT_ID`), then `python scripts/live_workiq.py`. It runs the live
+check: a fresh profile signs in, passes the doctor, runs a plan with a `workiq=` step for its
+own digital worker (real Copilot, on your GitHub CLI sign-in) and an `@workiq` step, then
+verifies the evidence and that every call only read. Your Microsoft 365 content stays out of
+its log. `python scripts/evidence.py --live` runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
+
+### Work IQ troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `the Work IQ CLI says its EULA is not accepted` | Read the EULA ([Work IQ repository](https://github.com/microsoft/work-iq)) and run `workiq accept-eula` yourself. |
+| `there is no Work IQ CLI at ...`, or `npx` fails | Install the CLI (`npm install -g @microsoft/workiq`, with `--registry <feed>` if the public registry is blocked), or give its path: `--cli-path`. |
+| `AADSTS500011` or `AADSTS650052` | The tenant has no Work IQ service principal: step 1. |
+| `an admin must grant consent for this app` (AADSTS65001) | Step 2's **Grant admin consent**; the message has the consent address. |
+| `you are not assigned to the app` (AADSTS50105) | Step 3. |
+| `the app doesn't allow public client flows` (AADSTS7000218) | Step 2's **Allow public client flows**, for `--device-code`. |
+| `Entra doesn't know this client id or tenant` | Check `--client-id` and `--tenant` against the app registration. |
+| `the token's audience is ..., not Work IQ` | The app lacks the `WorkIQAgent.Ask` permission of Work IQ: step 2. |
+| `Work IQ does not offer the retrieve tool` | The Work IQ MCP policy: step 5. |
+| A billing or spending policy error | Step 4. |
+| `sign in again` after a while | The refresh token expired or was revoked: `proofkin auth login workiq ...` again. |
+| `the daily Work IQ budget ... is used up` | Wait for tomorrow, or raise it: `proofkin workiq budget --per-day N --profile P`. |
+| A step for a peer is refused for its Microsoft 365 content | The peer's grant doesn't cover those labels: `peers allow <peer> --m365 <labels>`, or send the step to your own worker. |
+| `kb import workiq` writes nothing | Every result was withheld because Work IQ didn't mark it `allowed`; try another query. |
+
 ## Security model
 
 - Connections are encrypted and authenticated (QUIC/TLS with each agent's ed25519 key).
@@ -2251,6 +2411,40 @@ look @alice:app mcp=browser Open http://localhost:3000 and report what the home 
 Servers run on your machine with your rights, outside the shell sandbox, so offer only
 servers you trust. Remote URLs must be `https://`, except `http://` on this machine.
 
+#### Work IQ as a tool for tasks (`mcp=workiq`)
+
+A digital worker's (or your own agent's) folder can offer **Work IQ** to tasks,
+so the model searches Microsoft 365 while it works instead of only at the start of the step
+(`workiq=`). The server is called `workiq` and has nothing to start:
+
+```powershell
+proofkin mcp add app workiq --workiq --profile my-worker              # every read tool
+proofkin mcp add app workiq --workiq --tool retrieve --tool ask --profile my-worker
+```
+
+```text
+draft @my-worker:app mcp=workiq Write the launch FAQ from what my mail and files say about the launch
+```
+
+- Each task gets an address of its own on this machine
+  (`http://127.0.0.1:<port>/mcp/workiq/<session>`) and a random bearer that stop working when
+  the task ends. The agent calls Work IQ itself with the profile's sign-in (a digital worker
+  uses its owner's, when the owner turned that on), so the model never sees a token and a long
+  task keeps working as tokens are refreshed.
+- Only tools that read: `retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
+  `list_agents` (`--tool` offers fewer). A change tool is refused, and never reaches Work IQ.
+- Every result goes through the [content policy](#4-what-keeps-your-work-data-yours): only
+  results marked `allowed`, secrets redacted, in the external-content envelope. Every call is
+  audited (purpose `gateway`) and held to the daily budget.
+- Your own tasks get it (a digital worker's owner's). A peer's task gets it only when you
+  granted that peer `--m365-tools` (`proofkin peers allow <peer> --m365 Public,General
+  --m365-tools`): then only `retrieve` and `ask`, and only results with the labels you
+  granted; its calls are audited under the peer's name. Any other task that asks for
+  `mcp=workiq` is refused, and the refusal names the grant. What such a step's model read
+  has labels its plan never learns, so the step is marked `unknown` and nothing made from it
+  goes to a peer.
+- A browser can't reach it: requests with an `Origin` header are refused.
+
 ### Plugins: skills, agents and MCP servers, packaged together
 
 A **plugin** bundles skills, agents and MCP servers, in the layouts GitHub Copilot CLI
@@ -2284,6 +2478,12 @@ proofkin plugin disable reviewer --profile alice  # enable / remove
   placeholders; values not given with `--set` come from environment variables of the same
   name). `${PLUGIN_ROOT}` (and the Claude and Copilot spellings) becomes the plugin's
   folder, `${PLUGIN_DATA}` a folder it may write to, `${workspaceFolder}` the shared folder.
+- **Microsoft's Work IQ plugin** (`proofkin plugin add microsoft/work-iq:plugins/workiq`)
+  keeps its skills, and its MCP server (the hosted Work IQ address with its own sign-in
+  settings, or the CLI's `@microsoft/workiq mcp`) becomes this agent's own
+  [Work IQ server](#work-iq-as-a-tool-for-tasks-mcpworkiq): offer it with `proofkin mcp
+  add app workiq --plugin workiq`, and tasks reach Work IQ through your sign-in and the
+  gateway, with only the tools that read.
 - **Turning a plugin off** withdraws its skills, agents and the servers it offered; turning it on
   offers them again. **Updating** keeps each offer's access, tools and values, and pauses
   servers that would now start differently until you look at them and resume them.
@@ -2394,6 +2594,9 @@ Workflow for a change:
 2. Add the tests (and a live check in `scripts/live_test.py` if it involves real peers or
    providers) and list them under the claim. Test ids are `<target>::<path>` as printed by
    `cargo test`, without `::tests` (`lib::...`, `bin::...`, or the file name in `tests/`).
+   A live check that needs something not everyone has is listed as
+   `{"check": "<name>", "needs": "<VARIABLE>"}`: it counts only while that variable is set,
+   as `PROOFKIN_LIVE_WORKIQ` is for the Work IQ checks of `scripts/live_workiq.py`.
 3. Implement until `.\scripts\p2p.ps1 evidence` passes. Run with `-Live` before a release.
 4. Keep the report (`target\evidence\report.md`) with the PR or release as its evidence.
 
@@ -2437,7 +2640,8 @@ Workflow for a change:
 - [src/llm/bridge.rs](src/llm/bridge.rs): client for the Node bridge (multiplexed JSON lines over stdio)
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
-- [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
+- [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text) with the usage providers reported, summed per peer and provider
+- [src/factory/](src/factory) and [factory/templates/](factory/templates): the agent factory: blueprints checked against the profile and linted for least privilege (`blueprint.rs`), eval suites and their graders (`evals.rs`), the profile's factory store (`store.rs`), the built-in templates (`templates.rs`), drafts written by the owner's model (`draft.rs`) and `proofkin factory` (`cli.rs`)
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.proofkin-data` folder, named shares with a maximum access, their checks and MCP servers)
 - [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config), MCP configuration files and server templates with placeholders
 - [src/plugins.rs](src/plugins.rs): plugins (sources, fetching for review, the Copilot CLI, Claude Code and Agent Plugins layouts, marketplaces, the profile's plugin store, offers made from templates)
@@ -2461,7 +2665,7 @@ Workflow for a change:
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)
 - [src/pulls.rs](src/pulls.rs): pull request steps: the folder's agent opens the pull request with the work before it (only work it signed for the peer that asks) and follows it until it is merged or closed
 - [src/tracker.rs](src/tracker.rs): tracked work: plan runs as GitHub issues and sub-issues on a GitHub Project's board (GraphQL through `gh`)
-- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait, and the content policy (`content.rs`: only `allowed` results, label allowlist per audience, redaction, size cap, envelope); see [docs/work-iq.md](docs/work-iq.md)
+- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait, and the content policy (`content.rs`: only `allowed` results, label allowlist per audience, redaction, size cap, envelope), and the gateway (`gateway.rs`: a task's own MCP address on 127.0.0.1 for `mcp=workiq`, with a bearer that ends with the task); see [docs/work-iq.md](docs/work-iq.md)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
@@ -2470,9 +2674,10 @@ Workflow for a change:
 - [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card, [ui/models.js](ui/models.js) the model lists and the Models dialog, [ui/connect.js](ui/connect.js) the Connect other agents card
 - [docs/ux-guidelines.md](docs/ux-guidelines.md): the UI's design guidelines and definition of done
 - [docs/work-iq.md](docs/work-iq.md): the design for Microsoft 365 work context through Work IQ (being built, tracked in [#36](https://github.com/mcbelton/proofkin/issues/36))
-- [docs/agent-factory.md](docs/agent-factory.md) and [docs/agent-factory/](docs/agent-factory): the design for the agent factory: agents described in plain words, evaluated, released signed and deployed as digital workers, with its spec, API contract, architecture, threat model and test plan (proposed, tracked in [#175](https://github.com/mcbelton/proofkin/issues/175))
+- [docs/agent-factory.md](docs/agent-factory.md) and [docs/agent-factory/](docs/agent-factory): the design for the agent factory: agents described in plain words, evaluated, released signed and deployed as digital workers, with its spec, API contract, architecture, threat model and test plan (being built, tracked in [#175](https://github.com/mcbelton/proofkin/issues/175))
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
+- [scripts/live_workiq.py](scripts/live_workiq.py): live Work IQ check against your tenant (`PROOFKIN_LIVE_WORKIQ=cli|hosted`): sign-in, doctor, a `workiq=` step on real Copilot and an `@workiq` step, evidence and read-only audit
 - [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server and [tests/fixtures/plugin/](tests/fixtures/plugin) a Claude Code style plugin (a skill, an MCP server, a hook that must never run), [tests/fixtures/speckit/](tests/fixtures/speckit) and [tests/fixtures/openspec/](tests/fixtures/openspec) a Spec Kit feature and an OpenSpec change for the tests; [tests/connect.rs](tests/connect.rs) drives the MCP and A2A endpoints like other agents do
 - [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)
 

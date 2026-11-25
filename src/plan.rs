@@ -337,6 +337,12 @@ impl Step {
         self.is_workiq() || !self.workiq.is_empty()
     }
 
+    /// Whether the step's model may read Microsoft 365 content through a folder's Work IQ
+    /// server (`mcp=workiq`), whose labels its plan never learns.
+    pub fn uses_workiq_tools(&self) -> bool {
+        self.mcp.iter().any(|m| m == crate::workiq::gateway::SERVER)
+    }
+
     /// Who a `@workiq` step shows as having done it: `workiq`, or `workiq:<agent id>`.
     pub fn workiq_name(&self) -> String {
         match &self.agent {
@@ -774,10 +780,11 @@ impl Plan {
     }
 
     /// The plan with its Microsoft 365 marks set: a step is marked when it already is (the
-    /// `workiq=` option and `@workiq` steps set it) or when a `context=` topic is, with
-    /// the union of the labels, and a step is marked when a step it runs `after` is,
-    /// because it gets that step's output. Topics that don't exist are left out here;
-    /// the plan check reports them.
+    /// `workiq=` option and `@workiq` steps set it), when it asks for `mcp=workiq` (with the
+    /// label `unknown`: what its model reads there isn't known here), or when a `context=`
+    /// topic is, with the union of the labels, and a step is marked when a step it runs
+    /// `after` is, because it gets that step's output. Topics that don't exist are left out
+    /// here; the plan check reports them.
     pub fn marked(&self, kb: &KnowledgeBase) -> Plan {
         self.marked_with(kb, &HashMap::new())
     }
@@ -792,6 +799,15 @@ impl Plan {
             if step.brings_m365() {
                 let seed = seeds.get(&step.id).map(Vec::as_slice).unwrap_or_default();
                 labels = Some(union_labels(labels.as_deref().unwrap_or_default(), seed));
+            }
+            if step.uses_workiq_tools() {
+                // What its model reads through Work IQ has labels this plan never learns, so
+                // nothing made from it goes to a peer.
+                let unknown = [crate::workiq::content::UNKNOWN.to_owned()];
+                labels = Some(union_labels(
+                    labels.as_deref().unwrap_or_default(),
+                    &unknown,
+                ));
             }
             if let Some(labels) = labels {
                 step.m365 = Some(union_labels(
@@ -1026,7 +1042,7 @@ const STEP_OPTIONS: &[&str] = &[
 const MAX_TIMEOUT: u64 = 7 * 24 * 3600;
 
 /// Seconds in a step's `timeout=` value: a number and a unit (s, m, h or d).
-fn parse_timeout(value: &str) -> Result<u64> {
+pub(crate) fn parse_timeout(value: &str) -> Result<u64> {
     let digits = value.chars().take_while(char::is_ascii_digit).count();
     let (n, unit) = value.split_at(digits);
     let n: u64 = n.parse().map_err(|_| {
@@ -3188,6 +3204,13 @@ pub struct WorkRecord {
     pub kept: usize,
     pub withheld: usize,
     pub request_ids: String,
+    /// For a `workiq=` step: the section of its task's prompt with what was found, and its
+    /// SHA-256, which the step's signed evidence records (never the text itself; see
+    /// [`crate::evidence::ContextUse`]). Kept on this machine with the rest of the record.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
 }
 
 /// The [`WorkRecord`]s of a run, by step.
@@ -3367,18 +3390,18 @@ fn m365_refusal(
 }
 
 /// Searches Work IQ for `step` (which goes to `peer`) and returns the prompt section for
-/// what `peer` may receive. The labels kept and the sources are logged in `ctx`.
+/// what `peer` may receive. The labels kept, the sources and the section are logged in `ctx`.
 async fn search_work(
     agent: &Agent,
     ctx: &RunContext,
     step: &Step,
     peer: &PeerInfo,
-) -> Result<String> {
+) -> Result<crate::workiq::content::Section> {
     let Some(work) = &ctx.work_context else {
         bail!("Work IQ isn't set up for this run");
     };
     let Some((strategy, capabilities)) = step.workiq_request() else {
-        return Ok(String::new());
+        return Ok(Default::default());
     };
     let audience = fresh_recipients(agent, ctx)
         .audience_of(&peer.id)
@@ -3406,9 +3429,15 @@ async fn search_work(
             kept: section.kept,
             withheld: section.withheld.total(),
             request_ids: result.ids.to_string(),
+            sha256: if section.text.is_empty() {
+                String::new()
+            } else {
+                crate::evidence::sha256_hex(section.text.as_bytes())
+            },
+            text: section.text.clone(),
         },
     );
-    Ok(section.text)
+    Ok(section)
 }
 
 /// Asks Work IQ for `step`, a `@workiq` step, as the owner's own agent: `question` is the
@@ -3441,6 +3470,7 @@ fn ask_workiq(
                 kept: section.kept,
                 withheld: section.withheld.total(),
                 request_ids: result.ids.to_string(),
+                ..WorkRecord::default()
             },
         );
         Ok(Delivered {
@@ -3451,6 +3481,7 @@ fn ask_workiq(
             verified: false,
             refused: false,
             model: None,
+            usage: None,
         })
     }
 }
@@ -3737,11 +3768,27 @@ pub async fn run_plan_with(
                         changed = true;
                         continue;
                     }
-                    let prompt = if step.workiq.is_empty() {
-                        prompt
+                    let (prompt, context) = if step.workiq.is_empty() {
+                        (prompt, None)
                     } else {
                         match search_work(agent, ctx, step, &peer).await {
-                            Ok(work) => step_prompt_with(step, &deps, &format!("{issue}{work}")),
+                            Ok(work) => {
+                                let full =
+                                    step_prompt_with(step, &deps, &format!("{issue}{}", work.text));
+                                // Where it is in the prompt, so the peer's signed evidence
+                                // records its hash.
+                                let at = (!work.text.is_empty())
+                                    .then(|| full.find(&work.text))
+                                    .flatten();
+                                let context = at.map(|start| crate::evidence::ContextRef {
+                                    source: "workiq".to_owned(),
+                                    start,
+                                    len: work.text.len(),
+                                    results: work.kept,
+                                    labels: work.labels.clone(),
+                                });
+                                (full, context)
+                            }
                             Err(e) => {
                                 let state = StepState::failed(Some(peer.name), format!("{e:#}"));
                                 on_update(&step.id, &state);
@@ -3753,6 +3800,7 @@ pub async fn run_plan_with(
                     };
                     let mut task = LlmTask::new(step.provider, prompt.clone())
                         .with_checks(step.checks.clone(), step.attempts);
+                    task.context = context.into_iter().collect();
                     task.mcp = step.mcp.clone();
                     task.model = step.model.clone();
                     task.effort = step.effort.clone();
@@ -3830,6 +3878,8 @@ pub async fn run_plan_with(
                                     "Open a pull request from {}: {}",
                                     ask.branch, ask.title
                                 );
+                                // Its prompt is the pull request's: no work context in it.
+                                task.context.clear();
                                 task.title = Some(ask.title.clone());
                                 task.pull_request = Some(Box::new(ask));
                             }
@@ -5898,6 +5948,14 @@ mod tests {
         assert_eq!(step_labels(&marked, "n"), list(&["Confidential"]));
         assert_eq!(step_labels(&marked, "m"), None);
 
+        // A step whose model reads Work IQ itself (mcp=workiq) has labels the plan never
+        // learns: it and the steps after it are marked unknown, which no peer may receive.
+        let plan = Plan::parse("t @x mcp=workiq do\nu after t @x do\nv @x mcp=docs do").unwrap();
+        let marked = plan.marked(&kb);
+        assert_eq!(step_labels(&marked, "t"), list(&["unknown"]));
+        assert_eq!(step_labels(&marked, "u"), list(&["unknown"]));
+        assert_eq!(step_labels(&marked, "v"), None, "another MCP server");
+
         // The plan that is sent carries the marks.
         let ready = Plan::parse("a @x context=hr do\nb after a @x do")
             .unwrap()
@@ -6469,6 +6527,7 @@ mod tests {
             verified: false,
             refused: false,
             model: None,
+            usage: None,
         };
         let StepState::Failed { error, .. } =
             StepState::from_delivered("w".into(), &step, delivered(false))

@@ -1644,6 +1644,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn microsofts_work_iq_plugin_offers_work_iq_through_the_agents_own_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("workiq");
+        // The shape of microsoft/work-iq:plugins/workiq.
+        write(
+            &src,
+            ".github/plugin/plugin.json",
+            r#"{"name": "workiq", "version": "3.0.0", "description": "WorkIQ for Microsoft 365", "skills": "./skills/"}"#,
+        );
+        write(
+            &src,
+            "skills/workiq/SKILL.md",
+            "---\nname: workiq\ndescription: Find evidence in Microsoft 365 with retrieve\n---\nUse retrieve.",
+        );
+        write(
+            &src,
+            ".mcp.json",
+            r#"{"mcpServers": {"workiq": {"type": "http", "url": "https://workiq.svc.cloud.microsoft/mcp",
+                "oauthClientId": "ba081686-5d24-4bc6-a0d6-d034ecffed87", "oauthPublicClient": true,
+                "auth": {"redirectPort": 12798}}}}"#,
+        );
+        let Inspection::Plugin(p) = inspect(&src).unwrap() else {
+            panic!()
+        };
+        assert_eq!(p.skills.len(), 1, "its skills are kept");
+        let template = &p.mcp["workiq"];
+        assert!(template.workiq && template.url.is_none() && template.inputs.is_empty());
+        let notes = p.notes.join("\n");
+        assert!(
+            notes.contains("Work IQ, offered through this agent's own Work IQ sign-in"),
+            "{notes}"
+        );
+        assert!(!notes.contains("sign-in helpers aren't used"), "{notes}");
+
+        // The CLI's server is Work IQ too; another server isn't.
+        let (cli, _) = crate::mcp::parse_config(
+            &serde_json::json!({"mcpServers": {
+                "workiq": {"command": "npx", "args": ["-y", "@microsoft/workiq@latest", "mcp"]},
+                "local": {"command": "workiq.cmd", "args": ["mcp"]},
+                "other": {"command": "npx", "args": ["-y", "@acme/mcp"]}
+            }}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(cli["workiq"].workiq && cli["local"].workiq && !cli["other"].workiq);
+
+        // Offered in a folder, it is this agent's Work IQ server, named workiq.
+        let store = PluginStore::new(dir.path().join("profile"));
+        let fetched = fetch(
+            &Source::parse(src.to_str().unwrap()).unwrap(),
+            &store.staging(),
+            None,
+        )
+        .await
+        .unwrap();
+        store.install(&fetched, None).unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+        let mut shares = ShareStore::with_data(dir.path().join("data"));
+        shares.add("app", &app, crate::Access::ReadOnly).unwrap();
+        let server = store
+            .instantiate("workiq", "workiq", &app, &BTreeMap::new())
+            .unwrap();
+        assert!(server.workiq && server.url.is_none() && server.headers.is_empty());
+        assert_eq!(server.from.as_ref().unwrap().plugin, "workiq");
+        let err = shares
+            .add_mcp("app", "m365", server.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is called 'workiq'"), "{err}");
+        shares.add_mcp("app", "workiq", server).unwrap();
+    }
+
+    #[tokio::test]
     async fn plugins_install_offer_update_disable_and_remove() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("web-tools");

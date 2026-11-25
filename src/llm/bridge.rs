@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Access, LlmTask, Provider, Ran};
+use super::{Access, LlmTask, Provider, Ran, Usage};
 use crate::mcp::McpServer;
 use crate::profile::INHERITED_CREDENTIAL_VARS;
 
@@ -48,6 +48,9 @@ struct Response {
     /// The reasoning effort it was given, as the SDK took it.
     #[serde(default)]
     effort: Option<String>,
+    /// What the run used, as the SDK reported it (read leniently: see [`Usage::from_json`]).
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 /// Client for `bridge/index.mjs`, a long-lived Node process that runs tasks
@@ -108,7 +111,9 @@ impl Bridge {
                     .and_then(|p| p.remove(&resp.id));
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(if resp.ok {
-                        Ok(Ran::new(resp.text, resp.model).with_effort(resp.effort))
+                        Ok(Ran::new(resp.text, resp.model)
+                            .with_effort(resp.effort)
+                            .with_usage(resp.usage.as_ref().and_then(Usage::from_json)))
                     } else {
                         Err(resp.error)
                     });

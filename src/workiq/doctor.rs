@@ -178,38 +178,48 @@ struct SignedIn {
 /// Checks the Work IQ connection of a profile.
 pub struct Doctor<'a> {
     profile: &'a Profile,
-    endpoints: Endpoints,
+    /// Where the service is, or why a test-only setting can't say (see
+    /// [`Endpoints::configured`]).
+    endpoints: Result<Endpoints, String>,
 }
 
 impl<'a> Doctor<'a> {
     pub fn new(profile: &'a Profile) -> Self {
         Doctor {
             profile,
-            endpoints: Endpoints::default(),
+            endpoints: Endpoints::configured().map_err(|e| format!("{e:#}")),
         }
     }
 
     /// Uses other addresses than the real service's, for tests.
     pub fn with_endpoints(mut self, endpoints: Endpoints) -> Self {
-        self.endpoints = endpoints;
+        self.endpoints = Ok(endpoints);
         self
     }
 
     /// Runs the checks in order and stops at the first that fails.
     pub async fn run(&self) -> Report {
         let mut checks = Vec::new();
+        let endpoints = match &self.endpoints {
+            Ok(endpoints) => endpoints,
+            Err(e) => {
+                let fix = "unset it: it points Proofkin at a fake Work IQ for tests";
+                checks.push(Check::failed("discovery", e.clone(), Who::User, fix));
+                return self.report(checks);
+            }
+        };
         let hosted = self.profile.workiq_account().is_ok_and(|(_, account)| {
             matches!(account.connection, WorkIqConnection::Hosted { .. })
         });
         let discovery = if hosted {
-            self.discovery().await
+            self.discovery(endpoints).await
         } else {
             Check::skipped("discovery", "only hosted accounts use it")
         };
         if !self.finish(&mut checks, discovery) {
             return self.report(checks);
         }
-        let (signed_in, client) = match self.sign_in() {
+        let (signed_in, client) = match self.sign_in(endpoints) {
             Ok((check, signed_in, client)) => {
                 checks.push(check);
                 (signed_in, client)
@@ -249,9 +259,9 @@ impl<'a> Doctor<'a> {
         }
     }
 
-    async fn discovery(&self) -> Check {
+    async fn discovery(&self, endpoints: &Endpoints) -> Check {
         let name = "discovery";
-        let url = &self.endpoints.discovery_url;
+        let url = &endpoints.discovery_url;
         let retry = "check the network, proxy and firewall: Work IQ's address must be reachable \
                      over HTTPS; then run this again";
         let http = match http_client(DISCOVERY_TIMEOUT) {
@@ -308,7 +318,7 @@ impl<'a> Doctor<'a> {
         }
     }
 
-    fn sign_in(&self) -> Result<(Check, SignedIn, Client), Check> {
+    fn sign_in(&self, endpoints: &Endpoints) -> Result<(Check, SignedIn, Client), Check> {
         let name = "sign-in";
         let hint = format!("run `{}`", self.profile.workiq_login_hint());
         let (holder, account) = match self.profile.workiq_account() {
@@ -327,7 +337,7 @@ impl<'a> Doctor<'a> {
             let action = format!("run `{}`", holder.workiq_login_hint());
             return Err(Check::failed(name, format!("{e:#}"), Who::User, &action));
         }
-        let connection = connect_at(self.profile, &self.endpoints).map_err(|e| {
+        let connection = connect_at(self.profile, endpoints).map_err(|e| {
             Check::failed(
                 name,
                 format!("{e:#}"),
@@ -536,11 +546,15 @@ impl<'a> Doctor<'a> {
 
     /// The admin consent step for the account's app, with its URL when the app is known.
     fn consent_action(&self, signed_in: &SignedIn) -> String {
+        let authority = self
+            .endpoints
+            .as_ref()
+            .map_or(super::account::DEFAULT_AUTHORITY, |e| e.authority.as_str());
         match &signed_in.account.connection {
             WorkIqConnection::Hosted { tenant, client_id } => format!(
                 "an admin grants consent by opening {}/{}/adminconsent?client_id={} and accepting, \
                  then you sign in again",
-                self.endpoints.authority,
+                authority,
                 encode(tenant),
                 encode(client_id)
             ),

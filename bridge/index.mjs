@@ -4,8 +4,10 @@
 //   stdin : {"id":1,"provider":"claude"|"codex","prompt":"...","cwd":"...","access":"read-only"|"workspace-write"|"full","model":null,
 //            "effort":"minimal"|"low"|"medium"|"high"|"xhigh"|"max" (optional),
 //            "mcp":{"name":{"type":"stdio","command":"...","args":[],"env":{},"tools":[]}}}  (mcp optional)
-//   stdout: {"id":1,"ok":true,"text":"...","model":"...","effort":"..."} or {"id":1,"ok":false,"error":"..."}
-//           (model: the model that answered, when the SDK says; effort: the effort it was given)
+//   stdout: {"id":1,"ok":true,"text":"...","model":"...","effort":"...","usage":{...}} or {"id":1,"ok":false,"error":"..."}
+//           (model: the model that answered, when the SDK says; effort: the effort it was given;
+//            usage: input_tokens (cached ones included), cached_input_tokens, output_tokens and
+//            cost_usd, each only when the SDK reports it)
 // stdout is reserved for protocol lines; all logging goes to stderr.
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -300,7 +302,37 @@ async function runClaude({ prompt, cwd, model, effort, access, mcp }, abortContr
     const detail = result.result ?? (result.errors ?? []).join("; ");
     throw new Error(`Claude ${result.subtype}: ${detail}`);
   }
-  return { text: result.result, model: used ?? model ?? undefined, effort: level };
+  return { text: result.result, model: used ?? model ?? undefined, effort: level, usage: claudeUsage(result) };
+}
+
+/** A whole count, or undefined. */
+const count = (n) => (Number.isSafeInteger(n) && n >= 0 ? n : undefined);
+
+/** What a Claude query() used, from its result: the tokens of every model it called
+ * (cache reads and writes are input too) and its cost estimate. None if it says nothing. */
+export function claudeUsage(result) {
+  const models = Object.values(result?.modelUsage ?? {});
+  if (models.length === 0) return undefined;
+  const sum = (key) => models.reduce((n, m) => n + (count(m?.[key]) ?? 0), 0);
+  const cached = sum("cacheReadInputTokens");
+  const cost = result.total_cost_usd;
+  return {
+    input_tokens: sum("inputTokens") + cached + sum("cacheCreationInputTokens"),
+    cached_input_tokens: cached,
+    output_tokens: sum("outputTokens"),
+    cost_usd: Number.isFinite(cost) && cost >= 0 ? cost : undefined,
+  };
+}
+
+/** What a Codex turn used, as it reports it. None if it says nothing. */
+export function codexUsage(turn) {
+  const usage = turn?.usage;
+  if (!usage) return undefined;
+  return {
+    input_tokens: count(usage.input_tokens),
+    cached_input_tokens: count(usage.cached_input_tokens),
+    output_tokens: count(usage.output_tokens),
+  };
 }
 
 /** The model Codex uses when a task names none: `model` at the top of this agent's own
@@ -340,7 +372,12 @@ async function runCodex({ prompt, cwd, model, effort, access, mcp }, abortContro
     skipGitRepoCheck: true,
   });
   const turn = await thread.run(prompt, { signal: abortController.signal });
-  return { text: turn.finalResponse, model: model ?? codexConfigModel(), effort: effort ?? undefined };
+  return {
+    text: turn.finalResponse,
+    model: model ?? codexConfigModel(),
+    effort: effort ?? undefined,
+    usage: codexUsage(turn),
+  };
 }
 
 const PROVIDERS = { claude: runClaude, codex: runCodex };
@@ -371,8 +408,8 @@ async function handle(line) {
     const run = PROVIDERS[provider];
     if (!run) throw new Error(`unknown provider: ${provider}`);
     if (!CLAUDE_TOOLS[access]) throw new Error(`unknown access: ${access}`);
-    const { text, model, effort } = await run(request, controller);
-    reply({ id, ok: true, text, model: model || undefined, effort: effort || undefined });
+    const { text, model, effort, usage } = await run(request, controller);
+    reply({ id, ok: true, text, model: model || undefined, effort: effort || undefined, usage });
   } catch (err) {
     reply({ id, ok: false, error: controller.signal.aborted ? "cancelled" : String(err?.message ?? err) });
   } finally {

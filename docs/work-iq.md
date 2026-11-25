@@ -216,6 +216,9 @@ token:
 - Only read tools by default (`retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
   `list_agents`). Every result goes through the content policy for the task's audience;
   every call is audited and metered; sizes are capped.
+- The server is called `workiq`, so a plan knows a step with `mcp=workiq` reads Microsoft
+  365 content whose labels it never learns: the step is marked `unknown`, and nothing made
+  from it goes to a peer.
 - Peers' tasks get it only with the `--m365-tools` grant, within that peer's labels. Codex
   tasks can't use MCP servers, so they can't use it either.
 
@@ -232,8 +235,9 @@ the owner opts in.
 ### 8. Plugins and enterprise skills
 
 Adding Microsoft's Work IQ plugin (`microsoft/work-iq`, `plugins/workiq`) keeps its skills
-and maps its MCP server (the hosted URL, or `@microsoft/workiq`) to the native connection,
-instead of today's note that sign-in helpers aren't used. Later: find the organization's
+and maps its MCP server (the hosted URL, or `@microsoft/workiq`) to the agent's own `workiq`
+server: Work IQ through the agent's sign-in and gateway (section 6), never the plugin's own
+connection or sign-in settings. Later: find the organization's
 skills and plugins with Work IQ's `discover` and add them through the usual plugin review.
 
 ### 9. Audit, usage and budgets
@@ -282,16 +286,23 @@ editor, an import in Knowledge, and the sources a step used in its run.
 5. For the CLI connection instead: grant admin consent to the Work IQ CLI app (see
    Microsoft's [Work IQ repository](https://github.com/microsoft/work-iq)).
 
-The docs item ([#65](https://github.com/mcbelton/proofkin/issues/65)) turns this into a
-step-by-step guide with a check after each step.
+The step-by-step guide, with a check after each step and troubleshooting, is in the README:
+[Microsoft 365 work context (Work IQ)](../README.md#microsoft-365-work-context-work-iq).
 
 ## Testing
 
 - Tests against a fake Work IQ server (sessions, SSE, `structuredContent`, every error class,
   delays), fake Entra endpoints, and a fake stdio server for the CLI connection.
+- The commands through the program itself (`tests/workiq_e2e.rs`): sign-in, `workiq doctor`,
+  `workiq agents`, `kb import workiq`, and a plan's `@workiq` and `workiq=` steps run by
+  `proofkin`'s own agent, against the fakes. The test-only settings
+  `PROOFKIN_TEST_WORKIQ_URL` and `PROOFKIN_TEST_ENTRA_URL` point it at them; they take only a
+  loopback address. The CLI connection is tested the same way with `--cli-path`.
 - A `WIQ-*` claim in `evidence/claims.json` for each behavior above.
-- A live check behind `PROOFKIN_LIVE_WORKIQ=hosted|cli`, for a tenant with Work IQ: sign-in,
-  doctor, one `retrieve`, one `workiq=` step sent to the owner's own worker. It only reads.
+- A live check behind `PROOFKIN_LIVE_WORKIQ=hosted|cli` (`scripts/live_workiq.py`), for a
+  tenant with Work IQ: sign-in, doctor (one `retrieve`), a `workiq=` step sent to the owner's
+  own worker on real Copilot and an `@workiq` step, then the evidence and an audit that shows
+  only reads. It never prints Microsoft 365 content.
 
 ## Work items
 

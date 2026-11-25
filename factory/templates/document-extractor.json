@@ -1,0 +1,54 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "document-extractor",
+  "title": "Document extractor",
+  "purpose": "Extracts the fields a task asks for from documents into JSON, with the page or section each value came from",
+  "requirements": [
+    { "id": "R1", "text": "Answers with one JSON object holding every field the task asks for" },
+    { "id": "R2", "text": "Gives the page or section each value came from" },
+    { "id": "R3", "text": "Sets a field the document doesn't have to null instead of inventing it" }
+  ],
+  "instructions": "You extract information from documents.\n\nAnswer with one JSON object in a ```json block. Give each field the task asks for as {\"value\": ..., \"source\": \"page 3\"} (or \"section 2.1\"). When the document doesn't have a field, write {\"value\": null, \"source\": null}. Copy values exactly as written: don't convert units, currencies or dates unless the task asks.",
+  "capabilities": { "access": "read-only", "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "cost" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "Extract invoice_number, total and due_date from this invoice.\n\nPage 1\nINVOICE INV-2041\nTotal due: $1,250.00\nDue date: 2026-12-15",
+        "expect": [
+          { "json-schema": { "type": "object", "required": ["invoice_number", "total", "due_date"] } }
+        ],
+        "smoke": true,
+        "timeout": "10m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "Extract invoice_number and total from this invoice.\n\nPage 1\nINVOICE INV-2041\nTotal due: $1,250.00",
+        "expect": [
+          {
+            "json-schema": {
+              "type": "object",
+              "required": ["total"],
+              "properties": { "total": { "type": "object", "required": ["value", "source"] } }
+            }
+          },
+          { "contains": "page 1" }
+        ],
+        "timeout": "10m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R3",
+        "input": "Extract invoice_number and purchase_order from this invoice.\n\nPage 1\nINVOICE INV-2041\nTotal due: $1,250.00",
+        "expect": [{ "regex": "\"purchase_order\"\\s*:\\s*\\{\\s*\"value\"\\s*:\\s*null" }],
+        "timeout": "10m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 2, "timeout_secs": 1800 },
+  "approvers": ["me"]
+}

@@ -1,0 +1,44 @@
+{
+  "schema": "proofkin.agent-blueprint/v1",
+  "name": "implementer",
+  "title": "Implementer",
+  "purpose": "Implements a described change in a repository, with tests, and leaves the folder's test check passing",
+  "requirements": [
+    { "id": "R1", "text": "Makes the change the task describes, in the files where such code lives" },
+    { "id": "R2", "text": "Adds or updates tests that would fail without the change" },
+    { "id": "R3", "text": "Leaves the folder's test check passing" }
+  ],
+  "instructions": "You implement changes in the repository you are given.\n\nRead the code first and follow its conventions: naming, structure, error handling and tests. Make the smallest complete change that does what the task asks, add or update tests that would fail without it, and run the folder's test check before you finish. Don't change unrelated code or the build setup.\n\nEnd with a short summary: what changed, in which files, and how it was tested.",
+  "skills": ["implement-change"],
+  "capabilities": { "access": "full", "checks": ["test"], "delegate": false },
+  "model": { "providers": ["copilot", "claude", "codex"], "needs_mcp": false, "prefer": "quality" },
+  "evals": {
+    "repetitions": 3,
+    "cases": [
+      {
+        "id": "E1",
+        "requirement": "R1",
+        "input": "Add a function named slugify that lowercases a text and joins its words with '-', next to the other string helpers, and export it the way they are.",
+        "expect": [{ "files-changed": ["**"] }, { "regex": "(?i)slugify" }],
+        "smoke": true,
+        "timeout": "30m"
+      },
+      {
+        "id": "E2",
+        "requirement": "R2",
+        "input": "Add a function named clamp(value, low, high) next to the other number helpers, with tests for a value below, inside and above the range.",
+        "expect": [{ "files-changed": ["**"] }, { "regex": "(?i)\\btests?\\b" }, { "check": "test" }],
+        "timeout": "30m"
+      },
+      {
+        "id": "E3",
+        "requirement": "R3",
+        "input": "Make the function that reads the configuration refuse an empty value with a clear error message, and keep the tests passing.",
+        "expect": [{ "files-changed": ["**"] }, { "check": "test" }],
+        "timeout": "30m"
+      }
+    ]
+  },
+  "budgets": { "attempts": 3, "timeout_secs": 3600 },
+  "approvers": ["me"]
+}

@@ -28,7 +28,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{Agent, Event, Network, PeerInfo};
 use crate::audit::{AuditLog, Outcome};
-use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
+use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext, Usage};
 use crate::plan::{Plan, SquadStore, StepState};
 use crate::profile::{Profile, validate_name};
 use crate::runs::RunRecord;
@@ -84,6 +84,9 @@ struct TaskView {
     /// The model that did the work, as its provider (or peer) said.
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    /// What the work used, as its provider (or peer) reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
     prompt: String,
     target: String,
     status: &'static str,
@@ -178,6 +181,8 @@ struct StoredTask {
     provider: Provider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
     prompt: String,
     target: String,
     status: String,
@@ -228,6 +233,7 @@ impl From<&TaskView> for StoredTask {
             id: t.id,
             provider: t.provider,
             model: t.model.clone(),
+            usage: t.usage.clone(),
             prompt: t.prompt.clone(),
             target: t.target.clone(),
             status: t.status.to_owned(),
@@ -273,6 +279,7 @@ impl StoredTask {
             id: self.id,
             provider: self.provider,
             model: self.model,
+            usage: self.usage,
             prompt: self.prompt,
             target: self.target,
             status: finished.unwrap_or("cancelled"),
@@ -600,6 +607,7 @@ impl Shared {
                 id,
                 provider: step.provider,
                 model: None,
+                usage: None,
                 prompt: step.prompt.clone(),
                 target: format!(
                     "{}{}",
@@ -1569,6 +1577,7 @@ fn start_task(
         id,
         provider: body.provider,
         model: None,
+        usage: None,
         prompt,
         target: target.clone(),
         status: "running",
@@ -1608,6 +1617,7 @@ fn start_task(
                 match executor.execute(&task, &ctx).await {
                     Ok(ran) => Settled {
                         model: ran.shown_model(),
+                        usage: ran.usage.clone(),
                         ..Settled::of(Ok(ran.output))
                     },
                     Err(e) => Settled::of(Err(e)),
@@ -1643,6 +1653,7 @@ fn finish_task(shared: &Shared, id: u64, settled: Settled) {
         t.run = settled.run;
         t.progress = None;
         t.model = settled.model;
+        t.usage = settled.usage;
         match settled.result {
             Ok(out) => {
                 t.status = "done";
@@ -1657,10 +1668,11 @@ fn finish_task(shared: &Shared, id: u64, settled: Settled) {
 }
 
 /// How a task ended, for its card: its output (or why it failed), the model that did
-/// it, whether its peer signed it, and the evidence run kept of it.
+/// it and what it used, whether its peer signed it, and the evidence run kept of it.
 struct Settled {
     result: anyhow::Result<String>,
     model: Option<String>,
+    usage: Option<Usage>,
     evidence: Option<&'static str>,
     run: Option<String>,
 }
@@ -1670,6 +1682,7 @@ impl Settled {
         Self {
             result,
             model: None,
+            usage: None,
             evidence: None,
             run: None,
         }
@@ -1764,6 +1777,7 @@ fn settle(
     };
     Settled {
         model: d.model.clone(),
+        usage: d.usage.clone(),
         evidence,
         run,
         result: if d.ok {
@@ -2060,6 +2074,7 @@ fn start_plan(
             id,
             provider: step.provider,
             model: None,
+            usage: None,
             prompt: step.prompt.clone(),
             target: format!(
                 "{}{}",
@@ -3992,6 +4007,7 @@ async fn open_run_pull_request(
         id: task_id,
         provider: Provider::Copilot,
         model: None,
+        usage: None,
         prompt,
         target: peer.name.clone(),
         status: "running",
@@ -4330,6 +4346,7 @@ mod tests {
             id,
             provider: Provider::Copilot,
             model: None,
+            usage: None,
             prompt: String::new(),
             target: String::new(),
             status,

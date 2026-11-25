@@ -1299,6 +1299,65 @@
       ]
     },
     {
+      "id": "WIQ-14",
+      "area": "work-iq",
+      "claim": "A workiq= step's signed evidence records the Work IQ context its task had by hash, never its content: the plan's agent sends the task with where the Microsoft 365 section is in its prompt and how many results it held with their labels, and the worker refuses a task whose section isn't a whole part of its prompt, else signs context [{source workiq, sha256 of exactly that part, results, labels}] (a team step's lead too), and its result's summary says Work context from Microsoft 365 (Work IQ) with the count, labels and the start of the hash. The run record keeps the section and its SHA-256 on the plan's machine; runs verify fails a step whose evidence doesn't record the hash of the section the run kept for it, or whose kept section no longer has its hash. Records without context sign as before; claims never rest on Work IQ content.",
+      "tests": [
+        "agents::a_steps_signed_evidence_records_its_work_iq_context_by_hash_never_its_content",
+        "lib::evidence::work_context_is_recorded_by_the_hash_of_its_part_of_the_prompt"
+      ]
+    },
+    {
+      "id": "WIQ-25",
+      "area": "work-iq",
+      "claim": "The Work IQ commands work through the program itself, as a user runs them, against a fake Work IQ and Entra: auth login workiq --device-code signs in, workiq doctor passes its five checks, workiq agents lists the agents, kb import workiq saves what the content policy keeps (withheld counted), and an agent started with proofkin --name runs a plan's @workiq step itself and sends a workiq= step to a peer with only the results its Microsoft 365 grant allows; runs verify passes and the step's signed evidence records the context by the hash of the section the run kept; workiq usage counts every call; each run uses the refresh token the run before saved (Entra rotates them); after auth logout workiq the doctor fails. The same commands work through the Work IQ CLI given with --cli-path. The test-only settings PROOFKIN_TEST_WORKIQ_URL and PROOFKIN_TEST_ENTRA_URL that point the program at the fakes take only a root http(s) address on the loopback interface (localhost or a loopback IP); any other value is refused, never replaced by the real service, so no token goes elsewhere.",
+      "tests": [
+        "workiq_e2e::the_work_iq_commands_run_through_the_program_with_a_hosted_account",
+        "workiq_e2e::the_work_iq_commands_run_through_the_program_with_the_work_iq_cli",
+        "lib::workiq::the_test_settings_take_only_an_address_on_this_machine"
+      ]
+    },
+    {
+      "id": "WIQ-24",
+      "area": "work-iq",
+      "claim": "A live check against a real tenant's Work IQ, behind PROOFKIN_LIVE_WORKIQ=cli|hosted (scripts/live_workiq.py; python scripts/evidence.py --live runs it when that is set), only reads: a fresh profile signs in to Work IQ (through the Work IQ CLI, or with Proofkin's device code sign-in), its doctor passes every check with one retrieve, and its agent runs a plan whose workiq= step goes to the profile's own digital worker on real Copilot and whose @workiq step gets Microsoft 365 Copilot's answer. The run's signed evidence verifies, the step's evidence records the Work IQ context by its hash and nothing else, and every call in the profile's Work IQ audit file was a read tool. Step outputs stay out of its log and email addresses are masked. Without PROOFKIN_LIVE_WORKIQ the check is not run and fails nothing.",
+      "live": [
+        {
+          "check": "workiq: *",
+          "needs": "PROOFKIN_LIVE_WORKIQ"
+        }
+      ]
+    },
+    {
+      "id": "WIQ-16",
+      "area": "work-iq",
+      "claim": "A folder can offer Work IQ to its owner's tasks as its MCP server workiq (proofkin mcp add <folder> workiq --workiq [--tool ...]; the name is workiq, it has no command or URL, only tools that read: retrieve, ask, fetch, search_paths, get_schema, list_agents, and any task access may use it). A task that asks for mcp=workiq gets, for that task only, http://127.0.0.1:<port>/mcp/workiq/<session> with a random bearer; the agent calls Work IQ itself through the profile's audited client, so the model's MCP config holds no token. The session lists only the allowed tools Work IQ offers, refuses any other tool before it reaches Work IQ, puts every result through the content policy for the task's audience (a peer audience gets only retrieve and ask, within its labels), audits each call with purpose gateway, needs its bearer, refuses requests with an Origin header, and closes when the task ends. A digital worker's owner's tasks see what Work IQ allows (peers: WIQ-17). A plan marks a step with mcp=workiq, and the steps after it, with the label unknown, so nothing made from what its model read goes to a peer.",
+      "tests": [
+        "workiq_gateway::a_tasks_session_offers_only_read_tools_and_its_model_never_gets_the_token",
+        "workiq_gateway::what_a_session_sees_goes_through_the_content_policy_for_its_audience_and_is_audited",
+        "workiq_gateway::a_session_needs_its_bearer_takes_no_browser_and_closes_with_its_task",
+        "workiq_gateway::a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_only_with_its_grant",
+        "lib::plan::steps_with_microsoft_365_content_are_marked_through_context_and_after"
+      ]
+    },
+    {
+      "id": "WIQ-17",
+      "area": "work-iq",
+      "claim": "A peer's task gets Work IQ through the gateway (mcp=workiq) only when the agent's owner granted that peer --m365-tools: its session then offers only retrieve and ask, whose results carry labels, and the content policy gives it only results with the labels of its grant; every call is audited with the peer's name as its audience. Without the grant the task is refused before its model starts, and the refusal names the grant to add (proofkin peers allow <peer> --m365 <labels> --m365-tools). The grant is read again when the task starts. The requester's plan marks the step's output unknown (WIQ-16), so it goes no further to a peer.",
+      "tests": [
+        "workiq_gateway::a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_only_with_its_grant",
+        "workiq_gateway::what_a_session_sees_goes_through_the_content_policy_for_its_audience_and_is_audited"
+      ]
+    },
+    {
+      "id": "WIQ-19",
+      "area": "work-iq",
+      "claim": "Importing Microsoft's Work IQ plugin (the shape of microsoft/work-iq:plugins/workiq: .github/plugin/plugin.json, skills/, and a .mcp.json whose server is the hosted https://workiq.svc.cloud.microsoft/mcp with oauthClientId) keeps its skills and makes its MCP server a Work IQ template: its own connection and sign-in settings are dropped, the review notes that it is offered through this agent's own Work IQ sign-in and gateway with only its tools that read, and offering it in a folder gives the agent's workiq server (no URL, command or headers; it must be named workiq). The Work IQ CLI's server (npx @microsoft/workiq mcp, or workiq mcp) is recognized the same way; other servers are not.",
+      "tests": [
+        "lib::plugins::microsofts_work_iq_plugin_offers_work_iq_through_the_agents_own_gateway"
+      ]
+    },
+    {
       "id": "WIQ-22",
       "area": "work-iq",
       "claim": "The web UI has a token-guarded API for the profile's Work IQ account, which reads the profile as its files are now, so a sign-in made in another process counts. GET /api/workiq answers whether the account the agent uses is signed in, its line, how it connects (hosted or cli), its user, the CLI's account and path for a CLI account, the profile it belongs to (a digital worker may use its owner's) and whether that is this profile, why a digital worker its owner didn't let use theirs has none (not_used), the sign-in command, and today's calls against the per-day and per-run budgets (with each run's calls). POST /api/workiq/doctor answers the doctor's checks with their results, details and fixes, always as 200. POST /api/workiq/sign-in (account, cli_path) signs the profile in through Microsoft's Work IQ CLI as proofkin auth login workiq --cli does and answers who signed in and the line; DELETE /api/workiq signs out, and is refused when not signed in; each adds a line to the activity. PUT /api/workiq/budget (per_day, per_run) sets the budgets. Errors are 400s in the sign-in's or set_budget's own words. A digital worker that uses its owner's account sees it but is refused signing in, signing out and budgets: its owner does those. The page's Work IQ card, after the GitHub card, shows this from GET /api/workiq and acts through these endpoints; every element its script looks up is on the page, and its sign-in and budget dialogs close with Escape and Cancel like the others.",
@@ -1622,6 +1681,91 @@
         "ui::any_peer_tasks_go_to_a_peer_that_allows_their_model",
         "lib::plan::squad_steps_pick_the_least_busy_capable_member"
       ]
+    },
+    {
+      "id": "FAC-1",
+      "area": "agent-factory",
+      "claim": "An agent blueprint (proofkin.agent-blueprint/v1) is checked against the profile it is for: its skills, knowledge topics, folders with their checks and MCP servers, the providers it is signed in to, the models and efforts it allows, approvers on its allowlist and unique requirement ids, and a name nothing else has. Each problem has a stable code, is an error or a warning, and says what is wrong, how to fix it and the JSON pointer of the field. Asking for more than it needs (full access with no check, every tool of a server, every Work IQ source, delegation, instructions that ask for tools) is a least-privilege warning naming the narrower choice (AC-6).",
+      "tests": [
+        "lib::factory::blueprint::a_valid_blueprint_has_no_problems_and_round_trips",
+        "lib::factory::blueprint::text_that_is_not_a_v1_blueprint_is_one_problem_saying_why",
+        "lib::factory::blueprint::references_the_profile_lacks_are_errors_with_their_fix",
+        "lib::factory::blueprint::requirements_are_numbered_unique_and_stated",
+        "lib::factory::blueprint::capabilities_must_hang_together",
+        "lib::factory::blueprint::texts_budgets_and_memory_stay_in_range",
+        "lib::factory::blueprint::least_privilege_lint_warns_and_names_the_narrower_choice",
+        "lib::factory::blueprint::errors_come_before_warnings",
+        "lib::factory::blueprint::a_name_in_use_or_reserved_is_refused",
+        "factory::a_blueprint_file_is_checked_with_the_fixtures_next_to_it"
+      ]
+    },
+    {
+      "id": "FAC-2",
+      "area": "agent-factory",
+      "claim": "A task records the usage its provider reported: the Copilot session's tokens and premium requests, the Claude Agent SDK's tokens and cost estimate, and the tokens of Codex's turn. A provider that reports none records none, not zero. Usage adds up over a task's attempts, goes back to the requester with the result (older peers ignore it) and is kept in the worker's audit entry, which holds no prompt or output text. The web UI shows it on a finished task and in the audit, and proofkin audit sums it per peer and provider.",
+      "tests": [
+        "lib::llm::usage_keeps_only_what_providers_report_and_adds_up_runs",
+        "lib::llm::copilot::a_sessions_usage_is_its_models_tokens_and_its_premium_requests",
+        "bridge::sends_task_fields_and_returns_text",
+        "bridge::claude_tool_policy_confines_paths_and_tools",
+        "lib::protocol::progress_load_and_origins_keep_older_peers_working",
+        "lib::audit::usage_is_recorded_without_text_and_summed_per_peer_and_provider",
+        "agents::the_worker_reports_what_its_provider_said_the_work_used"
+      ],
+      "live": ["worker1 audited what Copilot said boss's tasks used"]
+    },
+    {
+      "id": "FAC-3",
+      "area": "agent-factory",
+      "claim": "The profile's factory keeps drafts, and each agent's lifecycle state and history (who, when, what), in its factory folder: written atomically under a lock, for its owner only. They survive restarts and concurrent writers, a damaged file is reported with its path and left as it is, a name has one agent, and an agent with releases is never deleted. proofkin factory list, show, edit, check and delete work on them: edit takes the blueprint from an editor, a file or stdin and keeps it with its problems (text that isn't JSON or renames the agent isn't saved), and check fails while a draft has errors, showing each with its fix.",
+      "tests": [
+        "lib::factory::store::drafts_and_their_history_survive_a_restart_and_concurrent_writers",
+        "lib::factory::store::a_damaged_file_is_reported_with_its_path_and_left_as_it_is",
+        "lib::factory::store::a_name_has_one_agent_and_deleting_keeps_released_ones",
+        "factory::a_template_starts_a_draft_that_is_listed_shown_checked_and_deleted",
+        "factory::edits_are_checked_when_saved_and_kept_with_their_problems"
+      ]
+    },
+    {
+      "id": "FAC-4",
+      "area": "agent-factory",
+      "claim": "An agent's eval suite has cases that each name the requirement they prove, give a task, its fixtures and what to expect, and every requirement needs a case with a deterministic expectation (AC-10). contains, not-contains, regex, json-schema, max-words, files-changed and check expectations pass and fail as the design says (check runs the folder's check in the run's folder); a judge rubric is scored by a model, never graded here. Fixtures must be files in the agent's fixtures folder, reached without links.",
+      "tests": [
+        "lib::factory::evals::cases_name_a_requirement_give_a_task_and_expect_what_the_agent_can_do",
+        "lib::factory::evals::every_requirement_needs_a_case_with_a_deterministic_expectation",
+        "lib::factory::evals::every_expectation_kind_parses_and_bad_ones_say_why",
+        "lib::factory::evals::deterministic_graders_pass_and_fail_as_specified",
+        "lib::factory::evals::a_check_expectation_runs_the_folders_check_in_the_runs_folder",
+        "lib::factory::evals::a_judge_rubric_is_scored_by_a_model_never_graded",
+        "lib::factory::evals::glob_patterns_match_paths_as_documented",
+        "lib::factory::evals::fixtures_must_be_files_in_the_agents_fixtures_folder",
+        {"test": "lib::factory::evals::fixtures_reached_through_symbolic_links_are_refused", "os": "unix"},
+        "factory::a_blueprint_file_is_checked_with_the_fixtures_next_to_it"
+      ]
+    },
+    {
+      "id": "FAC-5",
+      "area": "agent-factory",
+      "claim": "proofkin factory templates lists the built-in templates with their purpose, most access and number of eval cases. Each passes validation unchanged with a case for every requirement, and proofkin factory new --template makes a draft from one with no model, on the providers the profile is signed in to (AC-4).",
+      "tests": [
+        "lib::factory::templates::templates_are_listed_with_their_purpose_access_and_cases",
+        "lib::factory::templates::every_template_passes_validation_unchanged_with_a_case_for_every_requirement",
+        "lib::factory::templates::a_draft_from_a_template_runs_on_the_providers_the_profile_signed_in_to",
+        "factory::a_template_starts_a_draft_that_is_listed_shown_checked_and_deleted"
+      ]
+    },
+    {
+      "id": "FAC-6",
+      "area": "agent-factory",
+      "claim": "proofkin factory new --describe has the profile's default model write a draft from the owner's words: read-only, in an empty folder, given what the profile has as data and the description with secrets redacted. The draft is checked, and its problems go back to the model, at most 3 tries in all; then the owner gets the last draft with its problems (AC-1, AC-2). Its provenance records the provider, model, effort, template, the SHA-256 of the description (not its text), the time and the tries. Drafting grants nothing, whatever the description says (AC-3, TM-1), and needs a provider the profile is signed in to.",
+      "tests": [
+        "lib::factory::draft::the_owners_model_drafts_a_checked_blueprint_with_its_provenance",
+        "lib::factory::draft::problems_go_back_to_the_model_at_most_three_tries",
+        "lib::factory::draft::a_template_starts_the_draft",
+        "lib::factory::draft::drafting_grants_nothing_whatever_the_description_says",
+        "factory::drafting_needs_a_provider_the_profile_is_signed_in_to"
+      ],
+      "live": ["worker1's model drafted an agent from a description that passes the factory check"]
     }
   ]
 }

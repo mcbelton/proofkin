@@ -107,6 +107,10 @@ enum Command {
     /// skills they follow and the MCP servers they use; a profile's own, or from plugins.
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// The agent factory: agents described as blueprints, checked against the profile,
+    /// started from a template or drafted by its model from your words.
+    #[command(subcommand)]
+    Factory(proofkin::factory::cli::FactoryCommand),
     /// Spec-driven development: check a feature's spec, REST API contract and UX
     /// prototype, its design and its review pack (the checks plan steps run as
     /// verify=spec:api,design:threats,...), or import a Spec Kit or OpenSpec spec as a plan.
@@ -1105,12 +1109,16 @@ examples:
   proofkin mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot -- npx @playwright/mcp@latest --headless
   proofkin mcp add app docs --url https://docs.example.com/mcp --header \"Authorization=Bearer <token>\"
   proofkin mcp add app tickets --plugin team-tools --set TICKETS_TOKEN=<token> --description \"Our ticket system\"
+  proofkin mcp add app workiq --workiq --profile my-worker
   plan step:  check @alice:app mcp=browser Open http://localhost:3000 and report what the home page shows
 The server runs on this machine with your rights; commands, variables, headers and
 URLs stay here (peers learn only the names they may use, and descriptions you give).
 Tasks call only the tools you list (default: all), and tool results reach the model
 marked as untrusted content. A plugin server's values not given with --set are
-taken from environment variables of the same name.")]
+taken from environment variables of the same name. A `workiq` server (--workiq) is
+Work IQ through this agent, for its owner's tasks and peers granted --m365-tools: each
+task gets an address of its own on this machine, never the account's token, and only
+tools that read.")]
     Add {
         /// The shared folder whose tasks may use the server.
         share: String,
@@ -1137,12 +1145,16 @@ taken from environment variables of the same name.")]
         /// A value the plugin's server needs: NAME=VALUE (repeatable).
         #[arg(long = "set", value_name = "NAME=VALUE", requires = "plugin")]
         set: Vec<String>,
+        /// Work IQ through this agent's gateway (the server must be called `workiq`).
+        #[arg(long, conflicts_with_all = ["url", "command", "env", "plugin"])]
+        workiq: bool,
         /// A tool tasks may call (repeatable; default: all of the server's tools).
         #[arg(long = "tool", value_name = "TOOL")]
         tools: Vec<String>,
-        /// The least access a peer's task needs to use the server.
-        #[arg(long, value_enum, default_value_t = Access::Full)]
-        access: Access,
+        /// The least access a peer's task needs to use the server (default: full, or
+        /// read-only for --workiq, which runs nothing here).
+        #[arg(long, value_enum)]
+        access: Option<Access>,
         /// What the server is for, in a line (peers see it next to its name).
         #[arg(long)]
         description: Option<String>,
@@ -1560,6 +1572,7 @@ async fn main() -> Result<()> {
         Some(Command::Playbook(command)) => run_playbook(command),
         Some(Command::Skill(command)) => run_skill(command),
         Some(Command::Agent(command)) => run_agent_command(command),
+        Some(Command::Factory(command)) => proofkin::factory::cli::run(command).await,
         Some(Command::Spec(command)) => run_spec(command),
         Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command).await,
@@ -1632,7 +1645,7 @@ fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
         let access = e.access.map_or("-".to_owned(), |a| a.to_string());
         let outcome = serde_json::to_value(e.outcome)?;
         println!(
-            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}{}",
+            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}{}{}",
             format!(
                 "{} {:02}:{:02}:{:02}",
                 civil_date(days),
@@ -1660,7 +1673,25 @@ fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
                 .as_deref()
                 .map(|err| format!("\n{:>22}{err}", "error: "))
                 .unwrap_or_default(),
+            e.usage
+                .as_ref()
+                .map(|u| format!("\n{:>22}{}", "used: ", u.describe()))
+                .unwrap_or_default(),
         );
+    }
+    let totals = proofkin::audit::usage_totals(&entries);
+    if !totals.is_empty() {
+        println!("usage by peer and provider, as providers reported it:");
+        for t in &totals {
+            println!(
+                "  {:<14} {:<8} {:>5} task{}  {}",
+                t.peer,
+                t.provider,
+                t.tasks,
+                if t.tasks == 1 { " " } else { "s" },
+                t.usage.describe()
+            );
+        }
     }
     println!("log: {}", profile.audit_path().display());
     Ok(())
@@ -3697,6 +3728,7 @@ fn run_mcp(command: McpCommand) -> Result<()> {
             plugin,
             server,
             set,
+            workiq,
             tools,
             access,
             description,
@@ -3704,6 +3736,11 @@ fn run_mcp(command: McpCommand) -> Result<()> {
             command,
         } => {
             let profile = Profile::open(&profile.name)?;
+            let access = access.unwrap_or(if workiq {
+                Access::ReadOnly
+            } else {
+                Access::Full
+            });
             let offer = McpOffer {
                 share: share.clone(),
                 name: name.clone(),
@@ -3712,7 +3749,11 @@ fn run_mcp(command: McpCommand) -> Result<()> {
                 description: description.unwrap_or_default(),
                 replace: true,
             };
-            let (server, _) = if let Some(plugin) = plugin {
+            let (server, _) = if workiq {
+                profile.update_shares(|shares| {
+                    shares.offer_mcp(&offer, |_| Ok(McpServer::workiq(Vec::new())))
+                })?
+            } else if let Some(plugin) = plugin {
                 let store = profile.plugins();
                 let p = store.get(&plugin)?;
                 let template = p.pick_server(server.as_deref(), &name)?;
@@ -3739,10 +3780,17 @@ fn run_mcp(command: McpCommand) -> Result<()> {
                 profile.update_shares(|shares| shares.offer_mcp(&offer, |_| Ok(server)))?
             };
             println!(
-                "profile '{}': tasks in '{share}' with at least {access} access may use MCP server '{name}' ({}); tools: {}. Peers ask for it with mcp={name} in a plan step.",
+                "profile '{}': tasks in '{share}' with at least {access} access may use MCP server '{name}' ({}); tools: {}. {}",
                 profile.name,
                 server.describe(),
-                tools_text(&server.tools)
+                tools_text(&server.tools),
+                if server.workiq {
+                    format!(
+                        "Its owner's tasks ask for it with mcp={name} in a plan step, and peers' tasks once you grant them --m365-tools; it needs this profile's Work IQ sign-in (or its owner's, for a digital worker)."
+                    )
+                } else {
+                    format!("Peers ask for it with mcp={name} in a plan step.")
+                }
             );
         }
         McpCommand::Import {
@@ -4387,7 +4435,10 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
                 } else {
                     proofkin::workiq::login::Flow::Browser
                 };
+                let endpoints = proofkin::workiq::Endpoints::configured()?;
                 let who = proofkin::workiq::login::Login::new(&tenant, &client_id)
+                    .with_authority(&endpoints.authority)
+                    .with_mcp_url(&endpoints.mcp_url)
                     .run(&mut profile, flow)
                     .await?;
                 println!("profile '{}': Work IQ signed in as {who}", profile.name);
@@ -4542,6 +4593,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             )));
             // This program serves a task's checks to its model (proofkin task-checks).
             config.task_checks = std::env::current_exe().ok();
+            // And Work IQ to its owner's tasks that ask for a folder's `workiq` server.
+            config.workiq_gateway = Some(proofkin::workiq::gateway::Gateway::new(profile.clone()));
         }
         Agent::bind(config).await?
     };

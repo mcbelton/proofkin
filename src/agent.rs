@@ -17,7 +17,7 @@ use crate::evidence::{
     CHECK_TIMEOUT, Evidence, EvidenceKind, MAX_ATTEMPTS, retry_prompt, run_built_in, run_check,
     sha256_hex,
 };
-use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
+use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext, Usage};
 use crate::protocol::{ALPN, Message, Origin, Phase, Progress, write_message};
 use crate::shares::{DATA_SHARE, Share, ShareInfo, ShareStore, effective_access};
 use crate::trust::{TrustStore, TrustedPeer};
@@ -76,6 +76,9 @@ pub struct AgentConfig {
     /// The program that serves a task's checks to its model while it works (this program;
     /// see [`crate::checks_mcp`]). None: the model gets no such tool.
     pub task_checks: Option<PathBuf>,
+    /// Gives a task that asks for a folder's `workiq` MCP server Work IQ through a session
+    /// of its own (see [`crate::workiq::gateway`]). None: such tasks are refused.
+    pub workiq_gateway: Option<Arc<crate::workiq::gateway::Gateway>>,
     /// How long tasks wait for a dropped peer to come back (see [`TASK_GRACE`]).
     pub task_grace: Duration,
     /// Where the next id for the tasks it gives peers is kept, so ids go on after a
@@ -102,6 +105,7 @@ impl AgentConfig {
             team: None,
             pulls: None,
             task_checks: None,
+            workiq_gateway: None,
             task_grace: TASK_GRACE,
             task_ids: None,
         }
@@ -208,6 +212,8 @@ pub struct Delivered {
     pub refused: bool,
     /// The model that did the work, as the peer says (older peers don't).
     pub model: Option<String>,
+    /// What the work used, as the peer's provider reported it (older peers don't say).
+    pub usage: Option<Usage>,
 }
 
 /// The first id for the tasks an agent gives peers: the one kept at `path` (see
@@ -362,6 +368,8 @@ struct Served {
     ok: bool,
     /// The model that did the work, if the provider said (none for a team step).
     model: Option<String>,
+    /// What its model runs used, as the provider reported it (all its attempts').
+    usage: Option<Usage>,
 }
 
 /// A served task's place: waiting for a slot, or holding one (see
@@ -517,6 +525,7 @@ struct Inner {
     team: Option<Arc<crate::team::TeamRunner>>,
     pulls: Option<Arc<dyn crate::pulls::PullRequests>>,
     task_checks: Option<PathBuf>,
+    workiq_gateway: Option<Arc<crate::workiq::gateway::Gateway>>,
     task_grace: Duration,
     /// When peers that dropped were last seen, until they come back or are given up.
     left: Mutex<HashMap<EndpointId, Instant>>,
@@ -581,6 +590,7 @@ impl Agent {
             team: config.team,
             pulls: config.pulls,
             task_checks: config.task_checks,
+            workiq_gateway: config.workiq_gateway,
             task_grace: config.task_grace,
             left: Mutex::new(HashMap::new()),
         });
@@ -1335,6 +1345,7 @@ impl Agent {
                     verified: true,
                     refused: false,
                     model: None,
+                    usage: None,
                 }),
             );
         } else {
@@ -1346,6 +1357,7 @@ impl Agent {
                 patch: None,
                 refused: false,
                 model: None,
+                usage: None,
             };
             self.inner.deliver(request.requester, msg).await;
         }
@@ -1689,6 +1701,7 @@ impl Inner {
                         patch: None,
                         refused: true,
                         model: None,
+                        usage: None,
                     })
                     .is_ok();
             }
@@ -1864,6 +1877,38 @@ impl Inner {
         }
     }
 
+    /// Who Work IQ results through the gateway are for in a task from `id` (`name` on the
+    /// allowlist): its owner's own tasks see what Work IQ allows, a peer its owner granted
+    /// `--m365-tools` only its labels. Anyone else is refused, with the grant that would let
+    /// it.
+    fn workiq_audience(
+        &self,
+        id: &EndpointId,
+        name: &str,
+    ) -> Result<crate::workiq::audit::CallContext> {
+        use crate::workiq::audit::{CallContext, Purpose};
+        if self.owner.as_deref() == Some(name) {
+            return Ok(CallContext::local(Purpose::Gateway));
+        }
+        let grant = self
+            .trust
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|p| p.m365.clone());
+        match grant {
+            Some(grant) if grant.tools => {
+                Ok(CallContext::peer(name, grant.labels, Purpose::Gateway))
+            }
+            _ => bail!(
+                "{} gives Work IQ (mcp=workiq) only to its owner's own tasks and to peers granted \
+                 it, and {name} isn't: its owner can grant it with `proofkin peers allow {name} \
+                 --m365 <labels> --m365-tools`",
+                self.name
+            ),
+        }
+    }
+
     /// Checks the allowlist permission, the shared folder and the hourly quota for
     /// a task from `id`; returns where and with what access it may run.
     fn admit_task(&self, id: &EndpointId, task: &LlmTask) -> Result<(TaskContext, Share)> {
@@ -1937,6 +1982,10 @@ impl Inner {
                 self.name
             );
         }
+        // The work context its signed evidence will record must be in its prompt.
+        if let Err(e) = crate::evidence::context_uses(&task.prompt, &task.context) {
+            bail!("{} refused the task: {e:#}", self.name);
+        }
         let mut mcp = BTreeMap::new();
         for server in &task.mcp {
             let Some(def) = share.mcp.get(server) else {
@@ -1960,6 +2009,17 @@ impl Inner {
                     share.name,
                     self.name
                 );
+            }
+            if def.workiq {
+                // Work IQ through this agent's gateway, with its owner's work data.
+                if self.workiq_gateway.is_none() {
+                    bail!(
+                        "MCP server '{server}' in '{}' is Work IQ, which {} doesn't serve",
+                        share.name,
+                        self.name
+                    );
+                }
+                self.workiq_audience(id, &name)?;
             }
             mcp.insert(server.clone(), def.clone());
         }
@@ -2054,6 +2114,7 @@ impl Inner {
         }
         entry.origin = origin.as_ref().and_then(Origin::describe);
         entry.model = result.as_ref().ok().and_then(|s| s.model.clone());
+        entry.usage = result.as_ref().ok().and_then(|s| s.usage.clone());
         if let Some(audit) = &self.audit {
             audit.record(&entry);
         }
@@ -2429,6 +2490,7 @@ impl Inner {
                 evidence,
                 patch: None,
                 model: None,
+                usage: None,
             })
         };
         tokio::select! {
@@ -2577,6 +2639,9 @@ impl Inner {
         );
         evidence.share = Some(share.name.clone());
         evidence.prompt_sha256 = sha256_hex(task.prompt.as_bytes());
+        // Checked when the team step was admitted.
+        evidence.context =
+            crate::evidence::context_uses(&task.prompt, &task.context).unwrap_or_default();
         evidence.git = outcome.git;
         evidence.team = Some(Box::new(outcome.record));
         Ok(Served {
@@ -2585,6 +2650,7 @@ impl Inner {
             patch: outcome.patch,
             ok: outcome.ok,
             model: None,
+            usage: None,
         })
     }
 
@@ -2867,6 +2933,23 @@ impl Inner {
                 crate::checks_mcp::server(program, &ctx.workspace, &commands),
             );
         }
+        // A Work IQ server becomes this task's own address on this machine, with a bearer
+        // that stops working when the task ends: the model never gets the account's token.
+        // What it sees is for the task's requester (a grant revoked since counts).
+        let mut workiq_sessions = Vec::new();
+        for (name, def) in ctx.mcp.iter_mut().filter(|(_, def)| def.workiq) {
+            let gateway = self
+                .workiq_gateway
+                .as_ref()
+                .context("this agent doesn't serve Work IQ")?;
+            let context = self.workiq_audience(id, from)?;
+            let (server, session) = gateway
+                .open(def, context)
+                .await
+                .with_context(|| format!("MCP server '{name}'"))?;
+            *def = server;
+            workiq_sessions.push(session);
+        }
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();
         // The model it asked for (allowed: checked when it was admitted), else the
@@ -2881,8 +2964,8 @@ impl Inner {
         // The last attempt ended because the model's run stopped, not because checks failed.
         let mut stopped_before = false;
         // The model that did the work, and its effort: the latest attempt's, as its
-        // provider says.
-        let (mut model, mut effort) = (None, None);
+        // provider says. What the attempts used, added up.
+        let (mut model, mut effort, mut usage) = (None, None, None::<Usage>);
         while used < attempts {
             used += 1;
             let text = match (attempts, used) {
@@ -2945,6 +3028,7 @@ impl Inner {
             };
             model = ran.model.or(model);
             effort = ran.effort.or(effort);
+            usage = Usage::sum(usage.iter().chain(ran.usage.iter()));
             reports.push(ran.output);
             results.clear();
             for (i, (name, command)) in checks.iter().enumerate() {
@@ -3027,6 +3111,9 @@ impl Inner {
         evidence.provider = Some(task.provider);
         evidence.share = Some(share.name.clone());
         evidence.prompt_sha256 = sha256_hex(task.prompt.as_bytes());
+        // Checked when the task was admitted.
+        evidence.context =
+            crate::evidence::context_uses(&task.prompt, &task.context).unwrap_or_default();
         evidence.attempts = used;
         evidence.checks = results;
         let mut patch = None;
@@ -3100,6 +3187,7 @@ impl Inner {
             patch,
             // Results name the model with its effort: every version shows it as it is.
             model: crate::models::with_effort(model, effort.as_deref()),
+            usage,
         })
     }
 }
@@ -3346,6 +3434,7 @@ async fn run_connection(
                                 patch: served.patch,
                                 refused: false,
                                 model: served.model,
+                                usage: served.usage,
                             },
                             Err(e) => Message::TaskResult {
                                 task_id,
@@ -3355,6 +3444,7 @@ async fn run_connection(
                                 patch: None,
                                 refused,
                                 model: None,
+                                usage: None,
                             },
                         };
                         {
@@ -3405,6 +3495,7 @@ async fn run_connection(
                             patch: None,
                             refused: true,
                             model: None,
+                            usage: None,
                         };
                         let _ = tx.send(msg);
                     }
@@ -3424,6 +3515,7 @@ async fn run_connection(
                     patch,
                     refused,
                     model,
+                    usage,
                 } => {
                     let verified = evidence.as_ref().is_some_and(|e| {
                         e.verify(&peer_id, &output).is_ok()
@@ -3454,6 +3546,7 @@ async fn run_connection(
                             model: model
                                 .map(|m| crate::llm::clean_model(&m))
                                 .filter(|m| !m.is_empty()),
+                            usage: usage.and_then(Usage::checked),
                         }),
                     );
                 }
