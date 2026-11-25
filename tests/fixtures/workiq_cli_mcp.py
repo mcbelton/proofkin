@@ -12,8 +12,8 @@ Modes:
   ok            answers everything
   full          like ok, but offers the tools Proofkin's commands use, answering as the
                 content policy reads them: `retrieve` (one General file and one blocked one in
-                structuredContent), `ask` (an answer citing a General file), `list_agents`
-                (one agent)
+                structuredContent), `ask` (as Work IQ answers: the text in content, only the
+                conversation id structured), `list_agents` (one agent)
   bare          like ok, but `config show` names no default account
   user          like ok, and says who is signed in in the initialize reply
   crash         exits without answering on the first tools/call of the whole test (a marker
@@ -109,9 +109,10 @@ def full_result(name, arguments):
             }
         }
     elif name == "ask":
-        structured = {
-            "answer": "The CLI says the launch moved to May.",
-            "citations": [{"title": "Launch plan", "sensitivityLabel": {"displayName": "General"}}],
+        # As Work IQ answers: the text in content, the conversation id structured.
+        return {
+            "content": [{"type": "text", "text": "The CLI says the launch moved to May."}],
+            "structuredContent": {"conversationId": "conv-cli-1"},
         }
     else:
         structured = {"agents": [{"id": "sales:1", "name": "Sales"}]}
