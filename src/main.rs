@@ -5013,6 +5013,9 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 }
             }
             "/plan" => {
+                // As the profile is now: a sign-in made while the agent runs (Work IQ,
+                // GitHub) counts.
+                let profile = profile.reload().unwrap_or_else(|_| profile.clone());
                 let file = rest.trim();
                 let text = std::fs::read_to_string(file)
                     .with_context(|| format!("reading plan file {file:?}"));

@@ -124,8 +124,23 @@ async fn mcp(
             "serverInfo": { "name": "fake-workiq", "version": "0" },
         }),
         "tools/list" => {
-            let tools = ["retrieve", "ask", "send_mail", "list_agents", "fetch"]
-                .map(|name| json!({ "name": name, "inputSchema": { "type": "object" } }));
+            // search_paths is one of the gateway's read tools, but this Work IQ says it
+            // changes things: the gateway believes the hint.
+            let tools = [
+                "retrieve",
+                "ask",
+                "send_mail",
+                "list_agents",
+                "fetch",
+                "search_paths",
+            ]
+            .map(|name| {
+                let mut tool = json!({ "name": name, "inputSchema": { "type": "object" } });
+                if name == "search_paths" {
+                    tool["annotations"] = json!({ "readOnlyHint": false, "destructiveHint": true });
+                }
+                tool
+            });
             json!({ "tools": tools })
         }
         "tools/call" => {
@@ -291,7 +306,7 @@ async fn a_tasks_session_offers_only_read_tools_and_its_model_never_gets_the_tok
     assert_eq!(
         names,
         ["retrieve", "ask", "list_agents", "fetch"],
-        "send_mail changes things"
+        "send_mail changes things, and Work IQ says search_paths does"
     );
 
     let (_, sent) = send(
@@ -305,6 +320,18 @@ async fn a_tasks_session_offers_only_read_tools_and_its_model_never_gets_the_tok
     assert!(
         text_of(&sent).contains("isn't offered to this task"),
         "{sent}"
+    );
+    let (_, hinted) = send(
+        &server,
+        Some(&bearer),
+        false,
+        &call(4, "search_paths", json!({ "query": "x" })),
+    )
+    .await;
+    assert_eq!(hinted["result"]["isError"], true);
+    assert!(
+        text_of(&hinted).contains("says its search_paths changes things"),
+        "{hinted}"
     );
     assert!(
         fake.calls.lock().unwrap().is_empty(),
