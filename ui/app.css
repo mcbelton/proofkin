@@ -566,6 +566,19 @@ pre.diff:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; 
 .device-code-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .device-code { font-family: var(--mono); font-size: 22px; font-weight: 700; letter-spacing: 2px; padding: 4px 12px; border-radius: 6px; background: var(--surface-3); user-select: all; }
 .gh-flow-status { display: flex; align-items: center; gap: 6px; min-height: 1.5em; margin: 0; }
+/* Work IQ card: the account, today's calls and, once run, the doctor's checks (a live region
+   that stays in the page while empty, so its results are announced). */
+#workiq p, .workiq-checks p { margin: 4px 0; }
+.workiq-checks:not(:empty) { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border); }
+.workiq-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.workiq-path { overflow-wrap: anywhere; }
+.workiq-command { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.workiq-command code { overflow-wrap: anywhere; padding: 2px 6px; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text); }
+.workiq-hosted p { margin: 0 0 4px; }
+.workiq-check-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.workiq-check { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; }
+.workiq-detail, .workiq-fix { flex-basis: 100%; overflow-wrap: anywhere; }
+.workiq-fix { font-weight: 600; }
 .tracker-problem code { overflow-wrap: anywhere; font-size: 12px; font-weight: 400; }
 .tracker-groups { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; max-height: 60vh; overflow: auto; overscroll-behavior: contain; }
 .tracker-group h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
@@ -666,7 +679,7 @@ dialog form > .dialog-footer {
 .when-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .when-row .field-inline { color: var(--text); font-weight: 400; }
 .when-row input[type="number"] { width: 72px; }
-input[type="time"], input[type="url"], input[type="password"] {
+input[type="time"], input[type="url"], input[type="password"], input[type="email"] {
   font: inherit; color: var(--text); background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px 8px;
 }

@@ -2799,6 +2799,262 @@ function externalLink(href, text, label = text, attrs = {}) {
   return el("a", { href, target: "_blank", rel: "noopener", "aria-label": `${label} (opens a new tab)`, ...attrs }, text);
 }
 
+// ---------- Work IQ ----------
+let workiq = null;
+// What the doctor's checks said last (and when), and whether they are running now.
+let workiqReport = null;
+let workiqChecking = false;
+const WORKIQ_RESULT = { ok: ["done", "Passed"], failed: ["failed", "Failed"], skipped: ["skipped", "Skipped"] };
+const WORKIQ_FIXER = { user: "you", admin: "admin", support: "support" };
+
+/** The Work IQ card: the account this agent uses for Microsoft 365 work context (a digital
+ * worker may use its owner's), how it connects, and today's calls against its budgets. */
+async function loadWorkiq() {
+  workiq = await api("/api/workiq");
+  renderWorkiq();
+}
+
+function renderWorkiq() {
+  const w = workiq;
+  const box = $("#workiq");
+  // Rebuilt, the card keeps focus on the button that had it (or the one in its place).
+  const focused = box.contains(document.activeElement) ? document.activeElement.dataset.action ?? "" : null;
+  const button = (action, label, onclick, kind = "") => el("button", {
+    type: "button", class: `btn small${kind ? ` ${kind}` : ""}`, "data-action": action, onclick,
+  }, label);
+  const check = () => el("button", {
+    type: "button", class: "btn small", "data-action": "check", disabled: workiqChecking,
+    title: "Checks the connection step by step; the last check is one real Work IQ call, counted against today's budget",
+    onclick: (e) => runWorkiqDoctor(e.currentTarget),
+  }, workiqChecking ? "Checking…" : "Check");
+  let nodes;
+  if (w.not_used) {
+    nodes = [el("p", { class: "small", text: `${w.not_used[0].toUpperCase()}${w.not_used.slice(1)}` })];
+  } else if (!w.own && !w.signed_in) {
+    nodes = [el("p", { class: "small", text: `Uses ${w.holder}'s Work IQ account, which isn't signed in. Sign it in on ${w.holder}'s Work IQ card, or in a terminal:` }),
+      workiqCommand(`${w.hint} --cli`)];
+  } else if (!w.own) {
+    nodes = [el("p", { class: "small", text: `Uses ${w.holder}'s account: ${w.line}` }), workiqCliPath(w),
+      el("div", { class: "workiq-actions" }, check())];
+  } else if (!w.signed_in) {
+    nodes = [el("p", { class: "muted small", text: "Microsoft 365 work context for plans: through Microsoft's Work IQ CLI, or your organization's own app." }),
+      button("sign-in", "Sign in…", openWorkiqSignIn, "primary")];
+  } else {
+    nodes = [el("p", { class: "small", text: `Signed in: ${w.line}` }), workiqCliPath(w), workiqUsage(w.usage),
+      el("div", { class: "workiq-actions" }, check(), button("budget", "Budget…", openWorkiqBudget),
+        button("sign-out", "Sign out", signOutWorkiq, "danger"))];
+  }
+  box.replaceChildren(...nodes.flat().filter(Boolean));
+  if (focused !== null) focusWorkiq(focused);
+}
+
+/** Today's Work IQ calls against the budgets, and a warning once the day's are used up. */
+function workiqUsage(usage) {
+  if (!usage) return el("p", { class: "warn-text small", text: "Today's Work IQ calls are unknown: the profile's Work IQ audit file can't be read." });
+  const line = el("p", { class: "small", text: `Today: ${usage.today} of ${nOf(usage.per_day, "Work IQ call")} (at most ${usage.per_run} per run)` });
+  return usage.today < usage.per_day ? line
+    : [line, el("p", { class: "warn-text small", text: "Today's budget is used up: Work IQ calls are refused until tomorrow, unless you raise it (Budget…)." })];
+}
+
+/** Where the Work IQ CLI the account runs is, when the sign-in found it. */
+function workiqCliPath(w) {
+  return w.cli?.path ? el("p", { class: "muted small workiq-path" }, "Work IQ CLI at ", el("span", { class: "mono", text: w.cli.path })) : null;
+}
+
+/** A command to run in a terminal, with a button that copies it. */
+function workiqCommand(command) {
+  return el("p", { class: "workiq-command small" }, el("code", { class: "mono", text: command }),
+    el("button", { type: "button", class: "btn small", onclick: () => copy(command, "Command") }, "Copy command"));
+}
+
+/** Focus goes to the card's `action` button, else its first, else its heading. */
+function focusWorkiq(action) {
+  const box = $("#workiq");
+  (box.querySelector(`button[data-action="${action}"]`) ?? box.querySelector("button") ?? $("#workiq-h")).focus();
+}
+
+/** Whether focus went nowhere (the control that had it was disabled or removed). */
+function focusLost() {
+  return !document.activeElement || document.activeElement === document.body;
+}
+
+/** What the doctor's checks said last, under the card: each check's result and detail, and
+ * for the one that failed, who makes the fix and how. */
+function renderWorkiqChecks() {
+  const box = $("#workiq-checks");
+  const report = workiqReport;
+  if (!report) {
+    box.replaceChildren();
+    return;
+  }
+  box.replaceChildren(
+    el("p", { class: "small" }, el("strong", {
+      text: report.ok ? "Work IQ is ready." : "Work IQ is not ready: make the fix for the failed check, then check again.",
+    })),
+    el("p", { class: "task-meta", text: `Checked: ${stamp(report.at)}` }),
+    el("ul", { class: "workiq-check-list" }, ...report.checks.map((c) => {
+      const [cls, label] = WORKIQ_RESULT[c.result] ?? ["skipped", c.result];
+      return el("li", { class: "workiq-check" },
+        el("span", { class: `status ${cls}`, text: label }),
+        el("span", { class: "mono", text: c.name }),
+        el("span", { class: "workiq-detail", text: c.detail }),
+        c.fix ? el("span", { class: "workiq-fix", text: `Fix (${WORKIQ_FIXER[c.fix.who] ?? c.fix.who}): ${c.fix.action}` }) : null);
+    })));
+}
+
+/** Runs the doctor's checks (the last is one real Work IQ call) and lists what they say. */
+async function runWorkiqDoctor(button) {
+  if (workiqChecking) return;
+  const refocus = document.activeElement === button;
+  workiqChecking = true;
+  button.disabled = true;
+  button.textContent = "Checking…";
+  try {
+    workiqReport = { ...(await api("/api/workiq/doctor", { method: "POST" })), at: Date.now() };
+    renderWorkiqChecks();
+  } catch (err) {
+    toast(err.message, "error");
+  } finally {
+    workiqChecking = false;
+  }
+  // Its call counts against today's budget.
+  await loadWorkiq().catch((err) => {
+    renderWorkiq();
+    toast(err.message, "error");
+  });
+  if (refocus && focusLost()) focusWorkiq("check");
+}
+
+/** The command that signs this agent in with the organization's own app, in a terminal. */
+function workiqHostedCommand() {
+  const login = workiq?.hint ?? "proofkin auth login workiq --profile <name>";
+  return `${login} --tenant <id-or-domain> --client-id <app-id> --device-code`;
+}
+
+function openWorkiqSignIn() {
+  // What was typed stays (a sign-in that failed is tried again as it was).
+  $("#workiq-error").textContent = "";
+  $("#workiq-account").removeAttribute("aria-invalid");
+  $("#workiq-hosted-command").textContent = workiqHostedCommand();
+  $("#workiq-dialog").showModal();
+  $("#workiq-account").focus();
+}
+
+/** Signs this agent in through the Work IQ CLI, which Work IQ checks right away. */
+async function submitWorkiqSignIn(e) {
+  e.preventDefault();
+  const button = $("#workiq-submit");
+  if (button.disabled) return;
+  const dialog = $("#workiq-dialog");
+  const error = $("#workiq-error");
+  const account = $("#workiq-account");
+  error.textContent = "";
+  account.removeAttribute("aria-invalid");
+  if (account.validity.typeMismatch) {
+    error.textContent = "Enter the account as an email address, e.g. ada@contoso.com, or leave it empty for the CLI's default account.";
+    account.setAttribute("aria-invalid", "true");
+    account.focus();
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "Signing in…";
+  try {
+    const res = await api("/api/workiq/sign-in", {
+      method: "POST",
+      body: JSON.stringify({ account: account.value.trim(), cli_path: $("#workiq-cli-path").value.trim() }),
+    });
+    workiqReport = null;
+    renderWorkiqChecks();
+    await loadWorkiq().catch((err) => toast(err.message, "error"));
+    if (dialog.open) dialog.close();
+    toast(`Signed in to Work IQ: ${res.line ?? res.who}`);
+  } catch (err) {
+    // Closed while it ran: the error is the toast's.
+    if (dialog.open) error.textContent = err.message;
+    else toast(err.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Sign in";
+    if (dialog.open && focusLost()) button.focus();
+  }
+}
+
+function openWorkiqBudget() {
+  const usage = workiq?.usage;
+  $("#workiq-budget-error").textContent = "";
+  for (const [id, value] of [["#workiq-per-day", usage?.per_day], ["#workiq-per-run", usage?.per_run]]) {
+    $(id).value = value ?? "";
+    $(id).removeAttribute("aria-invalid");
+  }
+  $("#workiq-budget-dialog").showModal();
+  $("#workiq-per-day").focus();
+}
+
+/** What is wrong with a budget as typed, if anything: it is a whole number of calls from 1. */
+function workiqCallsProblem(text) {
+  if (!/^\d+$/.test(text) || Number(text) < 1) return "enter a whole number of calls, at least 1";
+  if (Number(text) > 4294967295) return `enter at most ${(4294967295).toLocaleString()} calls`;
+  return null;
+}
+
+/** Saves the Work IQ budgets: calls a day and per run. */
+async function submitWorkiqBudget(e) {
+  e.preventDefault();
+  const button = $("#workiq-budget-submit");
+  if (button.disabled) return;
+  const dialog = $("#workiq-budget-dialog");
+  const error = $("#workiq-budget-error");
+  const fields = [[$("#workiq-per-day"), "Calls a day"], [$("#workiq-per-run"), "Calls per run"]];
+  error.textContent = "";
+  for (const [input] of fields) input.removeAttribute("aria-invalid");
+  for (const [input, label] of fields) {
+    const problem = workiqCallsProblem(input.value.trim());
+    if (!problem) continue;
+    error.textContent = `${label}: ${problem}.`;
+    input.setAttribute("aria-invalid", "true");
+    input.focus();
+    return;
+  }
+  const [perDay, perRun] = fields.map(([input]) => Number(input.value.trim()));
+  button.disabled = true;
+  button.textContent = "Saving…";
+  try {
+    const res = await api("/api/workiq/budget", { method: "PUT", body: JSON.stringify({ per_day: perDay, per_run: perRun }) });
+    if (dialog.open) dialog.close();
+    toast(`Work IQ budget saved: ${nOf(res.per_day, "call")} a day, at most ${res.per_run} per run`);
+    await loadWorkiq().catch((err) => toast(err.message, "error"));
+  } catch (err) {
+    if (dialog.open) error.textContent = err.message;
+    else toast(err.message, "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Save budget";
+    if (dialog.open && focusLost()) button.focus();
+  }
+}
+
+/** Signs this agent out of Work IQ once confirmed, saying what that stops and what stays. */
+async function signOutWorkiq() {
+  const ok = await confirmDialog({
+    title: "Sign out of Work IQ?",
+    body: "Plans on this agent, and digital workers that use its account, can't use Microsoft 365 work context until you sign in again. "
+      + (workiq?.connection === "hosted" ? "Its token is removed from this machine." : "The Work IQ CLI itself stays signed in.")
+      + " The budgets and the audit file stay.",
+    confirm: "Sign out",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api("/api/workiq", { method: "DELETE" });
+    workiqReport = null;
+    renderWorkiqChecks();
+    toast("Signed out of Work IQ");
+    await loadWorkiq();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
 // ---------- tracker ----------
 let tracker = null;
 async function loadTracker() {
@@ -3593,6 +3849,7 @@ function init() {
   loadPlaybooks().catch((err) => toast(err.message, "error"));
   loadSkills().catch((err) => toast(err.message, "error"));
   loadGithub().catch((err) => toast(err.message, "error"));
+  loadWorkiq().catch((err) => toast(err.message, "error"));
   loadTracker().catch((err) => toast(err.message, "error"));
   $("#tracker-btn").addEventListener("click", openTrackerDialog);
   $("#tracker-form").addEventListener("submit", submitTracker);
@@ -3608,6 +3865,16 @@ function init() {
   $("#gh-flow-copy").addEventListener("click", () => ghFlow && copy(ghFlow.code, "Code"));
   $("#gh-flow-cancel").addEventListener("click", () => $("#gh-flow-dialog").close());
   $("#gh-flow-dialog").addEventListener("close", ghFlowClosed);
+  $("#workiq-form").addEventListener("submit", submitWorkiqSignIn);
+  $("#workiq-cancel").addEventListener("click", () => $("#workiq-dialog").close());
+  $("#workiq-dialog").addEventListener("close", () => focusWorkiq("sign-in"));
+  $("#workiq-hosted-copy").addEventListener("click", () => copy($("#workiq-hosted-command").textContent, "Command"));
+  $("#workiq-budget-form").addEventListener("submit", submitWorkiqBudget);
+  $("#workiq-budget-cancel").addEventListener("click", () => $("#workiq-budget-dialog").close());
+  $("#workiq-budget-dialog").addEventListener("close", () => focusWorkiq("budget"));
+  for (const id of ["#workiq-account", "#workiq-per-day", "#workiq-per-run"]) {
+    $(id).addEventListener("input", (e) => e.target.removeAttribute("aria-invalid"));
+  }
   $("#pr-form").addEventListener("submit", submitPr);
   $("#pr-cancel").addEventListener("click", () => $("#pr-dialog").close());
   // Monitors run in the background: refresh the health panel now and then.
@@ -3678,7 +3945,7 @@ function init() {
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog",
-    "#branch-dialog", "#pull-dialog"]) guardDialog($(id));
+    "#branch-dialog", "#pull-dialog", "#workiq-dialog", "#workiq-budget-dialog"]) guardDialog($(id));
   initModelsDialog();
   initBranchReview();
   $("#provider").addEventListener("change", renderTaskOptions);

@@ -307,7 +307,7 @@ shows which store is used. The allowlist is `<profile>\peers.json`.
 | `codex` | `proofkin auth login codex --profile P --api-key` | Prompts for an OpenAI API key (saved by `codex login --with-api-key`) |
 | `workiq` | `proofkin auth login workiq --profile P --tenant <id-or-domain> --client-id <app-id>` | Microsoft 365 work context: signs in to Entra ID in your browser (authorization code with PKCE, redirected to a loopback port on localhost; the address is printed too) and keeps the refresh token in the OS credential store |
 | `workiq` | `proofkin auth login workiq --profile P --tenant <id-or-domain> --client-id <app-id> --device-code` | Same, for machines without a browser: prints a web address and a code to enter on another device |
-| `workiq` | `proofkin auth login workiq --profile P --cli [--account <email>] [--cli-path <path>]` | Same Work IQ, through Microsoft's Work IQ CLI instead (install it with `npm install -g @microsoft/workiq`). The sign-in finds the CLI: `--cli-path`, else `workiq` on the PATH, else in npm's global folder (`npm prefix -g`; a Node version manager such as nvm keeps that folder off the PATH), and saves where it is, so agents start the same one; only when there is none does Proofkin use `npx -y @microsoft/workiq`. It runs `workiq mcp` (with `--account <email>` when you give one; else the CLI's default account) and talks to it over stdio. The CLI signs in by itself with its own app, which your tenant's admin must have approved, and picks the tenant from the account, so Proofkin keeps no token. `auth status` names the account: the one you gave, else the CLI's default account (`workiq config show`). The CLI doesn't get the agent's provider credentials (`GH_TOKEN`, `ANTHROPIC_API_KEY` and so on). If the CLI says its EULA isn't accepted, run `workiq accept-eula` yourself; Proofkin never accepts it for you |
+| `workiq` | `proofkin auth login workiq --profile P --cli [--account <email>] [--cli-path <path>]` | Same Work IQ, through Microsoft's Work IQ CLI instead (install it with `npm install -g @microsoft/workiq`). The sign-in finds the CLI: `--cli-path`, else `workiq` on the PATH, else in npm's global folder (`npm prefix -g`; a Node version manager such as nvm keeps that folder off the PATH), and saves where it is, so agents start the same one; only when there is none does Proofkin use `npx -y @microsoft/workiq`. It runs `workiq mcp` (with `--account <email>` when you give one; else the CLI's default account) and talks to it over stdio. The CLI signs in by itself with its own app, which your tenant's admin must have approved, and picks the tenant from the account, so Proofkin keeps no token. `auth status` names the account: the one you gave, else the CLI's default account (`workiq config show`). The CLI doesn't get the agent's provider credentials (`GH_TOKEN`, `ANTHROPIC_API_KEY` and so on). If the CLI says its EULA isn't accepted, run `workiq accept-eula` yourself; Proofkin never accepts it for you. The web UI's **Work IQ** card signs in through the Work IQ CLI too, with the same account and CLI path (see [Web UI](#web-ui)) |
 
 Secrets are read from a hidden prompt, or from stdin when piped. Every login is verified
 right away; if verification fails, that provider is signed out again.
@@ -1863,6 +1863,23 @@ proofkin --name me --providers copilot --serve --ui
   lost, **Review changes** and **Delete branch** once its pull request or its issues are
   closed, and **Open PR** only while there is work to merge (see
   [task branches](#when-a-task-branch-is-done-with)).
+- **Work IQ**: the [Work IQ](docs/work-iq.md) account this agent uses for Microsoft 365 work
+  context and how it connects ("ada@contoso.com through the Work IQ CLI"), and today's calls
+  against its [budgets](#work-iq-audit-file-and-budgets) ("Today: 3 of 200 Work IQ calls (at
+  most 25 per run)"). **Sign in…** signs in through the Work IQ CLI, as
+  `auth login workiq --cli` does: an account the CLI has signed in (empty: its default
+  account) and, when the CLI isn't found, where it is; if the sign-in fails, the dialog says
+  why and keeps what you typed. Your organization's own app (the hosted connection) signs in
+  from a terminal instead: the dialog shows the command to copy. **Check** runs the
+  [doctor](#checking-the-work-iq-connection) and lists each check (passed, failed or
+  skipped) with its detail and, for the one that failed, the fix and who makes it (you, an
+  admin or support); its last check is one real call, counted against the budget.
+  **Budget…** sets the calls a day and per run, and **Sign out** asks first (the budgets and
+  the audit file stay). A digital worker that uses its owner's account shows "Uses alice's
+  account: …" with only **Check**; one its owner hasn't allowed to says how the owner turns
+  that on. (API: `GET` and `DELETE /api/workiq`, `POST /api/workiq/sign-in` with
+  `{"account", "cli_path"}`, `POST /api/workiq/doctor`, and `PUT /api/workiq/budget` with
+  `{"per_day", "per_run"}`.)
 - **Tracker**: link the repository (and project board) your plan runs are tracked on, see
   the board's statuses or why it isn't updated (a missing scope with **Grant access**, and
   the commands to run in a terminal instead; anything else with the command that fixes
