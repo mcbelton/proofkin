@@ -57,6 +57,8 @@ fn worker_json(
         "models": worker.config.models,
         "folders": workers::folders(worker),
         "start_with_owner": worker.config.start_with_owner,
+        // For a deployed factory agent: the release its owner pinned on it.
+        "release": crate::factory::deploy::pin_of(worker).map(|p| json!({ "agent": p.agent, "version": p.version, "state": p.state })),
         "process": sup.process(worker),
         "online": id.is_some_and(|id| peers.iter().any(|p| p.id == id)),
         "data_folder": worker.data_folder().display().to_string(),

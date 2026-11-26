@@ -2138,7 +2138,8 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
             "design",
             "implement-spec",
             "implement-speckit",
-            "rehearse"
+            "rehearse",
+            "agent-factory"
         ]
     );
     let discover = &books["playbooks"][1]["outline"];
@@ -3211,6 +3212,10 @@ async fn the_page_follows_the_ux_guidelines() {
         "factory-list",
         "factory-new-dialog",
         "factory-agent-dialog",
+        "factory-edit-mode",
+        "fpanel-releases",
+        "fpanel-deployments",
+        "fpanel-metrics",
         "connect",
         "connect-toggle",
         "check-options",

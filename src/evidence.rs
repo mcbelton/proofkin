@@ -206,6 +206,11 @@ pub struct Evidence {
     /// as before).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ContextUse>,
+    /// The agent the work was done as: a deployed agent's release (`fin-analyst@1.2.0`), or
+    /// the agent its requester said the task acts as (absent otherwise, so other records
+    /// sign as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Ed25519 signature (hex) over everything above.
     #[serde(default)]
     pub signature: String,
@@ -239,6 +244,7 @@ impl Evidence {
                 .unwrap_or(0),
             team: None,
             context: Vec::new(),
+            agent: None,
             signature: String::new(),
         }
     }

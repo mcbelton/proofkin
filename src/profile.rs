@@ -676,11 +676,13 @@ impl Profile {
         crate::knowledge::KnowledgeBase::new(self.dir.join("knowledge"))
     }
 
-    /// Built-in skills, this profile's own (`skills/`) and those of its enabled plugins.
+    /// Built-in skills, this profile's own (`skills/`) and those of its enabled plugins, with
+    /// its agents: its own, its agent factory's released ones and its plugins'.
     pub fn skills(&self) -> crate::skills::Skills {
         crate::skills::Skills::new(self.dir.join("skills"))
             .with_plugins(self.plugins().skills())
             .with_plugin_agents(self.plugins().agents())
+            .with_factory(crate::factory::FactoryStore::of(self))
     }
 
     /// Plugins imported into this profile (see [`crate::plugins`]).

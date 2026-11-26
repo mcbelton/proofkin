@@ -1,0 +1,23 @@
+// Build an agent kept as code with peers (docs/agent-factory.md, US-14), in the repository
+// its owner keeps it in (proofkin factory init): its blueprint and eval suite, each proven
+// by the built-in agent:* checks; its evaluation, run by the owner on their own evaluation
+// worker and proven by its signed report; a red-team squad's independent review of what it
+// may do and how it could be attacked; the security champion's sign-off; then the owner's,
+// who releases it from the folder's commit (proofkin factory release AGENT --from FOLDER),
+// and the release's provenance names that commit. Share the folder with --worktrees: each
+// step builds on the one before.
+// Vars: peer, folder, change (what the agent does), change_id (the agent's name),
+//       reviewers (the red-team squad), security_champion, approver
+claim: AF-1 The agent's blueprint is valid and asks for the least it needs, with a testable requirement for everything it must do
+claim: AF-2 Its eval suite proves every requirement with deterministic expectations, and marks the smoke cases its canary runs
+claim: AF-3 Its folder has a passed evaluation report of exactly its build, signed by its owner
+claim: AF-4 A red-team squad reviewed independently what it may do and how it could be attacked
+claim: AF-5 The security champion accepted its capabilities and threats
+claim: AF-6 Its owner accepted it, to be released from the folder's commit
+blueprint @{{peer}}:{{folder}} skill=agent-blueprint verify=agent:blueprint attempts=3 claims=AF-1 Write agent/blueprint.json for agent {{change_id}}: {{change}}. Ask for the least it needs.
+evals after blueprint @{{peer}}:{{folder}} apply=blueprint skill=agent-evals verify=agent:blueprint,agent:evals attempts=3 claims=AF-2 Write agent/evals.json for agent {{change_id}}: a case proving each requirement of agent/blueprint.json, with its fixtures in agent/fixtures.
+evaluate after evals approve @{{approver}} Evaluate agent {{change_id}} on your own evaluation worker, and keep its report in the folder. Merge the evals step's branch, then run proofkin factory new {{change_id}} --from FOLDER (edit --from if it exists), proofkin factory evaluate {{change_id}} --yes, and proofkin factory report ID --json --out agent/reports/ID.json; commit the report, then approve.
+report after evaluate @{{peer}}:{{folder}} skill=agent-evals verify=agent:blueprint,agent:evals,agent:report claims=AF-3 Summarize the evaluation report of agent {{change_id}} in agent/reports: the gate, each requirement's pass rate, the built-in attacks and the recommended model.
+redteam after report #{{reviewers}}:{{folder}} skill=security-review,threat-modeling verify=agent:blueprint,agent:report claims=AF-4 Red-team agent {{change_id}}: read agent/blueprint.json, agent/evals.json and the report in agent/reports. Say what it may do (access, MCP tools, checks, Microsoft 365, delegation), how hostile files, tool results or requests could turn it against its owner, what its evaluation doesn't cover, and which cases to add.
+security after redteam approve @{{security_champion}} claims=AF-5 Accept the capabilities of agent {{change_id}} (agent/blueprint.json) and the threats the red team found.
+release after security approve @{{approver}} claims=AF-6 Accept agent {{change_id}} for release from the folder's commit; then run proofkin factory release {{change_id}} --from FOLDER, which releases exactly that commit and names it.

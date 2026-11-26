@@ -357,6 +357,8 @@ fn evaluation_brief(e: &Evaluation, running: bool) -> Value {
         "gate": e.gate,
         "recommended": e.recommended,
         "by": e.by,
+        // A deployment's canary: its smoke cases only, never a release's evaluation.
+        "canary": e.canary,
     })
 }
 
@@ -381,17 +383,52 @@ fn agent_json(store: &FactoryStore, s: &Shared, name: &str, all: bool) -> Result
     let evaluations = store.evaluations(name).map_err(internal)?;
     let shown = if all { evaluations.len() } else { 1 };
     let lifecycle = state.as_ref().map_or(Lifecycle::Draft, |st| st.state);
+    let releases: Vec<Value> = if all {
+        crate::factory::release::releases(store, name)
+            .map_err(internal)?
+            .iter()
+            .map(|(version, found)| match found {
+                Ok(r) => super::releases::release_view(r),
+                Err(e) => {
+                    json!({ "version": version, "state": "broken", "error": format!("{e:#}") })
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let waiting = state
+        .as_ref()
+        .map(|st| {
+            st.versions
+                .iter()
+                .filter(|v| {
+                    crate::factory::release::load(store, name, v)
+                        .is_ok_and(|r| !r.pending().is_empty())
+                })
+                .count()
+        })
+        .unwrap_or(0);
     Ok(json!({
         "name": name,
         "title": title,
         "state": lifecycle,
         "active_version": state.as_ref().and_then(|st| st.active_version.clone()),
         "versions": state.as_ref().map(|st| st.versions.clone()).unwrap_or_default(),
-        "deployments": [],
+        "replacement": state.as_ref().and_then(|st| st.replacement.clone()),
+        "purge_after": state.as_ref().and_then(|st| st.purge_after.clone()),
+        "deployments": state.as_ref().map(|st| st.deployments.iter().map(|d| super::releases::deployment_view(s, d)).collect::<Vec<_>>()).unwrap_or_default(),
+        "waiting": waiting,
         "errors": problems.iter().filter(|p| p.error).count(),
         "warnings": problems.iter().filter(|p| !p.error).count(),
         "builds": store.builds(name).map_err(internal)?,
-        "evaluations": evaluations.iter().take(shown).map(|e| evaluation_brief(e, running)).collect::<Vec<_>>(),
+        "evaluations": evaluations.iter().filter(|e| all || e.canary.is_none()).take(shown).map(|e| evaluation_brief(e, running)).collect::<Vec<_>>(),
+        "releases": releases,
+        "history": if all {
+            state.as_ref().map(|st| st.history.iter().rev().take(30).cloned().collect::<Vec<_>>()).unwrap_or_default()
+        } else {
+            Vec::new()
+        },
     }))
 }
 
@@ -402,6 +439,8 @@ pub(super) async fn list_agents(State(s): State<AppState>) -> Result<Json<Value>
 /// The factory's agents, each as [`agent_json`] says with its latest evaluation.
 pub(super) fn agents(s: &Shared) -> Result<Value, ApiError> {
     let store = FactoryStore::of(&s.info.profile);
+    // Retired agents whose retention passed lose their releases and reports now.
+    let _ = crate::factory::lifecycle::purge_due(&store, chrono::Utc::now());
     let agents = store
         .names()
         .map_err(internal)?
@@ -420,25 +459,56 @@ pub(super) async fn get_agent(
         return Err(not_found(format!("the factory has no agent '{name}'")));
     }
     let mut agent = agent_json(&store, &s, &name, true)?;
-    // The models it would be evaluated on now, and those left out.
+    // The models it would be evaluated on now, and those left out; what its blueprint may
+    // name, for the form that configures it.
     if let Some(draft) = store.draft(&name).map_err(internal)?
         && let Ok(bp) = from_value(&draft.blueprint)
     {
         let offers = eval_peer(&s).map(|p| p.offers);
-        let routes = crate::factory::routing::candidates(
-            &bp,
-            &catalog_of(&s, &name)?,
-            offers.as_ref(),
-            true,
-        );
+        let catalog = catalog_of(&s, &name)?;
+        let routes = crate::factory::routing::candidates(&bp, &catalog, offers.as_ref(), true);
         agent["candidates"] = json!(routes.candidates);
         agent["left_out"] = routes
             .left_out
             .iter()
             .map(|l| json!({ "candidate": l.route, "why": l.why }))
             .collect();
+        agent["choices"] = choices(&catalog, &s.info.profile);
     }
     Ok(Json(agent))
+}
+
+/// What a blueprint may name here, for the form that configures it: skills, knowledge
+/// topics, the shared folders it could be deployed to with their checks and the MCP servers
+/// they offer now, providers signed in, Work IQ, and the allowlist's names who may sign off
+/// its releases (teammates: not `owner`'s own digital workers).
+fn choices(c: &Catalog, owner: &crate::profile::Profile) -> Value {
+    let workers: std::collections::BTreeSet<String> = crate::workers::workers_of(owner)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| w.name)
+        .collect();
+    let folders: Vec<Value> = c
+        .folders
+        .iter()
+        .filter(|(name, _)| name.as_str() != crate::shares::DATA_SHARE)
+        .map(|(name, f)| {
+            json!({
+                "name": name,
+                "access": f.access,
+                "checks": f.checks,
+                "mcp": f.mcp.iter().filter(|(_, o)| o.live()).map(|(server, o)| json!({ "server": server, "tools": o.tools })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "skills": c.skills.iter().map(|(name, about)| json!({ "name": name, "description": about })).collect::<Vec<_>>(),
+        "topics": c.topics,
+        "folders": folders,
+        "providers": c.providers,
+        "workiq": c.workiq,
+        "peers": c.peers.iter().filter(|p| !workers.contains(*p)).collect::<Vec<_>>(),
+    })
 }
 
 /// The evaluation worker, as connected now.
@@ -743,7 +813,8 @@ pub(super) async fn cancel(s: &Shared, id: &str, by: &str) -> Result<Value, ApiE
     if handle.is_some() || !store.evaluation_running() {
         let _ = runner::clean(&store, worker.as_ref());
     }
-    if let (Some(supervisor), Some(worker)) = (&s.info.workers, &worker) {
+    // A canary's worker is a deployment: it keeps running (its canary waits again).
+    if let (Some(supervisor), Some(worker), None) = (&s.info.workers, &worker, &e.canary) {
         supervisor.stop(&worker.name).await;
     }
     s.system("info", format!("Cancelled evaluation {id}"));

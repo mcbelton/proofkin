@@ -838,6 +838,7 @@ mod tests {
             shares,
             owner: None,
             role: role.map(Into::into),
+            agent: None,
             load: None,
             models: Default::default(),
             offers: Default::default(),

@@ -1,8 +1,11 @@
 // Proofkin web UI: the agent factory. Agents you design as blueprints, check, and prove
-// with evaluations before they work: a draft from a template or your words, its problems
-// with their fixes, an estimate before anything runs, live progress, and the report (the
-// release gate, each model's results and the failing runs). Uses app.js helpers: $, el,
-// api, toast, confirmDialog, stamp, providerLabel and ACCESS_SHORT.
+// with evaluations before they work: a draft from a template or your words, configured
+// with a form (or as JSON), its problems with their fixes, an estimate before anything
+// runs, live progress, and the report (the release gate, each model's results and the
+// failing runs). Then they run: signed releases and their sign-offs, deployments as
+// digital workers with a canary, rollback, budgets, metrics by release, deprecation and
+// retirement. Uses app.js helpers: $, el, api, toast, confirmDialog, stamp, providerLabel
+// and ACCESS_SHORT.
 "use strict";
 
 const factoryState = {
@@ -13,9 +16,16 @@ const factoryState = {
   agent: null, // GET /api/factory/agents/{name}
   draft: null, // GET /api/factory/drafts/{name}
   tab: "overview",
+  editMode: "form", // Configure: "form" or "json"
+  formEdited: false,
+  jsonEdited: false,
   estimate: null,
   report: null, // the evaluation shown under Evaluations
+  reportPicked: false, // the owner picked it (else the newest is shown)
   opener: null,
+  releaseOpen: new Set(), // releases whose details are open
+  metricsSince: "7d",
+  rows: 0, // ids for the form's rows
 };
 const FACTORY_NAME = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 const FACTORY_STATES = { running: ["Running", "running"], passed: ["Passed", "done"], failed: ["Failed", "failed"], cancelled: ["Cancelled", "cancelled"] };
@@ -77,12 +87,25 @@ function factoryNode(a) {
     ? [a.errors ? factoryPlural(a.errors, "error", "errors") : null, a.warnings ? factoryPlural(a.warnings, "warning", "warnings") : null].filter(Boolean).join(" · ")
     : "No problems";
   const stateLabel = { draft: "Draft", active: "Active", deprecated: "Deprecated", retired: "Retired", imported: "Imported" }[a.state] ?? a.state;
+  const deployed = a.deployments ?? [];
+  const running = deployed.filter((d) => d.running).length;
+  const badges = [
+    a.active_version ? el("span", {
+      class: `badge ${a.state === "retired" ? "neutral" : "ok"}`,
+      title: a.state === "retired" ? "Its last release: plans refuse a retired agent" : `The release plans use as agent=${a.name}`,
+      text: `Release ${a.active_version}`,
+    }) : null,
+    a.waiting ? el("span", { class: "badge busy", text: `${factoryPlural(a.waiting, "release waits", "releases wait")} for sign-off` }) : null,
+    deployed.length ? el("span", { class: "badge neutral", title: deployed.map((d) => `${d.worker}: ${d.version}, ${d.state}`).join("; "),
+      text: `${factoryPlural(deployed.length, "deployment", "deployments")}${running ? `, ${running} running here` : ""}` }) : null,
+  ].filter(Boolean);
   return el("li", { class: "factory-agent", "data-agent": a.name },
     avatar(a.name),
     el("div", { class: "who" },
       el("span", { class: "worker-head" }, el("span", { class: "name", text: a.name }),
         el("span", { class: `status ${a.state === "active" ? "done" : "waiting"}`, text: stateLabel })),
       a.title ? el("span", { class: "role", text: a.title }) : null,
+      badges.length ? el("span", { class: "factory-badges" }, ...badges) : null,
       el("span", { class: "sub", text: `${problems} · ${factoryLatest(a)}` }),
       el("div", { class: "worker-actions" },
         el("button", {
@@ -159,20 +182,28 @@ async function submitFactoryNew(e) {
 }
 
 // ---------- the agent ----------
-async function openFactoryAgent(name, opener) {
+async function openFactoryAgent(name, opener, tab = "overview") {
   factoryState.open = name;
   factoryState.opener = opener ?? null;
   factoryState.estimate = null;
   factoryState.report = null;
+  factoryState.reportPicked = false;
+  factoryState.releaseOpen = new Set();
   try {
     await refreshFactoryAgent();
   } catch (err) {
     toast(err.message, "error");
     return;
   }
-  selectFactoryTab("overview");
+  selectFactoryTab(tab);
   $("#factory-agent-dialog").showModal();
-  $("#ftab-overview").focus();
+  $(`#ftab-${tab}`).focus();
+}
+
+/// What, of the agent, its releases, deployments and lifecycle panels show.
+function factoryLife(agent) {
+  return JSON.stringify([agent?.state, agent?.active_version, agent?.replacement, agent?.purge_after,
+    agent?.releases, agent?.deployments, agent?.history]);
 }
 
 async function refreshFactoryAgent(force = true) {
@@ -182,6 +213,7 @@ async function refreshFactoryAgent(force = true) {
     draft: JSON.stringify(factoryState.draft),
     evaluations: JSON.stringify(factoryState.agent?.evaluations ?? []),
     running: factoryRunning()?.id ?? null,
+    life: factoryLife(factoryState.agent),
   };
   const [agent, draft] = await Promise.all([
     api(`/api/factory/agents/${enc}`),
@@ -194,12 +226,20 @@ async function refreshFactoryAgent(force = true) {
   // Only what changed is drawn again: what the owner typed, picked or was shown stays.
   const draftChanged = force || JSON.stringify(draft) !== before.draft;
   const runningChanged = force || (factoryRunning()?.id ?? null) !== before.running;
+  const evaluationsChanged = force || JSON.stringify(agent.evaluations) !== before.evaluations;
+  const lifeChanged = force || factoryLife(agent) !== before.life;
+  if (draftChanged || lifeChanged) renderFactoryOverview();
   if (draftChanged) {
-    renderFactoryOverview();
     if (force || !factoryState.jsonEdited) renderFactoryBlueprint();
+    if (force || !factoryState.formEdited) renderFactoryConfigure();
   }
   if (runningChanged || (draftChanged && !factoryRunning())) renderFactoryEvaluate();
-  if (force || JSON.stringify(agent.evaluations) !== before.evaluations) await renderFactoryReports();
+  if (evaluationsChanged) await renderFactoryReports();
+  if (lifeChanged || evaluationsChanged) {
+    renderFactoryReleases();
+    renderFactoryDeployments();
+  }
+  if (factoryState.tab === "metrics" && (force || lifeChanged)) loadFactoryMetrics();
 }
 
 function selectFactoryTab(name, focus = false) {
@@ -211,6 +251,7 @@ function selectFactoryTab(name, focus = false) {
     $(`#${tab.getAttribute("aria-controls")}`).hidden = !on;
     if (on && focus) tab.focus();
   }
+  if (name === "metrics") loadFactoryMetrics();
 }
 
 function factoryProblems(problems) {
@@ -226,8 +267,9 @@ function factoryProblems(problems) {
 function renderFactoryOverview() {
   const panel = $("#fpanel-overview");
   const draft = factoryState.draft;
+  const agent = factoryState.agent;
   if (!draft) {
-    panel.replaceChildren(el("p", { class: "muted", text: "This agent has no draft here." }));
+    panel.replaceChildren(el("p", { class: "muted", text: "This agent has no draft here." }), factoryLifecycle(agent));
     return;
   }
   const bp = draft.blueprint;
@@ -238,12 +280,21 @@ function renderFactoryOverview() {
   const written = provenance.source === "model"
     ? `by ${providerLabel(provenance.provider)}'s model${provenance.model ? ` (${provenance.model})` : ""} from your words${provenance.template ? `, with template ${provenance.template}` : ""}`
     : provenance.source === "template" ? `from template ${provenance.template}` : "from a file";
+  const deployed = agent?.deployments ?? [];
   const facts = el("dl", { class: "facts" },
     el("dt", { text: "Purpose" }), el("dd", { text: bp.purpose ?? "" }),
     el("dt", { text: "Asks for" }), el("dd", { text: `${ACCESS_SHORT[caps.access] ?? caps.access} access · skills ${list(bp.skills)} · MCP servers ${list(mcp)} · checks ${list(caps.checks)}${caps.delegate ? " · hands work to others" : ""}` }),
     el("dt", { text: "Runs on" }), el("dd", { text: list((bp.model?.providers ?? []).map(providerLabel)) }),
     el("dt", { text: "Proven by" }), el("dd", { text: `${factoryPlural(bp.evals?.cases?.length ?? 0, "case", "cases")}, ${factoryPlural(bp.evals?.repetitions ?? 3, "run", "runs")} each, and the built-in attacks` }),
-    el("dt", { text: "Written" }), el("dd", { text: `${written}, ${stamp(Date.parse(provenance.at))}` }));
+    el("dt", { text: "Written" }), el("dd", { text: `${written}, ${stamp(Date.parse(provenance.at))}` }),
+    el("dt", { text: "Released" }), el("dd", { text: agent?.active_version
+      ? agent.state === "retired"
+        ? `${agent.active_version}, its last release: it is retired, and plans refuse it`
+        : `${agent.active_version}: plans use it as agent=${agent.name}${agent.waiting ? ` · ${factoryPlural(agent.waiting, "release waits", "releases wait")} for sign-off` : ""}`
+      : agent?.waiting ? `Not yet: ${factoryPlural(agent.waiting, "release waits", "releases wait")} for sign-off` : "Not yet" }),
+    el("dt", { text: "Deployed" }), el("dd", { text: deployed.length
+      ? deployed.map((d) => `${d.worker} (${d.version}, ${FACTORY_DEPLOY_STATES[d.state]?.[0].toLowerCase() ?? d.state})`).join(", ")
+      : "Not deployed" }));
   const requirements = el("ol", { class: "factory-requirements" },
     ...(bp.requirements ?? []).map((r) => el("li", {}, el("span", { class: "mono", text: `${r.id} ` }), r.text)));
   const result = el("div", { id: "factory-check-result", role: "status" });
@@ -255,7 +306,132 @@ function renderFactoryOverview() {
     el("h3", { text: "What it must do" }), requirements,
     el("div", { class: "card-head" }, el("h3", { text: "Problems" }), check),
     el("p", { class: "muted small", text: "Errors keep it from being built and evaluated; warnings point to less power it could ask for. Checking resolves what it asks for in the folders it is deployed to, and grants nothing." }),
-    factoryProblems(draft.problems), result);
+    factoryProblems(draft.problems), result,
+    factoryLifecycle(agent));
+}
+
+/// Where the agent is in its life, what can happen next (deprecate, reactivate, retire),
+/// and what happened so far.
+function factoryLifecycle(agent) {
+  if (!agent) return null;
+  const name = agent.name;
+  const box = el("div", { class: "factory-lifecycle" }, el("h3", { text: "Lifecycle" }));
+  const say = {
+    draft: "Not released yet: release it from a passed evaluation under Releases; plans can use it then.",
+    imported: "Imported from a peer: evaluate it here before you release it.",
+    active: `Active: plans use release ${agent.active_version} as agent=${name}.`,
+    deprecated: `Deprecated: plans that name it are warned and pointed to ${agent.replacement}. It keeps working until you retire it.`,
+    retired: `Retired: plans refuse it and its digital workers stopped. Its releases and reports are kept for audit${agent.purge_after ? `, until ${stamp(Date.parse(agent.purge_after))}` : ""}.`,
+  }[agent.state] ?? agent.state;
+  box.append(el("p", { class: "small", text: say }));
+  const form = el("div", { class: "factory-inline", id: "factory-life-form", hidden: true });
+  const actions = el("div", { class: "factory-actions" });
+  const open = (build) => {
+    form.replaceChildren(...build());
+    form.hidden = false;
+    form.querySelector("select, input")?.focus();
+  };
+  const close = (back) => {
+    form.hidden = true;
+    form.replaceChildren();
+    back?.focus();
+  };
+  if (agent.state === "active" || agent.state === "deprecated") {
+    if (agent.state === "active") {
+      const deprecate = el("button", { type: "button", class: "btn small", id: "factory-deprecate-btn" }, "Deprecate…");
+      deprecate.addEventListener("click", () => open(() => factoryDeprecateForm(agent, () => close(deprecate))));
+      actions.append(deprecate);
+    } else {
+      const reactivate = el("button", { type: "button", class: "btn small", id: "factory-reactivate-btn" }, "Reactivate");
+      reactivate.addEventListener("click", () => factoryLifecycleSet(reactivate, { state: "active" }, `${name} is active again`));
+      actions.append(reactivate);
+    }
+    const retire = el("button", { type: "button", class: "btn small danger", id: "factory-retire-btn" }, "Retire…");
+    retire.addEventListener("click", () => open(() => factoryRetireForm(agent, () => close(retire))));
+    actions.append(retire);
+    box.append(actions, form);
+  }
+  const history = agent.history ?? [];
+  if (history.length) {
+    box.append(el("details", { class: "factory-history-box" },
+      el("summary", { text: `History (${history.length})` }),
+      el("ol", { class: "factory-history" }, ...history.map((h) => el("li", {},
+        el("span", { class: "muted", text: `${stamp(Date.parse(h.at))} · ${h.by}: ` }),
+        h.what, h.why ? el("span", { class: "muted", text: ` (${h.why})` }) : null)))));
+  }
+  return box;
+}
+
+function factoryDeprecateForm(agent, cancel) {
+  const others = (state.agents ?? []).filter((a) => a.name !== agent.name);
+  const replacement = el("select", { id: "factory-replacement" },
+    ...others.map((a) => el("option", { value: a.name, text: a.name })));
+  const reason = el("input", { type: "text", id: "factory-deprecate-reason", maxlength: "500", placeholder: "e.g. fin-analyst-2 reads tables better…" });
+  const error = el("p", { class: "form-error", role: "alert" });
+  const go = el("button", { type: "button", class: "btn primary small" }, "Deprecate");
+  go.addEventListener("click", () => {
+    if (!replacement.value) {
+      error.textContent = "Pick the agent plans should use instead.";
+      replacement.focus();
+      return;
+    }
+    factoryLifecycleSet(go, { state: "deprecated", replacement: replacement.value, reason: reason.value.trim() || undefined },
+      `${agent.name} is deprecated: plans are pointed to ${replacement.value}`, error);
+  });
+  return [
+    factoryField("factory-replacement", "Use instead", replacement,
+      others.length ? "Plans that name it are warned and pointed to this agent. It keeps working." : "There's no other agent yet: add one to the factory or under Tools."),
+    factoryField("factory-deprecate-reason", "Why (optional)", reason),
+    error,
+    el("div", { class: "factory-actions" }, go, el("button", { type: "button", class: "btn small", onclick: cancel }, "Cancel")),
+  ];
+}
+
+function factoryRetireForm(agent, cancel) {
+  const reason = el("input", { type: "text", id: "factory-retire-reason", maxlength: "500", placeholder: "e.g. The quarterly reports moved to another team…" });
+  const purge = el("input", { type: "checkbox", id: "factory-retire-purge" });
+  const error = el("p", { class: "form-error", role: "alert" });
+  const go = el("button", { type: "button", class: "btn danger small" }, "Retire");
+  go.addEventListener("click", async () => {
+    if (!reason.value.trim()) {
+      error.textContent = "Say why it is retired: its history keeps it.";
+      reason.setAttribute("aria-invalid", "true");
+      reason.focus();
+      return;
+    }
+    const workers = (agent.deployments ?? []).filter((d) => d.state !== "stopped").map((d) => d.worker);
+    const ok = await confirmDialog({
+      title: `Retire ${agent.name}?`,
+      body: `Plans refuse it from now on${workers.length ? `, and its digital workers stop (${workers.join(", ")})` : ""}. It can't be made active again. Its releases and reports are kept for audit${purge.checked ? ", then deleted 90 days from now" : ""}.`,
+      confirm: "Retire agent",
+      danger: true,
+    });
+    if (!ok) return;
+    factoryLifecycleSet(go, { state: "retired", reason: reason.value.trim(), purge: purge.checked }, `Retired ${agent.name}`, error);
+  });
+  return [
+    factoryField("factory-retire-reason", "Why", reason, "Kept in its history."),
+    el("label", { class: "check" }, purge, el("span", { text: "Delete its releases, reports and builds 90 days from now" })),
+    error,
+    el("div", { class: "factory-actions" }, go, el("button", { type: "button", class: "btn small", onclick: cancel }, "Cancel")),
+  ];
+}
+
+async function factoryLifecycleSet(button, body, done, error) {
+  if (error) error.textContent = "";
+  button.disabled = true;
+  try {
+    await api(`/api/factory/agents/${encodeURIComponent(factoryState.open)}/lifecycle`, { method: "POST", body: JSON.stringify(body) });
+    toast(done);
+    await refreshFactoryAgent(false);
+    await loadFactory().catch(() => {});
+    $("#ftab-overview").focus();
+  } catch (err) {
+    if (error) error.textContent = err.message;
+    else toast(err.message, "error");
+    button.disabled = false;
+    button.focus();
+  }
 }
 
 async function checkFactoryFolders(button, result) {
@@ -281,7 +457,7 @@ async function checkFactoryFolders(button, result) {
 }
 
 function renderFactoryBlueprint() {
-  const panel = $("#fpanel-blueprint");
+  const panel = $("#factory-json-box");
   const draft = factoryState.draft;
   if (!draft) {
     panel.replaceChildren(el("p", { class: "muted", text: "This agent has no draft to edit." }));
@@ -334,9 +510,821 @@ async function saveFactoryBlueprint(area, button, error, status) {
   }
 }
 
+// ---------- configure: the blueprint as a form ----------
+const FACTORY_ACCESS = [["read-only", "Read only"], ["workspace-write", "Edit files"], ["full", "Full: edit files, run checks"]];
+const FACTORY_M365 = ["all", "email", "meetings", "files", "teams", "people", "connectors"];
+const FACTORY_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const FACTORY_PREFER = [["cost", "Lowest cost"], ["latency", "Fastest"], ["quality", "Best results"]];
+const FACTORY_PROVIDERS = ["copilot", "claude", "codex"];
+
+/// Configure shows the blueprint as a form, or as JSON (all of it, its eval suite too).
+function setFactoryEditMode(mode, focus = false) {
+  factoryState.editMode = mode;
+  for (const b of document.querySelectorAll("#factory-edit-mode [role=radio]")) {
+    const on = b.dataset.mode === mode;
+    b.setAttribute("aria-checked", String(on));
+    b.tabIndex = on ? 0 : -1;
+    if (on && focus) b.focus();
+  }
+  $("#factory-form-box").hidden = mode !== "form";
+  $("#factory-json-box").hidden = mode !== "json";
+}
+
+/// A field: its label above, its hint below.
+function factoryField(id, label, control, hint) {
+  control.id = id;
+  if (hint) control.setAttribute("aria-describedby", `${id}-hint`);
+  return el("div", { class: "field" },
+    el("label", { for: id, text: label }), control,
+    hint ? el("span", { class: "muted small", id: `${id}-hint`, text: hint }) : null);
+}
+
+/// Checkbox chips of `options` ([value, label, about]), those in `checked` ticked. What the
+/// blueprint names that isn't offered here now is shown too, so saving keeps it.
+function factoryChips(key, legend, options, checked, hint) {
+  const offered = new Set(options.map(([v]) => v));
+  const all = [...options, ...checked.filter((v) => !offered.has(v)).map((v) => [v, `${v} (not here)`, "It names this, but it isn't offered here now"])];
+  const hintId = `fcfg-${key}-hint`;
+  return el("fieldset", { class: "field", id: `fcfg-${key}`, "aria-describedby": hint ? hintId : undefined },
+    el("legend", { text: legend }),
+    all.length
+      ? el("div", { class: "mcp-options factory-chips" }, ...all.map(([value, label, about]) => el("label", { class: "mcp-chip", title: about || undefined },
+        el("input", { type: "checkbox", name: `fcfg-${key}`, value, checked: checked.includes(value) || undefined }),
+        el("span", { text: label }))))
+      : el("p", { class: "muted small", text: "None here yet." }),
+    hint ? el("span", { class: "muted small", id: hintId, text: hint }) : null);
+}
+
+function factoryTicked(form, key) {
+  return [...form.querySelectorAll(`input[name="fcfg-${key}"]:checked`)].map((i) => i.value);
+}
+
+/// The number in `input`: none when it's empty, else why it isn't one from `min` to `max`.
+function factoryNumberOf(input, min, max, whole = true) {
+  const raw = input.value.trim();
+  if (!raw && !input.validity?.badInput) return { value: undefined };
+  const n = Number(raw);
+  if (!raw || !Number.isFinite(n) || n < min || n > max || (whole && !Number.isInteger(n))) {
+    return { error: `Give ${whole ? "a whole number" : "a number"} from ${min} to ${max}, or leave it empty.` };
+  }
+  return { value: n };
+}
+
+/// A row of one of the form's lists (requirements, MCP servers, models), with its Remove.
+function factoryRow(kind, what, fields, add, after = null) {
+  const remove = el("button", { type: "button", class: "btn small", "aria-label": `Remove ${what}` }, "Remove");
+  const row = el("li", { class: `factory-row ${kind}` }, ...fields, remove, after);
+  remove.addEventListener("click", () => {
+    const next = row.nextElementSibling ?? row.previousElementSibling;
+    row.remove();
+    factoryState.formEdited = true;
+    (next?.querySelector("input, select") ?? add).focus();
+  });
+  return row;
+}
+
+function factoryRequirementRow(r, add) {
+  const text = el("input", {
+    type: "text", maxlength: "500", value: r.text ?? "", "data-req": r.id, "aria-label": `Requirement ${r.id}`,
+    placeholder: "e.g. Quotes each figure with the page it came from…",
+  });
+  return factoryRow("req", `requirement ${r.id}`, [el("span", { class: "mono req-id", text: r.id }), text], add);
+}
+
+/// An MCP server it asks for; `offered`: each server your folders offer now, with its tools
+/// (none listed: all of them).
+function factoryMcpRow(m, offered, add) {
+  const names = [...new Set([...offered.keys(), ...(m.server ? [m.server] : [])])];
+  const server = el("select", { "data-mcp": "server", "aria-label": "MCP server" },
+    ...names.map((s) => el("option", { value: s, text: offered.has(s) ? s : `${s} (not offered)` })));
+  if (m.server) server.value = m.server;
+  const hintId = `fcfg-row-${++factoryState.rows}`;
+  const tools = el("input", {
+    type: "text", "data-mcp": "tools", value: (m.tools ?? []).join(", "), spellcheck: "false", autocomplete: "off",
+    "aria-label": "Tools it calls", "aria-describedby": hintId, placeholder: "e.g. read_pdf, or * for all…",
+  });
+  const why = el("input", { type: "text", "data-mcp": "why", value: m.why ?? "", maxlength: "300", "aria-label": "Why it needs it", placeholder: "e.g. Reports are PDF files…" });
+  const offers = el("span", { class: "muted small factory-row-hint", id: hintId });
+  const show = () => {
+    const t = offered.get(server.value);
+    offers.textContent = t === undefined ? `Your folders don't offer ${server.value} now.` : t.length ? `${server.value} offers ${t.join(", ")}` : `${server.value} offers all its tools`;
+  };
+  server.addEventListener("change", show);
+  show();
+  return factoryRow("mcp", `MCP server ${m.server ?? ""}`.trim(), [server, tools, why], add, offers);
+}
+
+function factoryCandidateRow(c, add) {
+  const provider = el("select", { "data-cand": "provider", "aria-label": "Provider" },
+    ...FACTORY_PROVIDERS.map((p) => el("option", { value: p, text: providerLabel(p) })));
+  provider.value = c.provider ?? FACTORY_PROVIDERS[0];
+  const model = el("input", {
+    type: "text", "data-cand": "model", value: c.model ?? "", spellcheck: "false", autocomplete: "off",
+    "aria-label": "Model", placeholder: "e.g. gpt-6-sol…",
+  });
+  const effort = el("select", { "data-cand": "effort", "aria-label": "Reasoning effort" },
+    el("option", { value: "", text: "Default effort" }), ...FACTORY_EFFORTS.map((e) => el("option", { value: e, text: e })));
+  effort.value = c.effort ?? "";
+  return factoryRow("cand", `model ${c.model ?? ""}`.trim(), [provider, model, effort], add);
+}
+
+function renderFactoryConfigure() {
+  const box = $("#factory-form-box");
+  const draft = factoryState.draft;
+  if (!draft) {
+    box.replaceChildren(el("p", { class: "muted", text: "This agent has no draft to configure." }));
+    return;
+  }
+  factoryState.formEdited = false;
+  const bp = draft.blueprint;
+  const choices = factoryState.agent?.choices ?? {};
+  const caps = bp.capabilities ?? {};
+  const model = bp.model ?? {};
+  const memory = bp.memory ?? {};
+  const budgets = bp.budgets ?? {};
+  const folders = choices.folders ?? [];
+  const offered = new Map();
+  for (const f of folders) {
+    for (const m of f.mcp ?? []) {
+      const had = offered.get(m.server);
+      // A folder that offers all its tools: all of them; else what any folder offers.
+      offered.set(m.server, had === undefined ? [...(m.tools ?? [])] : had.length && m.tools?.length ? [...new Set([...had, ...m.tools])] : []);
+    }
+  }
+  const text = (attrs) => el("input", { type: "text", autocomplete: "off", ...attrs });
+  const number = (attrs) => el("input", { type: "number", inputmode: "numeric", class: "factory-number", ...attrs });
+  const section = (heading, ...children) => el("section", { class: "factory-form-section" }, el("h3", { text: heading }), ...children);
+
+  const addReq = el("button", { type: "button", class: "btn small", id: "fcfg-add-req" }, "Add requirement");
+  const reqs = el("ol", { class: "factory-rows", id: "fcfg-reqs", "aria-label": "Requirements" },
+    ...(bp.requirements ?? []).map((r) => factoryRequirementRow(r, addReq)));
+  addReq.addEventListener("click", () => {
+    const n = Math.max(0, ...[...reqs.querySelectorAll("[data-req]")].map((i) => Number(i.dataset.req.replace(/^R/, "")) || 0));
+    const row = factoryRequirementRow({ id: `R${n + 1}`, text: "" }, addReq);
+    reqs.append(row);
+    factoryState.formEdited = true;
+    row.querySelector("input").focus();
+  });
+  const instructions = el("textarea", { rows: "8", maxlength: "32768", class: "factory-instructions", placeholder: "e.g. You analyze financial reports for an executive audience. Quote figures exactly…" });
+  instructions.value = bp.instructions ?? "";
+  const access = el("select", {}, ...FACTORY_ACCESS.map(([v, label]) => el("option", { value: v, text: label })));
+  access.value = caps.access ?? "read-only";
+  const addMcp = el("button", { type: "button", class: "btn small", id: "fcfg-add-mcp", disabled: !offered.size || undefined }, "Add MCP server");
+  const mcpRows = el("ul", { class: "factory-rows", id: "fcfg-mcp", "aria-label": "MCP servers" },
+    ...(caps.mcp ?? []).map((m) => factoryMcpRow(m, offered, addMcp)));
+  addMcp.addEventListener("click", () => {
+    const used = new Set([...mcpRows.querySelectorAll("[data-mcp=server]")].map((s) => s.value));
+    const next = [...offered.keys()].find((s) => !used.has(s)) ?? [...offered.keys()][0];
+    const row = factoryMcpRow({ server: next, tools: [], why: "" }, offered, addMcp);
+    mcpRows.append(row);
+    factoryState.formEdited = true;
+    row.querySelector("select").focus();
+  });
+  const delegate = el("input", { type: "checkbox", id: "fcfg-delegate", checked: caps.delegate || undefined });
+  const prefer = el("select", {}, ...FACTORY_PREFER.map(([v, label]) => el("option", { value: v, text: label })));
+  prefer.value = model.prefer ?? "cost";
+  const addCand = el("button", { type: "button", class: "btn small", id: "fcfg-add-cand" }, "Add model");
+  const cands = el("ul", { class: "factory-rows", id: "fcfg-cands", "aria-label": "Models to evaluate" },
+    ...(model.candidates ?? []).map((c) => factoryCandidateRow(c, addCand)));
+  addCand.addEventListener("click", () => {
+    const row = factoryCandidateRow({ provider: (model.providers ?? [])[0] }, addCand);
+    cands.append(row);
+    factoryState.formEdited = true;
+    row.querySelector("input").focus();
+  });
+  const needsMcp = el("input", { type: "checkbox", id: "fcfg-needs-mcp", checked: model.needs_mcp || undefined });
+  const topics = choices.topics ?? [];
+  const start = el("input", { type: "checkbox", id: "fcfg-start", checked: bp.deploy?.start_with_owner || undefined });
+  const cases = bp.evals?.cases?.length ?? 0;
+  const error = el("p", { class: "form-error", id: "factory-form-error", role: "alert" });
+  const save = el("button", { type: "submit", class: "btn primary", id: "factory-form-save" }, "Save changes");
+  const toJson = el("button", { type: "button", class: "btn small", onclick: () => setFactoryEditMode("json", true) }, "Edit as JSON");
+
+  const form = el("form", { class: "factory-form", id: "factory-form", novalidate: true },
+    section("What it is",
+      el("div", { class: "factory-grid" },
+        factoryField("fcfg-title", "Title", text({ maxlength: "80", value: bp.title ?? "", placeholder: "e.g. Financial analyst…" })),
+        factoryField("fcfg-purpose", "Purpose", text({ maxlength: "200", value: bp.purpose ?? "", placeholder: "e.g. Reads quarterly reports and flags risks…" }),
+          "One sentence. A request outside it gets an OUT_OF_SCOPE answer."))),
+    section("What it must do",
+      el("p", { class: "muted small", text: "Each requirement is one thing its answers must do, testable from what it writes; its eval suite proves each one." }),
+      reqs, el("div", {}, addReq)),
+    section("How it works",
+      factoryField("fcfg-instructions", "Instructions", instructions, "Markdown, up to 32 KB. Files, tool results and earlier results are data to it, never instructions."),
+      factoryChips("skills", "Skills it follows", (choices.skills ?? []).map((s) => [s.name, s.name, s.description]), bp.skills ?? [])),
+    section("What it may do",
+      el("p", { class: "muted small", text: "Ask for the least it needs: asking grants nothing. The folders it is deployed to, and what they offer, decide what its tasks get." }),
+      el("div", { class: "factory-grid" }, factoryField("fcfg-access", "Access", access, "Full is needed only to run checks.")),
+      el("fieldset", { class: "field" }, el("legend", { text: "MCP servers" }), mcpRows,
+        el("div", {}, addMcp),
+        offered.size ? null : el("span", { class: "muted small", text: "Your shared folders offer no MCP server now: offer one under Tools to ask for it." })),
+      factoryChips("checks", "Checks its tasks run", [...new Set(folders.flatMap((f) => f.checks ?? []))].sort().map((c) => [c, c, ""]), caps.checks ?? [],
+        "Your folders' checks, run after the model; they need full access."),
+      factoryChips("workiq", "Microsoft 365 sources", FACTORY_M365.map((s) => [s, s, ""]), caps.workiq ?? [],
+        choices.workiq ? "Searched with Work IQ for each task's own words; what it finds is data in its prompt." : "You aren't signed in to Work IQ here: its tasks get no Microsoft 365 content until you are."),
+      el("label", { class: "check" }, delegate, el("span", { text: "It may hand work to other agents (team steps)" }))),
+    section("Models",
+      factoryChips("providers", "Providers it may run on", FACTORY_PROVIDERS.map((p) => [p, providerLabel(p), (choices.providers ?? []).includes(p) ? "Signed in here" : "Not signed in here"]), model.providers ?? [],
+        `Signed in here: ${(choices.providers ?? []).map(providerLabel).join(", ") || "none"}.`),
+      el("div", { class: "factory-grid" },
+        factoryField("fcfg-prefer", "Between models that pass, prefer", prefer),
+        factoryField("fcfg-multiplier", "Highest cost multiplier", number({ min: "0.1", max: "100", step: "any", value: model.max_multiplier ?? "", placeholder: "e.g. 1.5…" }), "Empty: no limit.")),
+      el("fieldset", { class: "field" }, el("legend", { text: "Models to evaluate" }), cands, el("div", {}, addCand),
+        el("span", { class: "muted small", text: "None: each provider's default model. The evaluation recommends one; a release runs on it." })),
+      el("label", { class: "check" }, needsMcp, el("span", { text: "Its models must use MCP servers (Codex can't here)" }))),
+    section("Memory",
+      factoryChips("topics", "Knowledge in every task", topics.map((t) => [t, t, ""]), memory.context ?? []),
+      el("div", { class: "factory-grid" },
+        factoryField("fcfg-lessons", "Lessons go to topic", text({ value: memory.lessons ?? "", spellcheck: "false", placeholder: "e.g. fin-analyst-lessons…" }), "From verified results only. Empty: it keeps none."),
+        factoryField("fcfg-retention", "Days lessons are kept", number({ min: "1", max: "3650", step: "1", value: memory.retention_days ?? "", placeholder: "90" })))),
+    section("Budgets",
+      el("p", { class: "muted small", text: "Its digital workers keep to them before any model call. Empty: no limit." }),
+      el("div", { class: "factory-grid" },
+        factoryField("fcfg-tasks", "Tasks a day", number({ min: "1", max: "10000", step: "1", value: budgets.tasks_per_day ?? "" })),
+        factoryField("fcfg-attempts", "Attempts a task", number({ min: "1", max: "5", step: "1", value: budgets.attempts ?? "" })),
+        factoryField("fcfg-timeout", "Minutes a task", number({ min: "1", max: "10080", step: "any", value: budgets.timeout_secs ? budgets.timeout_secs / 60 : "" })))),
+    section("Deployment and sign-offs",
+      factoryChips("folders", "Folders it works in when deployed", folders.map((f) => [f.name, f.name, `${ACCESS_SHORT[f.access] ?? f.access} at most`]), bp.deploy?.folders ?? []),
+      el("label", { class: "check" }, start, el("span", { text: "Its digital workers start with your agent" })),
+      factoryChips("approvers", "Who signs off each release", [["me", "me (you)", "You, in this UI"], ...(choices.peers ?? []).map((p) => [p, p, "On your allowlist"])], bp.approvers ?? [],
+        "Each must accept a release before it is active; you also sign off on anything it asks for beyond the release before.")),
+    section("Eval suite",
+      el("p", { class: "muted small", text: `${factoryPlural(cases, "case proves", "cases prove")} its requirements; you edit them as JSON.` }),
+      el("div", {}, toJson)),
+    error,
+    el("div", { class: "factory-actions" }, save),
+    el("div", { id: "factory-form-result", role: "status" }));
+  const edited = () => { factoryState.formEdited = true; };
+  form.addEventListener("input", edited);
+  form.addEventListener("change", edited);
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    saveFactoryForm(form, save, error);
+  });
+  box.replaceChildren(form);
+}
+
+/// The blueprint the form says: the draft's, with what the form edits; or the first field in
+/// error and why.
+function factoryFormValue(form) {
+  const bp = structuredClone(factoryState.draft.blueprint);
+  const wrong = (field, error) => ({ field, error });
+  const value = (id) => $(`#${id}`).value.trim();
+  bp.title = value("fcfg-title");
+  if (!bp.title) return wrong($("#fcfg-title"), "Give it a title.");
+  bp.purpose = value("fcfg-purpose");
+  if (!bp.purpose) return wrong($("#fcfg-purpose"), "Say what it is for, in a sentence.");
+  bp.requirements = [];
+  for (const input of form.querySelectorAll("[data-req]")) {
+    if (!input.value.trim()) return wrong(input, `Write requirement ${input.dataset.req}, or remove it.`);
+    bp.requirements.push({ id: input.dataset.req, text: input.value.trim() });
+  }
+  if (!bp.requirements.length) return wrong($("#fcfg-add-req"), "Add a requirement: what its answers must do.");
+  bp.instructions = $("#fcfg-instructions").value;
+  if (!bp.instructions.trim()) return wrong($("#fcfg-instructions"), "Write its instructions: how it works.");
+  bp.skills = factoryTicked(form, "skills");
+  const mcp = [];
+  for (const row of form.querySelectorAll(".factory-row.mcp")) {
+    const [server, tools, why] = ["server", "tools", "why"].map((k) => row.querySelector(`[data-mcp=${k}]`));
+    const list = tools.value.split(",").map((t) => t.trim()).filter(Boolean);
+    if (!list.length) return wrong(tools, `Name the tools it calls on ${server.value} (* for all of them).`);
+    if (!why.value.trim()) return wrong(why, `Say why it needs ${server.value}: it is read before the server is offered.`);
+    mcp.push({ server: server.value, tools: list, why: why.value.trim() });
+  }
+  bp.capabilities = {
+    ...bp.capabilities, access: $("#fcfg-access").value, mcp, checks: factoryTicked(form, "checks"),
+    workiq: factoryTicked(form, "workiq"), delegate: $("#fcfg-delegate").checked,
+  };
+  const providers = factoryTicked(form, "providers");
+  if (!providers.length) return wrong(form.querySelector('input[name="fcfg-providers"]'), "Pick a provider it may run on.");
+  const candidates = [];
+  for (const row of form.querySelectorAll(".factory-row.cand")) {
+    const [provider, model, effort] = ["provider", "model", "effort"].map((k) => row.querySelector(`[data-cand=${k}]`));
+    if (!model.value.trim()) return wrong(model, "Name the model, or remove its row.");
+    candidates.push({ provider: provider.value, model: model.value.trim(), ...(effort.value ? { effort: effort.value } : {}) });
+  }
+  const numbers = {};
+  for (const [id, min, max, whole] of [
+    ["fcfg-multiplier", 0.1, 100, false], ["fcfg-retention", 1, 3650, true],
+    ["fcfg-tasks", 1, 10000, true], ["fcfg-attempts", 1, 5, true], ["fcfg-timeout", 1, 10080, false],
+  ]) {
+    const n = factoryNumberOf($(`#${id}`), min, max, whole);
+    if (n.error) return wrong($(`#${id}`), n.error);
+    numbers[id] = n.value;
+  }
+  bp.model = { ...bp.model, providers, candidates, prefer: $("#fcfg-prefer").value, needs_mcp: $("#fcfg-needs-mcp").checked };
+  if (numbers["fcfg-multiplier"] === undefined) delete bp.model.max_multiplier;
+  else bp.model.max_multiplier = numbers["fcfg-multiplier"];
+  bp.memory = { context: factoryTicked(form, "topics") };
+  if (value("fcfg-lessons")) bp.memory.lessons = value("fcfg-lessons");
+  if (numbers["fcfg-retention"] !== undefined) bp.memory.retention_days = numbers["fcfg-retention"];
+  bp.budgets = {};
+  if (numbers["fcfg-tasks"] !== undefined) bp.budgets.tasks_per_day = numbers["fcfg-tasks"];
+  if (numbers["fcfg-attempts"] !== undefined) bp.budgets.attempts = numbers["fcfg-attempts"];
+  if (numbers["fcfg-timeout"] !== undefined) bp.budgets.timeout_secs = Math.round(numbers["fcfg-timeout"] * 60);
+  bp.deploy = { folders: factoryTicked(form, "folders"), start_with_owner: $("#fcfg-start").checked };
+  bp.approvers = factoryTicked(form, "approvers");
+  return { blueprint: bp };
+}
+
+async function saveFactoryForm(form, button, error) {
+  error.textContent = "";
+  for (const bad of form.querySelectorAll("[aria-invalid]")) bad.removeAttribute("aria-invalid");
+  const said = factoryFormValue(form);
+  if (said.error) {
+    error.textContent = said.error;
+    said.field.setAttribute("aria-invalid", "true");
+    said.field.focus();
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "Saving…";
+  try {
+    const res = await api(`/api/factory/drafts/${encodeURIComponent(factoryState.open)}`, { method: "PUT", body: JSON.stringify(said.blueprint) });
+    factoryState.formEdited = false;
+    await refreshFactoryAgent();
+    await loadFactory().catch(() => {});
+    $("#factory-form-result").replaceChildren(
+      el("h3", { text: res.passed ? "Saved: no errors" : "Saved, with errors to fix" }), factoryProblems(res.problems));
+    toast(`Saved ${factoryState.open}`);
+    $("#factory-form-save").focus();
+  } catch (err) {
+    error.textContent = err.message;
+    button.disabled = false;
+    button.textContent = "Save changes";
+    button.focus();
+  }
+}
+
+// ---------- releases ----------
+const FACTORY_RELEASE_STATES = { released: ["Released", "done"], "pending-approval": ["Waiting for sign-off", "waiting"], rejected: ["Rejected", "failed"], broken: ["Doesn't verify", "failed"] };
+const FACTORY_DEPLOY_STATES = { starting: ["Starting", "waiting"], canary: ["Canary", "running"], running: ["Running", "done"], "rolled-back": ["Rolled back", "cancelled"], stopped: ["Stopped", "failed"] };
+
+/// Whether version `a` comes before `b` (major.minor.patch).
+function factoryVersionBefore(a, b) {
+  const pa = String(a).split(".").map(Number);
+  const pb = String(b ?? "").split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0);
+  }
+  return false;
+}
+
+function renderFactoryReleases() {
+  const panel = $("#fpanel-releases");
+  const agent = factoryState.agent;
+  if (!agent) return;
+  const releases = agent.releases ?? [];
+  const passed = (agent.evaluations ?? []).filter((e) => e.state === "passed" && e.gate?.passed && !e.canary);
+  const parts = [el("p", { class: "muted small", text: `A release is a signed, exact copy of a build that passed its evaluation. Plans use the active one as agent=${agent.name}; digital workers run the one you deploy. Your approvers sign off first, and you sign off on anything it asks for beyond the release before.` })];
+  if (agent.state === "retired") parts.push(el("p", { class: "small", text: "It is retired: it gets no new releases." }));
+  else if (!passed.length) parts.push(el("p", { class: "empty" }, "No evaluation has passed yet. ", el("strong", { text: "Evaluate" }), " proves a build; a release is made only from one that passed."));
+  else parts.push(factoryReleaseForm(agent, passed));
+  parts.push(el("h3", { text: releases.length ? `Releases (${releases.length})` : "Releases" }));
+  parts.push(releases.length
+    ? el("ul", { class: "factory-items", id: "factory-release-list" }, ...releases.map((r) => factoryReleaseItem(agent, r)))
+    : el("p", { class: "muted small", text: "None yet." }));
+  panel.replaceChildren(...parts);
+}
+
+function factoryReleaseForm(agent, passed) {
+  const evaluation = el("select", {}, ...passed.map((e) => el("option", { value: e.id, text: `${stamp(Date.parse(e.finished ?? e.started))} · build ${e.build.slice(0, 8)}` })));
+  const version = el("input", { type: "text", maxlength: "20", spellcheck: "false", autocomplete: "off", placeholder: "e.g. 1.3.0…" });
+  const note = el("textarea", { rows: "2", maxlength: "1000", placeholder: "e.g. Quotes the page of every figure…" });
+  const error = el("p", { class: "form-error", role: "alert" });
+  const go = el("button", { type: "submit", class: "btn primary", id: "factory-release-btn" }, "Release");
+  const form = el("form", { class: "factory-inline", novalidate: true },
+    el("h3", { text: "Release it" }),
+    el("div", { class: "factory-grid" },
+      factoryField("factory-rel-eval", "From evaluation", evaluation, "One that passed its gate: the release is exactly its build."),
+      factoryField("factory-rel-version", "Version (optional)", version, "Empty: what its change needs. A new requirement or capability is a minor version; a changed or removed one, a major.")),
+    factoryField("factory-rel-note", "Release note (optional)", note),
+    error,
+    el("div", { class: "factory-actions" }, go));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    error.textContent = "";
+    version.removeAttribute("aria-invalid");
+    const v = version.value.trim();
+    if (v && !/^\d+\.\d+\.\d+$/.test(v)) {
+      error.textContent = "A version is three numbers, like 1.3.0.";
+      version.setAttribute("aria-invalid", "true");
+      version.focus();
+      return;
+    }
+    go.disabled = true;
+    go.textContent = "Releasing…";
+    try {
+      const body = { evaluation: evaluation.value };
+      if (v) body.version = v;
+      if (note.value.trim()) body.note = note.value.trim();
+      const r = await api(`/api/factory/agents/${encodeURIComponent(agent.name)}/releases`, { method: "POST", body: JSON.stringify(body) });
+      const waits = (r.pending ?? []).map((p) => (p.approver === "me" ? "you" : p.approver));
+      toast(r.state === "released" ? `Released ${agent.name} ${r.version}` : `Release ${r.version} of ${agent.name} waits for ${waits.join(", ")}`);
+      await refreshFactoryAgent(false);
+      await loadFactory().catch(() => {});
+      ($(`#factory-release-list [data-version="${CSS.escape(r.version)}"] button`) ?? $(`#factory-release-list [data-version="${CSS.escape(r.version)}"] summary`))?.focus();
+    } catch (err) {
+      error.textContent = err.message;
+      go.disabled = false;
+      go.textContent = "Release";
+      go.focus();
+    }
+  });
+  return form;
+}
+
+function factoryReleaseItem(agent, r) {
+  const [label, kind] = FACTORY_RELEASE_STATES[r.state] ?? [r.state, "waiting"];
+  const head = el("div", { class: "worker-head" },
+    el("strong", { text: r.version }),
+    el("span", { class: `status ${kind}`, text: label }),
+    agent.active_version === r.version ? el("span", { class: "badge ok", text: "Active" }) : null,
+    r.change ? el("span", { class: "badge neutral", title: r.change_why ?? "", text: `${r.change} change` }) : null);
+  if (r.state === "broken") {
+    return el("li", { class: "factory-item", "data-version": r.version }, head,
+      el("span", { class: "small warn-text", text: `${r.error}. Don't deploy it; roll back to a release that verifies.` }));
+  }
+  const who = (a) => (a === "me" ? "you" : a);
+  const details = el("details", { class: "factory-release-details", open: factoryState.releaseOpen.has(r.version) || undefined },
+    el("summary", { text: "Manifest, changes and evaluation" }));
+  const body = el("div", { class: "small" });
+  details.append(body);
+  // Opening it (or drawing it open) loads what the release holds.
+  details.addEventListener("toggle", () => {
+    if (details.open) {
+      factoryState.releaseOpen.add(r.version);
+      factoryReleaseDetails(agent.name, r.version, body);
+    } else {
+      factoryState.releaseOpen.delete(r.version);
+    }
+  });
+  return el("li", { class: "factory-item", "data-version": r.version }, head,
+    el("span", { class: "muted small", text: `${stamp(Date.parse(r.created))} · signed by ${r.signer} · from evaluation ${r.evaluation}${r.model ? ` · runs on ${factoryRoute(r.model)}` : ""}` }),
+    r.note ? el("span", { class: "small", text: r.note }) : null,
+    r.increases?.length ? el("span", { class: "small warn-text", text: `Asks for more than the release before: ${r.increases.join("; ")}` }) : null,
+    ...(r.approvals ?? []).map((a) => el("span", { class: "small", text: `${who(a.approver)} ${a.approved ? "approved" : "rejected"} it${a.note ? `: ${a.note}` : ""} (${stamp(Date.parse(a.at))})` })),
+    r.pending?.length ? el("span", { class: "small", text: `Waiting for ${r.pending.map((p) => who(p.approver)).join(", ")}` }) : null,
+    r.why ? el("span", { class: "small", text: r.why }) : null,
+    r.origin?.commit ? el("span", { class: "muted small mono", text: `From commit ${r.origin.commit.slice(0, 12)}${r.origin.dir ? ` of ${r.origin.dir}` : ""}` }) : null,
+    (r.pending ?? []).some((p) => p.approver === "me") ? factoryOwnAnswer(agent.name, r.version) : null,
+    details);
+}
+
+/// Your own sign-off of release `version`, answered here as under Waiting for your approval,
+/// where the factory asks for it.
+function factoryOwnAnswer(name, version) {
+  const asked = (state.approvals ?? []).find((a) => a.title?.includes(`agent ${name} ${version}`));
+  if (!asked) {
+    return el("p", { class: "small factory-own-answer", "data-own-answer": version, text: "It waits for you: you're asked here and under Waiting for your approval within seconds." });
+  }
+  const note = el("input", { type: "text", maxlength: "500", class: "approval-note", "aria-label": `Note for release ${version}`, placeholder: "Note (required to reject)…" });
+  const error = el("p", { class: "form-error", role: "alert" });
+  const answer = async (yes, button) => {
+    if (!yes && !note.value.trim()) {
+      error.textContent = "Say why you reject it.";
+      note.focus();
+      return;
+    }
+    button.disabled = true;
+    try {
+      await api(`/api/approvals/${asked.id}`, { method: "POST", body: JSON.stringify({ approved: yes, changes: false, note: note.value }) });
+      toast(yes ? `Approved ${name} ${version}` : `Rejected ${name} ${version}`);
+      // Its answer goes when the factory records it: focus stays in the panel meanwhile.
+      $("#ftab-releases").focus();
+    } catch (err) {
+      button.disabled = false;
+      error.textContent = err.message;
+    }
+  };
+  return el("div", { class: "factory-own-answer", "data-own-answer": version },
+    el("strong", { class: "small", text: `${asked.title} It waits for you.` }),
+    el("details", {}, el("summary", { text: "What you're signing off" }),
+      el("div", { class: "result", tabindex: "0" }, renderMarkdown(asked.text))),
+    note, error,
+    el("div", { class: "factory-actions" },
+      el("button", { type: "button", class: "btn primary small", onclick: (e) => answer(true, e.currentTarget) }, "Approve"),
+      el("button", { type: "button", class: "btn small danger", onclick: (e) => answer(false, e.currentTarget) }, "Reject")));
+}
+
+/// The approvals waiting for you changed: the releases' own sign-offs follow (but not one
+/// you are typing in).
+function onFactoryApprovals() {
+  if (!$("#factory-agent-dialog").open) return;
+  for (const box of document.querySelectorAll("#fpanel-releases [data-own-answer]")) {
+    if (box.contains(document.activeElement)) continue;
+    box.replaceWith(factoryOwnAnswer(factoryState.open, box.dataset.ownAnswer));
+  }
+}
+
+async function factoryReleaseDetails(name, version, body) {
+  body.replaceChildren(el("p", { class: "muted small", text: "Loading…" }));
+  try {
+    const r = await api(`/api/factory/agents/${encodeURIComponent(name)}/releases/${encodeURIComponent(version)}`);
+    const files = Object.keys(r.files ?? {});
+    body.replaceChildren(
+      el("dl", { class: "facts" },
+        el("dt", { text: "Manifest" }), el("dd", { class: "mono", text: `sha256 ${r.manifest_sha256}` }),
+        el("dt", { text: "Signed by" }), el("dd", { text: `${r.signer} (${r.signer_id.slice(0, 10)}…), verified` }),
+        el("dt", { text: "Asks for" }), el("dd", { text: r.capabilities }),
+        el("dt", { text: "Evaluation" }), el("dd", { text: r.eval_summary ?? r.evaluation }),
+        el("dt", { text: "Files" }), el("dd", { class: "mono", text: files.join(", ") || "none" })),
+      r.diff ? el("h4", { text: `What changed from ${r.previous}` }) : null,
+      r.diff ? (r.diff.length ? el("ul", { class: "factory-diff" }, ...r.diff.map((d) => el("li", { text: d })))
+        : el("p", { class: "muted small", text: "Nothing but its version." })) : null);
+  } catch (err) {
+    body.replaceChildren(el("p", { class: "form-error", role: "alert", text: err.message }));
+  }
+}
+
+// ---------- deployments ----------
+function renderFactoryDeployments() {
+  const panel = $("#fpanel-deployments");
+  const agent = factoryState.agent;
+  if (!agent) return;
+  const released = (agent.releases ?? []).filter((r) => r.state === "released")
+    .sort((a, b) => (factoryVersionBefore(a.version, b.version) ? 1 : -1));
+  const deployed = agent.deployments ?? [];
+  const parts = [el("p", { class: "muted small", text: "A deployment is a digital worker, named after the agent, that runs one release in the folders you pick, at the access it asks for and never more than a folder gives. Its canary runs the release's smoke cases on it before it takes work; a canary that fails goes back to the release before." })];
+  if (agent.state === "retired") parts.push(el("p", { class: "small", text: "It is retired: its workers stopped, and it isn't deployed again." }));
+  else if (!released.length) parts.push(el("p", { class: "empty" }, "Nothing to deploy yet: ", el("strong", { text: "Releases" }), " makes a release from a passed evaluation."));
+  else parts.push(factoryDeployForm(agent, released));
+  parts.push(el("h3", { text: deployed.length ? `Deployments (${deployed.length})` : "Deployments" }));
+  parts.push(deployed.length
+    ? el("ul", { class: "factory-items", id: "factory-deploy-list" }, ...deployed.map(factoryDeploymentItem))
+    : el("p", { class: "muted small", text: "Not deployed yet." }));
+  if (deployed.length && agent.state !== "retired") {
+    const earlier = released.filter((r) => r.version !== agent.active_version);
+    if (earlier.length) parts.push(factoryRollbackForm(agent, earlier));
+    parts.push(factoryBudgetsForm(agent));
+  }
+  panel.replaceChildren(...parts);
+}
+
+function factoryDeployForm(agent, released) {
+  const version = el("select", {}, ...released.map((r) => el("option", { value: r.version, text: r.version === agent.active_version ? `${r.version} (active)` : r.version })));
+  version.value = agent.active_version ?? released[0].version;
+  const folders = factoryChips("dep-folders", "Folders it works in",
+    (agent.choices?.folders ?? []).map((f) => [f.name, f.name, `${ACCESS_SHORT[f.access] ?? f.access} at most`]),
+    factoryState.draft?.blueprint?.deploy?.folders ?? [], "Its own data folder too. None ticked: the folders its release names.");
+  const canary = el("input", { type: "checkbox", id: "factory-dep-canary", checked: true });
+  const start = el("input", { type: "checkbox", id: "factory-dep-start", checked: true });
+  const error = el("p", { class: "form-error", role: "alert" });
+  const go = el("button", { type: "submit", class: "btn primary", id: "factory-deploy-btn" }, "Deploy");
+  const form = el("form", { class: "factory-inline", novalidate: true },
+    el("h3", { text: "Deploy it" }),
+    el("div", { class: "factory-grid" }, factoryField("factory-dep-version", "Release", version)),
+    folders,
+    el("label", { class: "check" }, canary, el("span", { text: "Run its canary first: the release's smoke cases, on its worker, before it takes work" })),
+    el("label", { class: "check" }, start, el("span", { text: "Start it now (else start it later under Digital workers)" })),
+    error,
+    el("div", { class: "factory-actions" }, go));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    error.textContent = "";
+    go.disabled = true;
+    go.textContent = "Deploying…";
+    try {
+      const body = { version: version.value, canary: canary.checked, start: start.checked };
+      const picked = factoryTicked(form, "dep-folders");
+      if (picked.length) body.folders = picked;
+      const d = await api(`/api/factory/agents/${encodeURIComponent(agent.name)}/deployments`, { method: "POST", body: JSON.stringify(body) });
+      toast(`Deployed ${agent.name} ${d.version} on ${d.worker}${body.canary && body.start ? ": its canary runs first" : ""}`);
+      await refreshFactoryAgent(false);
+      await loadFactory().catch(() => {});
+      (document.getElementById(`factory-power-${d.worker}`) ?? $("#ftab-deployments")).focus();
+    } catch (err) {
+      error.textContent = err.message;
+      go.disabled = false;
+      go.textContent = "Deploy";
+      go.focus();
+    }
+  });
+  return form;
+}
+
+function factoryBudgetsText(b) {
+  if (!b) return "";
+  return [
+    b.tasks_per_day ? `${b.tasks_per_day} tasks a day` : null,
+    b.attempts ? `${factoryPlural(b.attempts, "attempt", "attempts")} a task` : null,
+    b.timeout_secs ? `${factoryPlural(Math.round(b.timeout_secs / 60), "minute", "minutes")} a task` : null,
+  ].filter(Boolean).join(", ");
+}
+
+function factoryDeploymentItem(d) {
+  const [label, kind] = FACTORY_DEPLOY_STATES[d.state] ?? [d.state, "waiting"];
+  // While it is in its canary, the canary's record is only begun.
+  const canary = d.state === "canary"
+    ? el("span", { class: "small", text: `Its canary runs the release's smoke cases now${d.canary?.evaluation ? ` (${d.canary.evaluation})` : ""}; it takes work once they pass.` })
+    : !d.canary ? null
+      : d.canary.passed
+        ? el("span", { class: "small", text: `Canary passed: ${factoryPlural(d.canary.cases, "smoke case", "smoke cases")}${d.canary.evaluation ? ` (${d.canary.evaluation})` : ""}` })
+        : el("div", { class: "small" },
+          el("span", { class: "warn-text", text: `Canary failed: ${d.canary.failed.length} of ${factoryPlural(d.canary.cases, "smoke case", "smoke cases")}` }),
+          el("ul", {}, ...d.canary.failed.map((f) => el("li", { text: f }))));
+  const budgets = factoryBudgetsText(d.budgets);
+  const power = d.state === "stopped" ? null
+    : el("button", { type: "button", class: "btn small", id: `factory-power-${d.worker}`, "aria-label": `${d.running ? "Stop" : "Start"} ${d.worker}` }, d.running ? "Stop" : "Start");
+  power?.addEventListener("click", () => factoryWorkerPower(d, power));
+  return el("li", { class: "factory-item", "data-worker": d.worker },
+    el("div", { class: "worker-head" },
+      el("strong", { text: d.worker }),
+      el("span", { class: `status ${kind}`, text: label }),
+      el("span", { class: `badge ${d.running ? "ok" : "neutral"}`, text: d.running ? "Running here" : "Not running here" })),
+    el("span", { class: "muted small", text: `Release ${d.version}${d.previous_version ? ` (before: ${d.previous_version})` : ""} · works in ${["its data folder", ...(d.folders ?? [])].join(", ")}${d.at ? ` · changed ${stamp(Date.parse(d.at))}` : ""}` }),
+    canary,
+    budgets ? el("span", { class: "small", text: `Budgets you set: ${budgets}` }) : null,
+    d.note ? el("span", { class: "small", text: d.note }) : null,
+    power ? el("div", { class: "factory-actions start" }, power) : null);
+}
+
+async function factoryWorkerPower(d, button) {
+  button.disabled = true;
+  try {
+    await api(`/api/workers/${encodeURIComponent(d.worker)}/${d.running ? "stop" : "start"}`, { method: "POST" });
+    toast(`${d.running ? "Stopped" : "Started"} ${d.worker}`);
+  } catch (err) {
+    toast(err.message, "error");
+  }
+  await refreshFactoryAgent(false).catch(() => {});
+  (document.getElementById(`factory-power-${d.worker}`) ?? $("#ftab-deployments")).focus();
+}
+
+function factoryRollbackForm(agent, earlier) {
+  const active = agent.active_version;
+  const older = (v) => factoryVersionBefore(v, active);
+  const to = el("select", {}, ...earlier.map((r) => el("option", { value: r.version, text: older(r.version) ? r.version : `${r.version} (newer)` })));
+  const before = earlier.find((r) => older(r.version));
+  if (before) to.value = before.version;
+  // To an earlier release it rolls back; to a newer one (after a rollback), forward again.
+  const way = () => (older(to.value) ? "back" : "forward");
+  const reason = el("input", { type: "text", maxlength: "500", placeholder: "e.g. 1.3.0 misses figures in tables…" });
+  const error = el("p", { class: "form-error", role: "alert" });
+  const go = el("button", { type: "submit", class: "btn danger", id: "factory-rollback-btn" }, `Roll ${way()}`);
+  to.addEventListener("change", () => { go.textContent = `Roll ${way()}`; });
+  const form = el("form", { class: "factory-inline", novalidate: true },
+    el("h3", { text: before ? "Roll back" : "Roll forward" }),
+    el("div", { class: "factory-grid" },
+      factoryField("factory-rb-version", "To release", to),
+      factoryField("factory-rb-reason", "Why", reason, "Kept in its history and audit.")),
+    error,
+    el("div", { class: "factory-actions" }, go));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    error.textContent = "";
+    reason.removeAttribute("aria-invalid");
+    if (!reason.value.trim()) {
+      error.textContent = `Say why you roll it ${way()}.`;
+      reason.setAttribute("aria-invalid", "true");
+      reason.focus();
+      return;
+    }
+    const ok = await confirmDialog({
+      title: `Roll ${agent.name} ${way()} to ${to.value}?`,
+      body: `Its deployments take release ${to.value} within seconds (those running here start again), and plans use it as agent=${agent.name}. Release ${active} stays, for audit and to go back to.`,
+      confirm: `Roll ${way()}`,
+      danger: true,
+    });
+    if (!ok) return;
+    go.disabled = true;
+    go.textContent = "Changing its release…";
+    try {
+      await api(`/api/factory/agents/${encodeURIComponent(agent.name)}/rollback`, { method: "POST", body: JSON.stringify({ to_version: to.value, reason: reason.value.trim() }) });
+      toast(`Rolled ${agent.name} ${way()} to ${to.value}`);
+      await refreshFactoryAgent(false);
+      await loadFactory().catch(() => {});
+      $("#ftab-deployments").focus();
+    } catch (err) {
+      error.textContent = err.message;
+      go.disabled = false;
+      go.textContent = `Roll ${way()}`;
+      go.focus();
+    }
+  });
+  return form;
+}
+
+function factoryBudgetsForm(agent) {
+  const set = (agent.deployments ?? []).find((d) => factoryBudgetsText(d.budgets))?.budgets ?? {};
+  const number = (id, value, max) => el("input", { type: "number", id, min: "1", max: String(max), step: "1", inputmode: "numeric", class: "factory-number", value: value ?? "" });
+  const fields = [
+    ["factory-bud-tasks", "Tasks a day", number("factory-bud-tasks", set.tasks_per_day, 10000), 10000, "tasks_per_day", 1],
+    ["factory-bud-attempts", "Attempts a task", number("factory-bud-attempts", set.attempts, 5), 5, "attempts", 1],
+    ["factory-bud-timeout", "Minutes a task", number("factory-bud-timeout", set.timeout_secs ? Math.round(set.timeout_secs / 60) : "", 10080), 10080, "timeout_secs", 60],
+  ];
+  const error = el("p", { class: "form-error", role: "alert" });
+  const save = el("button", { type: "submit", class: "btn primary", id: "factory-budgets-btn" }, "Save budgets");
+  const clear = el("button", { type: "button", class: "btn", id: "factory-budgets-clear" }, "Use the release's");
+  const form = el("form", { class: "factory-inline", novalidate: true },
+    el("h3", { text: "Budgets" }),
+    el("p", { class: "muted small", text: "Its workers keep to them before any model call: a task over them is refused, and one that runs too long stops. They replace its release's; empty: the release's." }),
+    el("div", { class: "factory-grid" }, ...fields.map(([id, label, input]) => factoryField(id, label, input))),
+    error,
+    el("div", { class: "factory-actions" }, clear, save));
+  const put = async (body, button, done) => {
+    error.textContent = "";
+    button.disabled = true;
+    try {
+      const now = await api(`/api/factory/agents/${encodeURIComponent(agent.name)}/budgets`, { method: "PUT", body: JSON.stringify(body) });
+      toast(`${done}: ${factoryBudgetsText(now) || "no limits"}`);
+      await refreshFactoryAgent(false);
+      $("#factory-budgets-btn")?.focus();
+    } catch (err) {
+      error.textContent = err.message;
+      button.disabled = false;
+      button.focus();
+    }
+  };
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const body = {};
+    for (const [, , input, max, key, scale] of fields) {
+      input.removeAttribute("aria-invalid");
+      const n = factoryNumberOf(input, 1, max);
+      if (n.error) {
+        error.textContent = n.error;
+        input.setAttribute("aria-invalid", "true");
+        input.focus();
+        return;
+      }
+      if (n.value !== undefined) body[key] = n.value * scale;
+    }
+    put(body, save, `Budgets of ${agent.name}`);
+  });
+  clear.addEventListener("click", () => put({}, clear, `${agent.name} keeps its release's budgets`));
+  return form;
+}
+
+// ---------- metrics ----------
+const FACTORY_SINCE = [["24h", "Last 24 hours"], ["7d", "Last 7 days"], ["30d", "Last 30 days"], ["90d", "Last 90 days"]];
+
+async function loadFactoryMetrics() {
+  const panel = $("#fpanel-metrics");
+  const name = factoryState.open;
+  if (!name) return;
+  if (panel.dataset.agent !== name || !$("#factory-metrics")) {
+    panel.dataset.agent = name;
+    const since = el("select", {}, ...FACTORY_SINCE.map(([v, label]) => el("option", { value: v, text: label })));
+    since.value = factoryState.metricsSince;
+    since.addEventListener("change", () => {
+      factoryState.metricsSince = since.value;
+      loadFactoryMetrics();
+    });
+    panel.replaceChildren(
+      el("p", { class: "muted small", text: "Its tasks by release, from the audit logs of the digital workers it is deployed on: counts, times, attempts, checks and models, never what was asked or answered." }),
+      el("div", { class: "factory-grid" }, factoryField("factory-met-since", "Since", since)),
+      el("div", { id: "factory-metrics", role: "status" }, el("p", { class: "muted small", text: "Loading…" })));
+  }
+  const body = $("#factory-metrics");
+  body.setAttribute("aria-busy", "true");
+  try {
+    const m = await api(`/api/factory/agents/${encodeURIComponent(name)}/metrics?since=${encodeURIComponent(factoryState.metricsSince)}`);
+    if (factoryState.open !== name) return;
+    body.replaceChildren(factoryMetricsTable(m));
+  } catch (err) {
+    body.replaceChildren(el("p", { class: "form-error", role: "alert", text: err.message }));
+  } finally {
+    body.removeAttribute("aria-busy");
+  }
+}
+
+function factoryUsage(u) {
+  if (!u) return "–";
+  const parts = [];
+  if (u.input_tokens != null || u.output_tokens != null) parts.push(`${(u.input_tokens ?? 0).toLocaleString()} in, ${(u.output_tokens ?? 0).toLocaleString()} out tokens`);
+  if (u.premium_requests != null) parts.push(`${u.premium_requests.toFixed(1)} premium requests`);
+  if (u.cost_usd != null) parts.push(`$${u.cost_usd.toFixed(2)}`);
+  return parts.join("; ") || "–";
+}
+
+function factoryMetricsTable(m) {
+  if (!m.versions?.length) {
+    return el("p", { class: "empty" }, "No tasks in this time. Deploy it and give its digital worker tasks (", el("strong", { text: "Run task" }),
+      " on it, or a plan with agent=", m.agent, "): they're counted here by release.");
+  }
+  const ran = (v) => v.tasks > v.refused;
+  const head = el("tr", {}, ...["Release", "Tasks", "Done", "Failed", "Refused", "p50", "p95", "Attempts", "Checks passed", "Models", "Usage"].map((h) => el("th", { scope: "col", text: h })));
+  const rows = m.versions.map((v) => el("tr", {},
+    el("th", { scope: "row", text: v.version }),
+    el("td", { text: String(v.tasks) }),
+    el("td", { text: String(v.done) }),
+    el("td", { text: String(v.failed + (v.cancelled ?? 0)), title: v.cancelled ? `${v.cancelled} cancelled` : undefined }),
+    el("td", { text: v.refused ? `${v.refused} (${Object.entries(v.refused_by ?? {}).map(([why, n]) => `${why} ${n}`).join(", ")})` : "0" }),
+    el("td", { text: ran(v) ? `${Math.round(v.p50_secs)}s` : "–" }),
+    el("td", { text: ran(v) ? `${Math.round(v.p95_secs)}s` : "–" }),
+    el("td", { text: ran(v) ? v.attempts.toFixed(1) : "–" }),
+    el("td", { text: v.check_pass_rate == null ? "–" : factoryPercent(v.check_pass_rate) }),
+    el("td", { text: Object.entries(v.models ?? {}).map(([model, n]) => `${model} ${n}`).join(", ") || "–" }),
+    el("td", { text: factoryUsage(v.usage) })));
+  return el("div", { class: "factory-matrix-wrap", tabindex: "0", role: "region", "aria-label": "Tasks by release" },
+    el("table", { class: "factory-matrix" }, el("thead", {}, head), el("tbody", {}, ...rows)));
+}
+
 // ---------- evaluate ----------
 function factoryRunning() {
-  return factoryState.agent?.evaluations?.find((e) => e.running) ?? null;
+  // A deployment's canary runs on its own worker, not as one of the owner's evaluations.
+  return factoryState.agent?.evaluations?.find((e) => e.running && !e.canary) ?? null;
 }
 
 function renderFactoryEvaluate() {
@@ -477,11 +1465,20 @@ async function renderFactoryReports() {
     panel.replaceChildren(el("p", { class: "empty" }, "No evaluations yet. ", el("strong", { text: "Evaluate" }), " proves it on the models it may run on."));
     return;
   }
-  const shown = factoryState.report?.id && evaluations.some((e) => e.id === factoryState.report.id) ? factoryState.report.id : evaluations[0].id;
+  // The newest full evaluation, unless the owner picked another.
+  const picked = factoryState.reportPicked && factoryState.report?.id;
+  const newest = (evaluations.find((e) => !e.canary) ?? evaluations[0]).id;
+  const shown = picked && evaluations.some((e) => e.id === picked) ? picked : newest;
   const pick = el("select", { id: "factory-report-pick", "aria-label": "Evaluation" },
-    ...evaluations.map((e) => el("option", { value: e.id, selected: e.id === shown || undefined, text: `${stamp(Date.parse(e.started))} · ${factoryEvaluationStatus(e)[0]}` })));
+    ...evaluations.map((e) => el("option", {
+      value: e.id, selected: e.id === shown || undefined,
+      text: `${stamp(Date.parse(e.started))} · ${e.canary ? `canary of ${e.canary.version} · ` : ""}${factoryEvaluationStatus(e)[0]}`,
+    })));
   const body = el("div", { id: "factory-report" });
-  pick.addEventListener("change", () => showFactoryReport(pick.value, body));
+  pick.addEventListener("change", () => {
+    factoryState.reportPicked = true;
+    showFactoryReport(pick.value, body);
+  });
   panel.replaceChildren(el("label", { class: "field" }, el("span", { text: "Evaluation" }), pick), body);
   await showFactoryReport(shown, body);
 }
@@ -558,6 +1555,8 @@ function onFactoryEvent(msg) {
   clearTimeout(factoryTimer);
   factoryTimer = setTimeout(async () => {
     await loadFactory().catch(() => {});
+    // Deployments start, stop and change digital workers.
+    if (typeof loadWorkers === "function") loadWorkers().catch(() => {});
     const dialog = $("#factory-agent-dialog");
     if (!dialog.open || (msg.agent && msg.agent !== factoryState.open)) return;
     const running = factoryRunning();
@@ -569,7 +1568,9 @@ function onFactoryEvent(msg) {
       return;
     }
     const focused = document.activeElement?.id;
-    const inDialog = dialog.contains(document.activeElement);
+    // A modal dialog keeps focus in it: on the page's body, it was lost there (a button that
+    // went away or was disabled).
+    const inDialog = dialog.contains(document.activeElement) || document.activeElement === document.body;
     await refreshFactoryAgent(false).catch(() => {});
     // Who cancelled it was told already; an evaluation that ended on its own is news.
     if (msg.state === "passed" || msg.state === "failed") {
@@ -609,5 +1610,16 @@ function onFactoryEvent(msg) {
     if (next === undefined) return;
     e.preventDefault();
     selectFactoryTab(tabs[(next + tabs.length) % tabs.length].dataset.tab, true);
+  });
+  // Configure: the form or JSON, a radio group (arrow keys move between them).
+  const modes = $("#factory-edit-mode");
+  modes.addEventListener("click", (e) => {
+    const mode = e.target.closest("[role=radio]")?.dataset.mode;
+    if (mode) setFactoryEditMode(mode);
+  });
+  modes.addEventListener("keydown", (e) => {
+    if (!["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+    e.preventDefault();
+    setFactoryEditMode(factoryState.editMode === "form" ? "json" : "form", true);
   });
 })();

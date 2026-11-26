@@ -282,7 +282,7 @@ const planBuilder = (() => {
       "me, peers of your allowlist (the GitHub account it has for them) or GitHub logins; none asks no one. Empty: those who signed off before it");
   }
 
-  /// The agent a task acts as (from a plugin or the profile's own): what it brings.
+  /// The agent a task acts as (from the factory, a plugin or the profile's own): what it brings.
   function agentField(s, k) {
     const agents = state.agents ?? [];
     const chosen = planText.valuesOf(s, "agent")[0] ?? "";
@@ -290,17 +290,20 @@ const planBuilder = (() => {
     const label = (a) => `${a.name}${a.description ? `: ${a.description}` : ""}`;
     const pick = select({
       Yours: agents.filter((a) => a.source === "profile").map((a) => [a.name, label(a)]),
+      "From the factory": agents.filter((a) => a.source === "factory").map((a) => [a.name, `${a.name} ${a.version}${a.deprecated ? " (deprecated)" : ""}`]),
       "From plugins": agents.filter((a) => a.source === "plugin").map((a) => [a.name, `${label(a)} (plugin ${a.plugin})`]),
     }, chosen, "None: just the task");
     pick.addEventListener("change", () => { planText.setValues(s, "agent", pick.value || null); changed(true); });
-    const a = agents.find((x) => x.name === chosen);
+    // agent=name@version pins a factory agent's release.
+    const a = agents.find((x) => x.name === chosen) ?? agents.find((x) => x.source === "factory" && `${x.name}@${x.version}` === chosen);
     const brings = a && [
-      "Its instructions come first",
+      a.source === "factory" ? `Its release's instructions come first (${chosen.includes("@") ? `release ${chosen.split("@")[1]}` : `its active release, ${a.version}`})` : "Its instructions come first",
       a.skills.length ? `it follows ${a.skills.join(", ")}` : "",
       a.mcp.length ? `it uses the MCP servers ${a.mcp.join(", ")}, which the folder must offer` : "",
+      a.deprecated ? `it is deprecated: use ${a.deprecated} instead` : "",
     ].filter(Boolean).join("; ");
     return field(`${k}-agent`, "Agent", pick,
-      brings ? `${brings}.` : "A role from a plugin or your own, with its instructions, skills and MCP servers");
+      brings ? `${brings}.` : "A role from the factory, a plugin or your own, with its instructions, skills and MCP servers");
   }
 
   /// The declarative agents Work IQ offers your account (GET /api/workiq/agents), asked for

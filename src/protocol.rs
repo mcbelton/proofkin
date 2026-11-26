@@ -41,6 +41,10 @@ pub enum Message {
         /// older peers and providers without a list don't).
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         offers: crate::models::Offers,
+        /// For a deployed factory agent: the release it runs, `name@version` (older peers
+        /// see its role).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     Peers {
         addrs: Vec<EndpointAddr>,
@@ -412,6 +416,7 @@ mod tests {
             role: None,
             models: models.clone(),
             offers: offers.clone(),
+            agent: Some("fin-analyst@1.2.0".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);

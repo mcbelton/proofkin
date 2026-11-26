@@ -698,14 +698,30 @@
       </div>
       <div class="tabs" role="tablist" aria-label="Agent">
         <button type="button" role="tab" id="ftab-overview" data-tab="overview" aria-controls="fpanel-overview" aria-selected="true">Overview</button>
-        <button type="button" role="tab" id="ftab-blueprint" data-tab="blueprint" aria-controls="fpanel-blueprint" aria-selected="false" tabindex="-1">Blueprint</button>
+        <button type="button" role="tab" id="ftab-blueprint" data-tab="blueprint" aria-controls="fpanel-blueprint" aria-selected="false" tabindex="-1">Configure</button>
         <button type="button" role="tab" id="ftab-evaluate" data-tab="evaluate" aria-controls="fpanel-evaluate" aria-selected="false" tabindex="-1">Evaluate</button>
         <button type="button" role="tab" id="ftab-reports" data-tab="reports" aria-controls="fpanel-reports" aria-selected="false" tabindex="-1">Evaluations</button>
+        <button type="button" role="tab" id="ftab-releases" data-tab="releases" aria-controls="fpanel-releases" aria-selected="false" tabindex="-1">Releases</button>
+        <button type="button" role="tab" id="ftab-deployments" data-tab="deployments" aria-controls="fpanel-deployments" aria-selected="false" tabindex="-1">Deployments</button>
+        <button type="button" role="tab" id="ftab-metrics" data-tab="metrics" aria-controls="fpanel-metrics" aria-selected="false" tabindex="-1">Metrics</button>
       </div>
       <section role="tabpanel" id="fpanel-overview" aria-labelledby="ftab-overview" class="tab-panel factory-panel" tabindex="0"></section>
-      <section role="tabpanel" id="fpanel-blueprint" aria-labelledby="ftab-blueprint" class="tab-panel factory-panel" tabindex="0" hidden></section>
+      <section role="tabpanel" id="fpanel-blueprint" aria-labelledby="ftab-blueprint" class="tab-panel factory-panel" tabindex="0" hidden>
+        <div class="factory-edit-head">
+          <div class="segmented" role="radiogroup" aria-label="Edit with" id="factory-edit-mode">
+            <button type="button" role="radio" data-mode="form" aria-checked="true">Form</button>
+            <button type="button" role="radio" data-mode="json" aria-checked="false" tabindex="-1">JSON</button>
+          </div>
+          <span class="muted small">The form edits its blueprint; JSON edits all of it, its eval suite too.</span>
+        </div>
+        <div id="factory-form-box" class="factory-edit-box"></div>
+        <div id="factory-json-box" class="factory-edit-box" hidden></div>
+      </section>
       <section role="tabpanel" id="fpanel-evaluate" aria-labelledby="ftab-evaluate" class="tab-panel factory-panel" tabindex="0" hidden></section>
       <section role="tabpanel" id="fpanel-reports" aria-labelledby="ftab-reports" class="tab-panel factory-panel" tabindex="0" hidden></section>
+      <section role="tabpanel" id="fpanel-releases" aria-labelledby="ftab-releases" class="tab-panel factory-panel" tabindex="0" hidden></section>
+      <section role="tabpanel" id="fpanel-deployments" aria-labelledby="ftab-deployments" class="tab-panel factory-panel" tabindex="0" hidden></section>
+      <section role="tabpanel" id="fpanel-metrics" aria-labelledby="ftab-metrics" class="tab-panel factory-panel" tabindex="0" hidden></section>
     </div>
   </dialog>
 

@@ -314,6 +314,8 @@ pub struct Catalog {
     pub profiles: BTreeSet<String>,
     /// Names its factory uses: drafts and factory agents.
     pub factory: BTreeSet<String>,
+    /// Its factory's deployments: each digital worker, with the agent it runs.
+    pub deployed: BTreeMap<String, String>,
 }
 
 /// A shared folder: where it is, the most access it gives, its checks, the MCP servers it
@@ -358,6 +360,18 @@ impl Catalog {
         let accounts = profile.account_profile()?;
         let shares = profile.shares()?;
         let topics = profile.knowledge().list();
+        let store = crate::factory::FactoryStore::of(profile);
+        let factory = store.names()?;
+        let mut deployed = BTreeMap::new();
+        for name in &factory {
+            for d in store
+                .state(name)?
+                .map(|s| s.deployments)
+                .unwrap_or_default()
+            {
+                deployed.insert(d.worker, name.clone());
+            }
+        }
         Ok(Self {
             profile: profile.name.clone(),
             skills: skills
@@ -409,18 +423,29 @@ impl Catalog {
             models: profile.models(),
             workiq: profile.workiq_account().is_ok(),
             peers: profile.trust()?.peers.into_iter().map(|p| p.name).collect(),
-            agents: skills.agents().into_iter().map(|a| a.name).collect(),
-            profiles: Profile::list().unwrap_or_default().into_iter().collect(),
-            factory: crate::factory::FactoryStore::of(profile)
-                .names()?
+            // The factory's own agents are under `factory`.
+            agents: skills
+                .agents()
                 .into_iter()
+                .filter(|a| a.source != "factory")
+                .map(|a| a.name)
                 .collect(),
+            profiles: Profile::list().unwrap_or_default().into_iter().collect(),
+            factory: factory.into_iter().collect(),
+            deployed,
         })
     }
 
-    /// The catalog for checking `name`'s own draft: its name is free for it.
+    /// The catalog for checking `name`'s own draft: its name is free for it, and so are the
+    /// names of the digital workers it is deployed on (a profile, and a peer).
     pub fn without(mut self, name: &str) -> Self {
         self.factory.remove(name);
+        for (worker, agent) in &self.deployed {
+            if agent == name {
+                self.profiles.remove(worker);
+                self.peers.remove(worker);
+            }
+        }
         self
     }
 }
@@ -1232,6 +1257,7 @@ pub(crate) mod tests {
             agents: ["sec-reviewer".to_owned()].into(),
             profiles: ["alice".to_owned(), "tester".to_owned()].into(),
             factory: ["old-agent".to_owned()].into(),
+            deployed: BTreeMap::new(),
         }
     }
 
@@ -1362,6 +1388,21 @@ pub(crate) mod tests {
         let mut own = sample();
         own["name"] = json!("old-agent");
         assert!(check_value(&own, &catalog().without("old-agent")).is_empty());
+        // Nor do the digital workers it is deployed on (a profile and a peer named after
+        // it), which stay taken for any other agent.
+        let mut deployed = catalog();
+        for names in [
+            &mut deployed.factory,
+            &mut deployed.profiles,
+            &mut deployed.peers,
+        ] {
+            names.insert("notes".into());
+        }
+        deployed.deployed.insert("notes".into(), "notes".into());
+        own["name"] = json!("notes");
+        assert!(check_value(&own, &deployed.clone().without("notes")).is_empty());
+        let other = check_value(&own, &deployed.without("old-agent"));
+        assert_eq!(codes(&other), [("name_taken", true, "/name".into())]);
     }
 
     #[test]

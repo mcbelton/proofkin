@@ -1445,13 +1445,77 @@ proofkin factory report ev-20261124-091500-fin-analyst --json --out D:\src\fin-a
   with its fix. `agent:report` needs a passed, verified report of exactly the folder's build
   in `agent/reports/`. A step proves the folder with
   `verify=agent:blueprint,agent:evals,agent:report`, with read access.
+- `factory release NAME --from FOLDER` releases exactly the folder's commit (its `agent/`
+  must have nothing uncommitted), from the passed report of its build that you signed and
+  kept in `agent/reports/`; the release's provenance names the commit. The
+  **`agent-factory` playbook** builds such an agent with peers: its blueprint and suite
+  (skills `agent-blueprint` and `agent-evals`, each proven by its `agent:` check), your
+  evaluation, a red-team squad's review, the security champion's sign-off, then yours
+  (`proofkin playbook show agent-factory --set peer=alice --set folder=agents --set change="Answers questions about the team notes" --set change_id=notes`).
 
-In the web UI, the **Agent factory** card lists your agents and drafts, and starts one from a
-template or your words. An agent's dialog has its overview, its blueprint (edited and
-checked as you save), **Evaluate** (the estimate first, then live progress) and
-**Evaluations** (the gate, each model's results and the failing runs). Other agents draft,
-check and evaluate agents [over MCP](#connect-other-agents-mcp-and-a2a); releasing,
-deploying and approving stay with you.
+**Releases and deployments** run an agent once it has passed:
+
+```powershell
+proofkin factory release fin-analyst --evaluation ev-20261124-091500-fin-analyst --note "Quotes pages" --profile alice   # signed; --version 1.3.0 to choose
+proofkin factory approve fin-analyst --profile alice          # your sign-off (--reject --note WHY); peers answer when asked
+proofkin factory verify fin-analyst@1.2.0 --profile alice     # offline: every file, the signature and each sign-off
+proofkin factory diff fin-analyst 1.1.0 1.2.0 --profile alice # what changed: requirements, capabilities, model, budgets
+proofkin factory deploy fin-analyst --start --profile alice   # a digital worker runs it; its canary first (--no-canary), --folders, --version
+proofkin factory rollback fin-analyst --reason "misses tables" --profile alice   # every deployment back to the release before (--to VERSION)
+proofkin factory metrics fin-analyst --since 7d --profile alice   # tasks by release: done, failed, refused, p50/p95, attempts, checks, models, usage
+proofkin factory budget fin-analyst --tasks-per-day 50 --attempts 2 --timeout 20m --profile alice   # --clear: the release's
+proofkin factory deprecate fin-analyst --replacement fin-analyst-2 --profile alice   # reactivate NAME undoes it
+proofkin factory retire fin-analyst --reason "replaced" --profile alice   # --purge deletes its releases and reports after 90 days
+```
+
+- A **release** (`proofkin.agent-release/v1`) is a signed manifest of exactly one build that
+  passed: its files' hashes, its evaluation, the model it recommended (and those that
+  passed), its capabilities and who must accept it. Its version follows what changed: a
+  changed or removed requirement is a major version, a new requirement or capability a
+  minor one; versions are never reused or lowered.
+- Its **approvers** (`approvers` in the blueprint: `me` and peers on your allowlist) answer
+  first, asked when your agent runs and they are connected; then you sign off on anything it
+  asks for beyond the release before. Until then it waits, and plans keep using the active
+  release. Every sign-off is signed evidence of exactly that release.
+- Plans use the active release as `agent=NAME` (or a fixed one as `agent=NAME@1.2.0`); the
+  plan check warns about a deprecated agent and names its replacement, and refuses a retired
+  one.
+- A **deployment** is a digital worker named after the agent that runs one release, in the
+  folders you pick (at most the access it asks for, with only the MCP servers and tools it
+  asks for). Its **canary** first runs the release's smoke cases on it; until they pass it
+  takes only those tasks, and a canary that fails goes back to the release before (or stops
+  the worker). It keeps to its **budgets** before any model call: tasks a day, attempts and
+  a timeout; a task over them is refused and says why.
+- Its tasks' audit entries name the release (`fin-analyst@1.2.0`), the attempts and checks,
+  and what refused them, never their text: `factory metrics` and the **Agents** section of
+  `proofkin ops report` count them by release.
+- The factory's own audit log (`factory/audit.jsonl`) keeps every release, sign-off,
+  deployment, rollback, budget, deprecation and retirement.
+
+In the web UI, the **Agent factory** card lists your agents and drafts with their active
+release, sign-offs waiting and deployments, and starts one from a template or your words. An
+agent's dialog has:
+
+- **Overview**: what it asks for, its release and deployments, its problems, and its
+  lifecycle (deprecate it in favor of another agent, reactivate or retire it) with its
+  history.
+- **Configure**: its blueprint as a form (title, purpose, requirements, instructions,
+  skills, access, MCP servers and tools, checks, Microsoft 365 sources, delegation, models,
+  memory, budgets, deploy folders and approvers), with choices from what you have; **JSON**
+  edits all of it, its eval suite too. Both are checked as you save.
+- **Evaluate** (the estimate first, then live progress) and **Evaluations** (the gate, each
+  model's results and the failing runs).
+- **Releases**: release a passed evaluation (version and note), each release's state,
+  sign-offs (yours answered right there), what changed and what it holds.
+- **Deployments**: deploy a release (folders, canary, start now), each deployment's canary
+  and state, start or stop its worker, roll back with a reason, and its budgets.
+- **Metrics**: its tasks by release since 24 hours to 90 days ago.
+
+A deployed agent's worker shows the release it runs under **Digital workers** (with **Open
+agent**), under **Connected peers** and in **Run task**'s **Run on** list; the plan editor's
+**Agent** field and **Plugins & tools › Agents** list the factory's agents with their active
+release. Other agents draft, check and evaluate agents [over MCP](#connect-other-agents-mcp-and-a2a);
+releasing, deploying and approving stay with you.
 
 **Plan check.** Before a plan runs, it is checked against what exists now:
 

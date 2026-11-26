@@ -15,7 +15,7 @@ use crate::factory::evals::check_fixtures;
 use crate::factory::report::{EvalState, Evaluation, RunState};
 use crate::factory::runner::{self, Judges, Planned, Request, Runner};
 use crate::factory::store::{Draft, FactoryStore, Provenance, now};
-use crate::factory::{capabilities, code, draft, routing, templates};
+use crate::factory::{capabilities, code, draft, manage, routing, templates};
 use crate::llm::{ExecutorConfig, Provider, SdkExecutor};
 use crate::profile::Profile;
 use crate::workers::{Launch, Supervisor};
@@ -199,6 +199,165 @@ examples:
         #[command(flatten)]
         profile: ProfileOpt,
     },
+    /// Release an evaluated build: a semantic version and a manifest of its files' hashes,
+    /// signed with your identity key. It waits for the approvers its blueprint names
+    /// (and, when it asks for more than the active release, for you, last).
+    #[command(after_help = "\
+examples:
+  proofkin factory release fin-analyst --evaluation ev-20261124-091500-fin-analyst --note \"Cites pages\" --profile alice
+  proofkin factory release fin-analyst --from D:\\src\\fin-analyst --profile alice   (an agent kept as code, at its commit)
+The version is the next patch by default; new requirements or capabilities make it minor,
+a changed or removed requirement major. You may choose a higher one, never a lower one.")]
+    Release {
+        name: String,
+        /// The evaluation that passed the gate for exactly the build to release.
+        #[arg(long, required_unless_present = "from")]
+        evaluation: Option<String>,
+        /// The version to give it (MAJOR.MINOR.PATCH; default: what its change needs).
+        #[arg(long)]
+        version: Option<String>,
+        /// What changed, for its approvers (at most 1,000 characters).
+        #[arg(long)]
+        note: Option<String>,
+        /// Release the agent kept as code in this folder, at its commit, with the passed
+        /// report in its agent/reports.
+        #[arg(long, conflicts_with = "evaluation")]
+        from: Option<PathBuf>,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Sign off (or reject) a release that waits for you; approvers on your allowlist are
+    /// asked by your agent while it runs.
+    Approve {
+        name: String,
+        /// The release (default: the one waiting).
+        #[arg(long)]
+        version: Option<String>,
+        /// Reject it: the active release stays.
+        #[arg(long)]
+        reject: bool,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Check a release offline (NAME@VERSION), or every release of an agent: its
+    /// signature, every file's hash, its report and its approvals.
+    Verify {
+        /// NAME or NAME@VERSION.
+        target: String,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// What changed between two releases: requirements, instructions, skills,
+    /// capabilities, model, budgets and files.
+    Diff {
+        name: String,
+        from: String,
+        to: String,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Deploy a release as a digital worker named after the agent, pinned to it: every
+    /// task it serves gets the release's instructions and skills first. Its canary runs
+    /// the release's smoke cases on it before it takes work.
+    #[command(after_help = "\
+examples:
+  proofkin factory deploy fin-analyst --start --profile alice              (its active release, in its deploy folders; canary first)
+  proofkin factory deploy fin-analyst --version 1.1.0 --folders reports --start --profile alice
+Peers delegate to the worker as to any worker, within their grants, the folder's access
+and the agent's budgets. If its canary fails it goes back to the release it ran before,
+or stops when there was none.")]
+    Deploy {
+        name: String,
+        /// The release (default: the active one).
+        #[arg(long)]
+        version: Option<String>,
+        /// The shared folders it works in (comma-separated; default: its deploy folders).
+        #[arg(long, value_delimiter = ',')]
+        folders: Vec<String>,
+        /// Take work at once, without running its smoke cases first.
+        #[arg(long)]
+        no_canary: bool,
+        /// Start its worker now (and with your agent from now on), and run its canary.
+        #[arg(long)]
+        start: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+        /// Node bridge script for the Claude and Codex SDKs (default: the one `setup` installed).
+        #[arg(long, env = "PROOFKIN_BRIDGE")]
+        bridge: Option<PathBuf>,
+    },
+    /// Make an earlier release active on every deployment (within seconds), audited.
+    Rollback {
+        name: String,
+        /// The release to go back to (default: the one before the active one).
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        reason: String,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Deprecate an agent: plan checks warn about it and name its replacement.
+    Deprecate {
+        name: String,
+        #[arg(long)]
+        replacement: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Make a deprecated agent active again.
+    Reactivate {
+        name: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Retire an agent: plans can't use it, its deployments stop, and its releases and
+    /// reports are kept for audit (--purge: deleted 90 days from now).
+    Retire {
+        name: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        purge: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// An agent's metrics per version, from its deployments' audits: tasks, done,
+    /// failed, refused, p50 and p95 duration, attempts, check pass rate, models and usage.
+    Metrics {
+        name: String,
+        /// Since when: 7d, 24h, a date or a time.
+        #[arg(long, default_value = "7d")]
+        since: String,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Change a deployed agent's budgets: its worker refuses a task that would go over
+    /// them before any model call, and stops one that runs too long.
+    Budget {
+        name: String,
+        #[arg(long)]
+        tasks_per_day: Option<u32>,
+        /// Model attempts a task may ask for, 1 to 5.
+        #[arg(long)]
+        attempts: Option<u32>,
+        /// The longest a task runs (e.g. 20m, 1h).
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Back to its release's budgets.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
 }
 
 pub async fn run(command: FactoryCommand) -> Result<()> {
@@ -316,6 +475,117 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
             }
             println!("profile '{}': deleted {name}", profile.name);
         }
+        FactoryCommand::Release {
+            name,
+            evaluation,
+            version,
+            note,
+            from,
+            profile,
+        } => manage::release(
+            &Profile::open(&profile.name)?,
+            &name,
+            evaluation,
+            version,
+            note,
+            from.as_deref(),
+        )?,
+        FactoryCommand::Approve {
+            name,
+            version,
+            reject,
+            note,
+            profile,
+        } => manage::approve(
+            &Profile::open(&profile.name)?,
+            &name,
+            version.as_deref(),
+            reject,
+            &note,
+        )?,
+        FactoryCommand::Verify { target, profile } => {
+            manage::verify(&Profile::open(&profile.name)?, &target)?
+        }
+        FactoryCommand::Diff {
+            name,
+            from,
+            to,
+            profile,
+        } => manage::diff(&Profile::open(&profile.name)?, &name, &from, &to)?,
+        FactoryCommand::Deploy {
+            name,
+            version,
+            folders,
+            no_canary,
+            start,
+            profile,
+            bridge,
+        } => {
+            manage::deploy(
+                &Profile::open(&profile.name)?,
+                &name,
+                version,
+                (!folders.is_empty()).then_some(folders),
+                no_canary,
+                start,
+                bridge,
+            )
+            .await?
+        }
+        FactoryCommand::Rollback {
+            name,
+            to,
+            reason,
+            profile,
+        } => manage::rollback(
+            &Profile::open(&profile.name)?,
+            &name,
+            to.as_deref(),
+            &reason,
+        )?,
+        FactoryCommand::Deprecate {
+            name,
+            replacement,
+            reason,
+            profile,
+        } => manage::deprecate(
+            &Profile::open(&profile.name)?,
+            &name,
+            &replacement,
+            reason.as_deref(),
+        )?,
+        FactoryCommand::Reactivate {
+            name,
+            reason,
+            profile,
+        } => manage::reactivate(&Profile::open(&profile.name)?, &name, reason.as_deref())?,
+        FactoryCommand::Retire {
+            name,
+            reason,
+            purge,
+            profile,
+        } => manage::retire(&Profile::open(&profile.name)?, &name, &reason, purge)?,
+        FactoryCommand::Metrics {
+            name,
+            since,
+            json,
+            profile,
+        } => manage::print_metrics(&Profile::open(&profile.name)?, &name, &since, json)?,
+        FactoryCommand::Budget {
+            name,
+            tasks_per_day,
+            attempts,
+            timeout,
+            clear,
+            profile,
+        } => manage::budget(
+            &Profile::open(&profile.name)?,
+            &name,
+            tasks_per_day,
+            attempts,
+            timeout.as_deref(),
+            clear,
+        )?,
     }
     Ok(())
 }
@@ -602,6 +872,7 @@ fn show(profile: &Profile, name: &str, json: bool) -> Result<()> {
             println!("    {}  {}", e.id, evaluation_line(e, running));
         }
     }
+    manage::print_releases(profile, name)?;
     if let Some(state) = &state {
         println!("  history:");
         for change in state.history.iter().rev().take(10) {

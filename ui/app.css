@@ -340,7 +340,7 @@ textarea { resize: vertical; }
 .factory-template .t-title { font-weight: 600; }
 .factory-template .t-purpose { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
 .factory-panel h3 { font-size: 13px; margin: 0; }
-/* On a phone its four tabs take two lines rather than run past the dialog. */
+/* On a phone its seven tabs wrap rather than run past the dialog. */
 #factory-agent-dialog .tabs { flex-wrap: wrap; }
 #factory-new-progress:empty { display: none; }
 .factory-panel .card-head { margin: 0; }
@@ -365,6 +365,59 @@ textarea { resize: vertical; }
 .factory-matrix thead th { color: var(--muted); font-weight: 600; background: var(--surface-2); }
 .factory-matrix tbody tr:last-child > * { border-bottom: none; }
 .factory-panel progress { width: 100%; height: 10px; accent-color: var(--accent); }
+/* An agent's badges in the list: its active release, sign-offs waiting, deployments. */
+.factory-badges { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-top: 2px; }
+.factory-badges .badge { margin-left: 0; }
+/* Configure: the blueprint as a form (structured first), or as JSON. */
+.factory-edit-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.factory-edit-box { display: flex; flex-direction: column; gap: 14px; }
+.factory-edit-box[hidden] { display: none; }
+.factory-form { display: flex; flex-direction: column; gap: 16px; padding: 0; }
+.factory-form-section { display: flex; flex-direction: column; gap: 10px; padding-top: 14px; border-top: 1px solid var(--border); min-width: 0; }
+.factory-form-section:first-child { padding-top: 0; border-top: 0; }
+.factory-form-section > p, .factory-inline > p { margin: 0; }
+/* Its fields' values read as values, not as labels (dialog inputs inherit their label's weight). */
+.factory-panel .field input, .factory-panel .field select, .factory-panel .field textarea { font-weight: 400; }
+.factory-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px 16px; align-items: start; }
+.factory-grid input[type="text"], .factory-grid select { width: 100%; min-width: 0; }
+.factory-number { width: 100%; max-width: 170px; }
+.factory-instructions { width: 100%; min-height: 150px; font-family: var(--mono); font-size: 12.5px; }
+.factory-chips { max-height: 176px; overflow-y: auto; overscroll-behavior: contain; padding: 2px; }
+.factory-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.factory-row { display: grid; gap: 6px; align-items: center; min-width: 0; }
+.factory-row > input, .factory-row > select { width: 100%; min-width: 0; }
+.factory-row.req { grid-template-columns: 2.6em minmax(0, 1fr) auto; }
+.factory-row.mcp { grid-template-columns: minmax(0, .8fr) minmax(0, 1fr) minmax(0, 1.4fr) auto; }
+.factory-row.cand { grid-template-columns: minmax(0, .8fr) minmax(0, 1.4fr) minmax(0, .9fr) auto; }
+.factory-row .req-id { color: var(--muted); font-size: 12.5px; }
+.factory-row .btn.small { align-self: center; }
+.factory-row-hint { grid-column: 1 / -1; font-weight: 400; }
+/* On a phone a row's fields stack, each the panel's width. */
+@media (max-width: 640px) {
+  .factory-row.mcp, .factory-row.cand { grid-template-columns: minmax(0, 1fr); }
+  .factory-row.mcp .btn.small, .factory-row.cand .btn.small { justify-self: start; }
+}
+/* Releases, deployments and the lifecycle: items, and the forms that change them. */
+.factory-items { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.factory-item { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); font-size: 13px; min-width: 0; overflow-wrap: anywhere; }
+.factory-item ul { margin: 2px 0; padding-left: 18px; }
+.factory-item .badge { margin-left: 0; }
+.factory-inline { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); min-width: 0; }
+.factory-inline[hidden] { display: none; }
+.factory-inline textarea { width: 100%; }
+.factory-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.factory-actions.start, .factory-lifecycle .factory-actions { justify-content: flex-start; }
+.factory-actions .btn.small { align-self: center; }
+.factory-lifecycle { display: flex; flex-direction: column; gap: 8px; }
+.factory-lifecycle > p { margin: 0; }
+.factory-history { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; display: grid; gap: 3px; }
+.factory-history-box summary, .factory-release-details summary, .factory-own-answer summary { cursor: pointer; font-size: 12.5px; color: var(--accent); width: fit-content; }
+.factory-own-answer { display: flex; flex-direction: column; gap: 6px; margin: 2px 0; padding: 8px 10px; border: 1px solid var(--accent); border-radius: var(--radius-sm); background: var(--accent-soft); }
+.factory-own-answer .result { margin-top: 6px; max-height: 260px; overflow: auto; overscroll-behavior: contain; }
+.factory-own-answer .form-error:empty { display: none; }
+.factory-diff { margin: 4px 0 0; padding-left: 18px; }
+.factory-release-details .facts { margin-top: 6px; }
+.factory-release-details h4 { margin: 8px 0 0; font-size: 12.5px; }
 .worker-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
 .worker-head .name { min-width: 0; }
 .worker .sub { margin-top: 2px; }

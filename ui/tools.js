@@ -976,6 +976,8 @@ function renderAgentList() {
       el("div", { class: "task-top" },
         el("span", { class: "mono", text: `agent=${a.name}` }),
         a.plugin ? el("span", { class: "badge neutral", text: `plugin ${a.plugin}` }) : null,
+        a.version ? el("span", { class: "badge ok", title: "The factory's active release: plans use it", text: `release ${a.version}` }) : null,
+        a.deprecated ? el("span", { class: "badge busy", text: `deprecated: use ${a.deprecated}` }) : null,
         removable ? el("button", { type: "button", class: "btn small danger", onclick: () => removeAgent(a.name) }, "Remove") : null),
       a.description ? el("div", { class: "task-meta", text: a.description }) : null,
       agentUses(a),
@@ -987,6 +989,7 @@ function renderAgentList() {
     el("ul", { class: "tool-list compact" }, ...agents.map((a) => item(a, removable)))) : null;
   const groups = [
     group("Yours", tools.agents.filter((a) => a.source === "profile"), true),
+    group("From the factory", tools.agents.filter((a) => a.source === "factory"), false),
     group("From plugins", tools.agents.filter((a) => a.source === "plugin"), false),
   ].filter(Boolean);
   box.replaceChildren(...(groups.length ? groups

@@ -284,6 +284,13 @@ pub struct CandidateResult {
     pub runs: Tally,
 }
 
+/// The deployment a canary ran on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryOf {
+    pub worker: String,
+    pub version: String,
+}
+
 /// An evaluation's estimate: what it would run, before anything does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Estimate {
@@ -379,6 +386,11 @@ pub struct Evaluation {
     /// Why it stopped before it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// For a deployment's canary: the worker and the release it ran. Its runs are the
+    /// release's smoke cases on its model, and their tasks carry no instructions: the
+    /// deployed worker gives them its release's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary: Option<CanaryOf>,
     /// The evaluating agent, and its signature (hex) over the report (see the module).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signer: String,
@@ -725,6 +737,12 @@ impl Evaluation {
     /// failing runs with their outputs.
     pub fn markdown(&self) -> String {
         let mut text = format!("# Evaluation {} of {}\n\n", self.id, self.agent);
+        if let Some(c) = &self.canary {
+            text += &format!(
+                "The canary of release {} on its deployment {}: its smoke cases, on its model.\n\n",
+                c.version, c.worker
+            );
+        }
         let verdict = match self.state {
             EvalState::Running => "**RUNNING**".to_owned(),
             EvalState::Passed => "**PASSED**".to_owned(),
@@ -956,6 +974,7 @@ pub(crate) mod tests {
             gate: Gate::default(),
             recommended: None,
             error: None,
+            canary: None,
             signer: String::new(),
             signer_id: String::new(),
             signature: String::new(),

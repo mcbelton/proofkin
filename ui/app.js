@@ -368,8 +368,8 @@ function renderPeers() {
       avatar(p.name, true),
       el("div", { class: "who" },
         el("span", { class: "name", text: p.name }),
-        p.owner || p.role
-          ? el("span", { class: "role", text: [p.owner ? `Digital worker of ${p.owner}` : null, p.role].filter(Boolean).join(" · ") })
+        p.owner || p.role || p.agent
+          ? el("span", { class: "role", text: [p.owner ? `Digital worker of ${p.owner}` : null, p.agent ? `runs ${p.agent}` : null, p.role].filter(Boolean).join(" · ") })
           : null,
         el("span", { class: "sub" },
           el("span", { class: "mono", text: p.short }),
@@ -1765,6 +1765,17 @@ const VAR_HELP = {
   project: "The project's name",
   spec: "The feature's folder on this computer: specs/NNN-name in a Spec Kit project, or openspec/changes/<id> (a project folder with one feature works too)",
 };
+/// Help that differs in one playbook.
+const PLAYBOOK_VAR_HELP = {
+  "agent-factory": {
+    change: "What the agent does, in a sentence",
+    change_id: "The agent's name (letters, digits, -), as in proofkin factory",
+    folder: "The folder (a git repository, shared with worktrees) the agent is kept in as code",
+    reviewers: "The red-team squad: its members review the agent independently",
+    security_champion: "Who accepts the agent's capabilities and threats",
+    approver: "Who evaluates and releases the agent: its owner",
+  },
+};
 
 /// The playbook picker's step: "pick" (the list and what each does) or "fill" (who and where).
 function setPlaybookStep(step) {
@@ -1883,7 +1894,8 @@ function renderPlaybookVars(name) {
     field.required = v.default == null;
     const noWorker = v.name === "peer" && !workers.length;
     const help = noWorker ? NO_WORKER
-      : CHECK_VARS.has(v.name) ? `The folder's check that runs as "${v.name}"` : VAR_HELP[v.name];
+      : CHECK_VARS.has(v.name) ? `The folder's check that runs as "${v.name}"`
+      : PLAYBOOK_VAR_HELP[p.name]?.[v.name] ?? VAR_HELP[v.name];
     if (help) field.setAttribute("aria-describedby", `${field.id}-hint`);
     box.append(el("div", { class: "field" },
       el("label", { for: field.id, text: field.required ? `${v.name} (required)` : v.name }),
@@ -3530,7 +3542,9 @@ function renderTaskOptions() {
   if (provider && state.me?.providers.includes(provider)) targets.push(["local", "This agent"]);
   const serving = state.peers.filter((p) => p.capabilities.includes(provider));
   if (serving.length > 1) targets.push(["auto", "Any peer"]);
-  for (const p of serving) targets.push([p.id, p.name]);
+  // A deployed factory agent says which release it runs: "fin-analyst (1.2.0)".
+  const release = (p) => (!p.agent ? "" : p.agent.startsWith(`${p.name}@`) ? ` (${p.agent.slice(p.name.length + 1)})` : ` (${p.agent})`);
+  for (const p of serving) targets.push([p.id, `${p.name}${release(p)}`]);
   // Squads with an online member that serves the provider: the task goes to the least busy.
   const squads = (state.squads ?? []).filter((s) => squadServing(s, provider).length)
     .map((s) => [`#${s.name}`, `#${s.name} · ${s.members.filter((m) => m.online).length}/${s.members.length} online`]);
@@ -3983,10 +3997,14 @@ function connectEvents() {
     else if (msg.type === "workers") loadWorkers().catch((err) => toast(err.message, "error"));
     else if (msg.type === "factory") onFactoryEvent(msg);
     else if (msg.type === "approvals") {
-      const before = state.approvals?.length ?? 0;
+      const before = new Set((state.approvals ?? []).map((a) => a.id));
       state.approvals = msg.approvals;
       renderApprovals();
-      if (msg.approvals.length > before) toast("A teammate asks for your approval");
+      if (typeof onFactoryApprovals === "function") onFactoryApprovals();
+      const asked = msg.approvals.filter((a) => !before.has(a.id));
+      // The factory asks you to sign off your own releases; a teammate asks for the rest.
+      if (asked.some((a) => !/^(Release|Sign off) agent /.test(a.title ?? ""))) toast("A teammate asks for your approval");
+      else if (asked.length) toast("A release of yours waits for your sign-off");
     }
     else if (msg.type === "me") {
       state.me = msg.me;
