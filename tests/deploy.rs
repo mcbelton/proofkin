@@ -67,6 +67,7 @@ fn allowed(name: &str, key: &SecretKey, shares: &[&str]) -> TrustedPeer {
         shares: shares.iter().map(|s| s.to_string()).collect(),
         m365: None,
         github: None,
+        agents: Vec::new(),
     }
 }
 

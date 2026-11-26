@@ -33,11 +33,14 @@ pub mod adversarial;
 pub mod blueprint;
 pub mod build;
 pub mod capabilities;
+pub mod catalog;
 pub mod cli;
 pub mod code;
 pub mod deploy;
 pub mod draft;
+pub mod drift;
 pub mod evals;
+pub mod improve;
 pub mod judge;
 pub mod lifecycle;
 pub mod manage;
@@ -55,7 +58,7 @@ pub use blueprint::{Blueprint, Catalog, Problem};
 pub use store::FactoryStore;
 
 /// Why the factory won't do what it was asked: what is wrong, and which kind of wrong, so
-/// the web UI's API answers with the status code its contract gives (404, 400 or 409).
+/// the web UI's API answers with the status code its contract gives (404, 400, 409 or 422).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub kind: RefusalKind,
@@ -72,6 +75,9 @@ pub enum RefusalKind {
     /// It can't be done as things are: an evaluation that didn't pass, a capability the
     /// folders don't offer, an agent that is retired.
     Conflict,
+    /// What came from a peer doesn't verify: an imported bundle with a changed file, a
+    /// manifest signed by another key, a missing artifact.
+    Unprocessable,
 }
 
 impl fmt::Display for Refusal {
@@ -101,6 +107,14 @@ pub fn invalid(message: impl Into<String>) -> anyhow::Error {
 pub fn conflict(message: impl Into<String>) -> anyhow::Error {
     Refusal {
         kind: RefusalKind::Conflict,
+        message: message.into(),
+    }
+    .into()
+}
+
+pub fn unprocessable(message: impl Into<String>) -> anyhow::Error {
+    Refusal {
+        kind: RefusalKind::Unprocessable,
         message: message.into(),
     }
     .into()

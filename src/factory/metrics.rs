@@ -397,6 +397,9 @@ mod tests {
             ],
             replacement: None,
             purge_after: None,
+            watch: None,
+            publication: None,
+            imported: None,
             history: Vec::new(),
         };
         let metrics = of_entries("fin-analyst", &entries, parse_since("7d", now).unwrap());

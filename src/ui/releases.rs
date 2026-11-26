@@ -1,8 +1,9 @@
 //! The web UI's API for released agents (docs/agent-factory.md, sections 8 to 11), as its
 //! contract says (docs/agent-factory/spec/openapi.json): releases and their sign-offs (the
 //! owner's own come under **Waiting for your approval**, asked by the factory's sign-off
-//! driver), deployments and their canary, rollback, deprecation and retirement, metrics and
-//! budgets. Behind the web UI's token; over MCP every one of these stays with the owner.
+//! driver), deployments and their canary, rollback, deprecation and retirement, metrics,
+//! budgets and drift watches. Behind the web UI's token; over MCP every one of these stays
+//! with the owner.
 
 use std::sync::Arc;
 
@@ -17,16 +18,17 @@ use crate::factory::blueprint::Budgets;
 use crate::factory::deploy::{self, DeployAsk, Host};
 use crate::factory::lifecycle::{self, LifecycleRequest};
 use crate::factory::release::{self, Asked, Release};
-use crate::factory::store::{DeploymentRecord, FactoryStore};
-use crate::factory::{RefusalKind, metrics, refusal_kind};
+use crate::factory::store::{DeploymentRecord, DriftWatch, FactoryStore};
+use crate::factory::{RefusalKind, drift, metrics, refusal_kind};
 use crate::workers::Process;
 
 /// A factory refusal with the status code its contract gives it.
-fn refused(e: anyhow::Error) -> ApiError {
+pub(super) fn refused(e: anyhow::Error) -> ApiError {
     let code = match refusal_kind(&e) {
         Some(RefusalKind::NotFound) => StatusCode::NOT_FOUND,
         Some(RefusalKind::Invalid) => StatusCode::BAD_REQUEST,
         Some(RefusalKind::Conflict) => StatusCode::CONFLICT,
+        Some(RefusalKind::Unprocessable) => StatusCode::UNPROCESSABLE_ENTITY,
         None => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, Json(json!({ "error": format!("{e:#}") })))
@@ -40,7 +42,7 @@ fn not_found(name: &str) -> ApiError {
 }
 
 /// Checks `name` names one of the factory's agents.
-fn known(store: &FactoryStore, name: &str) -> Result<(), ApiError> {
+pub(super) fn known(store: &FactoryStore, name: &str) -> Result<(), ApiError> {
     if crate::profile::validate_name(name).is_err() || store.state(name).ok().flatten().is_none() {
         return Err(not_found(name));
     }
@@ -394,8 +396,94 @@ pub(super) async fn set_budgets(
     Ok(Json(serde_json::to_value(now).map_err(internal)?))
 }
 
+/// A drift watch as the contract has it.
+#[derive(Debug, Deserialize)]
+pub(super) struct WatchBody {
+    when: String,
+    fail_after: u32,
+    enabled: bool,
+}
+
+pub(super) async fn set_watch(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<WatchBody>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = s.profile_now();
+    known(&FactoryStore::of(&profile), &name)?;
+    let ask = drift::WatchAsk {
+        when: body.when,
+        fail_after: body.fail_after,
+        enabled: body.enabled,
+    };
+    let set = drift::set(&profile, &name, &ask, &profile.name).map_err(refused)?;
+    s.system(
+        "info",
+        if set.enabled {
+            format!(
+                "Drift watch of {name}: {}, an incident after {} failed runs in a row",
+                set.when, set.fail_after
+            )
+        } else {
+            format!("Drift watch of {name} paused")
+        },
+    );
+    s.send(json!({ "type": "factory", "agent": name }));
+    s.send(json!({ "type": "ops" }));
+    Ok(Json(
+        json!({ "when": set.when, "fail_after": set.fail_after, "enabled": set.enabled }),
+    ))
+}
+
+/// How many days of a drift watch's runs its page shows (its SLO's window).
+const TREND_DAYS: u64 = 28;
+
+/// A drift watch for the page: the watch, when it runs next, its last run, its trend (each
+/// run's pass rate over [`TREND_DAYS`] days) and its incidents.
+pub(super) fn watch_view(profile: &crate::profile::Profile, name: &str, w: &DriftWatch) -> Value {
+    let ops = profile.ops_store();
+    let monitor = drift::monitor(name);
+    let since = crate::runs::unix_now().saturating_sub(TREND_DAYS * 86_400);
+    let samples: Vec<_> = ops
+        .samples(since)
+        .into_iter()
+        .filter(|x| x.monitor == monitor)
+        .collect();
+    let passed = samples.iter().filter(|x| x.ok).count();
+    let trend: Vec<Value> = samples
+        .iter()
+        .rev()
+        .take(30)
+        .rev()
+        .map(|x| json!({ "ts": x.ts, "ok": x.ok, "pass_rate": x.pass_rate }))
+        .collect();
+    let incidents: Vec<Value> = ops
+        .incidents(since)
+        .into_iter()
+        .filter(|e| e.monitor == monitor)
+        .rev()
+        .take(20)
+        .map(|e| json!({ "ts": e.ts, "incident": e.incident, "kind": e.kind, "text": e.text }))
+        .collect();
+    json!({
+        "when": w.when,
+        "fail_after": w.fail_after,
+        "enabled": w.enabled,
+        "next_run": drift::next_run(w).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        "last": w.last,
+        "failures": w.failures,
+        "incident_open": w.incident.is_some(),
+        "monitor": monitor,
+        "trend": trend,
+        "runs": samples.len(),
+        "passed": passed,
+        "incidents": incidents,
+    })
+}
+
 /// Starts the factory's drivers for the owner's agent: sign-off requests for waiting
-/// releases, and the canaries of new deployments. A digital worker owns no factory.
+/// releases, the canaries of new deployments, and drift watches. A digital worker owns no
+/// factory.
 pub(super) fn start(s: &AppState) {
     let profile = &s.info.profile;
     if profile.config.owner.is_some() {
@@ -413,6 +501,25 @@ pub(super) fn start(s: &AppState) {
             supervisor,
             ready_wait: crate::factory::runner::READY_WAIT,
         });
-        tokio::spawn(crate::factory::manage::drive_canaries(host, changed));
+        tokio::spawn(crate::factory::manage::drive_canaries(
+            host.clone(),
+            changed.clone(),
+        ));
+        // Drift incidents reach the owner as monitors' do: on the page, and peers by chat.
+        let shared = s.clone();
+        let notify: crate::factory::drift::Notify =
+            Arc::new(move |e: &crate::ops::IncidentEvent| {
+                let line = e.text.lines().next().unwrap_or_default();
+                let opened = e.kind == crate::ops::IncidentKind::Opened;
+                shared.system(if opened { "warn" } else { "info" }, line.to_owned());
+                shared.agent.alert(format!(
+                    "[{} alert] {} {}: {line}",
+                    shared.agent.name(),
+                    e.monitor,
+                    format!("{:?}", e.kind).to_lowercase()
+                ));
+                shared.send(json!({ "type": "ops" }));
+            });
+        tokio::spawn(crate::factory::drift::drive(host, changed, notify));
     }
 }

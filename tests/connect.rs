@@ -246,6 +246,7 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
         shares: vec!["data".into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     };
     let mut worker = AgentConfig::new("worker", worker_key.clone());
     worker.network = Network::Local;
@@ -862,6 +863,7 @@ async fn mcp_clients_follow_a_task_with_progress_notifications() {
         shares: vec!["data".into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     };
     let mut worker = AgentConfig::new("slowworker", worker_key.clone());
     worker.network = Network::Local;
@@ -1210,6 +1212,23 @@ async fn editor_agents_design_agents_over_mcp_and_the_lifecycle_stays_with_the_o
         assert!(
             text.ends_with(&format!(
                 "stays with its owner, who runs: proofkin factory {verb} ask --profile owner"
+            )),
+            "{text}"
+        );
+    }
+    // So do sharing with peers, drift watches and improvements by the owner's model.
+    for (tool, command) in [
+        ("factory_publish", "publish ask --to PEER"),
+        ("factory_import", "import PUBLISHER/ask@VERSION"),
+        ("factory_watch", "watch ask --when \"daily 03:00\""),
+        ("factory_improve", "improve ask"),
+    ] {
+        let refused = call(tool, json!({ "name": "ask" })).await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        let text = refused["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.ends_with(&format!(
+                "stays with its owner, who runs: proofkin factory {command} --profile owner"
             )),
             "{text}"
         );

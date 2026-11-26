@@ -8,8 +8,6 @@ how Proofkin releases ship the factory.
 
 - The factory ships in phases (see `docs/agent-factory.md`, Roadmap), each in a Proofkin
   release with its claims proven and a live check passed.
-- Until the web UI and docs item is done, the factory is a preview: `proofkin factory ...`
-  says so, and the web UI hides it unless `PROOFKIN_FACTORY=1` is set.
 - The profile's factory folder is new; nothing existing is migrated. Agent files, workers
   and plans keep working as before.
 - For an owner's agent, rollout is the deployment flow: canary first, then the release takes
@@ -23,8 +21,9 @@ how Proofkin releases ship the factory.
 - **A bad Proofkin release:** install the previous version. Factory files carry their
   format version; an older Proofkin leaves `factory/` alone, and deployed workers keep
   running as plain workers with their role.
-- **A bad import:** `proofkin factory remove <agent>` deletes the imported bundle; nothing
-  ran, so there is nothing to undo.
+- **A bad import:** `proofkin factory delete <agent>` deletes it with its imported bundles
+  before it is active; nothing ran, so there is nothing to undo. Once active, retire it, or
+  roll back to another version imported from its publisher.
 
 ## Monitoring
 

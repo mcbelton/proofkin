@@ -64,8 +64,66 @@ pub async fn write(
         .map(crate::factory::templates::get)
         .transpose()?;
     let base = prompt(request, catalog, template.as_ref());
-    let choice = crate::models::choice(&catalog.models, request.provider);
-    let mut ask = LlmTask::new(request.provider, base.clone());
+    let name = request.name;
+    let answered = ask(
+        executor,
+        request.provider,
+        &catalog.models,
+        base,
+        "draft",
+        &|mut value: Value| {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("name".into(), Value::from(name));
+            }
+            let problems = check_value(&value, catalog);
+            (value, problems)
+        },
+        progress,
+    )
+    .await?;
+    Ok(Written {
+        draft: Draft {
+            blueprint: answered.blueprint,
+            provenance: Provenance {
+                source: "model".into(),
+                template: request.template.map(str::to_owned),
+                provider: Some(request.provider),
+                model: answered.model,
+                effort: answered.effort,
+                description_sha256: Some(crate::evidence::sha256_hex(description.as_bytes())),
+                at: now(),
+            },
+            tries: answered.tries,
+        },
+        problems: answered.problems,
+    })
+}
+
+/// What the model answered: its last blueprint, as `checked` made it, with its problems.
+pub(crate) struct Answered {
+    pub blueprint: Value,
+    pub problems: Vec<Problem>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub tries: u32,
+}
+
+/// Asks `executor`'s model of `provider` (at the profile's default model and effort, as
+/// `models` allows them) for a blueprint with prompt `base`, in an empty folder, read-only.
+/// Each JSON answer goes through `checked`, which makes it the blueprint (`what` it is: a
+/// draft, a proposal) and finds its problems; until one has no error, the model is told
+/// them and asked again, at most [`TRIES`] times in all.
+pub(crate) async fn ask(
+    executor: &dyn Executor,
+    provider: Provider,
+    models: &crate::models::Models,
+    base: String,
+    what: &str,
+    checked: &(dyn Fn(Value) -> (Value, Vec<Problem>) + Send + Sync),
+    progress: &(dyn Fn(String) + Send + Sync),
+) -> Result<Answered> {
+    let choice = crate::models::choice(models, provider);
+    let mut ask = LlmTask::new(provider, base.clone());
     ask.model = choice.pick(None)?;
     ask.effort = choice.pick_effort(None)?;
     let folder = EmptyFolder::new()?;
@@ -75,8 +133,7 @@ pub async fn write(
         tries += 1;
         progress(if tries == 1 {
             format!(
-                "{}'s model{} is writing the draft",
-                request.provider,
+                "{provider}'s model{} is writing the {what}",
                 ask.model
                     .as_deref()
                     .map(|m| format!(" ({m})"))
@@ -88,16 +145,13 @@ pub async fn write(
         let ran = executor
             .execute(&ask, &ctx)
             .await
-            .context("the model couldn't write the draft")?;
+            .with_context(|| format!("the model couldn't write the {what}"))?;
         model = ran.model.clone().or_else(|| ask.model.clone());
         effort = ran.effort.clone().or_else(|| ask.effort.clone());
         let answer = crate::team::written_plan(&ran.output);
         let problems = match serde_json::from_str::<Value>(&answer) {
-            Ok(mut value) => {
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("name".into(), Value::from(request.name));
-                }
-                let problems = check_value(&value, catalog);
+            Ok(value) => {
+                let (value, problems) = checked(value);
                 let done = !has_errors(&problems);
                 written = Some((value, problems.clone()));
                 if done {
@@ -118,21 +172,12 @@ pub async fn write(
     let Some((blueprint, problems)) = written else {
         bail!("the model didn't write a blueprint in {TRIES} tries: its answers weren't JSON");
     };
-    Ok(Written {
-        draft: Draft {
-            blueprint,
-            provenance: Provenance {
-                source: "model".into(),
-                template: request.template.map(str::to_owned),
-                provider: Some(request.provider),
-                model,
-                effort,
-                description_sha256: Some(crate::evidence::sha256_hex(description.as_bytes())),
-                at: now(),
-            },
-            tries,
-        },
+    Ok(Answered {
+        blueprint,
         problems,
+        model,
+        effort,
+        tries,
     })
 }
 
@@ -181,7 +226,7 @@ const RULES: &str = "\
 ";
 
 /// What the profile has that a blueprint may name, for the model.
-fn catalog_text(catalog: &Catalog) -> String {
+pub(crate) fn catalog_text(catalog: &Catalog) -> String {
     let none = |empty: bool| if empty { "none\n" } else { "" };
     let mut text = String::from("Skills (`skills`):\n");
     for (name, about) in &catalog.skills {

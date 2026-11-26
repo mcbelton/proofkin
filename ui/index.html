@@ -17,6 +17,7 @@
 <script src="/plan-builder.js" defer></script>
 <script src="/workers.js" defer></script>
 <script src="/factory.js" defer></script>
+  <script src="/factory-share.js" defer></script>
 <script src="/connect.js" defer></script>
 </head>
 <body>
@@ -82,9 +83,12 @@
       <section class="card" aria-labelledby="factory-h">
         <div class="card-head">
           <h2 id="factory-h">Agent factory</h2>
-          <button type="button" class="btn small" id="factory-new-btn">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>New agent
-          </button>
+          <span class="head-actions">
+            <button type="button" class="btn small" id="factory-catalog-btn" aria-label="Catalog">Catalog <span class="count" id="factory-catalog-count" aria-hidden="true" hidden>0</span></button>
+            <button type="button" class="btn small" id="factory-new-btn">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>New agent
+            </button>
+          </span>
         </div>
         <ul class="list" id="factory-list"></ul>
       </section>
@@ -705,6 +709,9 @@
         <button type="button" role="tab" id="ftab-releases" data-tab="releases" aria-controls="fpanel-releases" aria-selected="false" tabindex="-1">Releases</button>
         <button type="button" role="tab" id="ftab-deployments" data-tab="deployments" aria-controls="fpanel-deployments" aria-selected="false" tabindex="-1">Deployments</button>
         <button type="button" role="tab" id="ftab-metrics" data-tab="metrics" aria-controls="fpanel-metrics" aria-selected="false" tabindex="-1">Metrics</button>
+        <button type="button" role="tab" id="ftab-drift" data-tab="drift" aria-controls="fpanel-drift" aria-selected="false" tabindex="-1">Drift</button>
+        <button type="button" role="tab" id="ftab-improve" data-tab="improve" aria-controls="fpanel-improve" aria-selected="false" tabindex="-1">Improve</button>
+        <button type="button" role="tab" id="ftab-share" data-tab="share" aria-controls="fpanel-share" aria-selected="false" tabindex="-1">Share</button>
       </div>
       <section role="tabpanel" id="fpanel-overview" aria-labelledby="ftab-overview" class="tab-panel factory-panel" tabindex="0"></section>
       <section role="tabpanel" id="fpanel-blueprint" aria-labelledby="ftab-blueprint" class="tab-panel factory-panel" tabindex="0" hidden>
@@ -723,6 +730,20 @@
       <section role="tabpanel" id="fpanel-releases" aria-labelledby="ftab-releases" class="tab-panel factory-panel" tabindex="0" hidden></section>
       <section role="tabpanel" id="fpanel-deployments" aria-labelledby="ftab-deployments" class="tab-panel factory-panel" tabindex="0" hidden></section>
       <section role="tabpanel" id="fpanel-metrics" aria-labelledby="ftab-metrics" class="tab-panel factory-panel" tabindex="0" hidden></section>
+      <section role="tabpanel" id="fpanel-drift" aria-labelledby="ftab-drift" class="tab-panel factory-panel" tabindex="0" hidden></section>
+      <section role="tabpanel" id="fpanel-improve" aria-labelledby="ftab-improve" class="tab-panel factory-panel" tabindex="0" hidden></section>
+      <section role="tabpanel" id="fpanel-share" aria-labelledby="ftab-share" class="tab-panel factory-panel" tabindex="0" hidden></section>
+    </div>
+  </dialog>
+
+  <dialog id="factory-catalog-dialog" class="wide" aria-labelledby="factory-catalog-h">
+    <div class="dialog-body">
+      <div class="card-head">
+        <h2 id="factory-catalog-h">Catalog</h2>
+        <button type="button" class="btn small" id="factory-catalog-close">Close</button>
+      </div>
+      <p class="muted small">Agent releases your peers publish to you, as they say while connected: what each is for, the most access it asks for and how its evaluation went on its publisher's accounts. Importing one verifies it against its publisher's signature and runs nothing; it becomes active once it passes an evaluation on your accounts.</p>
+      <ul class="list" id="factory-catalog-list"></ul>
     </div>
   </dialog>
 

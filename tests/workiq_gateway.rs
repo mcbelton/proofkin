@@ -588,6 +588,7 @@ fn trusted(name: &str, id: EndpointId) -> TrustedPeer {
         shares: vec![DATA_SHARE.to_owned(), "app".to_owned()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     }
 }
 

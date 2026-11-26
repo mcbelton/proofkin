@@ -4,8 +4,9 @@
 // runs, live progress, and the report (the release gate, each model's results and the
 // failing runs). Then they run: signed releases and their sign-offs, deployments as
 // digital workers with a canary, rollback, budgets, metrics by release, deprecation and
-// retirement. Uses app.js helpers: $, el, api, toast, confirmDialog, stamp, providerLabel
-// and ACCESS_SHORT.
+// retirement; drift watches, improvements and sharing with peers are in factory-share.js.
+// Uses app.js helpers: $, el, api, toast, confirmDialog, stamp, providerLabel and
+// ACCESS_SHORT.
 "use strict";
 
 const factoryState = {
@@ -98,6 +99,10 @@ function factoryNode(a) {
     a.waiting ? el("span", { class: "badge busy", text: `${factoryPlural(a.waiting, "release waits", "releases wait")} for sign-off` }) : null,
     deployed.length ? el("span", { class: "badge neutral", title: deployed.map((d) => `${d.worker}: ${d.version}, ${d.state}`).join("; "),
       text: `${factoryPlural(deployed.length, "deployment", "deployments")}${running ? `, ${running} running here` : ""}` }) : null,
+    a.imported ? el("span", { class: "badge neutral", title: `Imported: its publisher's key is ${a.imported.publisher_id}`, text: `From ${a.imported.publisher}` }) : null,
+    a.watch?.incident_open ? el("span", { class: "badge danger", text: "Drift incident open" }) : null,
+    a.publication?.versions?.length && a.publication?.peers?.length
+      ? el("span", { class: "badge neutral", title: `Published ${a.publication.versions.join(", ")} to ${a.publication.peers.join(", ")}`, text: `Published to ${factoryPlural(a.publication.peers.length, "peer", "peers")}` }) : null,
   ].filter(Boolean);
   return el("li", { class: "factory-agent", "data-agent": a.name },
     avatar(a.name),
@@ -206,6 +211,12 @@ function factoryLife(agent) {
     agent?.releases, agent?.deployments, agent?.history]);
 }
 
+/// What, of the agent, its Drift, Improve and Share panels show (but its proposals).
+function factoryScale(agent) {
+  return JSON.stringify([agent?.state, agent?.active_version, agent?.watch, agent?.publication, agent?.imported,
+    agent?.imported_version, (agent?.releases ?? []).map((r) => [r.version, r.state]), agent?.choices?.peers]);
+}
+
 async function refreshFactoryAgent(force = true) {
   const name = factoryState.open;
   const enc = encodeURIComponent(name);
@@ -214,11 +225,17 @@ async function refreshFactoryAgent(force = true) {
     evaluations: JSON.stringify(factoryState.agent?.evaluations ?? []),
     running: factoryRunning()?.id ?? null,
     life: factoryLife(factoryState.agent),
+    scale: factoryScale(factoryState.agent),
+    proposals: JSON.stringify(factoryState.agent?.proposals ?? []),
   };
-  const [agent, draft] = await Promise.all([
+  // Only a draft there is is fetched (an import never has one): the first time, as the list says.
+  const known = factoryState.agent?.name === name ? factoryState.agent : factoryState.agents?.find((a) => a.name === name);
+  const skip = known?.has_draft === false;
+  const [agent, fetched] = await Promise.all([
     api(`/api/factory/agents/${enc}`),
-    api(`/api/factory/drafts/${enc}`).catch(() => null),
+    skip ? null : api(`/api/factory/drafts/${enc}`).catch(() => null),
   ]);
+  const draft = skip && agent.has_draft ? await api(`/api/factory/drafts/${enc}`).catch(() => null) : fetched;
   if (factoryState.open !== name) return;
   factoryState.agent = agent;
   factoryState.draft = draft;
@@ -240,6 +257,14 @@ async function refreshFactoryAgent(force = true) {
     renderFactoryDeployments();
   }
   if (factoryState.tab === "metrics" && (force || lifeChanged)) loadFactoryMetrics();
+  // Their forms are drawn again only when what they show changed: what the owner typed stays.
+  if (force || factoryScale(agent) !== before.scale) {
+    renderFactoryDrift();
+    renderFactoryImprove();
+    renderFactoryShare();
+  } else if (JSON.stringify(agent.proposals ?? []) !== before.proposals) {
+    renderFactoryProposals();
+  }
 }
 
 function selectFactoryTab(name, focus = false) {
@@ -268,25 +293,27 @@ function renderFactoryOverview() {
   const panel = $("#fpanel-overview");
   const draft = factoryState.draft;
   const agent = factoryState.agent;
-  if (!draft) {
+  // An import has no draft: its blueprint is its bundle's (or, once active, its release's).
+  const bp = draft?.blueprint ?? agent?.blueprint;
+  if (!bp) {
     panel.replaceChildren(el("p", { class: "muted", text: "This agent has no draft here." }), factoryLifecycle(agent));
     return;
   }
-  const bp = draft.blueprint;
   const caps = bp.capabilities ?? {};
   const list = (xs) => (xs?.length ? xs.join(", ") : "none");
   const mcp = (caps.mcp ?? []).map((m) => `${m.server} (${(m.tools ?? []).join(", ")})`);
-  const provenance = draft.provenance ?? {};
-  const written = provenance.source === "model"
-    ? `by ${providerLabel(provenance.provider)}'s model${provenance.model ? ` (${provenance.model})` : ""} from your words${provenance.template ? `, with template ${provenance.template}` : ""}`
-    : provenance.source === "template" ? `from template ${provenance.template}` : "from a file";
+  const provenance = draft?.provenance ?? {};
+  const written = !draft ? (agent?.imported ? `by ${agent.imported.publisher}, who published it to you` : "elsewhere: it has no draft here")
+    : provenance.source === "model"
+      ? `by ${providerLabel(provenance.provider)}'s model${provenance.model ? ` (${provenance.model})` : ""} from your words${provenance.template ? `, with template ${provenance.template}` : ""}`
+      : provenance.source === "template" ? `from template ${provenance.template}` : "from a file";
   const deployed = agent?.deployments ?? [];
   const facts = el("dl", { class: "facts" },
     el("dt", { text: "Purpose" }), el("dd", { text: bp.purpose ?? "" }),
     el("dt", { text: "Asks for" }), el("dd", { text: `${ACCESS_SHORT[caps.access] ?? caps.access} access · skills ${list(bp.skills)} · MCP servers ${list(mcp)} · checks ${list(caps.checks)}${caps.delegate ? " · hands work to others" : ""}` }),
     el("dt", { text: "Runs on" }), el("dd", { text: list((bp.model?.providers ?? []).map(providerLabel)) }),
     el("dt", { text: "Proven by" }), el("dd", { text: `${factoryPlural(bp.evals?.cases?.length ?? 0, "case", "cases")}, ${factoryPlural(bp.evals?.repetitions ?? 3, "run", "runs")} each, and the built-in attacks` }),
-    el("dt", { text: "Written" }), el("dd", { text: `${written}, ${stamp(Date.parse(provenance.at))}` }),
+    el("dt", { text: "Written" }), el("dd", { text: provenance.at ? `${written}, ${stamp(Date.parse(provenance.at))}` : written }),
     el("dt", { text: "Released" }), el("dd", { text: agent?.active_version
       ? agent.state === "retired"
         ? `${agent.active_version}, its last release: it is retired, and plans refuse it`
@@ -304,9 +331,11 @@ function renderFactoryOverview() {
   }, "Check in its folders");
   panel.replaceChildren(facts,
     el("h3", { text: "What it must do" }), requirements,
-    el("div", { class: "card-head" }, el("h3", { text: "Problems" }), check),
-    el("p", { class: "muted small", text: "Errors keep it from being built and evaluated; warnings point to less power it could ask for. Checking resolves what it asks for in the folders it is deployed to, and grants nothing." }),
-    factoryProblems(draft.problems), result,
+    ...(draft ? [
+      el("div", { class: "card-head" }, el("h3", { text: "Problems" }), check),
+      el("p", { class: "muted small", text: "Errors keep it from being built and evaluated; warnings point to less power it could ask for. Checking resolves what it asks for in the folders it is deployed to, and grants nothing." }),
+      factoryProblems(draft.problems), result,
+    ] : [el("p", { class: "muted small", text: "Its files are its publisher's, exactly: it isn't edited here. Share says where it stands." })]),
     factoryLifecycle(agent));
 }
 
@@ -875,9 +904,12 @@ function renderFactoryReleases() {
   const agent = factoryState.agent;
   if (!agent) return;
   const releases = agent.releases ?? [];
-  const passed = (agent.evaluations ?? []).filter((e) => e.state === "passed" && e.gate?.passed && !e.canary);
+  // An import's releases are its publisher's versions, each made once from what passed here.
+  const passed = (agent.evaluations ?? []).filter((e) => e.state === "passed" && e.gate?.passed && !e.canary
+    && !(agent.imported && releases.some((r) => r.build === e.build)));
   const parts = [el("p", { class: "muted small", text: `A release is a signed, exact copy of a build that passed its evaluation. Plans use the active one as agent=${agent.name}; digital workers run the one you deploy. Your approvers sign off first, and you sign off on anything it asks for beyond the release before.` })];
   if (agent.state === "retired") parts.push(el("p", { class: "small", text: "It is retired: it gets no new releases." }));
+  else if (agent.imported && !passed.length) parts.push(el("p", { class: "muted small", text: `Each version of ${agent.imported.publisher}'s you import is released here, signed by you with its publisher's version, once it passes an evaluation on your accounts or you accept its publisher's report (Share).` }));
   else if (!passed.length) parts.push(el("p", { class: "empty" }, "No evaluation has passed yet. ", el("strong", { text: "Evaluate" }), " proves a build; a release is made only from one that passed."));
   else parts.push(factoryReleaseForm(agent, passed));
   parts.push(el("h3", { text: releases.length ? `Releases (${releases.length})` : "Releases" }));
@@ -1343,9 +1375,16 @@ function renderFactoryEvaluate() {
       el("div", { class: "dialog-actions" }, cancel));
     return;
   }
+  // Only a draft, or a version imported and not evaluated here yet, is evaluated here.
+  if (agent && !factoryState.draft && !agent.imported_version) {
+    panel.replaceChildren(el("p", { class: "muted small", text: `${agent.imported
+      ? `Each version of ${agent.imported.publisher}'s you import is evaluated here once, before it is active.`
+      : "It has no draft here to evaluate."} What runs is evaluated again on a schedule under Drift.` }));
+    return;
+  }
   const candidates = agent?.candidates ?? [];
   const leftOut = agent?.left_out ?? [];
-  const reps = factoryState.draft?.blueprint?.evals?.repetitions ?? 3;
+  const reps = (factoryState.draft?.blueprint ?? agent?.blueprint)?.evals?.repetitions ?? 3;
   const picks = el("div", { class: "share-checks", id: "factory-candidates" },
     ...candidates.map((c, i) => el("label", { class: "check" },
       el("input", { type: "checkbox", value: String(i), checked: true }),
@@ -1546,9 +1585,12 @@ function factoryFailing(e) {
 // ---------- live updates ----------
 let factoryTimer = null;
 function onFactoryEvent(msg) {
-  // What the owner's model is doing while it writes a draft.
+  // What the owner's model is doing while it writes a draft, or an improvement.
   if (msg.progress) {
     if ($("#factory-new-dialog").open) $("#factory-new-progress").textContent = msg.progress;
+    if (msg.agent && msg.agent === factoryState.open && $("#factory-improve-progress")) {
+      $("#factory-improve-progress").textContent = msg.progress;
+    }
     return;
   }
   // Many runs end close together: one refresh for them.

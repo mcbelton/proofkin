@@ -20,7 +20,7 @@ use crate::factory::report::{EvalState, Evaluation};
 use crate::factory::routing::Route;
 use crate::factory::runner::{self, Judges, Request, Runner};
 use crate::factory::store::{Draft, FactoryStore, Lifecycle, Provenance, now};
-use crate::factory::{capabilities, draft, templates};
+use crate::factory::{capabilities, draft, improve, templates};
 use crate::llm::{Executor, ExecutorConfig, Provider, SdkExecutor};
 
 fn status(code: StatusCode, message: impl ToString) -> ApiError {
@@ -412,6 +412,8 @@ fn agent_json(store: &FactoryStore, s: &Shared, name: &str, all: bool) -> Result
     Ok(json!({
         "name": name,
         "title": title,
+        // An import never has one: its blueprint is its publisher's.
+        "has_draft": draft.is_some(),
         "state": lifecycle,
         "active_version": state.as_ref().and_then(|st| st.active_version.clone()),
         "versions": state.as_ref().map(|st| st.versions.clone()).unwrap_or_default(),
@@ -424,6 +426,34 @@ fn agent_json(store: &FactoryStore, s: &Shared, name: &str, all: bool) -> Result
         "builds": store.builds(name).map_err(internal)?,
         "evaluations": evaluations.iter().filter(|e| all || e.canary.is_none()).take(shown).map(|e| evaluation_brief(e, running)).collect::<Vec<_>>(),
         "releases": releases,
+        "proposals": if all {
+            improve::proposals(store, name)
+                .map_err(internal)?
+                .iter()
+                .take(10)
+                .map(|p| proposal_view(store, name, p))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        },
+        "publication": state.as_ref().and_then(|st| st.publication.as_ref()).map(|_| {
+            crate::factory::catalog::publication(store, &s.agent.trusted(), name).ok()
+        }),
+        "imported": state.as_ref().and_then(|st| st.imported.as_ref()).map(|o| json!({
+            "publisher": o.publisher,
+            "publisher_id": o.publisher_id,
+            "versions": o.versions.iter().map(|v| json!({
+                "version": v.version,
+                "state": crate::factory::catalog::import_state(store, name, &v.version),
+                "accepted_report": v.accepted_report,
+                "at": v.at,
+            })).collect::<Vec<_>>(),
+        })),
+        "watch": match state.as_ref().and_then(|st| st.watch.as_ref()) {
+            Some(w) if all => super::releases::watch_view(&s.info.profile, name, w),
+            Some(w) => json!({ "when": w.when, "fail_after": w.fail_after, "enabled": w.enabled, "incident_open": w.incident.is_some(), "last": w.last }),
+            None => Value::Null,
+        },
         "history": if all {
             state.as_ref().map(|st| st.history.iter().rev().take(30).cloned().collect::<Vec<_>>()).unwrap_or_default()
         } else {
@@ -474,6 +504,29 @@ pub(super) async fn get_agent(
             .map(|l| json!({ "candidate": l.route, "why": l.why }))
             .collect();
         agent["choices"] = choices(&catalog, &s.info.profile);
+    }
+    // An import has no draft: its blueprint is its bundle's, and it is evaluated here on the
+    // models of this profile's accounts.
+    if let Ok(Some((version, build))) = crate::factory::catalog::pending(&store, &name)
+        && let Ok(bp) = runner::blueprint_of(&build)
+    {
+        let offers = eval_peer(&s).map(|p| p.offers);
+        let catalog = catalog_of(&s, &name)?;
+        let routes = crate::factory::routing::candidates(&bp, &catalog, offers.as_ref(), true);
+        agent["candidates"] = json!(routes.candidates);
+        agent["left_out"] = routes
+            .left_out
+            .iter()
+            .map(|l| json!({ "candidate": l.route, "why": l.why }))
+            .collect();
+        agent["imported_version"] = json!(version);
+        agent["blueprint"] = serde_json::to_value(&bp).map_err(internal)?;
+    } else if store.draft(&name).map_err(internal)?.is_none()
+        && let Some(version) = agent["active_version"].as_str().map(str::to_owned)
+        && let Ok(bp) = crate::factory::release::blueprint_of(&store, &name, &version)
+    {
+        // A released agent whose draft went (an import made active): its release's.
+        agent["blueprint"] = serde_json::to_value(&bp).map_err(internal)?;
     }
     Ok(Json(agent))
 }
@@ -549,7 +602,13 @@ pub(super) async fn evaluate(
 ) -> Result<(StatusCode, Value), ApiError> {
     let profile = s.profile_now();
     let store = FactoryStore::of(&profile);
-    if crate::profile::validate_name(name).is_err() || store.draft(name).ok().flatten().is_none() {
+    let known = crate::profile::validate_name(name).is_ok()
+        && (store.draft(name).ok().flatten().is_some()
+            || crate::factory::catalog::pending(&store, name)
+                .ok()
+                .flatten()
+                .is_some());
+    if !known {
         return Err(not_found(format!("the factory has no draft '{name}'")));
     }
     let worker_name = runner::worker_name(&profile.name);
@@ -697,6 +756,25 @@ pub(super) async fn evaluate(
         let _ = runner::clean(&store, Some(&worker.profile));
         supervisor.stop(&worker.profile.name).await;
         s.evaluations.lock().unwrap().remove(&id);
+        // An import that passed here becomes active (once its owner signs off what it asks for).
+        match crate::factory::catalog::after_evaluation(&store, &s.info.profile.name, &key, &ended)
+        {
+            Ok(Some(r)) => s.system(
+                "info",
+                format!(
+                    "Imported {} {} passed here: {}",
+                    r.manifest.agent,
+                    r.manifest.version,
+                    if r.state == crate::factory::release::ReleaseState::Released {
+                        "it is active".to_owned()
+                    } else {
+                        "it waits for your sign-off of what it asks for".to_owned()
+                    }
+                ),
+            ),
+            Ok(None) => {}
+            Err(e) => s.system("error", format!("{} wasn't activated: {e:#}", ended.agent)),
+        }
         s.system(
             if ended.gate.passed { "info" } else { "warn" },
             format!(
@@ -852,4 +930,126 @@ mod tests {
             (json!(2), json!(true))
         );
     }
+}
+
+/// What an improvement asks for, as the contract has it (and the provider whose model writes
+/// it, and whether it is evaluated next, as the page asks).
+#[derive(Debug, Deserialize)]
+pub(super) struct ImprovementBody {
+    #[serde(default)]
+    pub cases: Vec<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub provider: Option<Provider>,
+    #[serde(default = "yes")]
+    pub evaluate: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A factory refusal as the improvements contract answers it: 404 for an unknown agent, 409
+/// for anything else it can't do.
+fn improvement_refused(e: anyhow::Error) -> ApiError {
+    match crate::factory::refusal_kind(&e) {
+        Some(crate::factory::RefusalKind::NotFound) => not_found(format!("{e:#}")),
+        Some(_) => conflict(format!("{e:#}")),
+        None => internal(format!("{e:#}")),
+    }
+}
+
+/// A proposal for the page: without the draft it replaced, with its evaluation's state.
+pub(super) fn proposal_view(store: &FactoryStore, name: &str, p: &improve::Proposal) -> Value {
+    let mut value = json!(p);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("previous_draft");
+        object.insert(
+            "evaluation".into(),
+            improve::evaluation_of(store, name, p)
+                .map(|e| evaluation_brief(&e, store.evaluation_running()))
+                .unwrap_or(Value::Null),
+        );
+    }
+    value
+}
+
+pub(super) async fn propose_improvement(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<ImprovementBody>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let by = owner(&s);
+    let profile = s.profile_now();
+    let store = FactoryStore::of(&profile);
+    let material = improve::material(&profile, &name, &body.cases, body.note.as_deref())
+        .map_err(improvement_refused)?;
+    let catalog = Catalog::of(&profile).map_err(internal)?.without(&name);
+    let provider = match body.provider {
+        Some(p) if catalog.providers.contains(&p) => p,
+        Some(p) => {
+            return Err(conflict(format!(
+                "profile '{}' isn't signed in to {p}: {}",
+                profile.name,
+                profile.login_hint(p)
+            )));
+        }
+        None => *catalog.providers.first().ok_or_else(|| {
+            conflict(format!(
+                "profile '{}' isn't signed in to a provider whose model could write the proposal: proofkin auth login copilot --profile {0}",
+                profile.name
+            ))
+        })?,
+    };
+    let (executor, started) = executor_for(&s, provider).await?;
+    let progress = |line: String| {
+        s.send(json!({ "type": "factory", "agent": name, "progress": line }));
+    };
+    let proposed = improve::propose(
+        executor.as_ref(),
+        &store,
+        &material,
+        &catalog,
+        provider,
+        &progress,
+    )
+    .await;
+    if let Some(started) = started {
+        started.stop().await;
+    }
+    let proposed = proposed.map_err(|e| internal(format!("{e:#}")))?;
+    let proposal =
+        improve::keep(&store, &material, &proposed, &by, &profile.skills()).map_err(internal)?;
+    s.system(
+        "info",
+        format!(
+            "Improvement {} of {name}: a new draft version of {} ({} change{}); what runs stays until you release it",
+            proposal.id,
+            material.basis_of,
+            proposal.diff.len(),
+            if proposal.diff.len() == 1 { "" } else { "s" }
+        ),
+    );
+    let mut value = draft_json(&proposed.draft, &proposed.problems);
+    value["proposal"] = proposal_view(&store, &name, &proposal);
+    // It is evaluated next, on the model its active release runs on.
+    if body.evaluate && !crate::factory::blueprint::has_errors(&proposed.problems) {
+        let candidates: Vec<Route> = improve::candidate_of(&store, &name)
+            .and_then(|c| runner::parse_candidate(&c).ok())
+            .into_iter()
+            .collect();
+        let asked = EvaluationBody {
+            candidates,
+            repetitions: None,
+            peer: None,
+            confirm: true,
+        };
+        match evaluate(&s, &name, asked, &by).await {
+            Ok((_, evaluation)) => value["evaluation"] = evaluation,
+            Err((_, Json(why))) => value["evaluation_error"] = why["error"].clone(),
+        }
+    }
+    s.send(json!({ "type": "factory", "agent": name }));
+    Ok((StatusCode::ACCEPTED, Json(value)))
 }

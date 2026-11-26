@@ -148,6 +148,7 @@ mod tests {
             shares: Vec::new(),
             m365: None,
             github: None,
+            agents: Vec::new(),
         }
     }
 

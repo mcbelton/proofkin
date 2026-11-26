@@ -15,7 +15,7 @@ use crate::factory::evals::check_fixtures;
 use crate::factory::report::{EvalState, Evaluation, RunState};
 use crate::factory::runner::{self, Judges, Planned, Request, Runner};
 use crate::factory::store::{Draft, FactoryStore, Provenance, now};
-use crate::factory::{capabilities, code, draft, manage, routing, templates};
+use crate::factory::{capabilities, code, draft, improve, manage, routing, templates};
 use crate::llm::{ExecutorConfig, Provider, SdkExecutor};
 use crate::profile::Profile;
 use crate::workers::{Launch, Supervisor};
@@ -358,6 +358,142 @@ or stops when there was none.")]
         #[command(flatten)]
         profile: ProfileOpt,
     },
+    /// Watch an agent for drift: its active release evaluated on its deployment on a
+    /// schedule (every case once, the built-in attacks too), judged by its release's gate and
+    /// within its budgets. fail-after failed runs in a row open an incident and alert you
+    /// with the failing cases. Without options it shows the watch.
+    #[command(after_help = "\
+examples:
+  proofkin factory watch fin-analyst --when \"daily 03:00\" --fail-after 2 --profile alice
+  proofkin factory watch fin-analyst --now --profile alice    (one run now, here: your agent stopped)
+  proofkin factory watch fin-analyst --off --profile alice    (paused; its open incident closes)
+Your agent runs the watch while it runs. Each run's pass rate is an ops sample of monitor
+factory:fin-analyst, and its incidents are ops incidents (proofkin ops report).")]
+    Watch {
+        name: String,
+        /// When it runs: daily 03:00, every 6h, weekdays 08:30, mon,fri 17:00.
+        #[arg(long)]
+        when: Option<String>,
+        /// Failed runs in a row that open an incident, 1 to 10 (default 2).
+        #[arg(long)]
+        fail_after: Option<u32>,
+        /// Pause it: it runs nothing, and its open incident closes.
+        #[arg(long, conflicts_with_all = ["when", "fail_after", "now"])]
+        off: bool,
+        /// Run it once now, here (your agent must be stopped): its deployment's worker is
+        /// started for it, and stopped after.
+        #[arg(long)]
+        now: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+        /// Node bridge script for the Claude and Codex SDKs (default: the one `setup` installed).
+        #[arg(long, env = "PROOFKIN_BRIDGE")]
+        bridge: Option<PathBuf>,
+    },
+    /// Propose a better version of an agent from what failed: your model gets its blueprint,
+    /// its failing cases with their outputs (secrets redacted), its deployments' failed tasks
+    /// (outcomes only, never their text) and your note. The proposal is a new draft version
+    /// with regression cases, shown as a diff next to the active release; it asks for nothing
+    /// more, and only a release changes what runs.
+    #[command(after_help = "\
+examples:
+  proofkin factory improve fin-analyst --profile alice                  (every case that failed)
+  proofkin factory improve fin-analyst --cases E2,E5 --note \"Quote the sentence, don't paraphrase it\" --profile alice
+  proofkin factory improve fin-analyst --evaluate --profile alice       (then evaluate it, your agent stopped)
+Its draft replaces the agent's draft (the proposal keeps the one it replaced). Release it
+once its evaluation passes, or edit it, or leave it: the active release runs meanwhile.
+An imported agent is its publisher's: they improve it, and you import their next version.")]
+    Improve {
+        name: String,
+        /// The cases to improve (comma-separated; default: every case that failed in the last
+        /// evaluation of what runs).
+        #[arg(long, value_delimiter = ',')]
+        cases: Vec<String>,
+        /// What to improve, in your words (at most 2,000 characters).
+        #[arg(long)]
+        note: Option<String>,
+        /// The provider whose model writes it (default: the first one the profile is signed
+        /// in to).
+        #[arg(long, value_enum)]
+        using: Option<Provider>,
+        /// Then evaluate it on the model its active release runs on (your agent must be
+        /// stopped).
+        #[arg(long)]
+        evaluate: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+        /// Node bridge script for the Claude and Codex SDKs (default: the one `setup` installed).
+        #[arg(long, env = "PROOFKIN_BRIDGE")]
+        bridge: Option<PathBuf>,
+    },
+    /// Publish released versions of an agent to peers on your allowlist: they see them in
+    /// their catalog (name, version, description, most access and an eval summary; never
+    /// knowledge, outputs or paths), and may import them. --to says who, in place of whom
+    /// it was published to; --off unpublishes it.
+    #[command(after_help = "\
+examples:
+  proofkin factory publish fin-analyst --to bob,dana --profile alice      (its active release)
+  proofkin factory publish fin-analyst --to bob --versions 1.2.0,1.1.0 --profile alice
+  proofkin factory publish fin-analyst --off --profile alice
+The grants live in your allowlist (proofkin peers allow ... --agents fin-analyst grants too).
+Your agent sends granted peers their catalog in its hello and whenever it changes; while it
+runs, publish in its web UI (Agent factory). Retiring an agent unpublishes it.")]
+    Publish {
+        name: String,
+        /// The peers to publish it to, by their names on your allowlist (comma-separated;
+        /// default: those it is published to).
+        #[arg(long, value_delimiter = ',')]
+        to: Vec<String>,
+        /// The released versions they see (comma-separated; default: its active release).
+        #[arg(long, value_delimiter = ',')]
+        versions: Vec<String>,
+        /// Unpublish it: no peer sees it any more.
+        #[arg(long, conflicts_with_all = ["to", "versions"])]
+        off: bool,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// List the agent releases peers publish to you: each one's publisher (its name on your
+    /// allowlist and its key), what it is for, the most access it asks for and how its
+    /// evaluation went. This connects to your peers for a moment (your agent must be
+    /// stopped; while it runs, its web UI lists them under Agent factory › Catalog).
+    Catalog {
+        /// How long to wait for your peers to connect, in seconds.
+        #[arg(long, default_value_t = 15)]
+        wait: u64,
+        /// How to reach peers: over the internet (relays, NAT traversal) or direct IPs only.
+        #[arg(long, value_enum, default_value_t = Network::Internet)]
+        network: Network,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
+    /// Import an agent release a peer publishes to you: its bundle is asked for over iroh,
+    /// verified (the manifest signed by the publisher's key, every file's hash) and kept;
+    /// nothing runs. It becomes active once it passes an evaluation on your accounts
+    /// (factory evaluate NAME --yes), or at once with --accept-publisher-report.
+    #[command(after_help = "\
+examples:
+  proofkin factory import alice/fin-analyst@1.2.0 --profile bob
+  proofkin factory evaluate fin-analyst --yes --profile bob                 (on your accounts: then it is active)
+  proofkin factory import alice/fin-analyst@1.2.0 --accept-publisher-report --profile bob
+Your agent must be stopped: this connects to the publisher for a moment (while your agent
+runs, import from its web UI: Agent factory › Catalog).")]
+    Import {
+        /// PUBLISHER/NAME@VERSION, the publisher by its name on your allowlist.
+        target: String,
+        /// Make it active from the publisher's report, without an evaluation here (recorded
+        /// in its history).
+        #[arg(long)]
+        accept_publisher_report: bool,
+        /// How long to wait for the publisher to connect, in seconds.
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
+        /// How to reach peers: over the internet (relays, NAT traversal) or direct IPs only.
+        #[arg(long, value_enum, default_value_t = Network::Internet)]
+        network: Network,
+        #[command(flatten)]
+        profile: ProfileOpt,
+    },
 }
 
 pub async fn run(command: FactoryCommand) -> Result<()> {
@@ -586,8 +722,188 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
             timeout.as_deref(),
             clear,
         )?,
+        FactoryCommand::Watch {
+            name,
+            when,
+            fail_after,
+            off,
+            now,
+            profile,
+            bridge,
+        } => {
+            manage::watch(
+                &Profile::open(&profile.name)?,
+                &name,
+                manage::WatchChange {
+                    when,
+                    fail_after,
+                    off,
+                    now,
+                },
+                bridge,
+            )
+            .await?
+        }
+        FactoryCommand::Improve {
+            name,
+            cases,
+            note,
+            using,
+            evaluate,
+            profile,
+            bridge,
+        } => {
+            improve(
+                &Profile::open(&profile.name)?,
+                &name,
+                &cases,
+                note.as_deref(),
+                using,
+                evaluate,
+                bridge,
+            )
+            .await?
+        }
+        FactoryCommand::Publish {
+            name,
+            to,
+            versions,
+            off,
+            profile,
+        } => manage::publish(&Profile::open(&profile.name)?, &name, to, versions, off)?,
+        FactoryCommand::Catalog {
+            wait,
+            network,
+            profile,
+        } => manage::catalog(&Profile::open(&profile.name)?, wait, network).await?,
+        FactoryCommand::Import {
+            target,
+            accept_publisher_report,
+            wait,
+            network,
+            profile,
+        } => {
+            manage::import(
+                &Profile::open(&profile.name)?,
+                &target,
+                accept_publisher_report,
+                wait,
+                network,
+            )
+            .await?
+        }
     }
     Ok(())
+}
+
+/// Has the profile's model propose an improvement of agent `name` (see
+/// [`crate::factory::improve`]), keeps it as its draft and prints its diff; with
+/// `evaluate_it`, evaluates it on the model its active release runs on.
+async fn improve(
+    profile: &Profile,
+    name: &str,
+    cases: &[String],
+    note: Option<&str>,
+    using: Option<Provider>,
+    evaluate_it: bool,
+    bridge: Option<PathBuf>,
+) -> Result<()> {
+    let store = FactoryStore::of(profile);
+    let material = improve::material(profile, name, cases, note)?;
+    let catalog = Catalog::of(profile)?.without(name);
+    let provider = match using {
+        Some(provider) if catalog.providers.contains(&provider) => provider,
+        Some(provider) => bail!(
+            "profile '{}' isn't signed in to {provider}: {}",
+            profile.name,
+            profile.login_hint(provider)
+        ),
+        None => *catalog.providers.first().ok_or_else(|| {
+            anyhow!(
+                "profile '{}' isn't signed in to a provider whose model could write the proposal: proofkin auth login copilot --profile {0}",
+                profile.name
+            )
+        })?,
+    };
+    println!(
+        "{name}: improving {} from {}{}{}",
+        material.basis_of,
+        plural(material.failures.len(), "failing case", "failing cases"),
+        if material.tasks.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {}",
+                plural(material.tasks.len(), "failed task", "failed tasks")
+            )
+        },
+        if material.note.is_some() {
+            " and your note"
+        } else {
+            ""
+        }
+    );
+    let bridge = crate::setup::resolve_bridge(
+        bridge.or_else(|| crate::profile::env_setting_os("BRIDGE").map(PathBuf::from)),
+    );
+    let executor = SdkExecutor::start(ExecutorConfig {
+        providers: vec![provider],
+        bridge_script: bridge.clone(),
+        profile: profile.clone(),
+    })
+    .await?;
+    let proposed = improve::propose(
+        executor.as_ref(),
+        &store,
+        &material,
+        &catalog,
+        provider,
+        &|line: String| println!("  {line}"),
+    )
+    .await;
+    executor.stop().await;
+    let proposed = proposed?;
+    let proposal = improve::keep(
+        &store,
+        &material,
+        &proposed,
+        &profile.name,
+        &profile.skills(),
+    )?;
+    println!(
+        "{name}: improvement {}: a new draft version of {} (what runs doesn't change until you release it)",
+        proposal.id, material.basis_of
+    );
+    if proposal.diff.is_empty() {
+        println!("  it changes nothing but its wording");
+    }
+    for line in &proposal.diff {
+        println!("  {line}");
+    }
+    if proposal.instructions.iter().any(|l| !l.starts_with("  ")) {
+        println!("  instructions:");
+        for line in &proposal.instructions {
+            println!("    {line}");
+        }
+    }
+    if !proposal.regression.is_empty() {
+        println!("  regression cases: {}", proposal.regression.join(", "));
+    }
+    print_problems(&proposed.problems);
+    let candidate = improve::candidate_of(&store, name);
+    if !evaluate_it {
+        println!(
+            "next: proofkin factory evaluate {name}{} --yes --profile {}",
+            candidate
+                .as_deref()
+                .map(|c| format!(" --candidate {c}"))
+                .unwrap_or_default(),
+            profile.name
+        );
+        return Ok(());
+    }
+    let candidates: Vec<String> = candidate.into_iter().collect();
+    evaluate(profile, name, &candidates, None, true, Some(bridge)).await
 }
 
 async fn new(
@@ -807,18 +1123,27 @@ fn draft_of(store: &FactoryStore, profile: &Profile, name: &str) -> Result<Draft
 
 fn show(profile: &Profile, name: &str, json: bool) -> Result<()> {
     let store = FactoryStore::of(profile);
-    let draft = draft_of(&store, profile, name)?;
+    let state = store.state(name)?;
+    // An import has no draft: it is what its release (or the bundle it waits with) says.
+    let draft = match (store.draft(name)?, &state) {
+        (Some(draft), _) => Some(draft),
+        (None, Some(_)) => None,
+        (None, None) => Some(draft_of(&store, profile, name)?),
+    };
+    let blueprint = match &draft {
+        Some(d) => d.blueprint.clone(),
+        None => serde_json::to_value(undrafted_blueprint(&store, name, state.as_ref())?)?,
+    };
     if json {
-        println!("{}", serde_json::to_string_pretty(&draft.blueprint)?);
+        println!("{}", serde_json::to_string_pretty(&blueprint)?);
         return Ok(());
     }
-    let state = store.state(name)?;
     let lifecycle = state
         .as_ref()
         .map(|s| s.state.to_string())
         .unwrap_or_else(|| "draft".into());
     let catalog = Catalog::of(profile)?.without(name);
-    match from_value(&draft.blueprint) {
+    match from_value(&blueprint) {
         Ok(blueprint) => {
             describe(&blueprint, &lifecycle);
             // Copilot's offers are known once it runs: its evaluation checks multipliers.
@@ -855,7 +1180,16 @@ fn show(profile: &Profile, name: &str, json: bool) -> Result<()> {
         }
         Err(_) => println!("{name} ({lifecycle})"),
     }
-    println!("  written: {}", provenance_text(&draft));
+    let written = match (&draft, state.as_ref().and_then(|s| s.imported.as_ref())) {
+        (Some(d), _) => provenance_text(d),
+        (None, Some(o)) => format!(
+            "by its publisher {} (imported; key {})",
+            o.publisher,
+            &o.publisher_id[..10.min(o.publisher_id.len())]
+        ),
+        (None, None) => "elsewhere: it has no draft here".into(),
+    };
+    println!("  written: {written}");
     let builds = store.builds(name)?;
     if !builds.is_empty() {
         let short: Vec<&str> = builds.iter().map(|h| &h[..12]).collect();
@@ -879,10 +1213,29 @@ fn show(profile: &Profile, name: &str, json: bool) -> Result<()> {
             println!("    {}  {}  {}", change.at, change.by, change.what);
         }
     }
+    let Some(draft) = &draft else {
+        return Ok(());
+    };
     let problems = problems_of(&store, name, &draft.blueprint, &catalog);
     println!("problems: {}", summary(&problems));
     print_problems(&problems);
     Ok(())
+}
+
+/// The blueprint of agent `name`, which has no draft here: its active release's, else the
+/// imported version's it waits with.
+fn undrafted_blueprint(
+    store: &FactoryStore,
+    name: &str,
+    state: Option<&crate::factory::store::AgentState>,
+) -> Result<Blueprint> {
+    if let Some(version) = state.and_then(|s| s.active_version.as_deref()) {
+        return crate::factory::release::blueprint_of(store, name, version);
+    }
+    match crate::factory::catalog::pending(store, name)? {
+        Some((_, build)) => runner::blueprint_of(&build),
+        None => bail!("{name} has neither a draft nor a release here"),
+    }
 }
 
 fn describe(blueprint: &Blueprint, lifecycle: &str) {
@@ -1456,6 +1809,24 @@ async fn run_evaluation(
     let evaluation = outcome?;
     runner::clean(&store, Some(&worker.profile))?;
     println!("{name}: {} ({id})", evaluation_line(&evaluation, false));
+    // An import that passed here becomes active (once you sign off what it asks for).
+    if let Some(r) =
+        crate::factory::catalog::after_evaluation(&store, &profile.name, key, &evaluation)?
+    {
+        println!(
+            "{name} {}: imported, evaluated here and released here ({}){}",
+            r.manifest.version,
+            r.state,
+            if r.state == crate::factory::release::ReleaseState::Released {
+                String::new()
+            } else {
+                format!(
+                    "; sign off what it asks for: proofkin factory approve {name} --profile {}",
+                    profile.name
+                )
+            }
+        );
+    }
     for r in &evaluation.results {
         let requirements: Vec<String> = r
             .requirements

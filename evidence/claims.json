@@ -2104,6 +2104,83 @@
         "lib::factory::blueprint::a_name_in_use_or_reserved_is_refused",
         "ui::the_page_follows_the_ux_guidelines"
       ]
+    },
+    {
+      "id": "FAC-28",
+      "area": "agent-factory",
+      "claim": "proofkin factory watch NAME --when SCHEDULE --fail-after N (or the web UI's Drift tab) evaluates an agent's active release on its deployment on that schedule while the owner's agent runs (--now runs it once, --off pauses it): every case once and the built-in attacks, on the deployment's worker, judged by the release's gate, as an evaluation no release is made from. Each run's pass rate is an ops sample of monitor factory:NAME; N failed runs in a row open an ops incident that alerts the owner with the failing cases and what the gate missed, and a run that passes again resolves it (AC-24). Health counts its open incident with the monitors'.",
+      "tests": [
+        "evaluation::a_drift_watch_opens_an_incident_after_failed_runs_in_a_row_and_resolves_it",
+        "lib::factory::drift::a_watch_is_due_on_its_schedule_from_its_last_run_and_waits_while_paused",
+        "lib::factory::drift::a_failed_run_says_what_its_gate_missed_without_its_model_before_each_reason",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
+      ],
+      "live": [
+        "worker1's drift watch evaluated the deployed notes agent with real Copilot: its case and the built-in attacks, kept as its last run"
+      ]
+    },
+    {
+      "id": "FAC-29",
+      "area": "agent-factory",
+      "claim": "proofkin factory improve NAME (or the web UI's Improve tab) has the owner's model propose a better version from what failed in the last evaluation of what runs: its failing cases with their outputs (secrets redacted, as data), its deployments' failed tasks (outcomes only, never their text) and the owner's note; with nothing to learn from it is refused. The proposal is a new draft version, shown as a diff next to the active release (instructions line by line), that asks for nothing more: it keeps the release's capabilities, model, budgets, approvers and every requirement and case, takes the model's instructions, skills and new requirements and cases, and adds a regression case for each failing case. It keeps the draft it replaced and is evaluated next like any draft, and the active release, its files and its deployments change only with a release (AC-25, TM-13). An imported agent is improved only by its publisher.",
+      "tests": [
+        "lib::factory::improve::an_improvement_is_a_new_draft_with_a_diff_and_regression_cases_that_runs_nothing",
+        "lib::factory::improve::a_proposal_keeps_every_case_and_capability_and_adds_regression_cases",
+        "lib::factory::improve::instructions_are_diffed_line_by_line",
+        "lib::factory::catalog::an_import_is_active_only_after_an_evaluation_here_or_its_publishers_report_on_purpose",
+        "factory_api::owners_release_deploy_roll_back_and_retire_factory_agents_from_the_web_ui"
+      ],
+      "live": [
+        "worker1's model proposed an improvement of the notes agent with real Copilot: a new draft with a diff, evaluated next, and the active release stayed"
+      ]
+    },
+    {
+      "id": "FAC-30",
+      "area": "agent-factory",
+      "claim": "proofkin factory publish NAME --to PEER (or the web UI's Share tab, or peers allow ... --agents) grants peers on the owner's allowlist chosen released versions of an agent. A granted peer gets its catalog in the owner's agent's hello and whenever it changes, and only what was granted to it: each release's name, version, description, the most access it asks for and an eval summary (its own runs' pass rate, its own cases, whether it resisted the built-in attacks), never knowledge topics, eval outputs or paths (AC-26, TM-7). The receiver names the publisher by its own allowlist entry, never by a name the publisher gives itself, and keeps only valid entries; retiring an agent unpublishes it. proofkin factory catalog (or the web UI's Catalog) lists what connected peers publish.",
+      "tests": [
+        "lib::factory::catalog::a_peer_sees_only_what_is_published_to_it_never_knowledge_outputs_or_paths",
+        "lib::factory::catalog::a_granted_peer_gets_its_catalog_in_the_hello_and_on_change_and_the_bundle"
+      ],
+      "live": [
+        "worker2's catalog lists the notes agent worker1 published to it: its access and how its evaluation went, never its knowledge, outputs or paths"
+      ]
+    },
+    {
+      "id": "FAC-31",
+      "area": "agent-factory",
+      "claim": "proofkin factory import PUBLISHER/NAME@VERSION (or Import in the web UI's Catalog) asks the publisher's agent for the release's bundle over iroh (at most 8 MiB, its report without its runs' outputs) and keeps it only whole: its manifest signed by the publisher's key and every file matching its hash, inside its folder; a changed file, a manifest re-signed by another key, a missing or added file or a path outside it is refused and nothing of it is kept (TM-2). Nothing of an import runs, and it isn't active until it passes an evaluation on the importer's own accounts, which releases exactly its build here, signed by the importer with its publisher's version (and the importer's sign-off for anything beyond read-only access), unless the importer accepts its publisher's report on purpose, recorded in its history (AC-27). An earlier version imported after a later one rolls nothing back; a name already used here is refused, and deleting an import before it is active deletes its bundle.",
+      "tests": [
+        "lib::factory::catalog::a_bundle_is_taken_only_whole_and_signed_by_its_publisher_and_nothing_runs",
+        "lib::factory::catalog::an_import_is_active_only_after_an_evaluation_here_or_its_publishers_report_on_purpose",
+        "lib::factory::catalog::an_earlier_version_imported_after_a_later_one_keeps_its_version_and_rolls_nothing_back",
+        "lib::factory::catalog::a_granted_peer_gets_its_catalog_in_the_hello_and_on_change_and_the_bundle"
+      ],
+      "live": [
+        "worker2 imported worker1's notes agent verified, ran nothing, and it became active only once it passed an evaluation on worker2's own accounts"
+      ]
+    },
+    {
+      "id": "FAC-32",
+      "area": "agent-factory",
+      "claim": "The web UI's API for drift watches, improvements, publications, the catalog and imports answers as its contract says, each with the status codes and schemas it lists, and refuses the same things the CLI does; MCP tools that would publish, import, watch or improve are refused with the owner's command to run. The Agent factory card's Drift tab sets and pauses a watch and shows its last run, failing cases, trend and incidents; Improve proposes an improvement and shows each proposal's diff; Share publishes an agent, or shows where an import came from and whether it is active; Catalog lists what peers publish and imports one; and the page follows the UX guidelines.",
+      "tests": [
+        "factory_api::owners_release_deploy_roll_back_and_retire_factory_agents_from_the_web_ui",
+        "connect::editor_agents_design_agents_over_mcp_and_the_lifecycle_stays_with_the_owner",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
+      "id": "FAC-33",
+      "area": "agent-factory",
+      "claim": "The agent factory is documented as built: the README (its commands and its security model), the CLI help, docs/agent-factory.md and its design package, which passes the checks it names (spec, api and design). Its live check runs it with real Copilot across agents: drafted, evaluated, released, deployed with a canary, watched for drift, improved, rolled back, published, imported and evaluated by a peer, handed a task by a peer, and retired.",
+      "tests": [
+        "factory::the_agent_factory_design_package_passes_the_checks_its_doc_names"
+      ],
+      "live": [
+        "worker1 released notes 1.0.1, deployed it and rolled its deployment back to 1.0.0",
+        "worker2 delegated a task to worker1's deployed notes agent, which answered with real Copilot"
+      ]
     }
   ]
 }

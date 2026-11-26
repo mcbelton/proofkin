@@ -182,6 +182,9 @@ sequenceDiagram
   R-->>SC: Pass rate below the gate
   SC->>OP: Second failure in a row, open an incident
   OP-->>O: Alert with the failing cases
+  SC->>R: The next scheduled evaluation
+  R-->>SC: Passed its gate
+  SC->>OP: Close the incident
 ```
 
 ## Improve an agent (US-9)
@@ -220,6 +223,7 @@ sequenceDiagram
   QA->>QA: Signature is alice's key, every hash matches, nothing runs
   QA->>R: Evaluate on the peer's own accounts
   R-->>QA: Passed
+  QA->>QA: Release 1.2.0 signed by the peer, its publisher's version
   QA-->>Q: fin-analyst 1.2.0 imported and active
 ```
 
@@ -252,7 +256,7 @@ sequenceDiagram
   C->>F: Same operations as the web UI
   F-->>C: Drafts, problems, estimates, reports
   C-->>E: Results
-  E->>C: tools/call that would release, deploy, roll back, retire or approve
+  E->>C: tools/call that would release, deploy, roll back, retire, approve, publish, import, watch or improve
   C-->>E: Refused, with the owner's command to run instead
 ```
 
@@ -283,6 +287,8 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
   [*] --> Draft: describe or template
+  [*] --> Imported: import a peer's release
+  Imported --> Active: evaluated here, or its report accepted
   Draft --> Draft: edit, check
   Draft --> Evaluated: build and evaluate
   Evaluated --> Draft: gate failed, edit

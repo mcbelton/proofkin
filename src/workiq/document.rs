@@ -777,6 +777,7 @@ mod tests {
                 tools: false,
             }),
             github: None,
+            agents: Vec::new(),
         };
         let general = peer("general", &["General"]);
         let wide = peer("wide", &["General", "Confidential"]);

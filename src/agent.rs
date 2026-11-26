@@ -95,6 +95,9 @@ pub struct AgentConfig {
     /// [`crate::factory::deploy`]). Every task it serves gets the release's instructions
     /// first, within its budgets; during its canary it takes only its owner's canary tasks.
     pub deployed: Option<Arc<crate::factory::deploy::Deployed>>,
+    /// What its owner publishes from their factory: each peer's catalog, and the bundles
+    /// peers import (see [`crate::factory::catalog`]). None: it publishes nothing.
+    pub publisher: Option<Arc<dyn crate::factory::catalog::Publisher>>,
 }
 
 impl AgentConfig {
@@ -121,6 +124,7 @@ impl AgentConfig {
             memory: None,
             owner_id: None,
             deployed: None,
+            publisher: None,
         }
     }
 }
@@ -207,6 +211,22 @@ pub enum Event {
     ApprovalClosed {
         id: u64,
     },
+    /// What a peer publishes to this agent changed (see [`Agent::catalogs`]).
+    Catalog {
+        name: String,
+        id: EndpointId,
+        entries: usize,
+    },
+}
+
+/// What a peer publishes to this agent from its factory, as it last said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    /// The peer, as this agent's allowlist names it.
+    pub name: String,
+    pub entries: Vec<crate::protocol::CatalogItem>,
+    /// When it said so (RFC 3339, UTC).
+    pub at: String,
 }
 
 /// A peer's result for a delegated task or approval.
@@ -548,6 +568,19 @@ struct Inner {
     memory: Option<Arc<crate::factory::memory::WorkerMemory>>,
     owner_id: Option<EndpointId>,
     deployed: Option<Arc<crate::factory::deploy::Deployed>>,
+    publisher: Option<Arc<dyn crate::factory::catalog::Publisher>>,
+    /// What each peer was last sent of this agent's catalog.
+    catalog_sent: Mutex<HashMap<EndpointId, Vec<crate::protocol::CatalogItem>>>,
+    /// What peers publish to this agent, by publisher.
+    catalogs: Mutex<BTreeMap<EndpointId, Published>>,
+    /// Bundles asked of peers and not received yet, by request id.
+    bundles: Mutex<HashMap<u64, BundleWait>>,
+}
+
+/// A bundle asked of `peer`, waiting for its answer.
+struct BundleWait {
+    peer: EndpointId,
+    reply: oneshot::Sender<Result<crate::protocol::Bundle, String>>,
 }
 
 /// A peer-to-peer agent on an iroh QUIC endpoint. Cheap to clone; all clones
@@ -615,6 +648,10 @@ impl Agent {
             memory: config.memory,
             owner_id: config.owner_id,
             deployed: config.deployed,
+            publisher: config.publisher,
+            catalog_sent: Mutex::new(HashMap::new()),
+            catalogs: Mutex::new(BTreeMap::new()),
+            bundles: Mutex::new(HashMap::new()),
         });
         tokio::spawn(accept_loop(inner.clone()));
         Ok((Self { inner }, rx))
@@ -940,6 +977,8 @@ impl Agent {
         if let Some(handle) = self.inner.peers.lock().unwrap().get(&id) {
             let _ = handle.tx.send(Message::Shares { shares });
         }
+        // And what it is published now.
+        self.inner.refresh_catalog();
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let _ = dial(inner, addr).await;
@@ -1392,6 +1431,95 @@ impl Agent {
         Ok(())
     }
 
+    /// What allowlisted peers publish to this agent from their factories, by publisher, as
+    /// they last said while connected.
+    pub fn catalogs(&self) -> Vec<(EndpointId, Published)> {
+        let trust = self.inner.trust.lock().unwrap();
+        self.inner
+            .catalogs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, p)| {
+                // Under the name the allowlist gives it now.
+                let name = trust.get(id)?.name.clone();
+                Some((*id, Published { name, ..p.clone() }))
+            })
+            .collect()
+    }
+
+    /// Asks connected peer `peer` for the bundle of release `version` of its agent `agent`,
+    /// and waits at most `timeout` for it. Fails with the peer's reason if it doesn't send
+    /// it (it doesn't publish it to this agent, it is too big, it doesn't verify there).
+    pub async fn request_bundle(
+        &self,
+        peer: EndpointId,
+        agent: &str,
+        version: &str,
+        timeout: Duration,
+    ) -> Result<crate::protocol::Bundle> {
+        let tx = self
+            .inner
+            .peers
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .map(|h| h.tx.clone())
+            .ok_or_else(|| anyhow!("{} isn't connected", peer.fmt_short()))?;
+        let request_id = self.new_task_id();
+        let (reply, answer) = oneshot::channel();
+        self.inner
+            .bundles
+            .lock()
+            .unwrap()
+            .insert(request_id, BundleWait { peer, reply });
+        let sent = tx.send(Message::BundleRequest {
+            request_id,
+            agent: agent.to_owned(),
+            version: version.to_owned(),
+        });
+        let answered = match sent {
+            Ok(()) => tokio::time::timeout(timeout, answer).await.ok(),
+            Err(_) => None,
+        };
+        self.inner.bundles.lock().unwrap().remove(&request_id);
+        match answered {
+            Some(Ok(Ok(bundle))) => Ok(bundle),
+            Some(Ok(Err(why))) => Err(anyhow!("{why}")),
+            _ => Err(anyhow!(
+                "no bundle came from {} in {}s",
+                peer.fmt_short(),
+                timeout.as_secs()
+            )),
+        }
+    }
+
+    /// Sends connected peers their catalog when what this agent's owner publishes changed;
+    /// [`Self::watch_catalog`] does it every so often.
+    pub fn refresh_catalog(&self) {
+        self.inner.refresh_catalog();
+    }
+
+    /// Looks every `every` at what this agent's owner publishes (it can change in the web
+    /// UI or with the command line), and sends connected peers their catalog when it
+    /// changed.
+    pub fn watch_catalog(&self, every: Duration) {
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                if *inner.shutdown.borrow() {
+                    return;
+                }
+                let refreshed = inner.clone();
+                let _ = tokio::task::spawn_blocking(move || refreshed.refresh_catalog()).await;
+            }
+        });
+    }
+
     /// Stops accepting peers, closes every connection and the endpoint. Peers learn
     /// first: the tasks this agent gave them are cancelled, and those it was running
     /// for them stop (reported as not done here, so another worker may take them).
@@ -1482,6 +1610,106 @@ enum Registration {
 }
 
 impl Inner {
+    /// The catalog `peer` gets: what this agent's owner publishes to it (nothing if it
+    /// publishes nothing, or the peer isn't on the allowlist).
+    fn catalog_for(&self, peer: &EndpointId) -> Vec<crate::protocol::CatalogItem> {
+        let Some(publisher) = &self.publisher else {
+            return Vec::new();
+        };
+        let entry = self.trust.lock().unwrap().get(peer).cloned();
+        entry
+            .map(|entry| publisher.entries_for(&entry))
+            .unwrap_or_default()
+    }
+
+    /// Keeps what `peer` (`name` on the allowlist) says it publishes to this agent, checked
+    /// (see [`crate::factory::catalog::clean`]); tells the application when it changed.
+    fn received_catalog(
+        &self,
+        peer: EndpointId,
+        name: &str,
+        entries: Vec<crate::protocol::CatalogItem>,
+    ) {
+        let entries = crate::factory::catalog::clean(entries);
+        let mut catalogs = self.catalogs.lock().unwrap();
+        let same = catalogs
+            .get(&peer)
+            .is_some_and(|p| p.entries == entries && p.name == name);
+        if same || (entries.is_empty() && !catalogs.contains_key(&peer)) {
+            return;
+        }
+        let count = entries.len();
+        if entries.is_empty() {
+            catalogs.remove(&peer);
+        } else {
+            catalogs.insert(
+                peer,
+                Published {
+                    name: name.to_owned(),
+                    entries,
+                    at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                },
+            );
+        }
+        drop(catalogs);
+        let _ = self.events.send(Event::Catalog {
+            name: name.to_owned(),
+            id: peer,
+            entries: count,
+        });
+    }
+
+    /// The bundle `peer` asks for, if this agent's owner publishes it to the peer, or why
+    /// not (built off the async runtime: it reads and hashes the release's files).
+    async fn bundle_for(
+        &self,
+        peer: EndpointId,
+        agent: String,
+        version: String,
+    ) -> Result<crate::protocol::Bundle, String> {
+        let entry = self.trust.lock().unwrap().get(&peer).cloned();
+        let (Some(publisher), Some(entry)) = (self.publisher.clone(), entry) else {
+            return Err(format!(
+                "{} publishes no {agent} {version} to you",
+                self.name
+            ));
+        };
+        tokio::task::spawn_blocking(move || publisher.bundle_for(&entry, &agent, &version))
+            .await
+            .unwrap_or_else(|e| Err(format!("the bundle couldn't be made: {e}")))
+    }
+
+    /// Sends each connected peer its catalog when it changed since it was last sent.
+    fn refresh_catalog(&self) {
+        if self.publisher.is_none() {
+            return;
+        }
+        let peers: Vec<(EndpointId, mpsc::UnboundedSender<Message>)> = self
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, h)| (*id, h.tx.clone()))
+            .collect();
+        for (id, tx) in peers {
+            let now = self.catalog_for(&id);
+            let mut sent = self.catalog_sent.lock().unwrap();
+            if sent.get(&id).is_some_and(|before| *before == now)
+                || (now.is_empty() && !sent.contains_key(&id))
+            {
+                continue;
+            }
+            if tx
+                .send(Message::Catalog {
+                    entries: now.clone(),
+                })
+                .is_ok()
+            {
+                sent.insert(id, now);
+            }
+        }
+    }
+
     /// Folders `peer` may run tasks in, by name and access (only if it may delegate
     /// and this agent serves tasks or team plans).
     fn shares_for(&self, peer: &EndpointId) -> Vec<ShareInfo> {
@@ -2086,10 +2314,10 @@ impl Inner {
         // A deployed agent's own rules: its release must run, it takes work only after its
         // canary (its owner's canary tasks meanwhile), and within its budgets.
         if let Some(deployed) = &self.deployed {
-            let owners_canary = self.owner_id == Some(*id)
+            let owners_evaluation = self.owner_id == Some(*id)
                 && task.share.as_deref() == Some(crate::factory::runner::SHARE);
             deployed
-                .admit(task, owners_canary)
+                .admit(task, owners_evaluation)
                 .map_err(|(by, message)| {
                     anyhow::Error::new(crate::audit::Refusal { by, message })
                         .context(format!("{} refused the task", self.name))
@@ -3495,7 +3723,15 @@ async fn run_connection(
             .as_ref()
             .and_then(|d| d.current().ok())
             .map(|p| p.label()),
+        catalog: inner.catalog_for(&peer_id),
     };
+    if let Message::Hello { catalog, .. } = &hello {
+        inner
+            .catalog_sent
+            .lock()
+            .unwrap()
+            .insert(peer_id, catalog.clone());
+    }
     write_message(&mut send, &hello).await?;
     let first = lines
         .next_line()
@@ -3511,6 +3747,7 @@ async fn run_connection(
         models,
         offers,
         agent,
+        catalog,
     } = serde_json::from_str(&first)?
     else {
         bail!("expected hello, got {first}");
@@ -3560,6 +3797,7 @@ async fn run_connection(
     }
     // Back before its tasks gave up on it.
     inner.left.lock().unwrap().remove(&peer_id);
+    inner.received_catalog(peer_id, &name, catalog);
     inner.send_held(peer_id, &tx);
     // A shutdown that raced with this handshake missed our close handle.
     if *inner.shutdown.borrow() {
@@ -3822,6 +4060,44 @@ async fn run_connection(
                             handle.offers = offers;
                             let _ = inner.events.send(Event::PeerModels { id: peer_id });
                         }
+                    }
+                }
+                Message::Catalog { entries } => {
+                    inner.received_catalog(peer_id, &name, entries);
+                }
+                Message::BundleRequest {
+                    request_id,
+                    agent,
+                    version,
+                } => {
+                    let (inner, tx) = (inner.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let sent = inner.bundle_for(peer_id, agent, version).await;
+                        let (bundle, error) = match sent {
+                            Ok(bundle) => (Some(Box::new(bundle)), None),
+                            Err(why) => (None, Some(why)),
+                        };
+                        let _ = tx.send(Message::Bundle {
+                            request_id,
+                            bundle,
+                            error,
+                        });
+                    });
+                }
+                Message::Bundle {
+                    request_id,
+                    bundle,
+                    error,
+                } => {
+                    let mut waits = inner.bundles.lock().unwrap();
+                    // Only the peer it was asked of answers it.
+                    if waits.get(&request_id).is_some_and(|w| w.peer == peer_id)
+                        && let Some(wait) = waits.remove(&request_id)
+                    {
+                        let _ = wait.reply.send(match (bundle, error) {
+                            (Some(bundle), _) => Ok(*bundle),
+                            (None, why) => Err(why.unwrap_or_else(|| "no bundle came".into())),
+                        });
                     }
                 }
                 Message::Hello { .. } => bail!("unexpected second hello"),

@@ -254,6 +254,7 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
         shares: Vec::new(),
         m365: None,
         github: None,
+        agents: Vec::new(),
     });
     let (stranger, _stranger_events) = Agent::bind(stranger).await.unwrap();
     let _ = stranger.connect(agent.addr()).await;
@@ -813,6 +814,7 @@ async fn a_plan_goes_on_after_its_agent_restarts() {
         shares: vec!["data".into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     };
     let gate = || Arc::new(tokio::sync::Semaphore::new(0));
     let (early, mid, late) = (gate(), gate(), gate());
@@ -1100,6 +1102,7 @@ async fn ui_gives_tasks_to_a_squad_member_and_moves_them_when_one_refuses() {
         shares: vec!["data".into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     };
     let mut config = AgentConfig::new("boss", boss_key.clone());
     config.network = Network::Local;
@@ -1240,6 +1243,7 @@ fn delegating(name: &str, id: iroh::EndpointId) -> TrustedPeer {
         shares: vec!["data".into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     }
 }
 
@@ -1466,6 +1470,7 @@ async fn ui_runs_plans_and_shows_squads() {
         shares: vec!["data".into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     };
     let mut worker = AgentConfig::new("worker", worker_key.clone());
     worker.network = Network::Local;
@@ -1864,6 +1869,7 @@ async fn a_running_plan_step_keeps_its_folder_in_its_target() {
         shares: vec!["data".into(), "docs".into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     };
     let mut worker = AgentConfig::new("worker", worker_key.clone());
     worker.network = Network::Local;
@@ -2008,6 +2014,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
                 ok,
                 ms: 120,
                 exit: Some(if ok { 0 } else { 1 }),
+                pass_rate: None,
             })
             .unwrap();
     }
@@ -2020,6 +2027,19 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
                 monitor: "api".into(),
                 kind: IncidentKind::Opened,
                 text: "api failed".into(),
+                checks: vec![],
+            })
+            .unwrap();
+    }
+    // A factory agent's drift watch opened one too; a monitor removed since left one behind.
+    for (incident, monitor) in [(now - 20, "factory:notes"), (now - 10, "gone")] {
+        store
+            .record_incident(&IncidentEvent {
+                ts: incident,
+                incident,
+                monitor: monitor.into(),
+                kind: IncidentKind::Opened,
+                text: format!("{monitor} failed"),
                 checks: vec![],
             })
             .unwrap();
@@ -2088,8 +2108,8 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     assert_eq!(ops["monitors"][0]["meets_slo"], false);
     assert!(ops["monitors"][0]["problem"].is_null());
     assert_eq!(
-        ops["open_incidents"], 1,
-        "one ongoing problem, however often it was opened"
+        ops["open_incidents"], 2,
+        "one ongoing problem per monitor, however often it was opened, and the drift watch's"
     );
     assert_eq!(
         ops["monitors"][1]["problem"],
@@ -2357,10 +2377,11 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         .map(|m| m["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["db", "web"]);
-    assert_eq!(ops["open_incidents"], 0);
+    assert_eq!(ops["open_incidents"], 1, "the drift watch's is still open");
+    let open = proofkin::ops::open_incidents(&store.incidents(0));
     assert!(
-        proofkin::ops::open_incidents(&store.incidents(0)).is_empty(),
-        "the removed monitor's incidents are closed"
+        !open.values().any(|m| m == "api"),
+        "the removed monitor's incidents are closed: {open:?}"
     );
 
     // GitHub: not signed in yet, so repositories can't be linked.
@@ -3197,6 +3218,7 @@ async fn the_page_follows_the_ux_guidelines() {
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     assert!(page.contains(r#"<script src="/workers.js" defer>"#));
     assert!(page.contains(r#"<script src="/factory.js" defer>"#));
+    assert!(page.contains(r#"<script src="/factory-share.js" defer>"#));
     assert!(page.contains(r#"<script src="/connect.js" defer>"#));
     for id in [
         "confirm-dialog",
@@ -3217,6 +3239,11 @@ async fn the_page_follows_the_ux_guidelines() {
         "fpanel-releases",
         "fpanel-deployments",
         "fpanel-metrics",
+        "fpanel-drift",
+        "fpanel-improve",
+        "fpanel-share",
+        "factory-catalog-btn",
+        "factory-catalog-dialog",
         "connect",
         "connect-toggle",
         "check-options",
@@ -3275,6 +3302,7 @@ async fn the_page_follows_the_ux_guidelines() {
         "/plan-builder.js",
         "/workers.js",
         "/factory.js",
+        "/factory-share.js",
         "/connect.js",
     ] {
         let js = request(port, "GET", script, &host, None, None).await;
@@ -3806,6 +3834,7 @@ async fn team_runs_show_on_the_bosss_step_and_the_leads_page() {
             shares: shares.iter().map(|s| (*s).to_owned()).collect(),
             m365: None,
             github: None,
+            agents: Vec::new(),
         }
     };
     let local = |config: &mut AgentConfig| {

@@ -3976,7 +3976,8 @@ async function loadState() {
   renderFeed();
   renderTasks();
   renderApprovals();
-  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules(), loadTools(), loadWorkers(), loadConnect(), loadFactory()]);
+  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules(), loadTools(), loadWorkers(), loadConnect(), loadFactory(),
+    typeof loadFactoryCatalog === "function" ? loadFactoryCatalog() : null]);
 }
 
 let events = null;
@@ -4003,6 +4004,7 @@ function connectEvents() {
     else if (msg.type === "ops") loadOps().catch((err) => toast(err.message, "error"));
     else if (msg.type === "workers") loadWorkers().catch((err) => toast(err.message, "error"));
     else if (msg.type === "factory") onFactoryEvent(msg);
+    else if (msg.type === "catalog" && typeof onFactoryCatalogEvent === "function") onFactoryCatalogEvent();
     else if (msg.type === "approvals") {
       const before = new Set((state.approvals ?? []).map((a) => a.id));
       state.approvals = msg.approvals;
@@ -4199,7 +4201,7 @@ function init() {
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog",
     "#branch-dialog", "#pull-dialog", "#workiq-dialog", "#workiq-budget-dialog", "#kb-import-dialog",
-    "#factory-new-dialog", "#factory-agent-dialog"]) guardDialog($(id));
+    "#factory-new-dialog", "#factory-agent-dialog", "#factory-catalog-dialog"]) guardDialog($(id));
   initModelsDialog();
   initBranchReview();
   $("#provider").addEventListener("change", renderTaskOptions);

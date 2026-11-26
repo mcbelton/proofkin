@@ -387,6 +387,7 @@ impl Pair {
             shares: vec![DATA_SHARE.into()],
             m365: None,
             github: None,
+            agents: Vec::new(),
         });
         // As the evaluation worker's allowlist has its owner (see runner::eval_worker).
         worker.trust.allow(TrustedPeer {
@@ -399,6 +400,7 @@ impl Pair {
             shares: vec![DATA_SHARE.into(), SHARE.into()],
             m365: None,
             github: None,
+            agents: Vec::new(),
         });
         let (worker_agent, worker_events) = worker.start().await;
         worker_agent.learn_offers(model.as_ref()).await;
@@ -958,6 +960,7 @@ async fn a_plan_step_proves_an_agent_kept_as_code_with_the_built_in_checks() {
         shares: vec![DATA_SHARE.into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     });
     helper.trust.allow(TrustedPeer {
         name: "boss".into(),
@@ -969,6 +972,7 @@ async fn a_plan_step_proves_an_agent_kept_as_code_with_the_built_in_checks() {
         shares: vec![DATA_SHARE.into(), "repo".into()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     });
     let (helper, _he) = helper.start().await;
     let mut shares = helper.shares();
@@ -1103,6 +1107,7 @@ async fn a_canary_runs_the_releases_smoke_cases_on_its_deployed_worker() {
                 worker: "eval".into(),
                 worker_id: pair.worker.id(),
                 folders: &pair.folders,
+                drift: false,
             },
         )
         .unwrap();
@@ -1145,4 +1150,170 @@ async fn a_canary_runs_the_releases_smoke_cases_on_its_deployed_worker() {
             Some("1.0.0")
         );
     }
+}
+
+/// AC-24: a drift watch's run evaluates the active release on its deployed worker, every
+/// case once and the built-in attacks too, judged by the release's gate. Its pass rate is an
+/// ops sample; the configured number of failed runs in a row opens an incident that alerts
+/// the owner with the failing cases, and a run that passes again resolves it.
+#[tokio::test]
+async fn a_drift_watch_opens_an_incident_after_failed_runs_in_a_row_and_resolves_it() {
+    use proofkin::factory::drift;
+    use proofkin::factory::store::{DeployState, DriftOutcome, DriftWatch};
+    use proofkin::ops::{IncidentKind, OpsStore};
+    let cases = json!([
+        risk_case(),
+        { "id": "E2", "requirement": "R2", "input": "Name the risk in q3.md once more.",
+          "fixtures": ["q3.md"], "expect": [{ "contains": "supplier delay" }] }
+    ]);
+    let bp = blueprint("read-only", &[], cases, &["fake-small"]);
+    // The model drifted (a wrong risk) for two runs of both cases, then it is right again.
+    let model = Model::new(true);
+    *model.once.lock().unwrap() = vec![("fake-small", "The risk is a strike."); 4];
+    let model = Arc::new(model);
+    let pinned = Pinned {
+        agent: "notes".into(),
+        version: "1.0.0".into(),
+        state: DeployState::Running,
+        instructions:
+            "\n### Agent: notes 1.0.0\nYou read project notes and report the risks they name.\n"
+                .into(),
+        budgets: proofkin::factory::blueprint::Budgets::default(),
+        delegate: false,
+        access: Access::ReadOnly,
+    };
+    let pair = Pair::with(
+        model.clone(),
+        Duration::from_secs(2),
+        Some(Deployed::fixed(pinned)),
+    )
+    .await;
+    pair.store
+        .update_state("notes", |s| {
+            s.watch = Some(DriftWatch {
+                when: "daily 03:00".into(),
+                fail_after: 2,
+                enabled: true,
+                since: "2026-11-01T00:00:00Z".into(),
+                last: None,
+                failures: 0,
+                incident: None,
+                retry: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+    let skills = proofkin::skills::Skills::new(pair.tmp.path().join("skills"));
+    let build = proofkin::factory::build::build(&bp, &skills).unwrap();
+    pair.store.save_build(&build).unwrap();
+    let fixtures = pair.store.release_dir("notes", "1.0.0").join("fixtures");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    std::fs::copy(
+        pair.store.fixtures_dir("notes").join("q3.md"),
+        fixtures.join("q3.md"),
+    )
+    .unwrap();
+    let ops = OpsStore::new(pair.tmp.path().join("ops"));
+    let alerts = Mutex::new(Vec::new());
+    let notify = |e: &proofkin::ops::IncidentEvent| alerts.lock().unwrap().push(e.clone());
+    for run in 1..=3 {
+        // Evaluations are known by the second they start.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let setup = runner::prepare_canary(
+            &pair.store,
+            runner::CanaryRequest {
+                blueprint: &bp,
+                build: &build,
+                version: "1.0.0".into(),
+                route: route("fake-small"),
+                by: "boss".into(),
+                worker: "eval".into(),
+                worker_id: pair.worker.id(),
+                folders: &pair.folders,
+                drift: true,
+            },
+        )
+        .unwrap();
+        let own: Vec<&str> = setup
+            .evaluation
+            .cases
+            .iter()
+            .filter(|c| !c.is_adversarial())
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(own, ["E1", "E2"], "every case, not only its smoke case");
+        assert!(
+            setup.evaluation.cases.iter().any(|c| c.is_adversarial()),
+            "the built-in attacks too"
+        );
+        assert!(setup.evaluation.canary.as_ref().is_some_and(|c| c.drift));
+        pair.share(&setup.share);
+        let started = proofkin::factory::store::now();
+        let ended = pair
+            .runner(Judges::default())
+            .run(setup.evaluation, &setup.share, |_| {})
+            .await
+            .unwrap();
+        ended.verify().unwrap();
+        let ran = drift::verdict(&ended, "1.0.0", "eval", &started);
+        let drifted = run < 3;
+        assert_eq!(
+            ran.outcome,
+            if drifted {
+                DriftOutcome::Failed
+            } else {
+                DriftOutcome::Passed
+            },
+            "{ran:?}"
+        );
+        drift::record(&pair.store, &ops, "boss", "notes", ran, &notify).unwrap();
+        let watch = pair.store.state("notes").unwrap().unwrap().watch.unwrap();
+        let alerted = alerts.lock().unwrap().clone();
+        match run {
+            1 => {
+                assert_eq!((watch.failures, watch.incident), (1, None));
+                assert!(alerted.is_empty(), "one failed run opens nothing");
+            }
+            2 => {
+                assert_eq!(watch.failures, 2);
+                assert!(watch.incident.is_some());
+                assert_eq!(alerted.len(), 1);
+                let opened = &alerted[0];
+                assert_eq!(opened.kind, IncidentKind::Opened);
+                assert_eq!(opened.monitor, "factory:notes");
+                for says in [
+                    "notes 1.0.0 failed its drift watch 2 times in a row on eval",
+                    "0% of its own runs (0 of 2)",
+                    "failing: E1: ",
+                    "E2: ",
+                ] {
+                    assert!(opened.text.contains(says), "{says:?} in {}", opened.text);
+                }
+            }
+            _ => {
+                assert_eq!((watch.failures, watch.incident), (0, None));
+                assert_eq!(alerted.len(), 2);
+                assert_eq!(alerted[1].kind, IncidentKind::Resolved);
+                assert!(
+                    alerted[1].text.contains("passed its drift watch again"),
+                    "{}",
+                    alerted[1].text
+                );
+            }
+        }
+    }
+    let samples = ops.samples(0);
+    let rates: Vec<(bool, Option<f64>)> = samples.iter().map(|s| (s.ok, s.pass_rate)).collect();
+    assert_eq!(
+        rates,
+        [(false, Some(0.0)), (false, Some(0.0)), (true, Some(1.0))],
+        "each run's pass rate is an ops sample"
+    );
+    assert!(samples.iter().all(|s| s.monitor == "factory:notes"));
+    let incidents = ops.incidents(0);
+    assert_eq!(
+        incidents.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [IncidentKind::Opened, IncidentKind::Resolved]
+    );
+    assert!(proofkin::ops::open_incidents(&incidents).is_empty());
 }

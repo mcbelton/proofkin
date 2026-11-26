@@ -217,13 +217,24 @@ pub fn plan(
     offers: Option<&Offers>,
 ) -> Result<Planned, Refused> {
     let store = FactoryStore::of(profile);
-    let draft = store
-        .draft(name)
-        .map_err(|e| Refused::invalid(format!("{e:#}")))?
-        .ok_or_else(|| Refused::invalid(format!("the factory has no draft '{name}'")))?;
     let catalog = Catalog::of(profile)
         .map_err(|e| Refused::invalid(format!("{e:#}")))?
         .without(name);
+    let draft = store
+        .draft(name)
+        .map_err(|e| Refused::invalid(format!("{e:#}")))?;
+    // An import has no draft: its build is its publisher's, exactly, with its skills.
+    let imported = match &draft {
+        Some(_) => None,
+        None => crate::factory::catalog::pending(&store, name)
+            .map_err(|e| Refused::invalid(format!("{e:#}")))?,
+    };
+    if let Some((_, build)) = imported {
+        let blueprint = blueprint_of(&build).map_err(|e| Refused::invalid(format!("{e:#}")))?;
+        return routed(blueprint, build, &catalog, asked, repetitions, offers, name);
+    }
+    let draft =
+        draft.ok_or_else(|| Refused::invalid(format!("the factory has no draft '{name}'")))?;
     let problems = draft_problems(&store, name, &draft.blueprint, &catalog);
     if has_errors(&problems) {
         let errors = problems.iter().filter(|p| p.error).count();
@@ -257,6 +268,23 @@ pub fn plan(
         });
     }
     let blueprint = from_value(&draft.blueprint).map_err(|p| Refused::invalid(p.to_string()))?;
+    let build = crate::factory::build::build(&blueprint, &profile.skills())
+        .and_then(|b| store.save_build(&b).map(|_| b))
+        .map_err(|e| Refused::invalid(format!("{e:#}")))?;
+    routed(blueprint, build, &catalog, asked, repetitions, offers, name)
+}
+
+/// `build` of `blueprint`, evaluated on the models `asked` (none: those its blueprint lists,
+/// else its providers' defaults) that `catalog`'s profile can run, `repetitions` times.
+fn routed(
+    blueprint: Blueprint,
+    build: Build,
+    catalog: &Catalog,
+    asked: &[Route],
+    repetitions: Option<u32>,
+    offers: Option<&Offers>,
+    name: &str,
+) -> Result<Planned, Refused> {
     let repetitions = repetitions.unwrap_or_else(|| blueprint.evals.repetitions());
     if !(1..=MAX_REPETITIONS).contains(&repetitions) {
         return Err(Refused::invalid(format!(
@@ -281,7 +309,7 @@ pub fn plan(
             })
             .collect::<Result<_, Refused>>()?;
     }
-    let routes = routing::candidates(&listed, &catalog, offers, true);
+    let routes = routing::candidates(&listed, catalog, offers, true);
     if !asked.is_empty() && !routes.left_out.is_empty() {
         let why: Vec<String> = routes
             .left_out
@@ -304,9 +332,6 @@ pub fn plan(
             why.join("; ")
         )));
     }
-    let build = crate::factory::build::build(&blueprint, &profile.skills())
-        .and_then(|b| store.save_build(&b).map(|_| b))
-        .map_err(|e| Refused::invalid(format!("{e:#}")))?;
     Ok(Planned {
         blueprint,
         build,
@@ -433,7 +458,7 @@ pub fn prepare(store: &FactoryStore, request: Request<'_>) -> Result<Setup> {
     Ok(Setup { evaluation, share })
 }
 
-/// What a deployment's canary is of, and where it runs.
+/// What a deployment's canary (or drift watch) is of, and where it runs.
 pub struct CanaryRequest<'a> {
     /// The release's blueprint and build.
     pub blueprint: &'a Blueprint,
@@ -446,11 +471,15 @@ pub struct CanaryRequest<'a> {
     pub worker: String,
     pub worker_id: EndpointId,
     pub folders: &'a ShareStore,
+    /// A drift watch's evaluation: every case, the built-in attacks too, instead of the
+    /// smoke cases.
+    pub drift: bool,
 }
 
 /// Prepares a deployment's canary: the release's smoke cases, once each, on its model, on
 /// the deployed worker (which gives each task its release's instructions), with the
-/// fixtures kept in the release. The caller holds the evaluation lock.
+/// fixtures kept in the release; for a drift watch, every case once, the built-in attacks
+/// too. The caller holds the evaluation lock.
 pub fn prepare_canary(store: &FactoryStore, request: CanaryRequest<'_>) -> Result<Setup> {
     let bp = request.blueprint;
     let now = chrono::Utc::now();
@@ -464,7 +493,7 @@ pub fn prepare_canary(store: &FactoryStore, request: CanaryRequest<'_>) -> Resul
     let seeds = Seeds::new();
     let cases: Vec<EvalCase> = cases(bp, &seeds, &store.evaluation_dir())
         .into_iter()
-        .filter(|c| c.smoke && !c.is_adversarial())
+        .filter(|c| request.drift || (c.smoke && !c.is_adversarial()))
         .collect();
     let runs = cases.iter().map(|c| EvalRun::new(0, &c.id, 1)).collect();
     let evaluation = Evaluation {
@@ -492,6 +521,7 @@ pub fn prepare_canary(store: &FactoryStore, request: CanaryRequest<'_>) -> Resul
         canary: Some(CanaryOf {
             worker: request.worker,
             version: request.version,
+            drift: request.drift,
         }),
         signer: String::new(),
         signer_id: String::new(),
@@ -777,6 +807,7 @@ pub fn eval_worker(
             shares: Vec::new(),
             m365: None,
             github: None,
+            agents: Vec::new(),
         });
         peer.can_delegate = true;
         peer.access = Access::Full;

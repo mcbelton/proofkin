@@ -416,6 +416,22 @@ textarea { resize: vertical; }
 .factory-own-answer .result { margin-top: 6px; max-height: 260px; overflow: auto; overscroll-behavior: contain; }
 .factory-own-answer .form-error:empty { display: none; }
 .factory-diff { margin: 4px 0 0; padding-left: 18px; }
+/* Drift, Improve, Share and the catalog (factory-share.js). */
+#factory-agent-dialog .tabs { flex-wrap: wrap; }
+.badge.danger { background: var(--danger-soft); color: var(--danger); }
+.factory-trend { list-style: none; margin: 4px 0 0; padding: 0; display: flex; align-items: flex-end; gap: 3px; height: 64px; border-bottom: 1px solid var(--border); }
+.factory-trend li { flex: 0 0 12px; height: 100%; display: flex; align-items: flex-end; }
+.factory-trend .bar { display: block; width: 100%; border-radius: 2px 2px 0 0; background: var(--success); }
+.factory-trend li.bad .bar { background: var(--danger); }
+.factory-trend-box > p { margin: 4px 0 0; }
+.factory-change { margin: 6px 0 0; padding: 8px 10px; max-height: 260px; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.factory-change .add { color: var(--success); }
+.factory-change .del { color: var(--danger); }
+.factory-change .chg { color: var(--accent); }
+@media (forced-colors: active) {
+  .factory-trend .bar { background: CanvasText; }
+  .factory-trend li.bad .bar { background: Mark; }
+}
 .factory-release-details .facts { margin-top: 6px; }
 .factory-release-details h4 { margin: 8px 0 0; font-size: 12.5px; }
 .worker-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }

@@ -853,3 +853,23 @@ fn an_agent_kept_as_code_is_checked_in_its_folder_and_drafted_from_it() {
     let out = home.fails(&["new", "other", "--from", dir, "--profile", "alice"]);
     assert!(out.contains("isn't named \"other\""), "{out}");
 }
+
+/// The agent factory's design package passes the checks its doc names
+/// (docs/agent-factory.md): its stories and criteria, its API contract, and its
+/// architecture, data, threats, tests and operations, as they say what was built.
+#[test]
+fn the_agent_factory_design_package_passes_the_checks_its_doc_names() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/agent-factory");
+    for part in ["spec", "api", "design"] {
+        let out = Command::new(EXE)
+            .args(["spec", "check", part, "--dir"])
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "spec check {part}: {text}");
+        assert!(!text.contains("FAILED"), "spec check {part}: {text}");
+    }
+}
