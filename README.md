@@ -1908,7 +1908,7 @@ its requirements become the plan's claims, and peers implement it with a test pe
 | A Spec Kit feature, `specs/NNN-name/` (`spec.md`, `plan.md`, `tasks.md`; the project's `.specify/memory/constitution.md`) | `US-1`... per user story (*each of its acceptance scenarios passes*), `FR-001`... per functional requirement | `SC-001`... per success criterion |
 | An OpenSpec change, `openspec/changes/<id>/` (`proposal.md`, `tasks.md`, `design.md`, deltas in `specs/<capability>/spec.md`) | `<capability>-1`... per ADDED or MODIFIED requirement (REMOVED and RENAMED ones become instructions) | `ACCEPT`: it does what the proposal says |
 | An OpenSpec capability, `openspec/specs/<capability>/` | `<capability>-1`... per requirement | `ACCEPT` |
-| A Microsoft 365 document: a Word (`.docx`), Markdown (`.md`, `.markdown`) or text (`.txt`) document on SharePoint or OneDrive, by its link (`--from <link>`), read through Work IQ | Read as a Spec Kit `spec.md`: `US-1`... per user story, `FR-001`... per requirement | `SC-001`... per success criterion; `DOC-1` for a document with neither user stories nor requirements |
+| A Microsoft 365 document: a Word (`.docx`), Markdown (`.md`, `.markdown`) or text (`.txt`) document on SharePoint (`*.sharepoint.com`, `*.sharepoint-df.com`) or OneDrive (`onedrive.live.com`, `1drv.ms`), by its link (`--from <link>`), read through Work IQ | Read as a Spec Kit `spec.md`: `US-1`... per user story, `FR-001`... per requirement | `SC-001`... per success criterion; `DOC-1` for a document with neither user stories nor requirements |
 
 The plan has three steps: **impl** on the peer you pick (`implement-change` skill, the
 folder's `test` check, up to 3 attempts, the tasks done in order and ticked off),
@@ -1928,20 +1928,23 @@ proofkin spec import ~/shop/openspec/changes/add-dark-mode --profile boss --set 
 ```
 
 **A spec in a document on SharePoint or OneDrive.** `--from` takes the `https://` link of
-a Word, Markdown or text document on `*.sharepoint.com`, `onedrive.live.com` or `1drv.ms`
-(a `.../Doc.aspx?sourcedoc=...` link works too) instead of a folder, and reads it through
+a Word, Markdown or text document on `*.sharepoint.com`, `*.sharepoint-df.com` (Microsoft's
+own pre-production SharePoint), `onedrive.live.com` or `1drv.ms` (a
+`.../Doc.aspx?sourcedoc=...` link works too) instead of a folder, and reads it through
 Work IQ with the profile's sign-in (`proofkin auth login workiq`, see
 [Work IQ](docs/work-iq.md)): its name, type, size and sensitivity label first (`fetch`),
 then its content (`fetch_blob`). Both calls are audited with purpose `spec-import` and held
-to the profile's Work IQ budgets. Another link, or a folder as well, is refused before any
-call. Other types of document are refused (save it as Word or Markdown), and so is a
-document over 4 MB, before its content is downloaded. A Word document is read as Markdown:
-its title and headings, lists, tables and text; headers, footers, comments and images are
-left out. Write each requirement on its own line as `FR-001: ...` (and each success
-criterion as `SC-001: ...`) to get a claim for each; a document with none is one claim,
-`DOC-1`, signed off, with a warning. The spec is saved as knowledge topic
-`spec-<document>` (from its file name; its text redacted and marked as external content),
-marked as Microsoft 365 content
+to the profile's Work IQ budgets, and an error Work IQ reports for the document gives its
+words (on one line, secrets redacted). Another link, or a folder as well, is refused before
+any call. Other types of document are refused (save it as Word or Markdown), and so is a
+document over 4 MB, or one whose sensitivity label protects it (its content is encrypted:
+save a copy without protection, or as Markdown), before its content is downloaded. A Word
+document is read as Markdown: its title and headings, lists, tables and text; headers,
+footers, comments and images are left out. Write each requirement on its own line as
+`FR-001: ...` (and each success criterion as `SC-001: ...`) to get a claim for each; a
+document with none is one claim, `DOC-1`, signed off, with a warning. The spec is saved as
+knowledge topic `spec-<document>` (from its file name; its text redacted and marked as
+external content), marked as Microsoft 365 content
 (`origin: workiq`) with the document's sensitivity label, or `unknown` when Work IQ gives
 no label information, so only your own agents and digital workers get it. A peer gets the
 plan's steps only with a Microsoft 365 grant that includes that label
