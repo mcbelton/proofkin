@@ -40,6 +40,13 @@ function factoryRoute(r) {
   return `${providerLabel(r.provider)}${model}${r.effort ? `, ${r.effort} reasoning` : ""}`;
 }
 
+/// A model in the factory's own words, as Activity says it (src/factory/routing.rs): e.g.
+/// "copilot claude-opus-5.5 (max reasoning)".
+function factoryRouteWords(r) {
+  if (!r.model) return `${r.provider} (its default model${r.effort ? `, ${r.effort} reasoning` : ""})`;
+  return `${r.provider} ${r.model}${r.effort ? ` (${r.effort} reasoning)` : ""}`;
+}
+
 function factoryPercent(x) {
   return `${Math.round((x ?? 0) * 100)}%`;
 }
@@ -992,6 +999,9 @@ function factoryOwnAnswer(name, version) {
       toast(yes ? `Approved ${name} ${version}` : `Rejected ${name} ${version}`);
       // Its answer goes when the factory records it: focus stays in the panel meanwhile.
       $("#ftab-releases").focus();
+      // Recorded by now, as a rule: Releases and Deployments show it at once (else the
+      // factory's event redraws them when it lands).
+      if (factoryState.open === name) await refreshFactoryAgent(false).catch(() => {});
     } catch (err) {
       button.disabled = false;
       error.textContent = err.message;
@@ -1061,20 +1071,47 @@ function renderFactoryDeployments() {
   panel.replaceChildren(...parts);
 }
 
+/// What the deploy form says of the folders a deployment works in, when the release picked
+/// names `named`.
+function factoryDeployHint(named) {
+  return `It works in the folders you tick (and its own data folder). None ticked: ${named.length ? `the folders its release names (${named.join(", ")})` : "its release names none"}`;
+}
+
 function factoryDeployForm(agent, released) {
   const version = el("select", {}, ...released.map((r) => el("option", { value: r.version, text: r.version === agent.active_version ? `${r.version} (active)` : r.version })));
   version.value = agent.active_version ?? released[0].version;
+  // The folders the picked release names: where it works when none is ticked.
+  const named = () => released.find((r) => r.version === version.value)?.folders ?? [];
+  // The folders you share (not known while its draft doesn't parse).
+  const shared = agent.choices?.folders;
   const folders = factoryChips("dep-folders", "Folders it works in",
-    (agent.choices?.folders ?? []).map((f) => [f.name, f.name, `${ACCESS_SHORT[f.access] ?? f.access} at most`]),
-    factoryState.draft?.blueprint?.deploy?.folders ?? [], "Its own data folder too. None ticked: the folders its release names.");
+    (shared ?? []).map((f) => [f.name, f.name, `${ACCESS_SHORT[f.access] ?? f.access} at most`]),
+    factoryState.draft?.blueprint?.deploy?.folders ?? [], factoryDeployHint(named()));
+  const hint = folders.querySelector("#fcfg-dep-folders-hint");
+  const none = el("p", { class: "small warn-text", id: "factory-dep-none", hidden: true },
+    "You share no folders yet, and a deployment works in at least one: share one with ",
+    el("span", { class: "mono", text: `proofkin share add NAME PATH --profile ${state.me?.profile ?? "PROFILE"}` }),
+    ", then deploy it here.");
   const canary = el("input", { type: "checkbox", id: "factory-dep-canary", checked: true });
   const start = el("input", { type: "checkbox", id: "factory-dep-start", checked: true });
   const error = el("p", { class: "form-error", role: "alert" });
   const go = el("button", { type: "submit", class: "btn primary", id: "factory-deploy-btn" }, "Deploy");
+  let busy = false;
+  // Nothing to tick and a release that names none: no folder it could work in.
+  const stuck = () => Array.isArray(shared) && !shared.length && !named().length;
+  const sync = () => {
+    hint.textContent = factoryDeployHint(named());
+    none.hidden = !stuck();
+    go.disabled = busy || stuck();
+    if (stuck()) go.setAttribute("aria-describedby", "factory-dep-none");
+    else go.removeAttribute("aria-describedby");
+  };
+  version.addEventListener("change", sync);
   const form = el("form", { class: "factory-inline", novalidate: true },
     el("h3", { text: "Deploy it" }),
     el("div", { class: "factory-grid" }, factoryField("factory-dep-version", "Release", version)),
     folders,
+    none,
     el("label", { class: "check" }, canary, el("span", { text: "Run its canary first: the release's smoke cases, on its worker, before it takes work" })),
     el("label", { class: "check" }, start, el("span", { text: "Start it now (else start it later under Digital workers)" })),
     error,
@@ -1082,11 +1119,20 @@ function factoryDeployForm(agent, released) {
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     error.textContent = "";
+    if (busy || stuck()) return;
+    const picked = factoryTicked(form, "dep-folders");
+    const first = form.querySelector('input[name="fcfg-dep-folders"]');
+    // None ticked means the folders its release names: with none, it would work in none.
+    if (!picked.length && !named().length && first) {
+      error.textContent = "Tick at least one folder it works in: its release names none";
+      first.focus();
+      return;
+    }
+    busy = true;
     go.disabled = true;
     go.textContent = "Deploying…";
     try {
       const body = { version: version.value, canary: canary.checked, start: start.checked };
-      const picked = factoryTicked(form, "dep-folders");
       if (picked.length) body.folders = picked;
       const d = await api(`/api/factory/agents/${encodeURIComponent(agent.name)}/deployments`, { method: "POST", body: JSON.stringify(body) });
       toast(`Deployed ${agent.name} ${d.version} on ${d.worker}${body.canary && body.start ? ": its canary runs first" : ""}`);
@@ -1095,11 +1141,13 @@ function factoryDeployForm(agent, released) {
       (document.getElementById(`factory-power-${d.worker}`) ?? $("#ftab-deployments")).focus();
     } catch (err) {
       error.textContent = err.message;
-      go.disabled = false;
+      busy = false;
       go.textContent = "Deploy";
+      sync();
       go.focus();
     }
   });
+  sync();
   return form;
 }
 
@@ -1327,6 +1375,38 @@ function factoryRunning() {
   return factoryState.agent?.evaluations?.find((e) => e.running && !e.canary) ?? null;
 }
 
+/// How evaluation `e` ended, in a line: what it recommends, or why it didn't pass.
+function factoryLastText(e) {
+  if (e.state === "passed") return e.recommended ? `Passed: it recommends ${factoryRouteWords(e.recommended)}` : "Passed";
+  if (e.state === "failed") {
+    // One model: its own gate's words (the evaluation's put the model before each reason).
+    const why = (e.gates?.length === 1 ? e.gates[0].reasons?.[0] : null) ?? e.gate?.reasons?.[0];
+    return why ? `Failed: ${why}` : "Failed";
+  }
+  if (e.state === "cancelled") return e.error ? `Cancelled: ${e.error}` : "Cancelled";
+  return `Stopped at ${e.done} of ${factoryPlural(e.total, "run", "runs")}: evaluate it again to go on`;
+}
+
+/// The last evaluation's result, shown under Evaluate until another starts, with the way to
+/// its report.
+function factoryLastResult() {
+  const e = (factoryState.agent?.evaluations ?? []).find((x) => !x.canary);
+  if (!e || e.running) return null;
+  const open = el("button", { type: "button", class: "btn link small", id: "factory-last-open" }, "Open in Evaluations");
+  open.addEventListener("click", async () => {
+    // Evaluations shows the newest, unless another was picked there.
+    if (factoryState.reportPicked && factoryState.report?.id !== e.id) {
+      factoryState.reportPicked = false;
+      await renderFactoryReports();
+    }
+    selectFactoryTab("reports", true);
+  });
+  return el("div", { class: "factory-item", id: "factory-last" },
+    el("strong", { id: "factory-last-text", text: factoryLastText(e) }),
+    el("span", { class: "muted small", text: `Its last evaluation · ${stamp(Date.parse(e.finished ?? e.started))} · ${e.id}` }),
+    el("div", { class: "factory-actions start" }, open));
+}
+
 function renderFactoryEvaluate() {
   const panel = $("#fpanel-evaluate");
   const agent = factoryState.agent;
@@ -1365,7 +1445,9 @@ function renderFactoryEvaluate() {
       estimate.replaceChildren();
     });
   }
+  const last = factoryLastResult();
   panel.replaceChildren(
+    ...(last ? [last] : []),
     el("p", { class: "muted small", text: "Its cases and the built-in attacks run on each model you pick, a few times each, as real tasks of your evaluation worker. The release gate needs 90% of its own runs, 2 of 3 of each requirement's and every attack to pass; a judge of another model family scores rubrics and never decides." }),
     el("fieldset", { class: "field" }, el("legend", { text: "Models" }),
       candidates.length ? picks : el("p", { class: "muted small", text: "No model it can be evaluated on here." }),

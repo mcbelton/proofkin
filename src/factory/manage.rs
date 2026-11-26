@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use iroh::EndpointAddr;
 
 use crate::agent::{Agent, AgentConfig, Network};
 use crate::factory::blueprint::{Budgets, from_value};
@@ -14,8 +15,9 @@ use crate::factory::deploy::{self, DeployAsk, Host};
 use crate::factory::release::{self, Asked, ReleaseState};
 use crate::factory::report::{EvalState, Evaluation};
 use crate::factory::store::{DeployState, FactoryStore};
-use crate::factory::{code, conflict, lifecycle, metrics, not_found};
+use crate::factory::{code, conflict, invalid, lifecycle, metrics, not_found};
 use crate::profile::Profile;
+use crate::trust::TrustStore;
 use crate::workers::{Launch, Supervisor};
 
 /// The next command for profile `profile`.
@@ -317,6 +319,24 @@ async fn host(
     ))
 }
 
+/// [`deploy::deploy`], its refusal of a release that names no folders saying the flag that
+/// names them (the web UI's words name none).
+fn deploy_as_asked(
+    profile: &Profile,
+    addr: EndpointAddr,
+    allowlist: &TrustStore,
+    name: &str,
+    ask: &DeployAsk,
+) -> Result<deploy::Placed> {
+    deploy::deploy(profile, addr, allowlist, name, ask).map_err(|e| {
+        if e.to_string() == deploy::no_folders(name) {
+            invalid(format!("{e} (--folders A,B)"))
+        } else {
+            e
+        }
+    })
+}
+
 /// Deploys agent `name` (its active release, or `version`) as a digital worker. With
 /// `start`, its worker starts here and runs its canary (unless `no_canary`); then it starts
 /// with your agent.
@@ -345,7 +365,7 @@ pub async fn deploy(
             );
         }
         let id = profile.identity()?.public();
-        let placed = deploy::deploy(profile, id.into(), &profile.trust()?, name, &ask)?;
+        let placed = deploy_as_asked(profile, id.into(), &profile.trust()?, name, &ask)?;
         if let Some(entry) = placed.entry {
             let mut trust = profile.trust()?;
             trust.allow(entry);
@@ -368,7 +388,7 @@ pub async fn deploy(
     }
     let (host, _instance) = host(profile, &format!("deploy {name}"), bridge).await?;
     let result = async {
-        let placed = deploy::deploy(
+        let placed = deploy_as_asked(
             profile,
             host.agent.addr(),
             &host.agent.trusted(),
@@ -690,7 +710,7 @@ mod tests {
     use crate::factory::blueprint::tests::sample;
     use crate::factory::release::tests::Fixture;
     use iroh::SecretKey;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
@@ -813,5 +833,48 @@ mod tests {
             why.contains("has no passed evaluation of build"),
             "another build: {why}"
         );
+    }
+
+    /// `factory deploy` of a release that names no folders, without --folders: refused in
+    /// the web UI's words and the flag that names them; a folder you don't share keeps its own.
+    #[test]
+    fn deploying_a_release_that_names_no_folders_says_the_folders_flag() {
+        let home = tempfile::tempdir().unwrap();
+        let owner = Profile::open_in(home.path(), "alice").unwrap();
+        owner.save().unwrap();
+        let f = Fixture::in_store(FactoryStore::of(&owner));
+        let passed = f.evaluated(
+            |v| {
+                v["approvers"] = json!([]);
+                v["capabilities"]["mcp"] = json!([]);
+                v["model"]["needs_mcp"] = json!(false);
+                v["memory"] = json!({});
+                v["deploy"]["folders"] = json!([]);
+            },
+            false,
+        );
+        f.release(&passed.id, None).unwrap();
+        let refused = |folders: Option<Vec<String>>| {
+            let ask = DeployAsk {
+                folders,
+                by: "alice".into(),
+                ..DeployAsk::default()
+            };
+            let to = f.owner.public().into();
+            let trust = TrustStore::default();
+            let e = deploy_as_asked(&owner, to, &trust, "fin-analyst", &ask).unwrap_err();
+            (crate::factory::refusal_kind(&e), format!("{e:#}"))
+        };
+
+        let (kind, why) = refused(None);
+        assert_eq!(kind, Some(RefusalKind::Invalid));
+        assert_eq!(
+            why,
+            "fin-analyst's release names no folders to work in: pick at least one folder you \
+             share (--folders A,B)"
+        );
+        let (kind, why) = refused(Some(vec!["ledger".into()]));
+        assert_eq!(kind, Some(RefusalKind::Invalid));
+        assert_eq!(why, "you share no folder 'ledger'");
     }
 }

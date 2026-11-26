@@ -329,13 +329,19 @@ impl Deployed {
 pub struct DeployAsk {
     /// The release (default: the active one).
     pub version: Option<String>,
-    /// The shared folders it works in (default: its blueprint's deploy folders).
+    /// The shared folders it works in (none, or an empty list: its release's deploy folders).
     pub folders: Option<Vec<String>>,
     /// Run the release's smoke cases on it before it takes work.
     pub canary: bool,
     /// It starts whenever its owner's agent starts (default: as its blueprint says).
     pub start_with_owner: Option<bool>,
     pub by: String,
+}
+
+/// Why agent `name` isn't deployed when neither the deployment nor its release names a folder
+/// it works in (its own data folder doesn't count): the web UI's words, which name no flags.
+pub fn no_folders(name: &str) -> String {
+    format!("{name}'s release names no folders to work in: pick at least one folder you share")
 }
 
 /// A deployment made or changed: its record and its worker.
@@ -387,14 +393,12 @@ pub fn deploy(
         )));
     }
     let bp = release::blueprint_of(&store, name, &version)?;
-    let folders = ask
-        .folders
-        .clone()
-        .unwrap_or_else(|| bp.deploy.folders.clone());
+    let folders = match &ask.folders {
+        Some(folders) if !folders.is_empty() => folders.clone(),
+        _ => bp.deploy.folders.clone(),
+    };
     if folders.is_empty() {
-        return Err(invalid(format!(
-            "{name} names no deploy folders: say which folders it works in"
-        )));
+        return Err(invalid(no_folders(name)));
     }
     let shares = owner.shares()?;
     for folder in &folders {

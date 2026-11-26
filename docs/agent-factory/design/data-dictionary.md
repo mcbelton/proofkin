@@ -123,7 +123,7 @@ Rules that apply to every field:
 | AgentSummary | versions | array of semantic versions | Yes | Internal | List releases | As long as the agent | Newest first |
 | AgentSummary | deployments | array of Deployment | Yes | Internal | Show where it runs | As long as the agent | Its digital workers |
 | DeployRequest | version | string, semantic version | No | Internal | Choose the release | Kept with the deployment | Defaults to the active release |
-| DeployRequest | folders | array of shared folder names | No | Internal | Choose where it works | Kept with the deployment | Defaults to the blueprint's deploy folders |
+| DeployRequest | folders | array of shared folder names | No | Internal | Choose where it works | Kept with the deployment | None or empty: the release's deploy folders; refused when that names none too |
 | DeployRequest | start | boolean | No | Internal | Start it now | Kept with the deployment | Also starts it with the owner's agent |
 | DeployRequest | canary | boolean | No | Internal | Check it before it takes work | Kept with the deployment | True by default: smoke cases run on the worker |
 | Deployment | worker | string, a digital worker name | Yes | Internal | Name the worker that runs it | As long as the deployment | Peers delegate to this name |

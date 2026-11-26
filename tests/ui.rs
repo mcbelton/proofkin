@@ -3442,6 +3442,29 @@ fn the_page_words_microsoft_365_labels_and_work_iq_steps_plainly() {
     assert!(stdout.starts_with("ok: "), "{stdout}");
 }
 
+/// The agent factory's Deployments tab says why it can't deploy before anything is sent:
+/// with no folder to offer and a release that names none, it says to share one and Deploy is
+/// disabled; with folders offered, none ticked and a release that names none, it refuses
+/// before it sends; its hint says where a deployment works (the folders ticked, else those
+/// its release names); and the route's refusal shows in its words. Evaluate shows how the
+/// last evaluation ended until another starts, with the way to its report, and approving a
+/// release there redraws Deployments at once. The cases (tests/factory.test.cjs) run in
+/// node, which loads ui/factory.js as the page does, on a fake page.
+#[test]
+fn the_deploy_form_says_why_it_cant_deploy_before_it_sends() {
+    let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/factory.test.cjs");
+    let out = std::process::Command::new("node")
+        .arg(&cases)
+        .output()
+        .expect("node must be installed to run the agent factory's page tests");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("ok: "), "{stdout}");
+}
+
 fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {

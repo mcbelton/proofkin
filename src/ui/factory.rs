@@ -359,8 +359,16 @@ fn evaluation_brief(e: &Evaluation, running: bool) -> Value {
         "done": e.done(),
         "total": e.runs.len(),
         "gate": e.gate,
+        // Each model's own gate, its reasons not prefixed with the model.
+        "gates": e.results.iter().map(|r| json!({
+            "candidate": r.candidate,
+            "passed": r.gate.passed,
+            "reasons": r.gate.reasons,
+        })).collect::<Vec<_>>(),
         "recommended": e.recommended,
         "by": e.by,
+        // Why it stopped before it ended (cancelled, or its runner stopped).
+        "error": e.error,
         // A deployment's canary: its smoke cases only, never a release's evaluation.
         "canary": e.canary,
     })
@@ -392,7 +400,7 @@ fn agent_json(store: &FactoryStore, s: &Shared, name: &str, all: bool) -> Result
             .map_err(internal)?
             .iter()
             .map(|(version, found)| match found {
-                Ok(r) => super::releases::release_view(r),
+                Ok(r) => super::releases::release_view(store, r),
                 Err(e) => {
                     json!({ "version": version, "state": "broken", "error": format!("{e:#}") })
                 }
