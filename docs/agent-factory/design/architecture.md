@@ -115,9 +115,10 @@ flowchart TB
 | Releases and approvals (`release.rs`) | Semantic versions, the signed manifest of hashes, sign-offs (owner again for capability increases), offline verify | identity keys, `ApprovalRequest`, `runs verify` |
 | Registry store (`store.rs`) | `<profile>/factory/`: drafts, builds, evaluations, releases, agent state and history; atomic, locked, hash-checked | `store.rs` atomic writes and locks |
 | Deployer (`deploy.rs`) | A release as a digital worker pinned to it; canary with smoke cases; rollback; deprecate and retire | `workers::create`, `Supervisor` |
-| Metrics, budgets, drift watch (`metrics.rs`) | Per-agent, per-version metrics from the audit; budgets enforced by the worker; scheduled evaluations as monitors with incidents | `audit`, `ops`, `schedule` |
-| Improver (`improve.rs`) | A new draft version from failing cases and failed tasks, evaluated on the suite plus regression cases; never applied by itself | Drafter, runner |
-| Catalog (`catalog.rs`) | Publishing releases to granted peers, the catalog in hello, importing bundles (verify, run nothing) | `protocol`, `trust`, plugins' import review |
+| Metrics and budgets (`metrics.rs`, `deploy.rs`) | Per-agent, per-version metrics from the audit; budgets enforced by the worker before any model call | `audit`, `ops` |
+| Drift watch (`drift.rs`) | The active release evaluated on its deployment on a schedule (every case once, the attacks too, within its budgets); each run an ops sample of monitor `factory:NAME`; failed runs in a row open an incident that alerts the owner | Eval runner, deployer, `ops`, `schedule` |
+| Improver (`improve.rs`) | A new draft version from failing cases, failed tasks' outcomes and the owner's note, written by the owner's model; it keeps the release's capabilities, requirements and cases and adds regression cases; shown as a diff and evaluated; never applied by itself | Drafter, eval runner, release diffs |
+| Catalog (`catalog.rs`) | Publishing releases to granted peers, the catalog in the hello, bundles over iroh, importing them (verify, run nothing) and activating an import once it passes an evaluation here | `protocol`, `trust`, release verification |
 | Interfaces | `proofkin factory ...`, the web UI's Agent factory, `/api/factory`, MCP tools (`factory_*`), A2A skills for deployed agents | `main.rs`, `ui.rs`, `ui/connect.rs` |
 
 Changes to existing modules stay small: `skills.rs` gets a third agent source (`factory`,
@@ -205,8 +206,9 @@ classDiagram
 - A deployment is a digital worker (`workers.rs`) whose profile pins `agent:
   name@version`; the owner's agent supervises it as it does every worker.
 - Storage is the profile: `<profile>/factory/` holds drafts, builds (content-addressed),
-  evaluations, releases and each agent's state and history; eval outputs are pruned after
-  30 days.
+  evaluations, releases, imported bundles (`imported/<publisher>/<name>/<version>/`) and
+  each agent's state and history; eval outputs are pruned after 30 days. Peers' catalogs
+  are kept in memory while they are connected, never stored.
 - Peers need nothing new to delegate to a deployed agent: it is a worker on their
   allowlist. Importing published agents needs a version that understands the catalog
   messages; older peers ignore them (unknown message types are ignored).

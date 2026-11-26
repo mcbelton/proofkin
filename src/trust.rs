@@ -48,6 +48,10 @@ pub struct TrustedPeer {
     /// to review (see [`crate::pulls`]). Absent: not known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<String>,
+    /// The factory agents this peer may see in its catalog and import, as their owner
+    /// publishes them (see [`crate::factory::catalog`]). Empty: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
 }
 
 /// A peer's grant to Microsoft 365 (Work IQ) content.
@@ -213,6 +217,14 @@ impl TrustStore {
         self.replaced(id, name).and_then(|p| p.github.clone())
     }
 
+    /// The factory agents granted to the peer that `allow` would replace (see
+    /// [`TrustedPeer::agents`]), so changing a peer's other rights keeps them.
+    pub fn agents_of(&self, id: &EndpointId, name: &str) -> Vec<String> {
+        self.replaced(id, name)
+            .map(|p| p.agents.clone())
+            .unwrap_or_default()
+    }
+
     /// The entry `allow` would replace: the one with id `id`, else the one named `name`.
     fn replaced(&self, id: &EndpointId, name: &str) -> Option<&TrustedPeer> {
         self.peers
@@ -304,6 +316,7 @@ mod tests {
             shares: default_shares(),
             m365: None,
             github: None,
+            agents: Vec::new(),
         }
     }
 
@@ -334,6 +347,7 @@ mod tests {
         let bob = TrustedPeer {
             m365: Some(grant.clone()),
             github: None,
+            agents: Vec::new(),
             ..peer("bob")
         };
         store.allow(bob.clone());
@@ -378,6 +392,7 @@ mod tests {
         let bob = TrustedPeer {
             m365: grant.clone(),
             github: None,
+            agents: Vec::new(),
             ..peer("bob")
         };
         let mut store = TrustStore::default();
@@ -396,6 +411,7 @@ mod tests {
         store.allow(TrustedPeer {
             m365: None,
             github: None,
+            agents: Vec::new(),
             ..bob.clone()
         });
         assert_eq!(store.get(&bob.id).unwrap().m365, None);

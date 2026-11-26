@@ -289,6 +289,10 @@ pub struct CandidateResult {
 pub struct CanaryOf {
     pub worker: String,
     pub version: String,
+    /// It is a drift watch's evaluation of the release (every case once), not its canary
+    /// (its smoke cases).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drift: bool,
 }
 
 /// An evaluation's estimate: what it would run, before anything does.

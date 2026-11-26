@@ -444,6 +444,7 @@ async fn helper(boss: EndpointId, dir: &Path) -> (Agent, Arc<Model>) {
         shares: vec![DATA_SHARE.to_owned()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     });
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();

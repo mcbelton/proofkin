@@ -1386,6 +1386,19 @@ agent's own --access.")]
         /// Forget the peer's GitHub account.
         #[arg(long)]
         no_github: bool,
+        /// Factory agents this peer may see in its catalog and import, as you publish them
+        /// (comma-separated; `proofkin factory publish NAME --to PEER` grants them too).
+        /// Without it, grants already set are kept.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "AGENTS",
+            conflicts_with = "no_agents"
+        )]
+        agents: Option<Vec<String>>,
+        /// Take back every factory agent granted to the peer.
+        #[arg(long)]
+        no_agents: bool,
     },
     /// List allowlisted peers.
     List {
@@ -4375,8 +4388,17 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             m365_tools,
             github,
             no_github,
+            agents,
+            no_agents,
         } => {
             let profile = Profile::open(&profile.name)?;
+            if let Some(bad) = agents
+                .iter()
+                .flatten()
+                .find(|a| proofkin::profile::validate_name(a).is_err())
+            {
+                bail!("{bad:?} isn't a factory agent's name");
+            }
             let grant = m365
                 .as_deref()
                 .map(|spec| proofkin::M365Grant::parse(spec, m365_tools))
@@ -4425,6 +4447,20 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 .as_deref()
                 .map(|g| format!("; GitHub account {g}"))
                 .unwrap_or_default();
+            let agents = match agents {
+                Some(mut list) => {
+                    list.sort();
+                    list.dedup();
+                    list
+                }
+                None if no_agents => Vec::new(),
+                None => trust.agents_of(&ticket.addr.id, &name),
+            };
+            let agents_note = if agents.is_empty() {
+                String::new()
+            } else {
+                format!("; factory agents {}", agents.join(","))
+            };
             trust.allow(TrustedPeer {
                 name: name.clone(),
                 id: ticket.addr.id,
@@ -4435,6 +4471,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 shares: share.clone(),
                 m365,
                 github,
+                agents,
             });
             trust.save(&profile.trust_path())?;
             let rights = if delegate {
@@ -4446,7 +4483,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 "chat only, may not delegate".into()
             };
             println!(
-                "profile '{}': allowed {name} ({}), {rights}{m365_note}{github_note}",
+                "profile '{}': allowed {name} ({}), {rights}{m365_note}{github_note}{agents_note}",
                 profile.name,
                 ticket.addr.id.fmt_short()
             );
@@ -4476,7 +4513,12 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                     Some(g) => format!("; GitHub {g}"),
                     None => String::new(),
                 };
-                println!("  {:<16} {}  {rights}{m365}{github}", p.name, p.id);
+                let agents = if p.agents.is_empty() {
+                    String::new()
+                } else {
+                    format!("; factory agents {}", p.agents.join(","))
+                };
+                println!("  {:<16} {}  {rights}{m365}{github}{agents}", p.name, p.id);
             }
         }
         PeersCommand::Github {
@@ -4726,6 +4768,12 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.worktrees_dir = profile.worktrees_dir();
         // Task ids go on after a restart (a plan run resumed waits for its old ones).
         config.task_ids = Some(profile.task_ids_path());
+        // An owner's agent publishes what their factory shares with peers (a worker owns none).
+        if profile.config.owner.is_none() {
+            config.publisher = Some(proofkin::factory::catalog::ProfilePublisher::new(
+                profile.clone(),
+            ));
+        }
         if let Some(secs) =
             proofkin::profile::env_setting("TASK_GRACE_SECS").and_then(|v| v.parse::<u64>().ok())
         {
@@ -4758,6 +4806,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         profile.data_folder(),
         Duration::from_secs(2),
     );
+    // What the factory publishes can change (the web UI, the command line): peers hear of it.
+    agent.watch_catalog(Duration::from_secs(3));
     // Model settings changed while it runs (the CLI, the owner's) apply right away.
     agent.watch_models(
         profile.clone(),
@@ -4934,7 +4984,23 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 supervisor: workers.clone(),
                 ready_wait: proofkin::factory::runner::READY_WAIT,
             });
-            tokio::spawn(proofkin::factory::manage::drive_canaries(host, changed));
+            tokio::spawn(proofkin::factory::manage::drive_canaries(
+                host.clone(),
+                changed.clone(),
+            ));
+            // Drift incidents reach the owner as monitors' do: here, and peers by chat.
+            let (alerts, me) = (agent.clone(), agent.name().to_owned());
+            let notify: proofkin::factory::drift::Notify =
+                Arc::new(move |e: &proofkin::ops::IncidentEvent| {
+                    let line = e.text.lines().next().unwrap_or_default();
+                    println!("! [{}] {:?}: {line}", e.monitor, e.kind);
+                    alerts.alert(format!(
+                        "[{me} alert] {} {}: {line}",
+                        e.monitor,
+                        format!("{:?}", e.kind).to_lowercase()
+                    ));
+                });
+            tokio::spawn(proofkin::factory::drift::drive(host, changed, notify));
         }
     }
 
@@ -4948,6 +5014,15 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 }
                 Event::Chat { from, text } => println!("<{from}> {text}"),
                 Event::PeerBusy { .. } | Event::PeerModels { .. } | Event::ModelsChanged => {}
+                Event::Catalog { name, entries, .. } => {
+                    if entries > 0 {
+                        println!(
+                            "catalog: {name} publishes {entries} agent release(s) to you (proofkin factory catalog)"
+                        );
+                    } else {
+                        println!("catalog: {name} publishes nothing to you any more");
+                    }
+                }
                 Event::TaskReceived {
                     from,
                     task_id,

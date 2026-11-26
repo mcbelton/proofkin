@@ -505,7 +505,7 @@ with `/ticket`.
 | Peers command | Description |
 | --- | --- |
 | `proofkin peers id --profile P` | Show P's endpoint id and ticket |
-| `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N] [--m365 LABELS\|off [--m365-tools]] [--github LOGIN\|--no-github]` | Allowlist a peer (re-run to change its rights). `--m365 General,Public,unlabeled` lets it receive Microsoft 365 content with those labels, `--m365-tools` lets its tasks use your Work IQ (read only), `--m365 off` removes the grant; without `--m365` a grant is kept. `--github` sets its GitHub account, which [pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan) ask to review; without it an account set before is kept |
+| `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N] [--m365 LABELS\|off [--m365-tools]] [--github LOGIN\|--no-github] [--agents NAMES\|--no-agents]` | Allowlist a peer (re-run to change its rights). `--m365 General,Public,unlabeled` lets it receive Microsoft 365 content with those labels, `--m365-tools` lets its tasks use your Work IQ (read only), `--m365 off` removes the grant; without `--m365` a grant is kept. `--github` sets its GitHub account, which [pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan) ask to review; without it an account set before is kept |
 | `proofkin share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--check NAME=COMMAND ...]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
 | `proofkin peers list --profile P` | List allowlisted peers and their rights |
 | `proofkin peers github <name-or-id> <login>\|--off --profile P` | Set (or forget) an allowlisted peer's GitHub account without changing its rights. A running agent uses it after it restarts; the web UI's **Change…** sets it at once |
@@ -1353,7 +1353,7 @@ each task card has an **Agent** field, and the text view lists agents beside the
 #### The agent factory
 
 The [agent factory](docs/agent-factory.md) turns your description into an agent that proves
-itself before it works (being built, tracked in
+itself before it works (tracked in
 [#175](https://github.com/mcbelton/proofkin/issues/175)). An agent is a **blueprint**: its
 whole definition as JSON (`proofkin.agent-blueprint/v1`): its requirements, instructions,
 skills, the access and tools it asks for, the models it may run on, and an eval suite with
@@ -1506,6 +1506,43 @@ proofkin factory retire fin-analyst --reason "replaced" --profile alice   # --pu
 - The factory's own audit log (`factory/audit.jsonl`) keeps every release, sign-off,
   deployment, rollback, budget, deprecation and retirement.
 
+**Drift, improvement and sharing** keep a released agent good, and let peers use it:
+
+```powershell
+proofkin factory watch fin-analyst --when "daily 03:00" --fail-after 2 --profile alice   # its active release, evaluated on its deployment; --now once, --off pauses it
+proofkin factory improve fin-analyst --cases E2,E5 --note "Quote the sentence" --profile alice   # a new draft from what failed; --evaluate evaluates it next
+proofkin factory publish fin-analyst --to bob,dana --profile alice     # its active release (--versions 1.2.0,1.1.0); --off unpublishes it
+proofkin factory catalog --profile bob                                 # what peers publish to bob (the web UI's Catalog while his agent runs)
+proofkin factory import alice/fin-analyst@1.2.0 --profile bob          # verified, nothing runs; then evaluate it on bob's accounts
+proofkin factory evaluate fin-analyst --yes --profile bob              # once it passes, the import is active
+```
+
+- A **drift watch** runs while your agent runs: every case once and the built-in attacks, on
+  the deployment's worker, judged by the release's gate and within its budgets. Each run's
+  pass rate is an ops sample of monitor `factory:fin-analyst` (the **Drift** tab shows their
+  trend); `--fail-after` failed runs in a row open an incident, listed in **Health** and
+  `proofkin ops report`, that alerts you with the failing cases, and a run that passes
+  closes it. A run its worker can't take is tried again for an hour, then skipped, counting
+  neither way.
+- An **improvement** is written by your model from the active release's blueprint, its
+  failing cases with their outputs (secrets redacted), its deployments' failed tasks
+  (outcomes only, never their text) and your note. It becomes the agent's draft: other
+  instructions and skills, maybe new requirements and cases, and a regression case for each
+  failing one; it asks for nothing more, and keeps every requirement and case it had. It is
+  shown as a diff next to the active release; only a release changes what runs.
+- **Publishing** grants peers on your allowlist the agent (`peers allow ... --agents
+  fin-analyst` sets the same grant). They get its catalog entry while connected: name,
+  version, purpose, the most access it asks for and how its evaluation went, never its
+  knowledge, outputs or paths, and under the name *they* gave you.
+- **Importing** asks the publisher for the release's bundle over iroh (at most 8 MiB). It is
+  kept only if its manifest is signed by the publisher's key and every file matches its
+  hash, and nothing of it runs. It becomes active once it passes an evaluation on your
+  accounts (`--accept-publisher-report` takes the publisher's report instead, recorded in
+  its history): a release signed by you with the publisher's version, and what it asks for
+  beyond read-only access needs your sign-off. Only its publisher improves and publishes it;
+  `factory delete` removes it, with its bundles, while it isn't active.
+- Peers who only want the work delegate to your deployed agent like to any worker.
+
 In the web UI, the **Agent factory** card lists your agents and drafts with their active
 release, sign-offs waiting and deployments, and starts one from a template or your words. An
 agent's dialog has:
@@ -1528,12 +1565,22 @@ agent's dialog has:
   budgets. None ticked means the folders its release names; if you share no folders and it
   names none, the form says to share one (`proofkin share add`) and Deploy stays disabled.
 - **Metrics**: its tasks by release since 24 hours to 90 days ago.
+- **Drift**: its drift watch (when it runs, failed runs before an incident, pause), its last
+  run with the failing cases, its trend over 28 days and its incidents.
+- **Improve**: propose an improvement (the cases, your note, evaluate it next) and the
+  proposals with what each changes next to the active release.
+- **Share**: publish it to peers and versions, or, for an import, where it came from and
+  whether it is active.
+
+**Catalog** lists what peers publish to you while they are connected, each with its
+publisher's key, and imports one.
 
 A deployed agent's worker shows the release it runs under **Digital workers** (with **Open
 agent**), under **Connected peers** and in **Run task**'s **Run on** list; the plan editor's
 **Agent** field and **Plugins & tools › Agents** list the factory's agents with their active
 release. Other agents draft, check and evaluate agents [over MCP](#connect-other-agents-mcp-and-a2a);
-releasing, deploying and approving stay with you.
+releasing, deploying, approving, publishing, importing, drift watches and improvements stay
+with you.
 
 **Plan check.** Before a plan runs, it is checked against what exists now:
 
@@ -2262,7 +2309,9 @@ proofkin --name me --providers copilot --serve --ui
   your own skills and agents.
 - **Agent factory**: your [factory agents](#the-agent-factory) and drafts: start one from a
   template or your words, edit and check its blueprint, evaluate it (the estimate first, then
-  live progress) and read its evaluations (the gate, each model's results, the failing runs).
+  live progress) and read its evaluations (the gate, each model's results, the failing runs);
+  release, deploy, roll back and retire it, watch it for drift, improve it and publish it.
+  **Catalog** lists what peers publish to you, to import.
 - **Connect other agents**: let agents on this computer (VS Code, Claude Code, any MCP or
   A2A client) hand work to your peers: turn it on or off, copy the addresses and ready-made
   client setups, show or replace the token ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
@@ -2352,8 +2401,8 @@ OpenSpec](#spec-kit-and-openspec)). For the [agent factory](#the-agent-factory):
 `factory_templates`, `factory_list`, `factory_draft`, `factory_check`, `factory_evaluate`
 (the estimate, unless `confirm` is true; then it runs on your evaluation worker) and
 `factory_status` (an evaluation's progress and report). Releasing, deploying, rolling back,
-retiring, deprecating and approving agents stay with you: those calls are refused with the
-command to run. The server speaks the stateless 2026-07-28 revision (the
+retiring, deprecating, approving, publishing and importing agents, drift watches and
+improvements stay with you: those calls are refused with the command to run. The server speaks the stateless 2026-07-28 revision (the
 version in each request's `_meta`, which the `MCP-Protocol-Version`, `Mcp-Method` and
 `Mcp-Name` headers must match; `server/discover`) and the `initialize`-based revisions
 2025-03-26 to 2025-11-25. It keeps no sessions, so `GET /mcp` answers 405.
@@ -2538,6 +2587,12 @@ runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
 - Results are signed by the agent that produced them, and checks a peer asks for run only
   with `full` access ([EDD with agents](#evidence-driven-development-with-agents)).
   Approval requests need only the allowlist, and each peer may have at most 20 open.
+- Factory agents get only what you grant: a blueprint asks, your folders, MCP offers and
+  allowlist decide, and asking for more than the active release needs your sign-off. A
+  peer sees only the agents you publish to it (`peers allow ... --agents`), and an agent
+  imported from a peer runs nothing until it passes an evaluation on your accounts (or you
+  accept its publisher's report): its bundle is refused unless its publisher's key signed it
+  and every file matches ([The agent factory](#the-agent-factory)).
 
 ### Shared folders
 
@@ -2914,7 +2969,7 @@ Workflow for a change:
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text) with the usage providers reported, summed per peer and provider
-- [src/factory/](src/factory) and [factory/templates/](factory/templates): the agent factory: blueprints checked against the profile and linted for least privilege (`blueprint.rs`), eval suites and their graders (`evals.rs`), the profile's factory store, with builds kept by their hash (`store.rs`), the built-in templates (`templates.rs`), drafts written by the owner's model (`draft.rs`), builds (`build.rs`), capabilities resolved against the owner's folders (`capabilities.rs`), the models an agent is evaluated and runs on (`routing.rs`), a worker's memory and lessons (`memory.rs`), evaluations: the built-in adversarial suite (`adversarial.rs`), the runner on the owner's evaluation worker (`runner.rs`), signed reports and the release gate (`report.rs`) and judges (`judge.rs`), agents as code and the `agent:*` checks (`code.rs`), and `proofkin factory` (`cli.rs`); [src/ui/factory.rs](src/ui/factory.rs) and [ui/factory.js](ui/factory.js): its web UI API and card
+- [src/factory/](src/factory) and [factory/templates/](factory/templates): the agent factory: blueprints checked against the profile and linted for least privilege (`blueprint.rs`), eval suites and their graders (`evals.rs`), the profile's factory store, with builds kept by their hash (`store.rs`), the built-in templates (`templates.rs`), drafts written by the owner's model (`draft.rs`), builds (`build.rs`), capabilities resolved against the owner's folders (`capabilities.rs`), the models an agent is evaluated and runs on (`routing.rs`), a worker's memory and lessons (`memory.rs`), evaluations: the built-in adversarial suite (`adversarial.rs`), the runner on the owner's evaluation worker (`runner.rs`), signed reports and the release gate (`report.rs`) and judges (`judge.rs`), agents as code and the `agent:*` checks (`code.rs`), releases and sign-offs (`release.rs`, `signoff.rs`), deployments, canaries and budgets (`deploy.rs`), the lifecycle (`lifecycle.rs`), metrics (`metrics.rs`), drift watches (`drift.rs`), improvements (`improve.rs`), publishing, the catalog and imports (`catalog.rs`), and `proofkin factory` (`cli.rs`, `manage.rs`); [src/ui/factory.rs](src/ui/factory.rs), [src/ui/releases.rs](src/ui/releases.rs), [src/ui/sharing.rs](src/ui/sharing.rs), [ui/factory.js](ui/factory.js) and [ui/factory-share.js](ui/factory-share.js): its web UI API and card
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.proofkin-data` folder, named shares with a maximum access, their checks and MCP servers)
 - [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config), MCP configuration files and server templates with placeholders
 - [src/plugins.rs](src/plugins.rs): plugins (sources, fetching for review, the Copilot CLI, Claude Code and Agent Plugins layouts, marketplaces, the profile's plugin store, offers made from templates)

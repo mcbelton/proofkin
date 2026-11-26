@@ -5637,6 +5637,7 @@ mod tests {
                 shares: Vec::new(),
                 m365: None,
                 github: github.map(Into::into),
+                agents: Vec::new(),
             });
         }
         let mut recipients = Recipients::new(trust, Vec::new());
@@ -5958,6 +5959,7 @@ mod tests {
             shares: Vec::new(),
             m365: None,
             github: Some("carol-gh".into()),
+            agents: Vec::new(),
         });
         let mut recipients = Recipients::new(trust, Vec::new());
         recipients.github = Some("me-gh".into());
@@ -6464,6 +6466,7 @@ mod tests {
             shares: vec![crate::shares::DATA_SHARE.into()],
             m365: None,
             github: None,
+            agents: Vec::new(),
         });
         let mut recipients = Recipients::new(trust, Vec::new());
         recipients.profile = Some("boss".into());
@@ -6635,6 +6638,7 @@ mod tests {
                     tools: false,
                 }),
                 github: None,
+                agents: Vec::new(),
             });
         }
         let helper = peers[3].id;
@@ -6765,6 +6769,7 @@ mod tests {
                 shares: vec![crate::shares::DATA_SHARE.into()],
                 m365,
                 github: None,
+                agents: Vec::new(),
             });
         }
         let id = |name: &str| peers.iter().find(|p| p.name == name).unwrap().id;

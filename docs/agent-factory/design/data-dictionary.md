@@ -161,7 +161,7 @@ Rules that apply to every field:
 | CatalogEntry | version | string, semantic version | Yes | Internal | Name the release | While the peer publishes it | A released version |
 | CatalogEntry | description | string, at most 200 characters | Yes | Internal | Say what it does | While the peer publishes it | The blueprint's purpose |
 | CatalogEntry | access | string: read-only, workspace-write or full | Yes | Internal | Show its most access before import | While the peer publishes it | From its capabilities |
-| CatalogEntry | eval_summary | object {pass_rate, cases, adversarial_passed} | Yes | Internal | Show how it was proven | While the peer publishes it | From the publisher's report; outputs are never sent |
+| CatalogEntry | eval_summary | object {pass_rate, cases, adversarial_passed} | Yes | Internal | Show how it was proven | While the peer publishes it | From the publisher's report: its own runs' pass rate, its own cases (the attacks not counted) and whether every attack was resisted; outputs are never sent |
 | ImportRequest | peer | string, a peer name | Yes | Personal | Say whose agent to import | Kept with the import | A connected peer that published it to this profile |
 | ImportRequest | name | string | Yes | Internal | Name the agent | Kept with the import | As published |
 | ImportRequest | version | string, semantic version | Yes | Internal | Name the release | Kept with the import | As published |
@@ -233,8 +233,10 @@ erDiagram
 | `factory/agents/<name>/evaluations/<id>.json` | Reports, runs and verdicts; outputs for 30 days | As long as the agent |
 | `factory/evaluation/` | The running evaluation's workspace: the folder its worker shares for evaluations, with the cases' fixtures and the attacks' files, and the lock that lets one evaluation run at a time | Until the evaluation ends |
 | `factory/agents/<name>/releases/<version>/release.json` | The signed manifest and approvals | Until the agent is purged |
-| `factory/agents/<name>/state.json` | Lifecycle state, active version, deployments, history | As long as the agent |
-| `factory/imported/<publisher>/<name>/<version>/` | Imported bundles | Until removed |
+| `factory/agents/<name>/state.json` | Lifecycle state, active version, deployments, history; its drift watch with its last run, its publication, and where an import came from | As long as the agent |
+| `factory/agents/<name>/proposals/<id>.json` | Improvement proposals: the cases, failed tasks' outcomes and note they came from, the draft they replaced and the one they propose | As long as the agent |
+| `ops/metrics.jsonl`, `ops/incidents.jsonl` (monitor `factory:<name>`) | Each drift run's pass rate, and the incidents failed runs open | As the ops logs keep them |
+| `factory/imported/<publisher>/<name>/<version>/` | Imported bundles: the publisher's signed release, its files and fixtures, and its report without its runs' outputs | Until removed |
 | `knowledge/<lessons topic>.md` | Lessons from verified results, with labels | The blueprint's retention (90 days by default) |
 | `knowledge/<context topic>.md` of a digital worker | Copies of its owner's topics it reads, with their Microsoft 365 marks | Until removed |
 | `profile.json` (`memory`) of a digital worker | Its memory: context topics, lessons topic, retention | Until changed |

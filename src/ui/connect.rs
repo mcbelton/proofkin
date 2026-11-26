@@ -781,27 +781,54 @@ fn tools() -> Value {
 const BY_AGENT: &str = "another agent (MCP)";
 
 /// The agent factory's lifecycle stays with its owner: these tools aren't offered, and a
-/// call is refused with the owner's command (TM-10). Each tool, with what it would do and
-/// the owner's verb.
+/// call is refused with the owner's command (TM-10). So do what peers are trusted with
+/// (publishing, importing), what runs on a schedule (drift watches) and what the owner's
+/// model writes over a draft (improvements). Each tool, with what it would do and the
+/// owner's command (`{agent}`: the agent it names).
 const OWNER_ONLY: &[(&str, &str, &str)] = &[
-    ("factory_release", "Releasing an agent", "release"),
-    ("factory_deploy", "Deploying an agent", "deploy"),
-    ("factory_rollback", "Rolling an agent back", "rollback"),
-    ("factory_retire", "Retiring an agent", "retire"),
-    ("factory_deprecate", "Deprecating an agent", "deprecate"),
+    ("factory_release", "Releasing an agent", "release {agent}"),
+    ("factory_deploy", "Deploying an agent", "deploy {agent}"),
+    (
+        "factory_rollback",
+        "Rolling an agent back",
+        "rollback {agent}",
+    ),
+    ("factory_retire", "Retiring an agent", "retire {agent}"),
+    (
+        "factory_deprecate",
+        "Deprecating an agent",
+        "deprecate {agent}",
+    ),
     (
         "factory_approve",
         "Approving what an agent asks for",
-        "approve",
+        "approve {agent}",
     ),
+    (
+        "factory_publish",
+        "Publishing an agent to peers",
+        "publish {agent} --to PEER",
+    ),
+    (
+        "factory_import",
+        "Importing a peer's agent",
+        "import PUBLISHER/{agent}@VERSION",
+    ),
+    (
+        "factory_watch",
+        "Watching an agent for drift",
+        "watch {agent} --when \"daily 03:00\"",
+    ),
+    ("factory_improve", "Improving an agent", "improve {agent}"),
 ];
 
 /// Why lifecycle tool `name` is refused: what stays with the owner, and their command.
 fn owner_only(s: &Shared, name: &str, args: &Value) -> Option<String> {
-    let (_, what, verb) = OWNER_ONLY.iter().find(|(tool, ..)| *tool == name)?;
+    let (_, what, command) = OWNER_ONLY.iter().find(|(tool, ..)| *tool == name)?;
     let agent = opt_text(args, "name").unwrap_or_else(|| "NAME".into());
     Some(format!(
-        "{what} stays with its owner, who runs: proofkin factory {verb} {agent} --profile {}",
+        "{what} stays with its owner, who runs: proofkin factory {} --profile {}",
+        command.replace("{agent}", &agent),
         s.info.profile.name
     ))
 }

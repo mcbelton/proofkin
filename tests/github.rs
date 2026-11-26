@@ -179,6 +179,7 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
             shares: vec![],
             m365: None,
             github: None,
+            agents: Vec::new(),
         }],
     }
     .save(&profile.trust_path())

@@ -116,6 +116,16 @@ pub struct AgentState {
     /// Once retired with `--purge`: when its releases, reports and builds may go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge_after: Option<String>,
+    /// Its drift watch: its active release evaluated on its deployment on a schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<DriftWatch>,
+    /// The releases its owner publishes to the peers granted it (see
+    /// [`crate::factory::catalog`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<Publication>,
+    /// For an agent imported from a peer: whose it is, and the versions imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<ImportOrigin>,
     /// Every change, oldest first.
     #[serde(default)]
     pub history: Vec<Change>,
@@ -131,6 +141,9 @@ impl AgentState {
             deployments: Vec::new(),
             replacement: None,
             purge_after: None,
+            watch: None,
+            publication: None,
+            imported: None,
             history: Vec::new(),
         }
     }
@@ -234,6 +247,111 @@ pub struct Change {
     pub what: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+}
+
+/// A drift watch (see [`crate::factory::drift`]): when its evaluations run, how many failed
+/// runs in a row open an incident, and where it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftWatch {
+    /// When its evaluations run, as schedules say it (`daily 03:00`, `every 6h`).
+    pub when: String,
+    /// Failed runs in a row that open an incident, 1 to 10.
+    pub fail_after: u32,
+    /// A paused watch runs nothing.
+    pub enabled: bool,
+    /// When its schedule counts from (it was set or resumed), unless it ran later.
+    pub since: String,
+    /// Its last run: passed, failed, or why it was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<DriftRun>,
+    /// Failed runs in a row.
+    #[serde(default)]
+    pub failures: u32,
+    /// The ops incident it opened, while it is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident: Option<u64>,
+    /// A due run that couldn't start (another evaluation ran): when it is tried again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<String>,
+}
+
+/// How a drift watch's run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DriftOutcome {
+    /// Its evaluation passed the release's gate.
+    Passed,
+    /// It didn't.
+    Failed,
+    /// It didn't run (no deployment runs the active release, its budget is spent...).
+    Skipped,
+}
+
+impl std::fmt::Display for DriftOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            DriftOutcome::Passed => "passed",
+            DriftOutcome::Failed => "failed",
+            DriftOutcome::Skipped => "skipped",
+        })
+    }
+}
+
+/// One run of a drift watch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftRun {
+    pub at: String,
+    /// The release it evaluated, and the worker it ran on.
+    pub version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worker: String,
+    pub outcome: DriftOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<String>,
+    /// The runs of the agent's own cases that passed, and of the built-in attacks.
+    #[serde(default)]
+    pub own: report::Tally,
+    #[serde(default)]
+    pub adversarial: report::Tally,
+    /// The cases that failed, each with why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
+    /// Why it was skipped, or what its gate missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The releases an agent's owner publishes: the peers granted the agent on the allowlist
+/// see these versions in their catalog, and may import them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Publication {
+    /// Released versions, newest first.
+    pub versions: Vec<String>,
+    pub at: String,
+}
+
+/// Where an imported agent comes from: its publisher, as this profile's allowlist names it
+/// and by key, and each version imported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportOrigin {
+    pub publisher: String,
+    pub publisher_id: String,
+    /// Newest first.
+    pub versions: Vec<ImportedVersion>,
+}
+
+/// A version imported: the bundle kept under `factory/imported/`, verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedVersion {
+    pub version: String,
+    /// The publisher's manifest hash: what was imported, exactly.
+    pub manifest_sha256: String,
+    /// Its build's hash: a local release of exactly this build makes it active.
+    pub build: String,
+    pub at: String,
+    /// The publisher's report was accepted instead of an evaluation here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accepted_report: bool,
 }
 
 /// A lifecycle change as the factory's audit log keeps it (`factory/audit.jsonl`): every
@@ -654,12 +772,14 @@ impl FactoryStore {
         Ok(dir)
     }
 
-    /// Deletes agent `name`'s draft and records (`false` if it had neither). An agent
-    /// with releases isn't deleted, so its records are kept: it is to be retired.
+    /// Deletes agent `name`'s draft and records (`false` if it had neither), and an import's
+    /// bundles. An agent with releases isn't deleted, so its records are kept: it is to be
+    /// retired.
     pub fn delete(&self, name: &str) -> Result<bool> {
         validate_agent_name(name)?;
         let _lock = FileLock::acquire(&self.state_path(name))?;
-        if let Some(state) = read_json::<AgentState>(&self.state_path(name))?
+        let state = read_json::<AgentState>(&self.state_path(name))?;
+        if let Some(state) = &state
             && !state.versions.is_empty()
         {
             bail!(
@@ -672,6 +792,20 @@ impl FactoryStore {
         if draft.exists() {
             std::fs::remove_file(&draft)
                 .with_context(|| format!("deleting {}", draft.display()))?;
+        }
+        // Nothing of an import ran: its bundles go with it.
+        if let Some(origin) = state.as_ref().and_then(|s| s.imported.as_ref())
+            && validate_name(&origin.publisher).is_ok()
+        {
+            let bundles = self
+                .root
+                .join(crate::factory::catalog::IMPORTED_DIR)
+                .join(&origin.publisher)
+                .join(name);
+            if bundles.exists() {
+                std::fs::remove_dir_all(&bundles)
+                    .with_context(|| format!("deleting {}", bundles.display()))?;
+            }
         }
         // Its folder goes too, with the lock file taking the lock made in it.
         let dir = self.agent_dir(name);

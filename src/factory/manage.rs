@@ -15,7 +15,7 @@ use crate::factory::deploy::{self, DeployAsk, Host};
 use crate::factory::release::{self, Asked, ReleaseState};
 use crate::factory::report::{EvalState, Evaluation};
 use crate::factory::store::{DeployState, FactoryStore};
-use crate::factory::{code, conflict, invalid, lifecycle, metrics, not_found};
+use crate::factory::{catalog, code, conflict, drift, invalid, lifecycle, metrics, not_found};
 use crate::profile::Profile;
 use crate::trust::TrustStore;
 use crate::workers::{Launch, Supervisor};
@@ -52,7 +52,13 @@ pub fn release(
             let me = key.public().to_string();
             let (id, commit) = from_folder(&profile.name, &me, &store, name, dir)?;
             asked.evaluation = id;
-            asked.dir = Some(dir.display().to_string());
+            // The folder by its name, not its path: releases may be published to peers.
+            asked.dir = Some(
+                std::path::absolute(dir)
+                    .ok()
+                    .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "its folder".into()),
+            );
             asked.commit = Some(commit);
         }
         (Some(id), None) => asked.evaluation = id,
@@ -627,6 +633,387 @@ pub fn budget(
     Ok(())
 }
 
+/// What `factory watch` asks to change.
+#[derive(Debug, Clone, Default)]
+pub struct WatchChange {
+    pub when: Option<String>,
+    pub fail_after: Option<u32>,
+    pub off: bool,
+    pub now: bool,
+}
+
+/// A drift watch in a few lines.
+fn print_watch(name: &str, w: &crate::factory::store::DriftWatch) {
+    println!(
+        "{name}: drift watch {}, an incident after {} failed run{} in a row; {}",
+        w.when,
+        w.fail_after,
+        if w.fail_after == 1 { "" } else { "s" },
+        match drift::next_run(w) {
+            Some(next) => format!("next run {}", next.format("%Y-%m-%d %H:%M")),
+            None => "paused".into(),
+        }
+    );
+    if let Some(last) = &w.last {
+        println!(
+            "  last run ({} at {}): {}{}",
+            last.version,
+            last.at,
+            drift::run_text(last),
+            last.evaluation
+                .as_deref()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default()
+        );
+    }
+    if w.failures > 0 {
+        println!("  {} failed run(s) in a row", w.failures);
+    }
+    if w.incident.is_some() {
+        println!(
+            "  incident open: {} (proofkin ops report)",
+            drift::monitor(name)
+        );
+    }
+}
+
+/// Shows, sets, pauses or runs (`change.now`, here, with the profile's agent stopped) agent
+/// `name`'s drift watch.
+pub async fn watch(
+    profile: &Profile,
+    name: &str,
+    change: WatchChange,
+    bridge: Option<PathBuf>,
+) -> Result<()> {
+    let store = FactoryStore::of(profile);
+    let state = store
+        .state(name)?
+        .ok_or_else(|| not_found(format!("the factory has no agent '{name}'")))?;
+    let current = state.watch.clone();
+    if change.off || change.when.is_some() || change.fail_after.is_some() {
+        let when = match (&change.when, &current) {
+            (Some(when), _) => when.clone(),
+            (None, Some(w)) => w.when.clone(),
+            (None, None) if change.off => bail!("{name} has no drift watch to pause"),
+            (None, None) => bail!("say when it runs: --when \"daily 03:00\""),
+        };
+        let ask = drift::WatchAsk {
+            when,
+            fail_after: change
+                .fail_after
+                .or(current.as_ref().map(|w| w.fail_after))
+                .unwrap_or(drift::DEFAULT_FAIL_AFTER),
+            enabled: !change.off,
+        };
+        let set = drift::set(profile, name, &ask, &profile.name)?;
+        print_watch(name, &set);
+        if set.enabled && !change.now {
+            println!(
+                "  your agent runs it while it runs (proofkin --name {} --ui); run it now: {}",
+                profile.name,
+                hint(profile, &format!("watch {name} --now"))
+            );
+        }
+    } else if !change.now {
+        match &current {
+            Some(w) => print_watch(name, w),
+            None => println!(
+                "{name}: no drift watch ({})",
+                hint(profile, &format!("watch {name} --when \"daily 03:00\""))
+            ),
+        }
+        return Ok(());
+    }
+    if !change.now {
+        return Ok(());
+    }
+    let (host, _instance) = host(profile, &format!("run {name}'s drift watch"), bridge).await?;
+    let printed = std::sync::Mutex::new(std::collections::HashSet::new());
+    let notify = |e: &crate::ops::IncidentEvent| {
+        println!(
+            "! [{}] {:?}: {}",
+            e.monitor,
+            e.kind,
+            e.text.lines().next().unwrap_or_default()
+        )
+    };
+    println!("{name}: its drift watch evaluates its active release on its deployment now");
+    let ran = drift::run(
+        &host,
+        name,
+        true,
+        |e: &Evaluation| {
+            let mut printed = printed.lock().unwrap();
+            for run in e
+                .runs
+                .iter()
+                .filter(|r| r.state == crate::factory::report::RunState::Done)
+            {
+                if printed.insert(run.case.clone()) {
+                    println!(
+                        "  {} {}",
+                        run.case,
+                        if run.passed { "passed" } else { "FAILED" }
+                    );
+                }
+            }
+        },
+        &notify,
+    )
+    .await;
+    host.agent.shutdown().await;
+    let ran = ran?;
+    println!(
+        "{name} {}: drift watch {}{}",
+        ran.version,
+        drift::run_text(&ran),
+        ran.evaluation
+            .as_deref()
+            .map(|e| format!(" ({e})"))
+            .unwrap_or_default()
+    );
+    if ran.outcome == crate::factory::store::DriftOutcome::Failed {
+        bail!("{name} failed its drift watch");
+    }
+    Ok(())
+}
+
+/// Publishes `versions` of agent `name` (none: its active release) to peers `to` (none: those
+/// it is published to), or unpublishes it (`off`): the grants in the allowlist, which the
+/// profile's agent holds while it runs.
+pub fn publish(
+    profile: &Profile,
+    name: &str,
+    to: Vec<String>,
+    versions: Vec<String>,
+    off: bool,
+) -> Result<()> {
+    if profile.is_running() {
+        bail!(
+            "profile '{}' runs in a proofkin agent: publish {name} in its web UI (Agent factory), or stop that agent first",
+            profile.name
+        );
+    }
+    let store = FactoryStore::of(profile);
+    let mut trust = profile.trust()?;
+    let now = catalog::publication(&store, &trust, name)?;
+    let (peers, versions) = if off {
+        (Vec::new(), Vec::new())
+    } else {
+        let peers = if to.is_empty() { now.peers } else { to };
+        let versions = if versions.is_empty() {
+            let active = store.state(name)?.and_then(|s| s.active_version);
+            match active {
+                Some(v) => vec![v],
+                None => bail!(
+                    "{name} has no active release to publish: release it first, or name --versions"
+                ),
+            }
+        } else {
+            versions
+        };
+        if peers.is_empty() {
+            bail!("say who to publish it to: --to PEER,... (names on your allowlist)");
+        }
+        (peers, versions)
+    };
+    let (shared, _) = catalog::publish(&store, &mut trust, name, &peers, &versions, &profile.name)?;
+    trust.save(&profile.trust_path())?;
+    if shared.versions.is_empty() || shared.peers.is_empty() {
+        println!("{name}: unpublished; no peer sees it in their catalog any more");
+    } else {
+        println!(
+            "{name}: published {} to {}; they see it in their catalog when your agent runs (proofkin --name {} ...)",
+            shared.versions.join(", "),
+            shared.peers.join(", "),
+            profile.name
+        );
+    }
+    Ok(())
+}
+
+/// The profile's agent for a moment, to reach its peers over `network` (`what` it is for,
+/// should the profile's own agent run: two would share one identity).
+async fn peer_agent(
+    profile: &Profile,
+    network: Network,
+    what: &str,
+) -> Result<(Agent, crate::profile::InstanceLock)> {
+    let instance = profile.lock_instance().map_err(|_| {
+        anyhow!(
+            "profile '{}' runs in a proofkin agent: {what} in its web UI (Agent factory › Catalog), or stop that agent first",
+            profile.name
+        )
+    })?;
+    let mut config = AgentConfig::new(profile.name.clone(), profile.identity()?);
+    config.network = network;
+    if network == Network::Local {
+        config.bind = Some("0.0.0.0:0".parse()?);
+    }
+    config.trust = profile.trust()?;
+    config.task_ids = Some(profile.task_ids_path());
+    config.worktrees_dir = profile.worktrees_dir();
+    let (agent, _events) = Agent::bind(config).await?;
+    Ok((agent, instance))
+}
+
+/// Lists what the peers connected within `wait` seconds publish to this profile.
+pub async fn catalog(profile: &Profile, wait: u64, network: Network) -> Result<()> {
+    let trust = profile.trust()?;
+    if trust.peers.is_empty() {
+        println!(
+            "profile '{}' has no allowlisted peers: no one publishes to it",
+            profile.name
+        );
+        return Ok(());
+    }
+    let (agent, _instance) = peer_agent(profile, network, "list the catalog").await?;
+    for peer in &trust.peers {
+        let (agent, addr) = (agent.clone(), peer.addr());
+        tokio::spawn(async move {
+            let _ = agent.connect(addr).await;
+        });
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    while std::time::Instant::now() < deadline && agent.peers().len() < trust.peers.len() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Catalogs come with the hello: a moment for the last ones.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let connected = agent.peers().len();
+    let published = agent.catalogs();
+    agent.shutdown().await;
+    let listed = catalog::listed(&FactoryStore::of(profile), &published);
+    println!(
+        "catalog of profile '{}' ({connected} of {} peers connected in {wait}s):",
+        profile.name,
+        trust.peers.len()
+    );
+    if listed.is_empty() {
+        println!("  nothing: no connected peer publishes an agent to you");
+    }
+    for (entry, here) in listed {
+        let s = &entry.item.eval_summary;
+        println!(
+            "  {}/{}@{}  {}  {:.0}% of its own runs passed, {} case{} of its own, the built-in attacks {}  (key {}){}",
+            entry.publisher,
+            entry.item.name,
+            entry.item.version,
+            entry.item.access,
+            s.pass_rate * 100.0,
+            s.cases,
+            if s.cases == 1 { "" } else { "s" },
+            if s.adversarial_passed {
+                "resisted"
+            } else {
+                "NOT all resisted"
+            },
+            &entry.publisher_id[..10],
+            match here {
+                Some(state) => format!(
+                    "; {}",
+                    serde_json::to_value(state)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default()
+                ),
+                None => String::new(),
+            }
+        );
+        println!("      {}", entry.item.description);
+        if here.is_none() {
+            println!(
+                "      import it: {}",
+                hint(
+                    profile,
+                    &format!(
+                        "import {}/{}@{}",
+                        entry.publisher, entry.item.name, entry.item.version
+                    )
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Imports `target` (`publisher/name@version`) from the publisher, connected within `wait`
+/// seconds: its bundle verified and kept, nothing run; active at once with `accept`.
+pub async fn import(
+    profile: &Profile,
+    target: &str,
+    accept: bool,
+    wait: u64,
+    network: Network,
+) -> Result<()> {
+    let (publisher, name, version) = catalog::parse_target(target)?;
+    let trust = profile.trust()?;
+    let peer = trust.get_by_name(&publisher).cloned().ok_or_else(|| {
+        anyhow!(
+            "'{publisher}' isn't on your allowlist (proofkin peers list --profile {})",
+            profile.name
+        )
+    })?;
+    let (agent, _instance) = peer_agent(profile, network, &format!("import {target}")).await?;
+    let fetched = async {
+        let _ = tokio::time::timeout(Duration::from_secs(wait), agent.connect(peer.addr())).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+        while !agent.peers().iter().any(|p| p.id == peer.id) {
+            if std::time::Instant::now() > deadline {
+                bail!("{publisher} didn't connect in {wait}s: is its agent running?");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        println!("{publisher} connected: asking for {name} {version}");
+        agent
+            .request_bundle(peer.id, &name, &version, Duration::from_secs(120))
+            .await
+    }
+    .await;
+    agent.shutdown().await;
+    let bundle = fetched?;
+    if bundle.agent != name || bundle.version != version {
+        bail!(
+            "{publisher} sent {} {}, not {name} {version}",
+            bundle.agent,
+            bundle.version
+        );
+    }
+    let files = bundle.files.len();
+    let imported = catalog::import(
+        &FactoryStore::of(profile),
+        &profile.name,
+        &profile.identity()?,
+        bundle,
+        &catalog::ImportAsk {
+            publisher: publisher.clone(),
+            publisher_id: peer.id.to_string(),
+            accept_publisher_report: accept,
+            by: profile.name.clone(),
+        },
+    )?;
+    println!(
+        "{name} {version}: imported from {publisher} (key {}): {files} files, signed by its key, every hash verified; nothing ran",
+        &imported.publisher_id[..10]
+    );
+    match (&imported.release, imported.state) {
+        (_, catalog::ImportState::Active) => println!(
+            "  active: you accepted {publisher}'s report; plans use it as agent={name}; {}",
+            hint(profile, &format!("deploy {name} --start"))
+        ),
+        (Some(r), _) => println!(
+            "  you accepted {publisher}'s report; its release here waits for your sign-off of what it asks for ({}): {}",
+            r.manifest.increases.join("; "),
+            hint(profile, &format!("approve {name}"))
+        ),
+        (None, _) => println!(
+            "  it becomes active once it passes an evaluation on your accounts: {}",
+            hint(profile, &format!("evaluate {name} --yes"))
+        ),
+    }
+    Ok(())
+}
+
 /// Prints `name`'s releases and deployments, for `factory show`.
 pub fn print_releases(profile: &Profile, name: &str) -> Result<()> {
     let store = FactoryStore::of(profile);
@@ -668,6 +1055,47 @@ pub fn print_releases(profile: &Profile, name: &str) -> Result<()> {
             println!("  deployments:");
             for d in &state.deployments {
                 print_deployment(d);
+            }
+        }
+        if let Some(w) = &state.watch {
+            print!("  ");
+            print_watch(name, w);
+        }
+        if let Some(p) = &state.publication {
+            let peers = catalog::publication(&store, &profile.trust()?, name)
+                .map(|s| s.peers)
+                .unwrap_or_default();
+            println!(
+                "  published: {} to {}",
+                p.versions.join(", "),
+                if peers.is_empty() {
+                    "no peer".to_owned()
+                } else {
+                    peers.join(", ")
+                }
+            );
+        }
+        if let Some(o) = &state.imported {
+            println!(
+                "  imported from {} (key {}):",
+                o.publisher,
+                &o.publisher_id[..10.min(o.publisher_id.len())]
+            );
+            for v in &o.versions {
+                let here = catalog::import_state(&store, name, &v.version);
+                println!(
+                    "    {} {}{}",
+                    v.version,
+                    serde_json::to_value(here)
+                        .ok()
+                        .and_then(|x| x.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                    if v.accepted_report {
+                        " (its publisher's report accepted)"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
     }
@@ -788,6 +1216,7 @@ mod tests {
         canary.canary = Some(crate::factory::report::CanaryOf {
             worker: "fin-analyst".into(),
             version: "1.0.0".into(),
+            drift: false,
         });
         canary.sign("alice", &f.owner);
         write(

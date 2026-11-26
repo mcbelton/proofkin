@@ -816,6 +816,106 @@ try:
           code_m == 0 and re.search(r"1\.0\.0: 1 tasks: 1 done", metrics) and code_o == 0
           and "| notes | 1.0.0 (active) | notes (running) | 1 | 1 | 0 | 0 |" in ops, metrics + ops)
 
+    def slow(*args, timeout=1800):
+        out = subprocess.run([EXE, *args], env=ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                             timeout=timeout, encoding="utf-8", errors="replace")
+        return out.returncode, out.stdout + out.stderr
+
+    print("== worker1's drift watch evaluates the deployed notes agent now, with real Copilot (its agent stopped)")
+    _, watched = slow("factory", "watch", "notes", "--when", "daily 03:00", "--fail-after", "2", "--now",
+                      "--profile", "worker1")
+    _, shown_watch = cli("factory", "watch", "notes", "--profile", "worker1")
+    print(watched + shown_watch)
+    check("worker1's drift watch evaluated the deployed notes agent with real Copilot: its case and the built-in "
+          "attacks, kept as its last run",
+          re.search(r"notes 1\.0\.0: drift watch (passed|failed): \d+% of its own runs \(\d of 1\), "
+                    r"the built-in attacks \d+ of \d+ \(ev-", watched)
+          and "notes: drift watch daily 03:00, an incident after 2 failed runs in a row" in shown_watch
+          and "last run (1.0.0 at" in shown_watch, watched + shown_watch)
+
+    print("== worker1's model proposes a better notes agent from a note, evaluated next; what runs stays")
+    _, improved = slow("factory", "improve", "notes", "--note",
+                       "Answer with the code word in capitals, then the line of notes.md it comes from.",
+                       "--evaluate", "--profile", "worker1")
+    _, shown = cli("factory", "show", "notes", "--profile", "worker1")
+    print(improved + shown)
+    check("worker1's model proposed an improvement of the notes agent with real Copilot: a new draft with a diff, "
+          "evaluated next, and the active release stayed",
+          re.search(r"notes: improvement pr-\S+: a new draft version of release 1\.0\.0", improved)
+          and "report: proofkin factory report ev-" in improved and "1.0.0 (active)" in shown, improved + shown)
+
+    print("== worker1 releases notes 1.0.1 (the same build), deploys it, then rolls its deployment back to 1.0.0")
+    code_r, released = cli("factory", "release", "notes", "--evaluation", eid, "--version", "1.0.1",
+                           "--note", "Live: the same build again", "--profile", "worker1")
+    code_a, approved = cli("factory", "approve", "notes", "--note", "Live sign-off", "--profile", "worker1")
+    code_d, redeployed = cli("factory", "deploy", "notes", "--version", "1.0.1", "--folders", "repo", "--no-canary",
+                             "--profile", "worker1")
+    code_b, rolled = cli("factory", "rollback", "notes", "--to", "1.0.0", "--reason", "Live rollback",
+                         "--profile", "worker1")
+    _, shown = cli("factory", "show", "notes", "--profile", "worker1")
+    print(released + approved + redeployed + rolled + shown)
+    check("worker1 released notes 1.0.1, deployed it and rolled its deployment back to 1.0.0",
+          code_r == 0 and code_a == 0 and "notes 1.0.1: released" in approved
+          and code_d == 0 and "notes 1.0.1: deployed on worker notes" in redeployed
+          and code_b == 0 and "notes: 1.0.0 is active" in rolled
+          and "notes runs 1.0.0 (running)" in shown and "1.0.0 (active)" in shown,
+          released + approved + redeployed + rolled + shown)
+
+    print("== worker1 publishes notes to worker2, and lets worker2 hand its deployed notes agent tasks")
+    code_p, published = cli("factory", "publish", "notes", "--to", "worker2", "--profile", "worker1")
+    _, out = cli("peers", "id", "--profile", "notes")
+    ids["notes"] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
+    allow("notes", "worker2", delegate=True)
+    _, out = cli("peers", "allow", ids["notes"], "--profile", "worker2", "--name", "notes-worker")
+    print(published + out)
+    data_notes = os.path.join(HOME, ".proofkin-data", "notes")
+    os.makedirs(data_notes, exist_ok=True)
+    with open(os.path.join(data_notes, "notes.md"), "w", encoding="utf-8") as f:
+        f.write("# Team notes\n\nThe code word for the launch is PELICAN.\n")
+
+    print("== start worker1 again: its agent serves its catalog and runs the deployed notes agent")
+    w1 = Agent("worker1", ["--providers", "copilot", "--serve"])
+    agents.append(w1)
+    serving = w1.wait_for(r"^started digital worker notes", 120)
+
+    print("== worker2 (its agent stopped) lists its catalog, and imports notes: verified, and nothing runs")
+    code_c, listed = slow("factory", "catalog", "--wait", "120", "--network", "internet", "--profile", "worker2",
+                          timeout=300)
+    print(listed)
+    check("worker2's catalog lists the notes agent worker1 published to it: its access and how its evaluation went, "
+          "never its knowledge, outputs or paths",
+          code_p == 0 and "notes: published 1.0.0 to worker2" in published and code_c == 0
+          and re.search(r"worker1/notes@1\.0\.0  read-only  \d+% of its own runs passed, 1 case of its own, "
+                        r"the built-in attacks", listed)
+          and HOME not in listed and "PELICAN" not in listed, published + listed)
+    code_i, imported = slow("factory", "import", "worker1/notes@1.0.0", "--wait", "120", "--network", "internet",
+                            "--profile", "worker2", timeout=300)
+    _, before = cli("factory", "show", "notes", "--profile", "worker2")
+    _, evaluated2 = slow("factory", "evaluate", "notes", "--yes", "--profile", "worker2")
+    _, after = cli("factory", "show", "notes", "--profile", "worker2")
+    print(imported + before + evaluated2 + after)
+    check("worker2 imported worker1's notes agent verified, ran nothing, and it became active only once it passed "
+          "an evaluation on worker2's own accounts",
+          code_i == 0 and "notes 1.0.0: imported from worker1" in imported and "nothing ran" in imported
+          and "notes (imported)" in before and "1.0.0 imported" in before
+          and "notes 1.0.0: imported, evaluated here and released here (released)" in evaluated2
+          and "notes (active)" in after and "1.0.0 (active)" in after and "by its publisher worker1" in after,
+          imported + before + evaluated2 + after)
+
+    print("== worker2 hands worker1's deployed notes agent a task, with real Copilot")
+    w2 = Agent("worker2", ["--providers", "copilot"])
+    agents.append(w2)
+    connected = w2.wait_for(r"^\+ notes-worker", 180)
+    w2.cursor = len(w2.lines)
+    w2.send("/delegate copilot@notes-worker Which code word does notes.md give for the launch? Answer with the word.")
+    answered = w2.wait_for(rf"=== copilot on notes-worker{MODEL} ===", 300)
+    time.sleep(1)
+    check("worker2 delegated a task to worker1's deployed notes agent, which answered with real Copilot",
+          serving and connected and answered and any("PELICAN" in l for l in w2.lines[w2.cursor:]),
+          (serving, connected, answered))
+    w2.stop()
+    w1.stop()
+
     print("== worker1 retires the notes agent: its deployment stops, and its releases stay for audit")
     code_t, retired = cli("factory", "retire", "notes", "--reason", "The live check is over", "--profile", "worker1")
     _, shown = cli("factory", "show", "notes", "--profile", "worker1")
@@ -828,7 +928,7 @@ finally:
         a.stop()
     # worker1's digital workers first (its evaluation worker, the deployed notes agent):
     # deleting a digital worker updates its owner's allowlist.
-    for profile in ("worker1-eval", "notes", *PROFILES):
+    for profile in ("worker1-eval", "worker2-eval", "notes", *PROFILES):
         cli("profile", "delete", "--profile", profile)
     shutil.rmtree(ws, ignore_errors=True)
     if svc:

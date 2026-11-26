@@ -152,6 +152,7 @@ pub fn retire(
         (Utc::now() + chrono::Duration::days(PURGE_AFTER_DAYS))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     });
+    let mut incident = None;
     let state = store.update_state(name, |s| {
         s.state = Lifecycle::Retired;
         s.purge_after = purge_after.clone();
@@ -172,8 +173,31 @@ pub fn retire(
             },
             Some(&reason),
         );
+        // Nothing runs it any more: nothing watches it, and no peer is offered it.
+        if let Some(w) = s.watch.as_mut().filter(|w| w.enabled) {
+            w.enabled = false;
+            w.failures = 0;
+            w.retry = None;
+            incident = w.incident.take();
+            s.changed(by, "drift watch paused: it was retired", None);
+        }
+        if s.publication.take().is_some_and(|p| !p.versions.is_empty()) {
+            s.changed(by, "unpublished: it was retired", None);
+        }
         Ok(())
     })?;
+    if let Some(incident) = incident {
+        owner
+            .ops_store()
+            .record_incident(&crate::ops::IncidentEvent {
+                ts: crate::runs::unix_now(),
+                incident,
+                monitor: crate::factory::drift::monitor(name),
+                kind: crate::ops::IncidentKind::Resolved,
+                text: format!("Closed: {name} was retired"),
+                checks: vec![],
+            })?;
+    }
     Ok((state, stopped))
 }
 

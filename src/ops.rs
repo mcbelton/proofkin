@@ -124,13 +124,16 @@ impl MonitorStore {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     pub ts: u64,
     pub monitor: String,
     pub ok: bool,
     pub ms: u64,
     pub exit: Option<i32>,
+    /// For a factory agent's drift watch: the share of its own cases' runs that passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,6 +614,7 @@ impl Ops {
             ok: result.passed,
             ms: result.millis,
             exit: result.exit_code,
+            pass_rate: None,
         };
         if let Err(e) = self.store.record_sample(&sample) {
             eprintln!("warning: could not record a metric: {e:#}");
@@ -989,6 +993,7 @@ mod tests {
                     ok: *ok,
                     ms: 100 * (i as u64 + 1),
                     exit: Some(if *ok { 0 } else { 7 }),
+                    pass_rate: None,
                 })
                 .unwrap();
         }

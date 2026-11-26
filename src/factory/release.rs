@@ -214,6 +214,20 @@ pub struct Origin {
     pub dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// For an imported agent: the publisher's release it is exactly (see
+    /// [`crate::factory::catalog`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<ImportedFrom>,
+}
+
+/// The publisher's release an imported agent's local release is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedFrom {
+    /// The publisher, as the importer's allowlist names it, and its key.
+    pub publisher: String,
+    pub publisher_id: String,
+    /// The publisher's manifest hash.
+    pub manifest_sha256: String,
 }
 
 /// What a release is, signed by its owner.
@@ -253,7 +267,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    fn signed_bytes(&self) -> Vec<u8> {
+    pub(crate) fn signed_bytes(&self) -> Vec<u8> {
         let mut bytes = DOMAIN.to_vec();
         bytes.extend(serde_json::to_vec(self).expect("a manifest serializes"));
         bytes
@@ -679,6 +693,34 @@ pub fn request(
         ))
     })?;
     let blueprint = runner::blueprint_of(&build)?;
+    // An imported agent's release is exactly its publisher's release: its version, no
+    // approver but its owner (for what it asks for), and where it came from.
+    let import = state.imported.as_ref().and_then(|o| {
+        o.versions
+            .iter()
+            .find(|v| v.build == evaluation.build)
+            .map(|v| ImportedFrom {
+                publisher: o.publisher.clone(),
+                publisher_id: o.publisher_id.clone(),
+                manifest_sha256: v.manifest_sha256.clone(),
+            })
+            .zip(o.versions.iter().find(|v| v.build == evaluation.build))
+    });
+    let asked_version = match &import {
+        Some((from, v)) => {
+            if asked.version.as_deref().is_some_and(|a| a != v.version) {
+                return Err(invalid(format!(
+                    "build {} is {} {} from {}: its release keeps its publisher's version",
+                    &evaluation.build[..12.min(evaluation.build.len())],
+                    name,
+                    v.version,
+                    from.publisher
+                )));
+            }
+            Some(v.version.clone())
+        }
+        None => asked.version.clone(),
+    };
     let chosen = evaluation
         .recommended
         .clone()
@@ -727,14 +769,15 @@ pub fn request(
             (change, why, newest.bumped(change))
         }
     };
-    let version = match &asked.version {
+    let version = match &asked_version {
         None => needed,
         Some(text) => {
             let chosen: Version = text.parse().map_err(|e| invalid(format!("{e:#}")))?;
             if used.contains(&chosen) {
                 return Err(invalid(format!("{chosen} is already a release of {name}")));
             }
-            if chosen < needed {
+            // An import's is its publisher's, whichever of their versions came here first.
+            if chosen < needed && import.is_none() {
                 return Err(invalid(format!(
                     "{chosen} is lower than {needed}, the version this release needs ({change}: {change_why})"
                 )));
@@ -779,11 +822,16 @@ pub fn request(
         previous: state.active_version.clone(),
         change,
         change_why,
-        approvers: blueprint.approvers.clone(),
+        approvers: if import.is_some() {
+            Vec::new()
+        } else {
+            blueprint.approvers.clone()
+        },
         origin: Origin {
             draft: store.draft(name)?.map(|d| d.provenance),
             dir: asked.dir.clone(),
             commit: asked.commit.clone(),
+            imported: import.map(|(from, _)| from),
         },
         note: asked.note.clone().filter(|n| !n.trim().is_empty()),
         created: now(),
@@ -902,10 +950,32 @@ pub fn load(store: &FactoryStore, name: &str, version: &str) -> Result<Release> 
 /// the request it answers, the owner's with the owner's key. A released release must have
 /// every answer it needed.
 pub fn verify_dir(dir: &Path, name: &str, version: &str) -> Result<Release> {
+    verify_in(dir, name, version, None)
+}
+
+/// Checks the release a peer published, as its bundle has it in `dir` (see
+/// [`crate::factory::catalog`]): as [`verify_dir`] does, but signed by `publisher_id`, and
+/// with its report as its bundle has it, without its runs' outputs: no longer the bytes its
+/// manifest hashes, so it must verify by its own signature, the publisher's, and be the
+/// manifest's passed evaluation of exactly its build.
+pub fn verify_bundle(dir: &Path, name: &str, version: &str, publisher_id: &str) -> Result<Release> {
+    verify_in(dir, name, version, Some(publisher_id))
+}
+
+fn verify_in(dir: &Path, name: &str, version: &str, bundle: Option<&str>) -> Result<Release> {
     let release: Release = read_json(&dir.join(RELEASE_FILE))?
         .ok_or_else(|| anyhow!("{} is missing", RELEASE_FILE))?;
     let m = &release.manifest;
     release.verify_signature()?;
+    if let Some(publisher) = bundle
+        && m.signer_id != publisher
+    {
+        bail!(
+            "its manifest is signed by {}'s key ({}), not its publisher's",
+            m.signer,
+            &m.signer_id[..10.min(m.signer_id.len())]
+        );
+    }
     if m.agent != name || m.version != version {
         bail!(
             "its manifest is of {} {}, not {name} {version}",
@@ -919,6 +989,8 @@ pub fn verify_dir(dir: &Path, name: &str, version: &str) -> Result<Release> {
     for (path, hash) in &m.files {
         match files.get(path) {
             None => bail!("{path} is missing"),
+            // A bundle's report has no outputs: it is checked by its signature below.
+            Some(_) if bundle.is_some() && path == REPORT_FILE => {}
             Some(bytes) if sha256_hex(bytes) != *hash => {
                 bail!("{path} doesn't match its hash: it was changed after it was released")
             }
@@ -957,6 +1029,9 @@ pub fn verify_dir(dir: &Path, name: &str, version: &str) -> Result<Release> {
     report
         .verify()
         .with_context(|| format!("its report {} doesn't verify", report.id))?;
+    if bundle.is_some() && report.signer_id != m.signer_id {
+        bail!("its report isn't signed by its publisher");
+    }
     for approval in &release.approvals {
         check_approval(&release, &report, approval)
             .with_context(|| format!("{}'s answer", approval.approver))?;
@@ -1055,7 +1130,12 @@ pub fn blueprint_of(store: &FactoryStore, name: &str, version: &str) -> Result<B
 
 /// The evaluation report release `version` of `name` was made from, as kept in it.
 pub fn report_of(store: &FactoryStore, name: &str, version: &str) -> Result<Evaluation> {
-    let text = std::fs::read_to_string(store.release_dir(name, version).join(REPORT_FILE))?;
+    report_of_dir(&store.release_dir(name, version))
+}
+
+/// The evaluation report of the release in folder `dir`.
+pub fn report_of_dir(dir: &Path) -> Result<Evaluation> {
+    let text = std::fs::read_to_string(dir.join(REPORT_FILE))?;
     Ok(serde_json::from_str(&text)?)
 }
 
@@ -1283,13 +1363,48 @@ pub fn answer(
 }
 
 /// What changed from release `from` of `name` to release `to`: requirements, instructions,
-/// skills, capabilities both ways, the model, budgets and files.
+/// skills, capabilities both ways, eval cases, the model, budgets and files.
 pub fn diff(store: &FactoryStore, name: &str, from: &str, to: &str) -> Result<Vec<String>> {
     let (a, b) = (load(store, name, from)?, load(store, name, to)?);
     let (old, new) = (
         blueprint_of(store, name, from)?,
         blueprint_of(store, name, to)?,
     );
+    let mut lines = blueprint_diff(&old, &new);
+    if a.manifest.model.chosen != b.manifest.model.chosen {
+        lines.push(format!(
+            "~ model: {} → {}",
+            a.manifest.model.chosen, b.manifest.model.chosen
+        ));
+    }
+    let files = |r: &Release| -> BTreeMap<String, String> {
+        r.manifest
+            .files
+            .iter()
+            .filter(|(p, _)| p.starts_with(&format!("{FILES_DIR}/")))
+            .map(|(p, h)| (p.clone(), h.clone()))
+            .collect()
+    };
+    let (fa, fb) = (files(&a), files(&b));
+    let changed: Vec<String> = fb
+        .iter()
+        .filter(|(p, h)| fa.get(*p) != Some(*h))
+        .map(|(p, _)| p.trim_start_matches("files/").to_owned())
+        .chain(
+            fa.keys()
+                .filter(|p| !fb.contains_key(*p))
+                .map(|p| format!("{} (removed)", p.trim_start_matches("files/"))),
+        )
+        .collect();
+    if !changed.is_empty() {
+        lines.push(format!("files changed: {}", changed.join(", ")));
+    }
+    Ok(lines)
+}
+
+/// What changed from blueprint `old` to `new`, a line each: requirements, instructions,
+/// skills, capabilities both ways, eval cases and budgets.
+pub fn blueprint_diff(old: &Blueprint, new: &Blueprint) -> Vec<String> {
     let mut lines = Vec::new();
     for r in &new.requirements {
         match old.requirements.iter().find(|o| o.id == r.id) {
@@ -1320,17 +1435,31 @@ pub fn diff(store: &FactoryStore, name: &str, from: &str, to: &str) -> Result<Ve
     for s in old.skills.iter().filter(|s| !new.skills.contains(s)) {
         lines.push(format!("- skill {s}"));
     }
-    for more in capabilities::increases(&old, &new) {
+    for more in capabilities::increases(old, new) {
         lines.push(format!("+ {more}"));
     }
-    for fewer in capabilities::increases(&new, &old) {
+    for fewer in capabilities::increases(new, old) {
         lines.push(format!("- {fewer}"));
     }
-    if a.manifest.model.chosen != b.manifest.model.chosen {
-        lines.push(format!(
-            "~ model: {} → {}",
-            a.manifest.model.chosen, b.manifest.model.chosen
-        ));
+    for c in &new.evals.cases {
+        match old.evals.cases.iter().find(|o| o.id == c.id) {
+            None => lines.push(format!(
+                "+ case {} ({}): {}",
+                c.id,
+                c.requirement,
+                one_line(&c.input)
+            )),
+            Some(o) if o != c => lines.push(format!("~ case {} ({})", c.id, c.requirement)),
+            Some(_) => {}
+        }
+    }
+    for o in old
+        .evals
+        .cases
+        .iter()
+        .filter(|o| !new.evals.cases.iter().any(|c| c.id == o.id))
+    {
+        lines.push(format!("- case {} ({})", o.id, o.requirement));
     }
     if old.budgets != new.budgets {
         lines.push(format!(
@@ -1339,29 +1468,46 @@ pub fn diff(store: &FactoryStore, name: &str, from: &str, to: &str) -> Result<Ve
             budgets_text(&new.budgets)
         ));
     }
-    let files = |r: &Release| -> BTreeMap<String, String> {
-        r.manifest
-            .files
+    lines
+}
+
+/// The lines of `old` and `new` as a diff: each kept line with two spaces, each removed one
+/// with `- `, each added one with `+ ` (the longest common lines kept; texts of up to 400
+/// lines each, longer ones a whole removal and addition).
+pub fn text_diff(old: &str, new: &str) -> Vec<String> {
+    let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    if a.len() > 400 || b.len() > 400 {
+        return a
             .iter()
-            .filter(|(p, _)| p.starts_with(&format!("{FILES_DIR}/")))
-            .map(|(p, h)| (p.clone(), h.clone()))
-            .collect()
-    };
-    let (fa, fb) = (files(&a), files(&b));
-    let changed: Vec<String> = fb
-        .iter()
-        .filter(|(p, h)| fa.get(*p) != Some(*h))
-        .map(|(p, _)| p.trim_start_matches("files/").to_owned())
-        .chain(
-            fa.keys()
-                .filter(|p| !fb.contains_key(*p))
-                .map(|p| format!("{} (removed)", p.trim_start_matches("files/"))),
-        )
-        .collect();
-    if !changed.is_empty() {
-        lines.push(format!("files changed: {}", changed.join(", ")));
+            .map(|l| format!("- {l}"))
+            .chain(b.iter().map(|l| format!("+ {l}")))
+            .collect();
     }
-    Ok(lines)
+    // common[i][j]: the longest common lines of a[i..] and b[j..].
+    let mut common = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            common[i][j] = if a[i] == b[j] {
+                common[i + 1][j + 1] + 1
+            } else {
+                common[i + 1][j].max(common[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j, mut lines) = (0, 0, Vec::new());
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            lines.push(format!("  {}", a[i]));
+            (i, j) = (i + 1, j + 1);
+        } else if i < a.len() && (j == b.len() || common[i + 1][j] >= common[i][j + 1]) {
+            lines.push(format!("- {}", a[i]));
+            i += 1;
+        } else {
+            lines.push(format!("+ {}", b[j]));
+            j += 1;
+        }
+    }
+    lines
 }
 
 /// Budgets in a line.
@@ -1526,6 +1672,7 @@ pub(crate) mod tests {
         canary.canary = Some(crate::factory::report::CanaryOf {
             worker: "fin-analyst".into(),
             version: "1.0.0".into(),
+            drift: false,
         });
         canary.sign("alice", &f.owner);
         f.store.save_evaluation(&canary).unwrap();

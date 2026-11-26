@@ -38,6 +38,7 @@ mod connect;
 mod factory;
 mod models;
 mod releases;
+mod sharing;
 mod tools;
 mod workers;
 mod workiq;
@@ -55,6 +56,7 @@ const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
 const WORKERS_JS: &str = include_str!("../ui/workers.js");
 const CONNECT_JS: &str = include_str!("../ui/connect.js");
 const FACTORY_JS: &str = include_str!("../ui/factory.js");
+const FACTORY_SHARE_JS: &str = include_str!("../ui/factory-share.js");
 const FEED_LIMIT: usize = 500;
 /// Most tasks kept for the page (and for other agents' lookups), besides running ones:
 /// the oldest finished ones go first, a plan's steps together once the plan has ended.
@@ -899,6 +901,18 @@ pub async fn start_with_work(
                 ),
                 Event::PeerBusy { .. } | Event::PeerModels { .. } => pump.broadcast_peers(),
                 Event::ModelsChanged => pump.broadcast_me(),
+                Event::Catalog { name, entries, .. } => {
+                    if entries > 0 {
+                        pump.system(
+                            "info",
+                            format!(
+                                "{name} publishes {entries} agent release{} to you (Agent factory › Catalog)",
+                                if entries == 1 { "" } else { "s" }
+                            ),
+                        );
+                    }
+                    pump.send(json!({ "type": "catalog" }));
+                }
                 Event::TaskReceived {
                     from,
                     task_id,
@@ -1149,6 +1163,17 @@ pub async fn start_with_work(
             "/api/factory/agents/{name}/budgets",
             put(releases::set_budgets),
         )
+        .route("/api/factory/agents/{name}/watch", put(releases::set_watch))
+        .route(
+            "/api/factory/agents/{name}/improvements",
+            post(factory::propose_improvement),
+        )
+        .route(
+            "/api/factory/agents/{name}/publication",
+            put(sharing::publish_agent),
+        )
+        .route("/api/factory/catalog", get(sharing::list_catalog))
+        .route("/api/factory/imports", post(sharing::import_agent))
         .route(
             "/api/factory/evaluations/{id}",
             get(factory::get_evaluation).delete(factory::cancel_evaluation),
@@ -1222,6 +1247,10 @@ pub async fn start_with_work(
         .route(
             "/factory.js",
             get(|| async { asset("text/javascript; charset=utf-8", FACTORY_JS) }),
+        )
+        .route(
+            "/factory-share.js",
+            get(|| async { asset("text/javascript; charset=utf-8", FACTORY_SHARE_JS) }),
         )
         // The A2A agent card is public (to this machine), like any agent's.
         .route("/.well-known/agent-card.json", get(connect::agent_card))
@@ -2990,9 +3019,14 @@ async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
             v
         })
         .collect();
+    // Monitors with an open incident (one ongoing problem each), and factory agents whose
+    // drift watch has one.
+    let open: std::collections::BTreeSet<String> = crate::ops::open_incidents(&store.incidents(0))
+        .into_values()
+        .filter(|m| m.starts_with("factory:") || monitors.iter().any(|x| &x.name == m))
+        .collect();
     Ok(Json(json!({
-        // Monitors with an open incident (one ongoing problem each).
-        "open_incidents": stats.iter().filter(|m| m.open_incident).count(),
+        "open_incidents": open.len(),
         "monitors": listed,
         "checks": checks,
         "incidents": recent,
@@ -4386,6 +4420,7 @@ async fn allow_peer(
         shares,
         m365,
         github,
+        agents: s.agent.trusted().agents_of(&ticket.addr.id, &name),
     };
     let words = grant_words(&peer);
     s.agent.allow(peer);

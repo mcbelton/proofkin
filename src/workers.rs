@@ -187,6 +187,7 @@ fn finish(
         shares: granted,
         m365: None,
         github: None,
+        agents: Vec::new(),
     });
     trust.save(&worker.trust_path())?;
     let entry = TrustedPeer {
@@ -199,6 +200,7 @@ fn finish(
         shares: vec![DATA_SHARE.to_owned()],
         m365: None,
         github: None,
+        agents: Vec::new(),
     };
     Ok(Created { worker, id, entry })
 }
@@ -615,6 +617,7 @@ mod tests {
             shares: Vec::new(),
             m365: None,
             github: None,
+            agents: Vec::new(),
         });
         assert!(refused(spec("alice"), &allowlist).contains("already on your allowlist"));
         let copilot = WorkerSpec {

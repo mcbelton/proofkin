@@ -45,6 +45,10 @@ pub enum Message {
         /// see its role).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
+        /// The factory agents the sender publishes to the receiver (see
+        /// [`crate::factory::catalog`]); changes come in a `catalog` message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        catalog: Vec<CatalogItem>,
     },
     Peers {
         addrs: Vec<EndpointAddr>,
@@ -133,9 +137,63 @@ pub enum Message {
         #[serde(default)]
         offers: crate::models::Offers,
     },
+    /// The factory agents the sender publishes to the receiver now, as its hello says them
+    /// (sent when they change; empty: none any more).
+    Catalog {
+        #[serde(default)]
+        entries: Vec<CatalogItem>,
+    },
+    /// Asks for the bundle of a release the receiver publishes to the sender; answered with
+    /// `bundle`.
+    BundleRequest {
+        request_id: u64,
+        agent: String,
+        version: String,
+    },
+    /// A release's bundle, or why it isn't sent.
+    Bundle {
+        request_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bundle: Option<Box<Bundle>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// A message type from a newer version; ignored so mixed versions keep working.
     #[serde(other)]
     Unknown,
+}
+
+/// A factory release a peer publishes, as its catalog lists it: what it is for, the most
+/// access it asks for and how its evaluation went. Never knowledge, outputs or paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogItem {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub access: crate::llm::Access,
+    pub eval_summary: EvalSummary,
+}
+
+/// How a published release's evaluation went, as its publisher's report says.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalSummary {
+    /// The share of the runs of its own cases that passed.
+    pub pass_rate: f64,
+    /// Its own cases: how the built-in attacks went is `adversarial_passed`.
+    pub cases: usize,
+    pub adversarial_passed: bool,
+}
+
+// A pass rate is a share of runs, never NaN.
+impl Eq for EvalSummary {}
+
+/// A published release's files, by their paths in its folder (see
+/// [`crate::factory::release`]), each in base64: its report without its runs' outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bundle {
+    pub agent: String,
+    pub version: String,
+    pub files: std::collections::BTreeMap<String, String>,
 }
 
 /// What a delegated task is part of on the requester's side.
@@ -417,6 +475,7 @@ mod tests {
             models: models.clone(),
             offers: offers.clone(),
             agent: Some("fin-analyst@1.2.0".into()),
+            catalog: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);

@@ -1,8 +1,11 @@
 # Agent factory in Proofkin: describe an agent, prove it, run it (design)
 
-Status: being built with Proofkin, phase by phase. Tracked in
+Status: built with Proofkin, phase by phase. Tracked in
 [#175](https://github.com/mcbelton/proofkin/issues/175), one sub-issue per piece of work (see
-[Work items](#work-items)). Until an item is closed, what it describes doesn't exist yet.
+[Work items](#work-items)); the items marked later
+([#194](https://github.com/mcbelton/proofkin/issues/194),
+[#208](https://github.com/mcbelton/proofkin/issues/208),
+[#215](https://github.com/mcbelton/proofkin/issues/215)) don't exist yet.
 Phase 1 (Foundation) is built: blueprints, the factory store and `proofkin factory`, eval
 suites, templates, drafts, and usage in task results and the audit. Phase 2 (Generation) is
 built: builds kept by their hash, capabilities resolved against the owner's folders, the
@@ -16,6 +19,10 @@ sign-offs (peers' and the owner's for capability increases), factory agents in p
 canary and rollback, deprecation and retirement, metrics by release (`factory metrics` and
 the ops report), budgets, the `agent-factory` playbook with `release --from`, and the web UI
 and API to configure an agent with a form and release, deploy, roll back, retire and watch it.
+Phase 5 (Scale) is built: drift watches (scheduled evaluations of what runs, as ops samples
+and incidents), improvement proposals from what failed (a new draft, never applied by
+itself), publishing releases to peers, the catalog they see, verified imports evaluated on
+the importer's accounts, and the web UI and API for them.
 
 The formal design package is in [agent-factory/](agent-factory/): the
 [spec](agent-factory/spec/SPEC.md) (14 user stories, 33 acceptance criteria), the
@@ -387,36 +394,53 @@ proofkin factory rollback fin-analyst --reason "Summaries got longer than 200 wo
 - **Budgets** per deployed agent: tasks per day, attempts and timeout. The worker refuses
   a task that would exceed them before any model call, with a one-line reason, audited.
 - **Drift watch**: `proofkin factory watch fin-analyst --when "daily 03:00" --fail-after 2`
-  schedules evaluations of the active release on its deployment. Their pass rates are ops
-  samples; `fail_after` failures in a row open an incident and alert the owner with the
-  failing cases.
+  evaluates the active release on its deployment on a schedule while the owner's agent runs
+  (`--now` runs it once, `--off` pauses it): every case once, the built-in attacks too,
+  judged by its release's gate and within its budgets. Each run's pass rate is an ops sample
+  of monitor `factory:fin-analyst`; `fail_after` failed runs in a row open an ops incident
+  that alerts the owner with the failing cases, and a run that passes closes it. A run its
+  worker can't take (busy, stopped, nothing deployed) is tried again for an hour, then
+  skipped: it counts neither way.
 
 ### 12. Improvement
 
 `proofkin factory improve fin-analyst --cases E2,E5 --note "Quote the sentence"` gives the
-owner's model the blueprint, the failing cases with their (redacted) outputs, the outcomes
-of failed tasks (from the audit, without text) and the note. Its answer is a **new draft
-version**, evaluated on the same suite plus regression cases made from the failures, and
-shown as a diff next to the active release. Only a release changes what runs.
+owner's model the blueprint of the active release, the failing cases with their (redacted)
+outputs, the outcomes of its deployments' failed tasks (from the audit, never their text)
+and the note. Its answer is a **new draft version**: the model may rewrite the instructions,
+pick other skills and add requirements and cases; everything else stays as it was (the
+capabilities, model, memory, budgets, deployment, approvers, and every requirement and case),
+and each failing case gets a regression case. The proposal keeps the draft it replaced and is
+shown as a diff next to the active release; `--evaluate` evaluates it on the model the active
+release runs on. Only a release changes what runs. An imported agent is its publisher's to
+improve.
 
 ### 13. Sharing agents between peers
 
 ([ADR-0007](agent-factory/design/adr/ADR-0007-peer-to-peer-catalog.md))
 
 ```powershell
-proofkin factory publish fin-analyst --to bob,dana            # alice
-proofkin factory catalog                                      # bob: what peers published to him
+proofkin factory publish fin-analyst --to bob,dana             # alice: its active release
+proofkin factory catalog                                       # bob: what peers publish to him
 proofkin factory import alice/fin-analyst@1.2.0                # bob: verify, run nothing
-proofkin factory evaluate fin-analyst                          # bob: on his own accounts, then it is active
+proofkin factory evaluate fin-analyst --yes                    # bob: on his own accounts, then it is active
 ```
 
 - Granted peers get **catalog entries** (name, version, description, most access and an
-  eval summary) with the hello and whenever they change; never knowledge, eval outputs or
-  paths. Grants live in the allowlist (`peers allow ... --agents fin-analyst`).
-- **Importing** asks for the bundle over iroh (size-capped): the signer must be the
-  publisher's key and every hash must match. Nothing runs.
+  eval summary: its own runs' pass rate, its cases, whether it resisted the built-in
+  attacks) in the hello and whenever they change; never knowledge, eval outputs or paths.
+  Grants live in the allowlist (`peers allow ... --agents fin-analyst`, or `factory publish
+  --to`). A catalog is kept only while connected, and names the publisher by the receiver's
+  own allowlist entry, never by a name the publisher gives itself.
+- **Importing** asks for the bundle over iroh (at most 8 MiB): the manifest must be signed
+  by the publisher's key and every file must match its hash, inside its folder
+  (`factory/imported/<publisher>/<name>/<version>/`). Nothing runs. The bundle's report comes
+  without its runs' outputs.
 - An import becomes active only after it passes an **evaluation on the importer's accounts**,
-  or if the importer explicitly accepts the publisher's report (`--accept-publisher-report`).
+  or if the importer explicitly accepts the publisher's report (`--accept-publisher-report`,
+  recorded in its history). Its local release is signed by the importer and keeps the
+  publisher's name and version; what it asks for beyond read-only access still needs the
+  importer's sign-off. It stays its publisher's: it isn't published or improved here.
 - Peers who only want the work can delegate to the publisher's deployed agent instead.
 
 ### 14. Interfaces: CLI, web UI, API and MCP
@@ -425,14 +449,15 @@ proofkin factory evaluate fin-analyst                          # bob: on his own
 - **Web UI**: an **Agent factory** card: describe or start from a template, the blueprint
   as a form with its problems and capability increases, evaluations with their estimate,
   matrix and failing cases, releases with their sign-offs, deployments with canary and
-  rollback, metrics, budgets and drift. It follows
-  [docs/ux-guidelines.md](ux-guidelines.md).
+  rollback, metrics, budgets, the drift watch with its trend and incidents, improvement
+  proposals with their diff, publishing, and the **Catalog** of what peers publish, to import
+  from. It follows [docs/ux-guidelines.md](ux-guidelines.md).
 - **API**: `/api/factory/*`, as in the [contract](agent-factory/spec/openapi.json), behind the
   web UI's token.
 - **MCP**: `factory_templates`, `factory_list`, `factory_draft`, `factory_check`,
   `factory_evaluate` and `factory_status` for editor agents. Releasing, deploying, rolling
-  back, retiring and approving stay with the owner: those calls are refused with the
-  command to run.
+  back, retiring, approving, publishing, importing, drift watches and improvements stay with
+  the owner: those calls are refused with the command to run.
 - **Agents as code** (US-14): `proofkin factory init <dir> --name fin-analyst --template researcher`
   writes `agent/blueprint.json`, `agent/evals.json` and `agent/fixtures/`; the built-in checks
   `agent:blueprint`, `agent:evals` and `agent:report` prove them in plan steps; the
@@ -444,6 +469,8 @@ proofkin factory evaluate fin-analyst                          # bob: on his own
 ```mermaid
 stateDiagram-v2
   [*] --> Draft: describe or template
+  [*] --> Imported: import a peer's release
+  Imported --> Active: evaluated here, or its report accepted
   Draft --> Evaluated: build and evaluate
   Evaluated --> Draft: gate failed
   Evaluated --> PendingApproval: request release
@@ -511,8 +538,9 @@ list of options. Proofkin's equivalents:
 - A `FAC-*` claim in `evidence/claims.json` for each behavior, proven by
   `.\scripts\p2p.ps1 evidence`. The [test plan](agent-factory/design/test-plan.md) lists a
   test for every acceptance criterion and high-risk threat.
-- A live check in `scripts/live_test.py`: draft, evaluate, release, deploy, delegate from a
-  peer, roll back and retire an agent with real Copilot.
+- A live check in `scripts/live_test.py`: draft, evaluate, release, deploy, watch for drift,
+  improve, publish and import, delegate from a peer, roll back and retire an agent with real
+  Copilot.
 
 ## Roadmap
 
@@ -528,7 +556,7 @@ phase is a GitHub milestone, and its web UI ships with it:
 | 5. Scale | Enterprise scale | Drift watch, improvement, publish and import; the web UI and API for them; docs and the live check |
 | Later | Enterprise scale | Lexical retrieval, provider fallback, OpenTelemetry export |
 
-Each phase ends in a Proofkin release with its claims proven and one live check for the
+Each phase ended in a Proofkin release with its claims proven and one live check for the
 batch.
 
 ## Work items
@@ -585,6 +613,9 @@ with one release and one live check per phase. The items marked later come after
 - The default gate: 90% overall and 2 of 3 runs per requirement, or stricter for agents with
   edit access?
 - How to evaluate an agent that leads a team: one case per team run, or per team step?
-- Should imported agents keep the publisher's version numbers, or get a local suffix?
 - Should the catalog travel by gossip to peers of peers (with the publisher's consent), or
-  stay one hop?
+  stay one hop? (It is one hop.)
+
+Decided while building: an imported agent keeps its publisher's name and versions (a local
+version made from it would collide with their next one), so it is improved and published
+only by its publisher.

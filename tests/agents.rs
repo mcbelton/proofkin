@@ -308,6 +308,7 @@ impl Node {
             shares: vec![DATA_SHARE.to_owned()],
             m365: None,
             github: None,
+            agents: Vec::new(),
         });
     }
 
@@ -3427,6 +3428,7 @@ async fn a_step_with_microsoft_365_content_is_checked_again_when_its_task_is_sen
         shares: vec![DATA_SHARE.to_owned()],
         m365: grant(&["General"]),
         github: None,
+        agents: Vec::new(),
     });
     let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
     let expected = Recipients::new(boss.trusted(), Vec::new())
@@ -5384,6 +5386,7 @@ async fn a_workers_memory_goes_in_front_of_tasks_for_whoever_may_have_it() {
             tools: false,
         }),
         github: None,
+        agents: Vec::new(),
     });
     let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
     let StepState::Done {
@@ -5441,6 +5444,7 @@ async fn a_workers_memory_goes_in_front_of_tasks_for_whoever_may_have_it() {
         shares: vec![DATA_SHARE.to_owned()],
         m365,
         github: None,
+        agents: Vec::new(),
     };
     analyst.allow(entry(
         "partner",
@@ -5655,6 +5659,7 @@ async fn a_teams_results_go_back_only_to_a_requester_who_may_have_what_they_hold
             tools: false,
         }),
         github: None,
+        agents: Vec::new(),
     });
     let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
     let StepState::Done {

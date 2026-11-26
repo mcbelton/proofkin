@@ -103,6 +103,22 @@ pub fn pin_of(worker: &Profile) -> Option<Pin> {
         .flatten()
 }
 
+/// The tasks a worker whose audit log is `audit` took today (UTC) as release `label`
+/// (`name@version`): what its budget of tasks a day counts.
+pub fn tasks_today(audit: &Path, label: &str) -> u32 {
+    let day = chrono::Utc::now().date_naive();
+    crate::audit::AuditLog::read(audit, usize::MAX)
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| {
+            e.outcome != crate::audit::Outcome::Refused
+                && e.agent.as_deref() == Some(label)
+                && chrono::DateTime::from_timestamp_millis(e.ts_ms as i64)
+                    .is_some_and(|t| t.date_naive() == day)
+        })
+        .count() as u32
+}
+
 /// Reads and verifies the release pinned in a worker's `dir` (its `release/` folder): the
 /// copy must be exactly the pinned release, signed by `owner` (its owner's endpoint id, when
 /// known). `None`: it pins none.
@@ -217,18 +233,8 @@ impl Deployed {
         };
         if let (Ok(pinned), Some(audit)) = (&loaded, &self.audit) {
             // Today's tasks so far, after a restart.
-            let label = pinned.label();
             let day = chrono::Utc::now().date_naive();
-            let taken = crate::audit::AuditLog::read(audit, usize::MAX)
-                .unwrap_or_default()
-                .iter()
-                .filter(|e| {
-                    e.outcome != crate::audit::Outcome::Refused
-                        && e.agent.as_deref() == Some(label.as_str())
-                        && chrono::DateTime::from_timestamp_millis(e.ts_ms as i64)
-                            .is_some_and(|t| t.date_naive() == day)
-                })
-                .count() as u32;
+            let taken = tasks_today(audit, &pinned.label());
             *self.today.lock().unwrap() = (day, taken);
         }
         *self.seen.lock().unwrap() = bytes;
@@ -256,16 +262,19 @@ impl Deployed {
 
     /// Whether a task from a peer may run, before any model call: the release must load,
     /// the deployment take work (in its canary only its owner's canary tasks do), and the
-    /// task fit its budgets. `owner` says the task is its owner's, in the canary's folder.
-    /// Counts the task against today's budget when it may.
+    /// task fit its budgets. `owners_evaluation` says the task is its owner's, in the
+    /// evaluation folder: its canary's tasks run outside its budgets, its drift watch's (on
+    /// a deployment that takes work) within them. Counts the task against today's budget
+    /// when it may.
     pub fn admit(
         &self,
         task: &LlmTask,
-        owners_canary: bool,
+        owners_evaluation: bool,
     ) -> Result<Arc<Pinned>, (&'static str, String)> {
         let pinned = self
             .current()
             .map_err(|why| ("release", format!("its release can't run: {why}")))?;
+        let in_canary = matches!(pinned.state, DeployState::Canary | DeployState::Starting);
         match pinned.state {
             DeployState::Stopped => {
                 return Err((
@@ -276,7 +285,7 @@ impl Deployed {
                     ),
                 ));
             }
-            DeployState::Canary | DeployState::Starting if !owners_canary => {
+            DeployState::Canary | DeployState::Starting if !owners_evaluation => {
                 return Err((
                     "canary",
                     format!(
@@ -287,7 +296,7 @@ impl Deployed {
             }
             _ => {}
         }
-        if owners_canary {
+        if owners_evaluation && in_canary {
             return Ok(pinned);
         }
         if task.runs_model()
@@ -423,7 +432,13 @@ pub fn deploy(
             "'{name}' is a digital worker already, and runs no release of {name}: remove it, or rename the agent"
         )));
     }
-    let start_with_owner = ask.start_with_owner.unwrap_or(bp.deploy.start_with_owner);
+    // Unless asked, a deployment keeps whether it starts with its owner; a new one does as
+    // its blueprint says.
+    let start_with_owner = ask.start_with_owner.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .map_or(bp.deploy.start_with_owner, |w| w.config.start_with_owner)
+    });
     let (mut worker, id, entry) = match existing {
         Some(worker) => {
             let id = worker.identity()?.public();
@@ -912,6 +927,7 @@ pub async fn run_canary(
                     worker: worker.to_owned(),
                     worker_id: id,
                     folders: &folders,
+                    drift: false,
                 },
             )?,
         };
@@ -1207,12 +1223,21 @@ mod tests {
 
         let canary = Deployed::fixed(Pinned {
             state: DeployState::Canary,
-            ..pinned
+            ..pinned.clone()
         });
         let (why, text) = canary.admit(&task, false).unwrap_err();
         assert_eq!(why, "canary");
         assert!(text.contains("in its canary"), "{text}");
-        canary.admit(&task, true).unwrap();
+        for _ in 0..3 {
+            canary.admit(&task, true).unwrap();
+        }
+
+        // Its owner's drift watch runs on a deployment that takes work: within its budget.
+        let watched = Deployed::fixed(pinned);
+        watched.admit(&task, true).unwrap();
+        watched.admit(&task, false).unwrap();
+        let (why, _) = watched.admit(&task, true).unwrap_err();
+        assert_eq!(why, "budget", "the owner's evaluation tasks count too");
     }
 
     #[test]
@@ -1310,6 +1335,7 @@ mod tests {
                 shares: vec![DATA_SHARE.into()],
                 m365: None,
                 github: None,
+                agents: Vec::new(),
             });
             trust.save(&worker.trust_path()).unwrap();
             place(
@@ -1352,6 +1378,47 @@ mod tests {
     fn pinned_on(owner: &Profile, worker: &str) -> Arc<Pinned> {
         let worker = crate::workers::worker_of(owner, worker).unwrap();
         Deployed::of(&worker, None).unwrap().current().unwrap()
+    }
+
+    /// Deploying another release to a worker, without saying whether it starts with its
+    /// owner, keeps what its owner chose: only a new worker does as its blueprint says.
+    #[test]
+    fn a_redeployment_keeps_whether_its_worker_starts_with_its_owner() {
+        let (home, owner, _f) = deployed(&["fin-analyst"], true);
+        let reports = home.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let mut shares = owner.shares().unwrap();
+        shares.add("reports", &reports, Access::ReadOnly).unwrap();
+        shares.save(&owner.shares_path()).unwrap();
+        let starts = || {
+            crate::workers::worker_of(&owner, "fin-analyst")
+                .unwrap()
+                .config
+                .start_with_owner
+        };
+        let mut worker = crate::workers::worker_of(&owner, "fin-analyst").unwrap();
+        worker.config.start_with_owner = false;
+        worker.save().unwrap();
+        let ask = DeployAsk {
+            version: Some("1.0.0".into()),
+            folders: Some(vec!["reports".into()]),
+            canary: false,
+            start_with_owner: None,
+            by: "alice".into(),
+        };
+        let at = || EndpointAddr::from(SecretKey::generate().public());
+        let placed = deploy(&owner, at(), &TrustStore::default(), "fin-analyst", &ask).unwrap();
+        assert_eq!(placed.record.version, "1.0.0");
+        assert!(
+            !starts(),
+            "its blueprint says it starts with its owner; its owner said no"
+        );
+        let asked = DeployAsk {
+            start_with_owner: Some(true),
+            ..ask
+        };
+        deploy(&owner, at(), &TrustStore::default(), "fin-analyst", &asked).unwrap();
+        assert!(starts(), "unless asked");
     }
 
     #[test]
