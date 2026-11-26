@@ -428,7 +428,13 @@ pub fn deploy(
             "'{name}' is a digital worker already, and runs no release of {name}: remove it, or rename the agent"
         )));
     }
-    let start_with_owner = ask.start_with_owner.unwrap_or(bp.deploy.start_with_owner);
+    // Unless asked, a deployment keeps whether it starts with its owner; a new one does as
+    // its blueprint says.
+    let start_with_owner = ask.start_with_owner.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .map_or(bp.deploy.start_with_owner, |w| w.config.start_with_owner)
+    });
     let (mut worker, id, entry) = match existing {
         Some(worker) => {
             let id = worker.identity()?.public();
@@ -1368,6 +1374,47 @@ mod tests {
     fn pinned_on(owner: &Profile, worker: &str) -> Arc<Pinned> {
         let worker = crate::workers::worker_of(owner, worker).unwrap();
         Deployed::of(&worker, None).unwrap().current().unwrap()
+    }
+
+    /// Deploying another release to a worker, without saying whether it starts with its
+    /// owner, keeps what its owner chose: only a new worker does as its blueprint says.
+    #[test]
+    fn a_redeployment_keeps_whether_its_worker_starts_with_its_owner() {
+        let (home, owner, _f) = deployed(&["fin-analyst"], true);
+        let reports = home.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        let mut shares = owner.shares().unwrap();
+        shares.add("reports", &reports, Access::ReadOnly).unwrap();
+        shares.save(&owner.shares_path()).unwrap();
+        let starts = || {
+            crate::workers::worker_of(&owner, "fin-analyst")
+                .unwrap()
+                .config
+                .start_with_owner
+        };
+        let mut worker = crate::workers::worker_of(&owner, "fin-analyst").unwrap();
+        worker.config.start_with_owner = false;
+        worker.save().unwrap();
+        let ask = DeployAsk {
+            version: Some("1.0.0".into()),
+            folders: Some(vec!["reports".into()]),
+            canary: false,
+            start_with_owner: None,
+            by: "alice".into(),
+        };
+        let at = || EndpointAddr::from(SecretKey::generate().public());
+        let placed = deploy(&owner, at(), &TrustStore::default(), "fin-analyst", &ask).unwrap();
+        assert_eq!(placed.record.version, "1.0.0");
+        assert!(
+            !starts(),
+            "its blueprint says it starts with its owner; its owner said no"
+        );
+        let asked = DeployAsk {
+            start_with_owner: Some(true),
+            ..ask
+        };
+        deploy(&owner, at(), &TrustStore::default(), "fin-analyst", &asked).unwrap();
+        assert!(starts(), "unless asked");
     }
 
     #[test]

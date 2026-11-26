@@ -2027,9 +2027,10 @@
     {
       "id": "FAC-21",
       "area": "agent-factory",
-      "claim": "A release is deployed as a digital worker named after the agent and pinned to it: the worker runs exactly that release on every task (its copy verified against its owner's signature; a changed copy refuses work), with at most the access the release asks for in each folder it is given, only the MCP servers and tools it asks for, and no delegation unless it asks for it and its owner allows it (AC-7, AC-18, TM-5). Peers, its worker's card and Run on show the release it runs.",
+      "claim": "A release is deployed as a digital worker named after the agent and pinned to it: the worker runs exactly that release on every task (its copy verified against its owner's signature; a changed copy refuses work), with at most the access the release asks for in each folder it is given, only the MCP servers and tools it asks for, and no delegation unless it asks for it and its owner allows it (AC-7, AC-18, TM-5). Peers, its worker's card and Run on show the release it runs. Deploying another release to it keeps whether it starts with its owner, unless the owner says otherwise.",
       "tests": [
         "lib::factory::deploy::a_worker_runs_exactly_its_pinned_release_and_a_changed_copy_refuses_work",
+        "lib::factory::deploy::a_redeployment_keeps_whether_its_worker_starts_with_its_owner",
         "deploy::a_deployed_worker_runs_its_release_on_every_task_at_the_access_it_asks_for"
       ],
       "live": [

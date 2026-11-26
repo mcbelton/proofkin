@@ -827,24 +827,26 @@ async fn improve(
             )
         })?,
     };
-    println!(
-        "{name}: improving {} from {}{}{}",
-        material.basis_of,
-        plural(material.failures.len(), "failing case", "failing cases"),
-        if material.tasks.is_empty() {
-            String::new()
-        } else {
-            format!(
-                ", {}",
-                plural(material.tasks.len(), "failed task", "failed tasks")
-            )
-        },
-        if material.note.is_some() {
-            " and your note"
-        } else {
-            ""
-        }
-    );
+    let mut from = Vec::new();
+    if !material.failures.is_empty() {
+        from.push(plural(
+            material.failures.len(),
+            "failing case",
+            "failing cases",
+        ));
+    }
+    if !material.tasks.is_empty() {
+        from.push(plural(material.tasks.len(), "failed task", "failed tasks"));
+    }
+    if material.note.is_some() {
+        from.push("your note".to_owned());
+    }
+    let from = match from.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => "nothing".to_owned(),
+    };
+    println!("{name}: improving {} from {from}", material.basis_of);
     let bridge = crate::setup::resolve_bridge(
         bridge.or_else(|| crate::profile::env_setting_os("BRIDGE").map(PathBuf::from)),
     );
@@ -1301,7 +1303,7 @@ fn provenance_text(draft: &Draft) -> String {
     let p = &draft.provenance;
     let mut text = match p.source.as_str() {
         "model" => format!(
-            "by {}'s model{}{} from a description",
+            "by {}'s model{}{} from your words",
             p.provider
                 .map(|x| x.to_string())
                 .unwrap_or_else(|| "a".into()),

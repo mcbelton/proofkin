@@ -1517,10 +1517,11 @@ proofkin factory evaluate fin-analyst --yes --profile bob              # once it
 
 - A **drift watch** runs while your agent runs: every case once and the built-in attacks, on
   the deployment's worker, judged by the release's gate and within its budgets. Each run's
-  pass rate is a sample of monitor `factory:fin-analyst` in **Health** and `proofkin ops
-  report`; `--fail-after` failed runs in a row open an incident that alerts you with the
-  failing cases, and a run that passes closes it. A run its worker can't take is tried again
-  for an hour, then skipped, counting neither way.
+  pass rate is an ops sample of monitor `factory:fin-analyst` (the **Drift** tab shows their
+  trend); `--fail-after` failed runs in a row open an incident, listed in **Health** and
+  `proofkin ops report`, that alerts you with the failing cases, and a run that passes
+  closes it. A run its worker can't take is tried again for an hour, then skipped, counting
+  neither way.
 - An **improvement** is written by your model from the active release's blueprint, its
   failing cases with their outputs (secrets redacted), its deployments' failed tasks
   (outcomes only, never their text) and your note. It becomes the agent's draft: other
