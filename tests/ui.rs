@@ -4654,6 +4654,7 @@ async fn the_workiq_api_signs_in_through_the_cli_runs_the_doctor_sets_budgets_an
     }
     assert_eq!(before["holder"], name);
     assert_eq!(before["own"], true);
+    assert_eq!(before["changes"], false, "{before}");
     assert_eq!(
         before["hint"],
         format!("proofkin auth login workiq --profile {name}")

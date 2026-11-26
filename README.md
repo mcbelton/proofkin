@@ -440,7 +440,8 @@ of its log), with **Start**/**Stop**, **Starts with this agent** and **Delete**.
   which stops it first) deletes its key, allowlist, folder settings and audit log, and
   takes it off its owner's allowlist and out of its squads (a squad left empty goes). Its
   data folder stays. A worker running outside its owner's agent isn't deleted until it
-  stops.
+  stops. A factory agent's deployment on it ends (the agent and its releases stay; see
+  [Agent factory](docs/agent-factory.md)).
 - Work stays private unless shared: a peer reaches only the folders the worker or owner
   explicitly shares with that peer.
 - **Memory:** `proofkin worker memory tester --context glossary,architecture --lessons
@@ -627,10 +628,10 @@ usage by peer and provider, as providers reported it:
 Every call to [Work IQ](docs/work-iq.md) (Microsoft 365 work context), whether it is done,
 failed or refused, is one line in the profile's `workiq-audit.jsonl`: time, tool, purpose (a
 step of a run with the run id, a knowledge import, a gateway task, `doctor` or a command),
-audience (`local` or the peer's name), the query's SHA-256 and length (never its text),
-outcome (`ok`, `refused`, or the error's class), the counts of results and withheld results
-and the sensitivity labels seen when known, the request and correlation ids, and the
-duration. A write error only warns.
+audience (`local` or the peer's name), the query's SHA-256 and length (never its text; for a
+change, its path's), outcome (`ok`, `refused`, or the error's class), the counts of results
+and withheld results and the sensitivity labels seen when known, the request and correlation
+ids, and the duration. A write error only warns.
 
 Calls are limited to 200 a day (the local date) and 25 per run. A call over a budget is not
 sent: it fails saying which budget is used up and how to raise it, and is recorded as
@@ -639,9 +640,13 @@ sent: it fails saying which budget is used up and how to raise it, and is record
 ```text
 > proofkin workiq usage --profile alice
 > proofkin workiq budget --per-day 500 --per-run 40 --profile alice
+> proofkin workiq changes on --profile alice
 ```
 
 `budget` keeps a limit you leave out, and saves them in `profile.json` (`workiq_budget`).
+`changes on|off` lets the profile's plans make the Microsoft 365 changes you sign off, or
+stops them (`workiq_changes`; off by default, see [Making Microsoft 365 changes in a
+plan](#making-microsoft-365-changes-in-a-plan-workiq-apply)).
 `proofkin workiq agents --profile alice` lists the declarative agents Work IQ offers (name
 and id), for `agent=` on [`@workiq` steps](#asking-microsoft-365-in-a-step-workiq).
 
@@ -685,8 +690,11 @@ cancels your running tasks the same way, so nothing keeps spending its accounts 
 A dropped connection doesn't lose work. If a connection is replaced (for example both peers
 dialed each other at once) or drops and comes back, running tasks carry on and their
 results arrive over the new connection. After 2 seconds the peer shows as disconnected and
-its tasks say **reconnecting to** it. They are failed (on your side) and cancelled (on the
-peer's) only if it stays away for the **task grace**: 60 seconds, or
+its tasks say **reconnecting to** it (a connection back to it still in its handshake is
+waited for first, up to 10 seconds). A plan checked or started meanwhile (`/plan`, the web
+UI, MCP, A2A or a team step) waits for a peer that is reconnecting, up to the same 10
+seconds, instead of finding it not connected. Those tasks are failed (on your side) and
+cancelled (on the peer's) only if the peer stays away for the **task grace**: 60 seconds, or
 `PROOFKIN_TASK_GRACE_SECS`. Only time the machine is awake counts, so sleep doesn't use up a
 peer's grace: the tasks that were running when a laptop went to sleep go on after it wakes.
 An agent that stops on purpose (Ctrl+C, or **Stop** on a digital worker) says so first: the
@@ -868,13 +876,50 @@ write after ask @alice Write the announcement
 - `after` hands the answer to later steps; `save=topic` writes it, with its mark, to the
   knowledge base, and the topic's source note says it was a Work IQ answer.
 - An answer is context and never proof, so a `@workiq` step can't have `claims=`, `verify=`,
-  `apply=`, `mcp=`, `skill=`, `attempts=`, `levels=`, `team` or `approve`, nor `context=`,
-  `workiq=` or a folder. The run shows it as done by `workiq` (or `workiq:<agent id>`),
+  `mcp=`, `skill=`, `attempts=`, `levels=`, `team` or `approve`, nor `context=`, `workiq=` or
+  a folder (`apply=` makes it [a step that makes Microsoft 365
+  changes](#making-microsoft-365-changes-in-a-plan-workiq-apply)). The run shows it as done by
+  `workiq` (or `workiq:<agent id>`),
   with no evidence and not verified: its report heads the step *(Work IQ) on workiq* and
   says *No evidence: an answer from Microsoft 365 Copilot is context, never proof*. In the
   web UI its task reads **Microsoft 365 Copilot (Work IQ)** (with `agent=sales:1`,
   **Microsoft 365 agent sales:1 (Work IQ)**), not the plan's provider.
 - `workiq` is reserved as a target name, so no peer can be called that in a plan.
+
+### Making Microsoft 365 changes in a plan (`@workiq apply=`)
+
+A step's model never changes Microsoft 365 itself. A step proposes the changes, you sign
+them off, and a later step with no model makes exactly those, once and in order, with your
+account:
+
+```text
+draft @worker:app mcp=workiq Draft the replies to this week's open escalations from their threads
+ok after draft approve @me Send these replies?
+send after ok @workiq apply=draft
+```
+
+- Turn changes on for the profile first: `proofkin workiq changes on --profile me` (off by
+  default; `workiq changes off` stops them). Your tenant's policy still applies on top.
+  `proofkin workiq doctor` and the Work IQ card say whether they are on.
+- The proposing step (`draft`) is told to write its changes in one fenced `m365-changes`
+  block in its result, one JSON object a line:
+  `{"tool":"do_action","path":"/me/sendMail","body":{"message":{...}}}`. `tool` is
+  `create_entity`, `update_entity`, `delete_entity` or `do_action`; `path` is a Microsoft
+  Graph path (starting with `/`, no host); `body` is a JSON object (none for a delete);
+  `ifMatch` is an entity's ETag, for an update or a delete. At most 20 changes. A block that
+  breaks a rule fails the step, naming the line and the rule; a result with no block proposes
+  nothing.
+- Your sign-off (`approve @me`) shows each change first: a mail's recipients, subject and
+  first lines, any other change's verb, path and the start of its body, and the list's
+  SHA-256. Your signed answer covers exactly that text. Only your own sign-off counts.
+- The apply step checks that your approval was for the list as it is now, then makes each
+  change once, in order, and stops at the first that fails or whose outcome is unknown. Its
+  result lists each change's outcome (*done*, *accepted* for a 202, *failed* with the fix, or
+  *outcome unknown*: check in Microsoft 365) and the changes not made. A change is never sent
+  again, even if the agent restarts.
+- The plan check refuses an apply step, naming the fix, without your sign-off between the
+  two steps, with changes off or without the Work IQ sign-in, or when another step applies
+  the same step. Both steps' results stay in the run's record, never on GitHub.
 
 ### Team steps: handing work down a level
 
@@ -1740,7 +1785,8 @@ is tracked on GitHub, where your team already tracks work:
   GitHub links the pull request to the issues and closes them when it merges. The run's
   issue waits *In review* until then (or, if it has other open sub-issues, where it was)
   and is closed once all its sub-issues are (checked every 10 minutes by a running
-  agent, or now with `tracker sync`). The **Tracker** card lists those run issues under
+  agent, or now with `tracker sync`), if a run made it: an issue you named with
+  `track: #N` goes back where it was and stays open. The **Tracker** card lists those run issues under
   *Left open until their sub-issues close*: each run with how many of its sub-issues are
   closed, and the open ones with the pull request that will close them, or *no pull request yet*.
   **Check now** (`tracker sync`) closes what can be closed at once and says what is still
@@ -1771,7 +1817,11 @@ Here the run works on issue #12 (reopened if it is closed; `track: <title>` make
 named after its first claim). Step `api` works on #15, made a sub-issue of #12 if it isn't
 one; `ui` and `signoff` get new sub-issues. A later run with `track: #12` takes up its
 steps' open sub-issues again: it gives each its step's title and text (the earlier run's
-stay in the issue's history) and comments that it took the issue over.
+stay in the issue's history) and comments that it took the issue over. A run closes only
+an issue a run made (`track: <title>`, or no `track:` line): an issue you name with
+`track: #12`, such as an epic or a bucket of findings, may hold other work, so when the
+run passes it says so on the issue, puts it back where it was on the board and leaves it
+open.
 In the web UI the **Tracker** card links and shows the
 tracker, and **Board items** lists what is open by status; **Plan it** starts a plan on an
 item, with a step per open sub-issue. **Add existing issues** (`tracker add`) puts the
@@ -2500,6 +2550,7 @@ account, `proofkin auth logout workiq --profile me` removes it.
 | A model that searches Microsoft 365 while it works | `mcp=workiq` on a step for your own worker, whose folder offers it (`proofkin mcp add <folder> workiq --workiq`) | [Work IQ as a tool for tasks](#work-iq-as-a-tool-for-tasks-mcpworkiq) |
 | Cited results kept as a knowledge topic for `context=` | `proofkin kb import workiq <topic> --query <text> [--from SOURCES]` | **Importing from Microsoft 365** under the knowledge base, and [the design](docs/work-iq.md#5-work-context-in-plans) |
 | A peer that may receive some of it | `proofkin peers allow <peer> --profile me --m365 General,Public,unlabeled` | [Security model](#security-model) |
+| Changes in Microsoft 365 a plan makes once you sign them off | `proofkin workiq changes on`, then `@workiq apply=STEP` after an `approve @me` step | [Making Microsoft 365 changes in a plan](#making-microsoft-365-changes-in-a-plan-workiq-apply) |
 | What it cost and the limits | `proofkin workiq usage`, `proofkin workiq budget --per-day N --per-run N` | [Work IQ audit file and budgets](#work-iq-audit-file-and-budgets) |
 
 A first plan to try (`/plan first.plan` in the agent, or the web UI's plan editor), with one
@@ -2755,8 +2806,8 @@ draft @my-worker:app mcp=workiq Write the launch FAQ from what my mail and files
   uses its owner's, when the owner turned that on), so the model never sees a token and a long
   task keeps working as tokens are refreshed.
 - Only tools that read: `retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
-  `list_agents` (`--tool` offers fewer), and never one Work IQ's own annotations say changes
-  things. A change tool is refused, and never reaches Work IQ.
+  `list_agents`, `call_function` (`--tool` offers fewer), and never one Work IQ's own
+  annotations say changes things. A change tool is refused, and never reaches Work IQ.
 - Every result goes through the [content policy](#4-what-keeps-your-work-data-yours): only
   results marked `allowed`, secrets redacted, in the external-content envelope. Every call is
   audited (purpose `gateway`) and held to the daily budget.

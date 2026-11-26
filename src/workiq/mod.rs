@@ -13,6 +13,7 @@ use crate::profile::{Profile, WorkIqConnection};
 
 pub mod account;
 pub mod audit;
+pub mod changes;
 pub mod client;
 pub mod content;
 pub mod context;

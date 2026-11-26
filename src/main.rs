@@ -246,6 +246,32 @@ is not sent; it fails and is recorded as refused in workiq-audit.jsonl.")]
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Allow Microsoft 365 changes, or stop them. On, a plan's `@workiq apply=STEP` step makes
+    /// the changes step STEP proposed, once you signed them off (`approve @me`). Off (the
+    /// default), plans make none.
+    #[command(after_help = "\
+examples:
+  proofkin workiq changes on --profile alice
+  proofkin workiq changes off --profile alice
+A plan proposes changes in one step, you sign them off, and a later step makes exactly
+those, once and in order:
+  draft @worker:app mcp=workiq Draft the replies to this week's open escalations
+  ok after draft approve @me Send these replies?
+  send after ok @workiq apply=draft
+Your tenant's policy still applies on top: it may deny a change.")]
+    Changes {
+        #[arg(value_enum)]
+        state: Switch,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+/// On or off.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -1811,6 +1837,23 @@ async fn run_workiq(command: WorkiqCommand) -> Result<()> {
                 budget.per_run()
             );
         }
+        WorkiqCommand::Changes { state, profile } => {
+            let mut profile = Profile::open(&profile.name)?;
+            let on = state == Switch::On;
+            profile.config.workiq_changes = on.then(Default::default);
+            profile.save()?;
+            if on {
+                println!(
+                    "profile '{}': Microsoft 365 changes are on: a plan's @workiq apply=STEP step makes the changes step STEP proposed, once you sign them off",
+                    profile.name
+                );
+            } else {
+                println!(
+                    "profile '{}': Microsoft 365 changes are off: plans make none",
+                    profile.name
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1971,7 +2014,8 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
     Ok(())
 }
 
-/// Deletes digital worker `name` and takes it off its owner's allowlist and squads.
+/// Deletes digital worker `name` (ending a factory agent's deployment on it) and takes it
+/// off its owner's allowlist and squads.
 fn remove_worker(name: &str) -> Result<()> {
     use proofkin::workers;
     let worker = Profile::open(name)?;
@@ -1981,7 +2025,7 @@ fn remove_worker(name: &str) -> Result<()> {
         );
     };
     let owner = Profile::open(&owner)?;
-    workers::delete(&owner, name)?;
+    let ended = workers::delete(&owner, name)?;
     let squads = workers::forget(&owner, name)?;
     println!(
         "digital worker '{name}' deleted; it left '{}''s allowlist{}",
@@ -1992,6 +2036,9 @@ fn remove_worker(name: &str) -> Result<()> {
             format!(" and squads {}", squads.join(", "))
         }
     );
+    if !ended.is_empty() {
+        println!("its deployment of factory agent {} ended", ended.join(", "));
+    }
     println!("its data folder stays: {}", worker.data_folder().display());
     if owner.is_running() {
         println!(
@@ -5189,6 +5236,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 let skills = profile.skills();
                 let squads_now = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                 let recipients = proofkin::plan::Recipients::of(&agent, &profile);
+                // A peer reconnecting (e.g. both agents dialed at once) is waited for.
+                agent.settle_peers().await;
                 let parsed = text.and_then(|text| {
                     let plan = Plan::parse(&text)?;
                     let problems = proofkin::plan::preflight(

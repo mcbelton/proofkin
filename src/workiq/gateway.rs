@@ -36,13 +36,16 @@ use crate::redact::redact;
 /// Microsoft 365 content.
 pub const SERVER: &str = "workiq";
 /// The tools the gateway offers, all of them only reading; a server may name fewer.
-pub const DEFAULT_TOOLS: [&str; 6] = [
+/// `call_function` reads too: Work IQ annotates it read only (CLI 1.0.1), and like any tool
+/// it is refused if its annotations ever say it changes things.
+pub const DEFAULT_TOOLS: [&str; 7] = [
     "retrieve",
     "ask",
     "fetch",
     "search_paths",
     "get_schema",
     "list_agents",
+    "call_function",
 ];
 /// The tools whose results carry sensitivity labels, so the content policy can hold them to
 /// a peer's grant. The others go only to the owner's own tasks.
@@ -133,18 +136,7 @@ impl Gateway {
             .context("the task asked for Work IQ (mcp=workiq), but this agent can't use it")?
             .client
             .with_audit(Arc::new(Audit::for_profile(&profile)));
-        let tools: Vec<String> = if def.tools.is_empty() {
-            DEFAULT_TOOLS.iter().map(|t| (*t).to_owned()).collect()
-        } else {
-            def.tools.clone()
-        };
-        let tools: Vec<String> = match &context.audience {
-            Audience::Local => tools,
-            Audience::Peer { .. } => tools
-                .into_iter()
-                .filter(|t| LABELED_TOOLS.contains(&t.as_str()))
-                .collect(),
-        };
+        let tools = session_tools(&def.tools, &context.audience);
         if tools.is_empty() {
             bail!("the Work IQ server offers this task none of the tools whose results it may see");
         }
@@ -209,6 +201,23 @@ impl Gateway {
 /// Whether `a` and `b` are the same, taking as long whichever byte differs.
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// The tools a task's session offers: the server's (none named: all of [`DEFAULT_TOOLS`]),
+/// and for a peer's task only those whose results carry labels its grant can be held to.
+fn session_tools(named: &[String], audience: &Audience) -> Vec<String> {
+    let tools: Vec<String> = if named.is_empty() {
+        DEFAULT_TOOLS.iter().map(|t| (*t).to_owned()).collect()
+    } else {
+        named.to_vec()
+    };
+    match audience {
+        Audience::Local => tools,
+        Audience::Peer { .. } => tools
+            .into_iter()
+            .filter(|t| LABELED_TOOLS.contains(&t.as_str()))
+            .collect(),
+    }
 }
 
 fn plain(status: StatusCode, text: &str) -> Response {
@@ -431,4 +440,30 @@ fn withheld_anywhere(result: &ToolResult) -> bool {
     }
     result.structured_content.as_ref().is_some_and(protected)
         || summarize(result, &Audience::Local).is_some_and(|s| s.withheld > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The owner's own tasks get every read tool, `call_function` too; a peer's task gets
+    /// only the tools whose results carry labels its grant holds them to, whatever the
+    /// server names.
+    #[test]
+    fn a_session_offers_its_owner_every_read_tool_and_a_peer_only_labeled_ones() {
+        let local = session_tools(&[], &Audience::Local);
+        assert_eq!(local, DEFAULT_TOOLS.map(String::from));
+        assert!(local.iter().any(|t| t == "call_function"));
+        let peer = Audience::Peer {
+            labels: vec!["General".into()],
+        };
+        assert_eq!(session_tools(&[], &peer), ["retrieve", "ask"]);
+        let named = vec![
+            "fetch".to_owned(),
+            "call_function".to_owned(),
+            "ask".to_owned(),
+        ];
+        assert_eq!(session_tools(&named, &Audience::Local), named);
+        assert_eq!(session_tools(&named, &peer), ["ask"]);
+    }
 }

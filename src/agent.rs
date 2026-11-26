@@ -28,6 +28,11 @@ pub const MAX_CONCURRENT_TASKS: usize = 2;
 const HOUR: Duration = Duration::from_secs(3600);
 /// How long a dropped peer may take to reconnect before `PeerDisconnected` is reported.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
+/// The longest wait for a peer that is reconnecting (see [`Agent::settle_peers`]), and
+/// for a connection to a dropped peer to end its handshake before it is reported gone.
+const SETTLE_WAIT: Duration = Duration::from_secs(10);
+/// How long a new connection's peer may take to say hello before it is closed.
+const HELLO_WAIT: Duration = Duration::from_secs(30);
 /// How long tasks wait for a dropped peer to come back before they fail (delegated
 /// to it) or stop (asked by it), by default.
 pub const TASK_GRACE: Duration = Duration::from_secs(60);
@@ -515,7 +520,11 @@ struct Inner {
     endpoint: Endpoint,
     trust: Mutex<TrustStore>,
     peers: Mutex<HashMap<EndpointId, PeerHandle>>,
+    /// Peers being dialed, until the connection's handshake ends (see [`Dialing`]).
     dialing: Mutex<HashSet<EndpointId>>,
+    /// Connections in their handshake (the hello each way), how many by peer: each is
+    /// registered in `peers`, refused or closed once it ends (see [`Handshake`]).
+    handshaking: Mutex<HashMap<EndpointId, usize>>,
     events: mpsc::UnboundedSender<Event>,
     next_conn_id: AtomicU64,
     shutdown: watch::Sender<bool>,
@@ -614,6 +623,7 @@ impl Agent {
             trust: Mutex::new(config.trust),
             peers: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashSet::new()),
+            handshaking: Mutex::new(HashMap::new()),
             events,
             next_conn_id: AtomicU64::new(0),
             shutdown: watch::Sender::new(false),
@@ -695,6 +705,7 @@ impl Agent {
 
     /// Dials an allowlisted peer. Returns once the connection is established;
     /// the handshake completes asynchronously and is reported via [`Event::PeerConnected`].
+    /// A peer connected already, or being dialed (until that handshake ends), isn't dialed.
     pub async fn connect(&self, addr: impl Into<EndpointAddr>) -> Result<()> {
         dial(self.inner.clone(), addr.into()).await
     }
@@ -711,6 +722,18 @@ impl Agent {
             .map(|p| p.addr.clone())
             .ok_or_else(|| anyhow!("not connected to {}", peer.fmt_short()))?;
         dial_with(self.inner.clone(), addr, true).await
+    }
+
+    /// Waits while a peer is reconnecting, up to 10 seconds: one whose connection is in
+    /// its handshake, or that dropped moments ago and may be back within the disconnect
+    /// grace. A plan checked then ([`Agent::peers`]) sees it, not *not connected*: right
+    /// after peers connect, or while a simultaneous dial's duplicate connection is
+    /// replaced. Returns at once when none is.
+    pub async fn settle_peers(&self) {
+        let deadline = Instant::now() + SETTLE_WAIT;
+        while self.inner.reconnecting() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Dials every allowlisted peer that isn't connected, now and then every
@@ -1556,7 +1579,7 @@ async fn accept_loop(inner: Arc<Inner>) {
             let Ok((send, recv)) = conn.accept_bi().await else {
                 return;
             };
-            let _ = run_connection(inner, conn, send, recv, false).await;
+            let _ = run_connection(inner, conn, send, recv, None).await;
         });
     }
 }
@@ -1584,20 +1607,18 @@ fn dial_with(
         if !inner.is_trusted(&id) {
             bail!("{id} is not on the allowlist; add it with: proofkin peers allow <ticket-or-id>");
         }
-        if !inner.dialing.lock().unwrap().insert(id) {
+        let Some(dialing) = Dialing::begin(&inner, id) else {
             return Ok(());
-        }
-        let result = async {
+        };
+        let (conn, send, recv) = async {
             let conn = inner.endpoint.connect(addr, ALPN).await?;
             let (send, recv) = conn.open_bi().await?;
             anyhow::Ok((conn, send, recv))
         }
-        .await;
-        inner.dialing.lock().unwrap().remove(&id);
-        let (conn, send, recv) =
-            result.with_context(|| format!("connecting to {}", id.fmt_short()))?;
+        .await
+        .with_context(|| format!("connecting to {}", id.fmt_short()))?;
         tokio::spawn(async move {
-            let _ = run_connection(inner, conn, send, recv, true).await;
+            let _ = run_connection(inner, conn, send, recv, Some(dialing)).await;
         });
         Ok(())
     })
@@ -1786,6 +1807,23 @@ impl Inner {
             .values()
             .map(|p| p.addr.clone())
             .collect()
+    }
+
+    fn is_connected(&self, id: &EndpointId) -> bool {
+        self.peers.lock().unwrap().contains_key(id)
+    }
+
+    fn in_handshake(&self, id: &EndpointId) -> bool {
+        self.handshaking.lock().unwrap().contains_key(id)
+    }
+
+    /// Whether a peer is reconnecting: it has no connection now, but one in its handshake
+    /// (the winner of a simultaneous dial whose loser closed first), or it was reported
+    /// connected and not yet reported gone (it dropped moments ago).
+    fn reconnecting(&self) -> bool {
+        let mut ids: Vec<EndpointId> = self.handshaking.lock().unwrap().keys().copied().collect();
+        ids.extend(self.announced.lock().unwrap().iter().copied());
+        ids.iter().any(|id| !self.is_connected(id))
     }
 
     /// Registers a handshaken connection. If both sides dialed each other, both
@@ -3699,14 +3737,68 @@ fn clean_models(models: crate::models::Models) -> crate::models::Models {
         .collect()
 }
 
+/// A connection to peer `id` in its handshake, counted in [`Inner::handshaking`] until
+/// this is dropped (registered, refused or failed).
+struct Handshake<'a> {
+    inner: &'a Inner,
+    id: EndpointId,
+}
+
+impl<'a> Handshake<'a> {
+    fn begin(inner: &'a Inner, id: EndpointId) -> Self {
+        *inner.handshaking.lock().unwrap().entry(id).or_default() += 1;
+        Self { inner, id }
+    }
+}
+
+impl Drop for Handshake<'_> {
+    fn drop(&mut self) {
+        let mut handshaking = self.inner.handshaking.lock().unwrap();
+        if let Some(n) = handshaking.get_mut(&self.id) {
+            *n -= 1;
+            if *n == 0 {
+                handshaking.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// A dial to peer `id`, in [`Inner::dialing`] until this is dropped: once its connection's
+/// handshake ends (registered, refused or failed), or its connecting failed. Another dial
+/// to the peer meanwhile (e.g. `keep_connected` right after an explicit connect, or gossip)
+/// is skipped: two connections from one side, in their handshakes at once, could be kept
+/// differently by the two sides, each closing the one the other kept.
+struct Dialing {
+    inner: Arc<Inner>,
+    id: EndpointId,
+}
+
+impl Dialing {
+    fn begin(inner: &Arc<Inner>, id: EndpointId) -> Option<Self> {
+        inner.dialing.lock().unwrap().insert(id).then(|| Self {
+            inner: inner.clone(),
+            id,
+        })
+    }
+}
+
+impl Drop for Dialing {
+    fn drop(&mut self) {
+        self.inner.dialing.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// Runs a connection to a peer: dialed by this agent (with its [`Dialing`]) or accepted.
 async fn run_connection(
     inner: Arc<Inner>,
     conn: Connection,
     mut send: SendStream,
     recv: RecvStream,
-    outbound: bool,
+    dialed: Option<Dialing>,
 ) -> Result<()> {
+    let outbound = dialed.is_some();
     let peer_id = conn.remote_id();
+    let handshake = Handshake::begin(&inner, peer_id);
     let mut lines = BufReader::new(recv).lines();
 
     let hello = Message::Hello {
@@ -3733,9 +3825,9 @@ async fn run_connection(
             .insert(peer_id, catalog.clone());
     }
     write_message(&mut send, &hello).await?;
-    let first = lines
-        .next_line()
-        .await?
+    let first = tokio::time::timeout(HELLO_WAIT, lines.next_line())
+        .await
+        .map_err(|_| anyhow!("no hello within {}s", HELLO_WAIT.as_secs()))??
         .context("peer closed before hello")?;
     let Message::Hello {
         name: announced,
@@ -3795,6 +3887,8 @@ async fn run_connection(
             }
         }
     }
+    drop(handshake);
+    drop(dialed);
     // Back before its tasks gave up on it.
     inner.left.lock().unwrap().remove(&peer_id);
     inner.received_catalog(peer_id, &name, catalog);
@@ -4119,6 +4213,14 @@ async fn run_connection(
         let inner = inner.clone();
         tokio::spawn(async move {
             crate::awake::sleep(DISCONNECT_GRACE).await;
+            // A connection back to it still in its handshake (slow under load) ends first.
+            let deadline = Instant::now() + SETTLE_WAIT;
+            while !inner.is_connected(&peer_id)
+                && inner.in_handshake(&peer_id)
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             let gone = !inner.peers.lock().unwrap().contains_key(&peer_id);
             if !gone {
                 return;

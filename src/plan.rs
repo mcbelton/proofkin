@@ -50,6 +50,7 @@ use crate::protocol::{Origin, Phase, Progress};
 use crate::skills::Skills;
 use crate::trust::TrustStore;
 use crate::workiq::audit::{CallContext, Purpose};
+use crate::workiq::changes::{self, Change, Outcome};
 use crate::workiq::content::{
     Audience, DEFAULT_CAP, Source, UNLABELED, answer_section, retrieval_section,
 };
@@ -331,6 +332,12 @@ impl Step {
         self.target == Target::Workiq
     }
 
+    /// For a `@workiq apply=STEP` step: STEP, whose proposed Microsoft 365 changes it makes
+    /// once its owner signed them off (see [`crate::workiq::changes`]).
+    pub fn applies_changes(&self) -> Option<&str> {
+        self.apply.as_deref().filter(|_| self.is_workiq())
+    }
+
     /// Whether the step's own output or results are Microsoft 365 content whose labels are
     /// known only when it runs: a `@workiq` step, or one with `workiq=`.
     pub fn brings_m365(&self) -> bool {
@@ -368,13 +375,27 @@ impl Step {
             ("team", self.team.is_some()),
             ("claims=", !self.claims.is_empty()),
             ("verify=", !self.checks.is_empty()),
-            ("apply=", self.apply.is_some()),
             ("mcp=", !self.mcp.is_empty()),
             ("skill=", !self.skills.is_empty()),
             ("attempts=", self.attempts.is_some()),
         ];
         if let Some((what, _)) = has.iter().find(|(_, present)| *present) {
             return Some(never_proof(what));
+        }
+        if let Some(proposer) = self.applies_changes() {
+            let given = [
+                ("agent=", self.agent.is_some()),
+                ("save=", self.save.is_some()),
+                ("context=", !self.context.is_empty()),
+                ("workiq=", !self.workiq.is_empty()),
+                ("a folder", self.share.is_some()),
+            ];
+            return given.iter().find(|(_, present)| *present).map(|(what, _)| {
+                format!(
+                    "@workiq step '{}' makes the Microsoft 365 changes step '{proposer}' proposed, as you signed them off: it can't have {what}",
+                    self.id
+                )
+            });
         }
         let meaningless = [
             ("context=", !self.context.is_empty()),
@@ -606,6 +627,7 @@ impl Plan {
                 );
             }
             if let Some(apply) = &step.apply
+                && !step.is_workiq()
                 && !step.after.contains(apply)
             {
                 bail!(
@@ -686,6 +708,7 @@ impl Plan {
             let stuck: Vec<&str> = pending.keys().copied().collect();
             bail!("dependency cycle between steps: {}", stuck.join(", "));
         }
+        self.check_changes()?;
         for step in self.steps.iter().filter(|s| s.pr) {
             let place = format!(
                 "{}:{}",
@@ -712,6 +735,77 @@ impl Plan {
                         .map(|s| s.id.as_str())
                         .collect::<Vec<_>>()
                         .join(" and ")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The rules of `@workiq apply=STEP` steps (docs/work-iq.md, section 7): STEP is a step
+    /// that proposes (no sign-off, pull request or other apply step), the apply step runs
+    /// after it through your own sign-off (`approve @me`: the changes are made with your
+    /// account), and no other step makes the same changes.
+    fn check_changes(&self) -> Result<()> {
+        let mut makers: HashMap<&str, &str> = HashMap::new();
+        for step in &self.steps {
+            let Some(proposer) = step.applies_changes() else {
+                continue;
+            };
+            let id = &step.id;
+            let Some(source) = self.steps.iter().find(|s| s.id == proposer) else {
+                bail!("@workiq step '{id}' makes the changes of unknown step '{proposer}'");
+            };
+            if source.approve || source.pr || source.applies_changes().is_some() {
+                bail!(
+                    "@workiq step '{id}' makes the Microsoft 365 changes step '{proposer}' proposes, but '{proposer}' {}: name the step whose result proposes them",
+                    if source.approve {
+                        "is a sign-off"
+                    } else if source.pr {
+                        "opens a pull request"
+                    } else {
+                        "makes changes itself"
+                    }
+                );
+            }
+            let fix = format!(
+                "sign them off in between, e.g. ok after {proposer} approve @me Make these changes? and {id} after ok @workiq apply={proposer}"
+            );
+            let before = ancestors(self, id);
+            if !before.contains(proposer) {
+                bail!(
+                    "@workiq step '{id}' makes the Microsoft 365 changes step '{proposer}' proposes, so it runs after it; {fix}"
+                );
+            }
+            let signoffs: Vec<&Step> = self
+                .steps
+                .iter()
+                .filter(|s| {
+                    s.approve && before.contains(&s.id) && ancestors(self, &s.id).contains(proposer)
+                })
+                .collect();
+            if !signoffs
+                .iter()
+                .any(|s| s.target == Target::Peer("me".into()))
+            {
+                bail!(
+                    "@workiq step '{id}' makes the Microsoft 365 changes step '{proposer}' proposes with your account, so {}; {fix}",
+                    if signoffs.is_empty() {
+                        "you sign them off first".to_owned()
+                    } else {
+                        format!(
+                            "only your own sign-off counts (approve @me), not {}",
+                            signoffs
+                                .iter()
+                                .map(|s| s.target.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" or ")
+                        )
+                    }
+                );
+            }
+            if let Some(other) = makers.insert(proposer, id) {
+                bail!(
+                    "steps '{other}' and '{id}' both make the Microsoft 365 changes step '{proposer}' proposes; a change is made once"
                 );
             }
         }
@@ -856,6 +950,9 @@ pub struct Recipients {
     pub profile: Option<String>,
     /// Whether the profile has a Work IQ account for `workiq=` steps.
     pub workiq_account: bool,
+    /// Whether the profile allows Microsoft 365 changes (`@workiq apply=` steps, see
+    /// [`crate::profile::ProfileConfig::workiq_changes`]).
+    pub workiq_changes: bool,
     /// The profile's own GitHub login (see [`crate::profile::Profile::github_user`]): pull
     /// request steps ask it to review for `reviewers=me` and for the owner's own sign-offs.
     pub github: Option<String>,
@@ -871,6 +968,7 @@ impl Recipients {
             workers,
             profile: None,
             workiq_account: false,
+            workiq_changes: false,
             github: None,
             runs_dir: None,
         }
@@ -884,6 +982,7 @@ impl Recipients {
             workers: crate::workers::worker_ids(profile).unwrap_or_default(),
             profile: Some(profile.name.clone()),
             workiq_account: profile.workiq_account().is_ok(),
+            workiq_changes: profile.config.workiq_changes.is_some(),
             github: profile.github_user(),
             runs_dir: Some(profile.runs_dir()),
         }
@@ -1400,7 +1499,7 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
             format!("{prompt}\n{continuation}")
         };
     }
-    if prompt.is_empty() && !pr {
+    if prompt.is_empty() && !pr && !(target == Target::Workiq && apply.is_some()) {
         bail!("missing the task prompt: what to do comes last, after who runs it and the options");
     }
     if pr {
@@ -2134,6 +2233,22 @@ pub fn preflight(
                 true,
                 format!(
                     "{what} needs this profile's Work IQ sign-in, and there is none; run: proofkin auth login workiq{profile}"
+                ),
+            );
+        }
+        if let Some(proposer) = step.applies_changes()
+            && !recipients.workiq_changes
+        {
+            let profile = recipients
+                .profile
+                .as_ref()
+                .map(|p| format!(" --profile {p}"))
+                .unwrap_or_default();
+            report(
+                Some(step),
+                true,
+                format!(
+                    "it makes the Microsoft 365 changes step '{proposer}' proposes, and this profile doesn't allow changes; turn them on with: proofkin workiq changes on{profile}"
                 ),
             );
         }
@@ -3200,6 +3315,9 @@ pub enum SentWork {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         changes: bool,
     },
+    /// A `@workiq apply=` step's Microsoft 365 changes, being made: after a restart they
+    /// aren't made again (see [`rejoin`]).
+    Changes,
 }
 
 /// A run going on after its agent restarted: its steps that had finished, as they ended
@@ -3364,6 +3482,11 @@ fn rejoin(
             };
             Box::pin(async move { agent.rejoin_approval(approver, task_id, &ask).await })
         }
+        (SentWork::Changes, _) => Box::pin(async {
+            Err(anyhow!(
+                "this agent stopped while the step made Microsoft 365 changes: none is made again; check in Microsoft 365 which were made"
+            ))
+        }),
     };
     (sent.peer, work)
 }
@@ -3586,6 +3709,171 @@ fn ask_workiq(
     }
 }
 
+/// The Microsoft 365 changes sign-off `signoff` shows (docs/work-iq.md, section 7): for each
+/// step before it whose changes a step after it makes, those changes and their SHA-256, as
+/// its result proposes them.
+fn change_previews(
+    plan: &Plan,
+    states: &BTreeMap<String, StepState>,
+    signoff: &Step,
+) -> Vec<String> {
+    let earlier = ancestors(plan, &signoff.id);
+    let mut shown = Vec::new();
+    for maker in &plan.steps {
+        let Some(proposer) = maker.applies_changes() else {
+            continue;
+        };
+        if !earlier.contains(proposer) || !ancestors(plan, &maker.id).contains(&signoff.id) {
+            continue;
+        }
+        let StepState::Done { output, .. } = &states[proposer] else {
+            continue;
+        };
+        shown.push(match changes::proposed(output) {
+            Ok(list) => changes::preview(proposer, &maker.id, &list.unwrap_or_default()),
+            Err(e) => format!(
+                "### Microsoft 365 changes step {proposer} proposes\n\nThey can't be read, so step {} makes none: {e:#}\n",
+                maker.id
+            ),
+        });
+    }
+    shown
+}
+
+/// The Microsoft 365 changes step `proposer` proposed that `step` (`@workiq apply=proposer`)
+/// makes, with their SHA-256, if you signed off exactly those: a sign-off `approve @me`
+/// between them that you (`me`) approved, whose signed answer is for a request (`asked`, by
+/// sign-off) that showed this list's SHA-256.
+fn signed_changes(
+    plan: &Plan,
+    states: &BTreeMap<String, StepState>,
+    asked: &HashMap<String, String>,
+    me: &EndpointId,
+    step: &Step,
+    proposer: &str,
+) -> std::result::Result<(Vec<Change>, String), String> {
+    let StepState::Done { output, .. } = &states[proposer] else {
+        return Err(format!("step {proposer} isn't done"));
+    };
+    let list = changes::proposed(output)
+        .map_err(|e| {
+            format!(
+                "the Microsoft 365 changes step {proposer} proposed can't be read, so none was made: {e:#}"
+            )
+        })?
+        .unwrap_or_default();
+    let digest = changes::digest(&list);
+    let before = ancestors(plan, &step.id);
+    let mut lost = false;
+    for signoff in plan.steps.iter().filter(|s| {
+        s.approve
+            && s.target == Target::Peer("me".into())
+            && before.contains(&s.id)
+            && ancestors(plan, &s.id).contains(proposer)
+    }) {
+        let StepState::Done {
+            evidence: Some(evidence),
+            verified: true,
+            ..
+        } = &states[&signoff.id]
+        else {
+            continue;
+        };
+        if evidence.kind != crate::evidence::EvidenceKind::Approval
+            || evidence.approved != Some(true)
+            || evidence.signer_id != me.to_string()
+        {
+            continue;
+        }
+        let Some(text) = asked.get(&signoff.id) else {
+            lost = true;
+            continue;
+        };
+        if crate::evidence::sha256_hex(text.as_bytes()) == evidence.prompt_sha256
+            && changes::shown_in(text, proposer, &digest)
+        {
+            return Ok((list, digest));
+        }
+    }
+    Err(if lost {
+        format!(
+            "you signed off the Microsoft 365 changes step {proposer} proposed before this agent restarted, and that request isn't kept: none was made; run the plan again to sign them off again"
+        )
+    } else {
+        format!(
+            "no sign-off of yours approved the Microsoft 365 changes step {proposer} proposed as they are now (SHA-256 {digest}): none was made"
+        )
+    })
+}
+
+/// Makes the Microsoft 365 changes step `proposer` proposed and you signed off (`list`, whose
+/// SHA-256 is `digest`) for `step`, a `@workiq apply=` step: each once, in order, through the
+/// run's audited Work IQ client, stopping at the first that fails or whose outcome is
+/// unknown. Its result says how each ended; it fails unless all were made.
+fn apply_changes(
+    ctx: &RunContext,
+    step: &Step,
+    proposer: &str,
+    list: Vec<Change>,
+    digest: String,
+) -> impl Future<Output = Result<Delivered>> + Send + 'static {
+    let work = ctx.work_context.clone();
+    let purpose = Purpose::Step {
+        run: ctx.run_id.clone().unwrap_or_default(),
+        step: step.id.clone(),
+    };
+    let proposer = proposer.to_owned();
+    async move {
+        let mut outcomes = Vec::new();
+        if !list.is_empty() {
+            let Some(work) = work else {
+                bail!("Work IQ isn't set up for this run");
+            };
+            let call = CallContext::local(purpose);
+            for change in &list {
+                let outcome = match work.change(&call, &change.tool, change.arguments()).await {
+                    Ok(result) => Outcome::of(&result),
+                    Err(e) => Outcome::of_error(&e),
+                };
+                let made = outcome.made();
+                outcomes.push(outcome);
+                if !made {
+                    break;
+                }
+            }
+        }
+        let ok = outcomes.len() == list.len() && outcomes.iter().all(Outcome::made);
+        Ok(Delivered {
+            ok,
+            output: changes::report(&proposer, &digest, &list, &outcomes),
+            evidence: None,
+            patch: None,
+            verified: false,
+            refused: false,
+            model: None,
+            usage: None,
+        })
+    }
+}
+
+/// Why `delivered`, the result of `step`, fails: the Microsoft 365 changes it proposes, for a
+/// later step to make, break a rule (see [`changes::proposed`]).
+fn proposal_problem(plan: &Plan, step: &Step, delivered: &Delivered) -> Option<String> {
+    let made_later = plan
+        .steps
+        .iter()
+        .any(|s| s.applies_changes() == Some(step.id.as_str()));
+    if !delivered.ok || !made_later {
+        return None;
+    }
+    changes::proposed(&delivered.output).err().map(|e| {
+        format!(
+            "the Microsoft 365 changes it proposes can't be made: {e:#}\n\n{}",
+            delivered.output
+        )
+    })
+}
+
 /// `plan` with the labels each `workiq=` step's results turned out to have added to its
 /// mark, so what a step saves as knowledge is marked with them.
 pub fn with_actual_labels(plan: &Plan, log: &WorkLog) -> Plan {
@@ -3686,6 +3974,10 @@ pub async fn run_plan_with(
     let mut rounds: HashMap<String, u32> = HashMap::new();
     let mut asked: HashMap<String, String> = HashMap::new();
     let mut reworks: HashMap<String, Rework> = HashMap::new();
+    // The request each sign-off was asked with: an apply step makes the Microsoft 365
+    // changes only if your signed answer is for a request that showed exactly them (see
+    // [`signed_changes`]).
+    let mut asked_texts: HashMap<String, String> = HashMap::new();
     loop {
         // Skip steps whose prerequisites failed; start steps whose prerequisites are done.
         let mut changed = true;
@@ -3717,6 +4009,9 @@ pub async fn run_plan_with(
                     continue;
                 }
                 if let Some(sent) = sent_before.remove(&step.id) {
+                    if let SentWork::Approval { text, .. } = &sent.work {
+                        asked_texts.insert(step.id.clone(), text.clone());
+                    }
                     let (peer_name, work) = rejoin(agent, sent, &progress_tx, &step.id);
                     let state = StepState::Running {
                         peer: peer_name.clone(),
@@ -3750,11 +4045,19 @@ pub async fn run_plan_with(
                     })
                     .collect();
                 // The issue it works on, as its tracker has it (people wrote it).
-                let issue = ctx
+                let mut issue = ctx
                     .issue_texts
                     .get(&step.id)
                     .map(|text| issue_section(step, text))
                     .unwrap_or_default();
+                // A later step makes the Microsoft 365 changes it proposes: it says how.
+                if plan
+                    .steps
+                    .iter()
+                    .any(|s| s.applies_changes() == Some(step.id.as_str()))
+                {
+                    issue += &changes::instruction();
+                }
                 let prompt = step_prompt_with(step, &deps, &issue);
                 let fail = |error: String| StepState::failed(None, error);
                 // What its card says while it is done again for a sign-off's changes.
@@ -3795,6 +4098,12 @@ pub async fn run_plan_with(
                             let (agent, title) = (agent.clone(), format!("Plan step {}", step.id));
                             // A person reads it: the rule for models is left out.
                             let mut text = approval_text(&prompt);
+                            // The Microsoft 365 changes it signs off come first, as they
+                            // are made.
+                            let shown = change_previews(plan, &states, step);
+                            if !shown.is_empty() {
+                                text = format!("{}\n---\n\n{text}", shown.join("\n"));
+                            }
                             let round = rounds.get(&step.id).copied().unwrap_or(0);
                             if let Some(note) = asked.get(&step.id) {
                                 text = format!(
@@ -3830,6 +4139,7 @@ pub async fn run_plan_with(
                                 preview,
                                 changes,
                             };
+                            asked_texts.insert(step.id.clone(), ask.text.clone());
                             (
                                 name,
                                 Box::pin(async move {
@@ -3839,6 +4149,47 @@ pub async fn run_plan_with(
                         }
                         Err(e) => {
                             let state = fail(format!("{e:#}"));
+                            on_update(&step.id, &state);
+                            states.insert(step.id.clone(), state);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                } else if let Some(proposer) = step.applies_changes() {
+                    // Made by this agent, once: only the changes you signed off, and only
+                    // while the profile allows changes.
+                    let signed = if ctx.recipients.workiq_changes {
+                        signed_changes(plan, &states, &asked_texts, &agent.id(), step, proposer)
+                    } else {
+                        Err(format!(
+                            "this profile doesn't allow Microsoft 365 changes, so none was made; turn them on with: proofkin workiq changes on{}",
+                            ctx.recipients
+                                .profile
+                                .as_ref()
+                                .map(|p| format!(" --profile {p}"))
+                                .unwrap_or_default()
+                        ))
+                    };
+                    match signed {
+                        Ok((list, digest)) => {
+                            if let Some(journal) = &ctx.journal {
+                                (journal.0)(
+                                    &step.id,
+                                    &SentStep {
+                                        peer: step.workiq_name(),
+                                        peer_id: None,
+                                        task_id: agent.new_task_id(),
+                                        work: SentWork::Changes,
+                                    },
+                                );
+                            }
+                            (
+                                step.workiq_name(),
+                                Box::pin(apply_changes(ctx, step, proposer, list, digest)),
+                            )
+                        }
+                        Err(why) => {
+                            let state = fail(why);
                             on_update(&step.id, &state);
                             states.insert(step.id.clone(), state);
                             changed = true;
@@ -4146,7 +4497,10 @@ pub async fn run_plan_with(
                         }
                         state
                     }
-                    Ok(delivered) => StepState::from_delivered(peer, step, delivered),
+                    Ok(delivered) => match proposal_problem(plan, step, &delivered) {
+                        Some(why) => StepState::failed(Some(peer), why),
+                        None => StepState::from_delivered(peer, step, delivered),
+                    },
                     Err(e) => StepState::failed(Some(peer), format!("{e:#}")),
                 };
                 on_update(&id, &state);
@@ -6365,7 +6719,6 @@ mod tests {
         for option in [
             "claims=C-1",
             "verify=test",
-            "apply=x",
             "mcp=docs",
             "skill=adr",
             "attempts=2",
@@ -6396,6 +6749,122 @@ mod tests {
         // The round trip through JSON keeps the target.
         let json = serde_json::to_string(&plan.steps[1].target).unwrap();
         assert_eq!(json, r#"{"kind":"workiq"}"#);
+    }
+
+    /// `@workiq apply=STEP` makes the Microsoft 365 changes STEP proposed: only after your
+    /// own sign-off of them (`approve @me` between the two), once, and with nothing that
+    /// would make it more than that.
+    #[test]
+    fn a_step_that_makes_changes_runs_after_your_own_sign_off_and_is_the_only_one() {
+        let ok = "draft @worker:app mcp=workiq Draft the replies\n\
+                  ok after draft approve @me Send these replies?\n\
+                  send after ok @workiq apply=draft";
+        let plan = Plan::parse(ok).unwrap();
+        let send = &plan.steps[2];
+        assert_eq!(send.applies_changes(), Some("draft"));
+        assert!(send.is_workiq() && send.prompt.is_empty());
+        assert_eq!(plan.steps[0].applies_changes(), None);
+        let worded = Plan::parse(&format!("{ok} Send them as signed off")).unwrap();
+        assert_eq!(worded.steps[2].prompt, "Send them as signed off");
+        // The sign-off may come through another step.
+        Plan::parse(
+            "draft @worker:app Draft\nok after draft approve @me Fine?\nnote after ok @worker:app Log it\nsend after note @workiq apply=draft",
+        )
+        .unwrap();
+
+        let fix = "sign them off in between, e.g. ok after draft approve @me Make these changes? and send after ok @workiq apply=draft";
+        let twice = format!("{ok}\nagain after ok @workiq apply=draft");
+        for (text, why) in [
+            (
+                "draft @worker:app Draft\nsend after draft @workiq apply=draft",
+                "with your account, so you sign them off first",
+            ),
+            (
+                "draft @worker:app Draft\nok after draft approve @carol Fine?\nsend after ok @workiq apply=draft",
+                "only your own sign-off counts (approve @me), not @carol",
+            ),
+            (
+                "ok approve @me Fine?\ndraft after ok @worker:app Draft\nsend after draft @workiq apply=draft",
+                "you sign them off first",
+            ),
+            (
+                "draft @worker:app Draft\nok approve @me Fine?\nsend after ok @workiq apply=draft",
+                "so it runs after it",
+            ),
+            (
+                twice.as_str(),
+                "steps 'send' and 'again' both make the Microsoft 365 changes step 'draft' proposes",
+            ),
+            (
+                "ok approve @me Fine?\nsend after ok @workiq apply=nope",
+                "unknown step 'nope'",
+            ),
+            (
+                "draft @worker:app Draft\nok after draft approve @me Fine?\nsend after ok @workiq apply=ok",
+                "'ok' is a sign-off",
+            ),
+        ] {
+            let err = format!("{:#}", Plan::parse(text).unwrap_err());
+            assert!(err.contains(why), "{text}: {err}");
+        }
+        let err = format!(
+            "{:#}",
+            Plan::parse("draft @worker:app Draft\nsend after draft @workiq apply=draft")
+                .unwrap_err()
+        );
+        assert!(err.contains(fix), "{err}");
+        for (option, why) in [
+            ("agent=sales", "can't have agent="),
+            ("save=notes", "can't have save="),
+            ("context=hr", "can't have context="),
+            ("claims=C-1", "context and never proof"),
+            ("attempts=2", "context and never proof"),
+        ] {
+            let text = format!(
+                "draft @worker:app Draft\nok after draft approve @me Fine?\nsend after ok @workiq apply=draft {option} Send"
+            );
+            let err = format!("{:#}", Plan::parse(&text).unwrap_err());
+            assert!(err.contains(why), "{option}: {err}");
+        }
+        let err = format!(
+            "{:#}",
+            Plan::parse("draft @worker:app Draft\nok after draft approve @me Fine?\nsend after ok @workiq:app apply=draft")
+                .unwrap_err()
+        );
+        assert!(err.contains("can't have a folder"), "{err}");
+    }
+
+    #[test]
+    fn the_plan_check_needs_changes_on_for_a_step_that_makes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let plan = Plan::parse(
+            "draft @workiq Draft the replies\nok after draft approve @me Send them?\nsend after ok @workiq apply=draft",
+        )
+        .unwrap();
+        let mut recipients = Recipients {
+            profile: Some("boss".into()),
+            workiq_account: true,
+            ..Recipients::default()
+        };
+        let errors = |recipients: &Recipients| -> Vec<String> {
+            preflight(&plan, &[], &SquadStore::default(), &kb, &skills, recipients)
+                .into_iter()
+                .filter(|p| p.error)
+                .map(|p| p.message)
+                .collect()
+        };
+        let found = errors(&recipients);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("it makes the Microsoft 365 changes step 'draft' proposes")
+                && found[0].contains("proofkin workiq changes on --profile boss"),
+            "{}",
+            found[0]
+        );
+        recipients.workiq_changes = true;
+        assert!(errors(&recipients).is_empty());
     }
 
     #[test]

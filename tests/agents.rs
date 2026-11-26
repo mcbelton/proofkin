@@ -577,6 +577,110 @@ async fn simultaneous_dials_converge_on_one_connection() {
     );
 }
 
+/// A peer being dialed isn't dialed again until that connection's handshake ends, as when
+/// the program dials a `--peer` and `keep_connected` dials it right after: two connections
+/// from one side, in their handshakes at once, could be kept differently by the two sides,
+/// each closing the one the other kept. This peer never says hello, so the first dial
+/// stays in its handshake until the peer closes it.
+#[tokio::test]
+async fn a_peer_being_dialed_is_not_dialed_again_until_its_handshake_ends() {
+    let key = SecretKey::generate();
+    let silent = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(key.clone())
+        .alpns(vec![proofkin::protocol::ALPN.to_vec()])
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn({
+        let (silent, held) = (silent.clone(), held.clone());
+        async move {
+            while let Some(incoming) = silent.accept().await {
+                if let Ok(conn) = incoming.await {
+                    held.lock().unwrap().push(conn);
+                }
+            }
+        }
+    });
+    let accepted = || held.lock().unwrap().len();
+    let mut a = Node::new("a");
+    a.trust.allow(TrustedPeer {
+        name: "silent".into(),
+        id: key.public(),
+        addrs: BTreeSet::new(),
+        can_delegate: false,
+        tasks_per_hour: 0,
+        access: Access::ReadOnly,
+        shares: Vec::new(),
+        m365: None,
+        github: None,
+        agents: Vec::new(),
+    });
+    let (a, _ae) = a.start().await;
+
+    a.connect(silent.addr()).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while accepted() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first dial reached the peer");
+    a.connect(silent.addr()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(accepted(), 1, "a second connection was opened");
+
+    // Closed before its hello, the dial ends: the peer is dialed again.
+    for conn in held.lock().unwrap().iter() {
+        conn.close(0u32.into(), b"bye");
+    }
+    timeout(Duration::from_secs(10), async {
+        while accepted() < 2 {
+            a.connect(silent.addr()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the peer was dialed again once the handshake failed");
+}
+
+/// A plan checked while a peer reconnects waits for it (`settle_peers`), instead of
+/// finding it not connected: here its connection closed and it dials again. One that
+/// doesn't come back is given up on after the disconnect grace.
+#[tokio::test]
+async fn settling_waits_for_a_reconnecting_peer_and_gives_up_on_a_gone_one() {
+    let (mut a, mut b) = (Node::new("a"), Node::new("b"));
+    mutual(&mut a, &mut b);
+    let (a, _ae) = a.start().await;
+    let (b, _be) = b.start().await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, 1).await;
+    wait_for_peers(&b, 1).await;
+
+    assert!(a.disconnect(b.id()));
+    wait_for_peers(&a, 0).await;
+    let redial = tokio::spawn({
+        let (b, addr) = (b.clone(), a.addr());
+        async move {
+            wait_for_peers(&b, 0).await;
+            b.connect(addr).await
+        }
+    });
+    a.settle_peers().await;
+    assert_eq!(a.peers().len(), 1, "it waited for b to come back");
+    redial.await.unwrap().unwrap();
+
+    assert!(a.disconnect(b.id()));
+    wait_for_peers(&a, 0).await;
+    let started = std::time::Instant::now();
+    a.settle_peers().await;
+    assert!(a.peers().is_empty());
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}
+
 #[tokio::test]
 async fn shutdown_disconnects_peers() {
     let (mut a, mut b) = (Node::new("a"), Node::new("b"));
@@ -3511,6 +3615,11 @@ struct FakeWork {
     asks: Mutex<Vec<WorkAsk>>,
     /// The question and the agent id of each `ask`.
     questions: Mutex<Vec<(String, Option<String>)>>,
+    /// Each change made: its tool, its arguments and the step it was made for.
+    changes: Mutex<Vec<(String, serde_json::Value, Option<String>)>>,
+    /// How the changes go, in order: what Work IQ answers, or why it fails; past the list,
+    /// done.
+    change_replies: Mutex<std::collections::VecDeque<Result<serde_json::Value, String>>>,
 }
 
 impl FakeWork {
@@ -3532,6 +3641,8 @@ impl FakeWork {
             answer,
             asks: Mutex::default(),
             questions: Mutex::default(),
+            changes: Mutex::default(),
+            change_replies: Mutex::default(),
         })
     }
 
@@ -3541,6 +3652,10 @@ impl FakeWork {
 
     fn asks(&self) -> Vec<WorkAsk> {
         self.asks.lock().unwrap().clone()
+    }
+
+    fn changes(&self) -> Vec<(String, serde_json::Value, Option<String>)> {
+        self.changes.lock().unwrap().clone()
     }
 }
 
@@ -3587,6 +3702,35 @@ impl proofkin::workiq::context::WorkContext for FakeWork {
         Ok(proofkin::workiq::ToolResult {
             content: Vec::new(),
             structured_content: Some(self.answer.clone()),
+            is_error: false,
+            ids: proofkin::workiq::RequestIds::default(),
+        })
+    }
+
+    async fn change(
+        &self,
+        context: &proofkin::workiq::audit::CallContext,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<proofkin::workiq::ToolResult> {
+        use proofkin::workiq::audit::Purpose;
+        let step = match &context.purpose {
+            Purpose::Step { step, .. } => Some(step.clone()),
+            _ => None,
+        };
+        self.changes
+            .lock()
+            .unwrap()
+            .push((tool.to_owned(), arguments, step));
+        let reply = self.change_replies.lock().unwrap().pop_front();
+        let structured = match reply {
+            Some(Err(why)) => anyhow::bail!("{why}"),
+            Some(Ok(value)) => value,
+            None => serde_json::json!({}),
+        };
+        Ok(proofkin::workiq::ToolResult {
+            content: Vec::new(),
+            structured_content: Some(structured),
             is_error: false,
             ids: proofkin::workiq::RequestIds::default(),
         })
@@ -4123,6 +4267,144 @@ async fn an_agentless_workiq_step_sends_no_agent_id() {
     assert_eq!(work.questions(), [("What changed?".to_owned(), None)]);
     match &states["a"] {
         StepState::Done { peer, .. } => assert_eq!(peer, "workiq"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A plan proposes Microsoft 365 changes in one step, you sign them off, and a later step
+/// makes exactly those, once and in order: the sign-off shows each change and the list's
+/// SHA-256, a rejected sign-off makes none, and a change that fails stops the ones after it.
+#[tokio::test]
+async fn a_plan_makes_the_microsoft_365_changes_you_sign_off_once_and_in_order() {
+    let mail = r#"{"tool":"do_action","path":"/me/sendMail","body":{"message":{"subject":"Re: the outage","body":{"contentType":"Text","content":"It is fixed."},"toRecipients":[{"emailAddress":{"address":"ana@contoso.com"}}]}}}"#;
+    let update = r#"{"tool":"update_entity","path":"/me/events/AAMk1","body":{"subject":"Moved"}}"#;
+    let proposing = || {
+        FakeWork::answering(
+            Vec::new(),
+            serde_json::json!({
+                "answer": format!("Here are the replies.\n\n```m365-changes\n{mail}\n{update}\n```"),
+                "citations": [
+                    { "title": "Escalations", "sensitivityLabel": { "displayName": "General" } },
+                ],
+            }),
+        )
+    };
+    let plan = Plan::parse(
+        "draft @workiq Draft the replies to the open escalations\n\
+         ok after draft approve @me Send these replies?\n\
+         send after ok @workiq apply=draft",
+    )
+    .unwrap();
+    let (boss, _be) = Node::new("boss").start().await;
+    let ctx = |work: &Arc<FakeWork>| RunContext {
+        run_id: Some("r1".into()),
+        recipients: proofkin::plan::Recipients {
+            workiq_changes: true,
+            ..Default::default()
+        },
+        work_context: Some(work.clone()),
+        ..RunContext::default()
+    };
+    // You answer each sign-off as `approve` says; what it showed is kept.
+    let sign = |approve: bool| {
+        let shown = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (boss, seen) = (boss.clone(), shown.clone());
+        let task = tokio::spawn(async move {
+            loop {
+                for a in boss.approvals() {
+                    seen.lock().unwrap().push(a.text.clone());
+                    let _ = boss.answer_approval(a.id, approve, "as shown").await;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        (task, shown)
+    };
+    let run = |work: Arc<FakeWork>| {
+        let (boss, plan) = (boss.clone(), plan.clone());
+        async move {
+            let ctx = ctx(&work);
+            timeout(
+                Duration::from_secs(30),
+                run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Approved: both are made, in order, with exactly the proposed arguments.
+    let work = proposing();
+    let (signer, shown) = sign(true);
+    let states = run(work.clone()).await;
+    signer.abort();
+    let question = &work.questions()[0].0;
+    assert!(
+        question.contains("```m365-changes") && question.contains("Don't change Microsoft 365"),
+        "{question}"
+    );
+    let shown = shown.lock().unwrap().clone();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert!(
+        shown[0].starts_with("### Microsoft 365 changes step draft proposes")
+            && shown[0].contains("SHA-256 of the list: `")
+            && shown[0].contains("To: ana@contoso.com")
+            && shown[0].contains("Subject: Re: the outage")
+            && shown[0].contains("update_entity /me/events/AAMk1"),
+        "{}",
+        shown[0]
+    );
+    let made = work.changes();
+    assert_eq!(made.len(), 2, "{made:?}");
+    assert_eq!(made[0].0, "do_action");
+    assert_eq!(made[0].1["actionUrl"], "/me/sendMail");
+    assert_eq!(
+        made[0].1["jsonBody"]["message"]["subject"],
+        "Re: the outage"
+    );
+    assert_eq!(
+        made[1],
+        (
+            "update_entity".to_owned(),
+            serde_json::json!({ "entityUrl": "/me/events/AAMk1", "jsonBody": { "subject": "Moved" } }),
+            Some("send".to_owned())
+        )
+    );
+    let output = done_output(&states, "send");
+    assert!(
+        output.contains("1. Action /me/sendMail: done")
+            && output.contains("2. Update /me/events/AAMk1: done"),
+        "{output}"
+    );
+
+    // Rejected: none is made, and the step that would make them is skipped.
+    let work = proposing();
+    let (signer, _) = sign(false);
+    let states = run(work.clone()).await;
+    signer.abort();
+    assert!(work.changes().is_empty());
+    assert!(
+        matches!(states["send"], StepState::Skipped { .. }),
+        "{:?}",
+        states["send"]
+    );
+
+    // A change that fails stops the ones after it, and the step fails saying which.
+    let work = proposing();
+    work.change_replies
+        .lock()
+        .unwrap()
+        .push_back(Err("denied by policy".into()));
+    let (signer, _) = sign(true);
+    let states = run(work.clone()).await;
+    signer.abort();
+    assert_eq!(work.changes().len(), 1);
+    match &states["send"] {
+        StepState::Failed { error, .. } => assert!(
+            error.contains("1. Action /me/sendMail: failed: denied by policy")
+                && error.contains("Not made, after change 1: 2."),
+            "{error}"
+        ),
         other => panic!("{other:?}"),
     }
 }

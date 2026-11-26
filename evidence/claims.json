@@ -33,8 +33,12 @@
     {
       "id": "NET-4",
       "area": "network",
-      "claim": "Two peers dialing each other at once end up with one connection and no join/leave flapping.",
-      "tests": ["agents::simultaneous_dials_converge_on_one_connection"]
+      "claim": "Two peers dialing each other at once end up with one connection and no join/leave flapping, and a peer being dialed isn't dialed again until that connection's handshake ends (so two dials from one side can't leave both without a connection). A plan checked or started while a peer reconnects waits for it (up to 10 seconds) instead of finding it not connected, and gives up on one that doesn't come back after the disconnect grace.",
+      "tests": [
+        "agents::simultaneous_dials_converge_on_one_connection",
+        "agents::a_peer_being_dialed_is_not_dialed_again_until_its_handshake_ends",
+        "agents::settling_waits_for_a_reconnecting_peer_and_gives_up_on_a_gone_one"
+      ]
     },
     {
       "id": "NET-5",
@@ -1053,12 +1057,13 @@
     {
       "id": "TRK-2",
       "area": "tracking",
-      "claim": "The board follows a tracked run: a step's item is In progress while it runs (with the peer doing it, moved once however often the peer reports), In review while its committed work waits for a pull request or its sign-off for a person, and Done once closed; a step that changed no files is closed when it is done; a failed or skipped step goes back to Todo. Each result and failure is commented on its issue with its signed evidence (signer, checks, commit and branch), and the run's issue gets the verdict and its claims; it is closed once all its sub-issues are, waiting in review while its own steps' pull requests are open (and where it was while other work is), and it goes back to where it was if the run failed. Without the project scope tracking keeps to the issues and says how to grant it, and tracking never fails or holds up the plan's steps.",
+      "claim": "The board follows a tracked run: a step's item is In progress while it runs (with the peer doing it, moved once however often the peer reports), In review while its committed work waits for a pull request or its sign-off for a person, and Done once closed; a step that changed no files is closed when it is done; a failed or skipped step goes back to Todo. Each result and failure is commented on its issue with its signed evidence (signer, checks, commit and branch),       and the run's issue gets the verdict and its claims; it is closed once all its sub-issues are, waiting in review while its own steps' pull requests are open (and where it was while other work is), and it goes back to where it was if the run failed. Only an issue a run made (its body has the run marker: track: <title>, or no track: line) is closed, set In review or Done, or left for settling: an issue a person named with track: #N goes back where it was and stays open, and the run's comment says why; settling lets go of one an earlier version left waiting, without closing it. Without the project scope tracking keeps to the issues and says how to grant it, and tracking never fails or holds up the plan's steps.",
       "tests": [
         "lib::tracker::a_tracked_run_has_an_issue_with_a_sub_issue_per_step_and_the_board_follows_it",
         "lib::tracker::without_the_project_scope_tracking_keeps_to_issues_and_says_how_to_fix_it",
         "lib::tracker::a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do",
-        "lib::tracker::a_passed_runs_issue_waits_for_its_other_open_work_then_closes"
+              "lib::tracker::a_passed_runs_issue_waits_for_its_other_open_work_then_closes",
+              "lib::tracker::a_run_never_closes_an_issue_a_person_named"
       ]
     },
     {
@@ -1391,7 +1396,7 @@
     {
       "id": "WIQ-16",
       "area": "work-iq",
-      "claim": "A folder can offer Work IQ to its owner's tasks as its MCP server workiq (proofkin mcp add <folder> workiq --workiq [--tool ...]; the name is workiq, it has no command or URL, only tools that read: retrieve, ask, fetch, search_paths, get_schema, list_agents, and any task access may use it). A task that asks for mcp=workiq gets, for that task only, http://127.0.0.1:<port>/mcp/workiq/<session> with a random bearer; the agent calls Work IQ itself through the profile's audited client, so the model's MCP config holds no token. The session lists only the allowed tools Work IQ offers, never one whose MCP annotations say it changes things (readOnlyHint false or destructiveHint true), refuses any other tool before it reaches Work IQ, puts every result through the content policy for the task's audience (a peer audience gets only retrieve and ask, within its labels), audits each call with purpose gateway, needs its bearer, refuses requests with an Origin header, and closes when the task ends. A digital worker's owner's tasks see what Work IQ allows (peers: WIQ-17). A plan marks a step with mcp=workiq, and the steps after it, with the label unknown, so nothing made from what its model read goes to a peer.",
+      "claim": "A folder can offer Work IQ to its owner's tasks as its MCP server workiq (proofkin mcp add <folder> workiq --workiq [--tool ...]; the name is workiq, it has no command or URL, only tools that read: retrieve, ask, fetch, search_paths, get_schema, list_agents, call_function, and any task access may use it). A task that asks for mcp=workiq gets, for that task only, http://127.0.0.1:<port>/mcp/workiq/<session> with a random bearer; the agent calls Work IQ itself through the profile's audited client, so the model's MCP config holds no token. The session lists only the allowed tools Work IQ offers, never one whose MCP annotations say it changes things (readOnlyHint false or destructiveHint true), refuses any other tool before it reaches Work IQ, puts every result through the content policy for the task's audience (a peer audience gets only retrieve and ask, within its labels), audits each call with purpose gateway, needs its bearer, refuses requests with an Origin header, and closes when the task ends. A digital worker's owner's tasks see what Work IQ allows (peers: WIQ-17). A plan marks a step with mcp=workiq, and the steps after it, with the label unknown, so nothing made from what its model read goes to a peer.",
       "tests": [
         "workiq_gateway::a_tasks_session_offers_only_read_tools_and_its_model_never_gets_the_token",
         "workiq_gateway::what_a_session_sees_goes_through_the_content_policy_for_its_audience_and_is_audited",
@@ -1410,6 +1415,32 @@
       ]
     },
     {
+      "id": "WIQ-18",
+      "area": "work-iq",
+      "claim": "A plan makes Microsoft 365 changes only as its owner signed them off (docs/work-iq.md section 7). A step whose changes a later @workiq apply=STEP step makes is told to propose them in one fenced m365-changes block, one JSON object a line: tool is create_entity, update_entity, delete_entity or do_action; path a Microsoft Graph path that starts with / with no host, no .. and no control characters, at most 2 KB; body a JSON object, none for a delete; ifMatch only for an update or a delete; at most 20 changes and 256 KB. A block that breaks a rule fails the step, naming the line and the rule. The approve @me step between them shows each change first (a mail's recipients, subject and first 10 lines with HTML removed; another change's verb, path and the first 500 characters of its body) and the list's SHA-256 over its canonical JSON, so the approver's signed answer (its prompt_sha256) covers exactly that list. The apply step has no model: it makes the changes only after a verified approval signed by its own agent for a request that showed the list as it is now, calls each once, in order, with exactly the proposed arguments (parentUrl, entityUrl or actionUrl, jsonBody, and If-Match), and stops at the first that fails or whose outcome is unknown; its result lists each outcome (done, accepted for a 202, failed, outcome unknown) and the changes not made. A rejected sign-off makes none. The plan check refuses an apply step, naming the fix, without an approve @me between the two steps (a peer's sign-off doesn't count), when it doesn't run after the step, when another step applies the same step, with an option that would make it more than that, or when the profile doesn't allow changes (proofkin workiq changes on sets workiq_changes in profile.json; off by default; workiq doctor and the Work IQ card say which). Neither step's result goes on GitHub.",
+      "tests": [
+        "lib::workiq::changes::a_block_of_changes_is_read_with_each_tools_arguments",
+        "lib::workiq::changes::a_block_that_breaks_a_rule_names_the_line_and_the_rule",
+        "lib::workiq::changes::the_digest_is_over_canonical_json_so_key_order_and_spaces_dont_matter",
+        "lib::workiq::changes::a_sign_off_shows_a_mails_people_subject_and_first_lines_and_other_changes_bodies",
+        "lib::workiq::changes::outcomes_say_done_accepted_failed_or_unknown_and_what_was_not_made",
+        "lib::workiq::changes::the_instruction_shows_a_block_that_parses",
+        "lib::plan::a_step_that_makes_changes_runs_after_your_own_sign_off_and_is_the_only_one",
+        "lib::plan::the_plan_check_needs_changes_on_for_a_step_that_makes_them",
+        "lib::tracker::proposed_microsoft_365_changes_and_their_outcomes_stay_off_github",
+        "agents::a_plan_makes_the_microsoft_365_changes_you_sign_off_once_and_in_order"
+      ]
+    },
+    {
+      "id": "WIQ-28",
+      "area": "work-iq",
+      "claim": "call_function is one of the gateway's read tools (Work IQ CLI 1.0.1 annotates it read only): a folder's workiq server offers it to its owner's own tasks unless --tool names fewer, and like fetch, whose results carry no sensitivity labels, it never goes to a peer's task, even one granted --m365-tools (those get only retrieve and ask). Like any tool, it is refused if its annotations say it changes things.",
+      "tests": [
+        "lib::workiq::gateway::a_session_offers_its_owner_every_read_tool_and_a_peer_only_labeled_ones",
+        "workiq_gateway::a_digital_workers_owner_gets_work_iq_in_its_task_and_a_peer_only_with_its_grant"
+      ]
+    },
+    {
       "id": "WIQ-19",
       "area": "work-iq",
       "claim": "Importing Microsoft's Work IQ plugin (the shape of microsoft/work-iq:plugins/workiq: .github/plugin/plugin.json, skills/, and a .mcp.json whose server is the hosted https://workiq.svc.cloud.microsoft/mcp with oauthClientId) keeps its skills and makes its MCP server a Work IQ template: its own connection and sign-in settings are dropped, the review notes that it is offered through this agent's own Work IQ sign-in and gateway with only its tools that read, and offering it in a folder gives the agent's workiq server (no URL, command or headers; it must be named workiq). The Work IQ CLI's server (npx @microsoft/workiq mcp, or workiq mcp) is recognized the same way; other servers are not.",
@@ -1420,7 +1451,7 @@
     {
       "id": "WIQ-22",
       "area": "work-iq",
-      "claim": "The web UI has a token-guarded API for the profile's Work IQ account, which reads the profile as its files are now, so a sign-in made in another process counts. GET /api/workiq answers whether the account the agent uses is signed in, its line, how it connects (hosted or cli), its user, the CLI's account and path for a CLI account, the profile it belongs to (a digital worker may use its owner's) and whether that is this profile, why a digital worker its owner didn't let use theirs has none (not_used), the sign-in command, and today's calls against the per-day and per-run budgets (with each run's calls). POST /api/workiq/doctor answers the doctor's checks with their results, details and fixes, always as 200. POST /api/workiq/sign-in (account, cli_path) signs the profile in through Microsoft's Work IQ CLI as proofkin auth login workiq --cli does and answers who signed in and the line; DELETE /api/workiq signs out, and is refused when not signed in; each adds a line to the activity. PUT /api/workiq/budget (per_day, per_run) sets the budgets. Errors are 400s in the sign-in's or set_budget's own words. A digital worker that uses its owner's account sees it but is refused signing in, signing out and budgets: its owner does those. The page's Work IQ card, after the GitHub card, shows this from GET /api/workiq and acts through these endpoints; every element its script looks up is on the page, and its sign-in and budget dialogs close with Escape and Cancel like the others.",
+      "claim": "The web UI has a token-guarded API for the profile's Work IQ account, which reads the profile as its files are now, so a sign-in made in another process counts. GET /api/workiq answers whether the account the agent uses is signed in, its line, how it connects (hosted or cli), its user, the CLI's account and path for a CLI account, the profile it belongs to (a digital worker may use its owner's) and whether that is this profile, why a digital worker its owner didn't let use theirs has none (not_used), the sign-in command, whether this profile allows Microsoft 365 changes (changes, see WIQ-18), and today's calls against the per-day and per-run budgets (with each run's calls). POST /api/workiq/doctor answers the doctor's checks with their results, details and fixes, always as 200. POST /api/workiq/sign-in (account, cli_path) signs the profile in through Microsoft's Work IQ CLI as proofkin auth login workiq --cli does and answers who signed in and the line; DELETE /api/workiq signs out, and is refused when not signed in; each adds a line to the activity. PUT /api/workiq/budget (per_day, per_run) sets the budgets. Errors are 400s in the sign-in's or set_budget's own words. A digital worker that uses its owner's account sees it but is refused signing in, signing out and budgets: its owner does those. The page's Work IQ card, after the GitHub card, shows this from GET /api/workiq and acts through these endpoints; every element its script looks up is on the page, and its sign-in and budget dialogs close with Escape and Cancel like the others.",
       "tests": [
         "ui::the_workiq_api_signs_in_through_the_cli_runs_the_doctor_sets_budgets_and_signs_out",
         "ui::a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_the_owner",
@@ -2041,10 +2072,12 @@
     {
       "id": "FAC-22",
       "area": "agent-factory",
-      "claim": "A new deployment first runs its release's smoke cases on its worker (its canary), and takes only those tasks of its owner's until they pass; a canary that fails pins the release before again, or stops the worker when there is none (AC-19). factory rollback, and the web UI, make another release active on every deployment within seconds, with a reason kept in its history and the factory's audit (AC-20, AC-22).",
+      "claim": "A new deployment first runs its release's smoke cases on its worker (its canary), and takes only those tasks of its owner's until they pass; a canary that fails pins the release before again, or stops the worker when there is none (AC-19).             factory rollback, and the web UI, make another release active on every deployment within seconds, with a reason kept in its history and the factory's audit (AC-20, AC-22). Deleting a deployment's worker (the web UI's Delete, worker remove) ends the deployment: its record goes, with a line in the agent's history and the audit saying why, and the delete's answer names the agents whose deployment ended. Rollback and budgets pass by a deployment whose worker is gone, instead of failing for the whole agent.",
       "tests": [
         "lib::factory::deploy::a_failed_canary_goes_back_to_the_release_before_or_stops_its_worker",
         "lib::factory::deploy::a_rollback_pins_the_release_before_on_every_deployment_and_is_audited",
+              "lib::factory::deploy::a_deleted_workers_deployment_ends_and_rollback_and_budgets_pass_it_by",
+              "workers::owners_create_start_stop_and_delete_digital_workers_from_the_web_ui",
         "deploy::a_deployment_in_its_canary_takes_only_its_owners_canary_tasks",
         "evaluation::a_canary_runs_the_releases_smoke_cases_on_its_deployed_worker"
       ],

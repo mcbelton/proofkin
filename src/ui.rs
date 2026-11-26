@@ -2012,6 +2012,7 @@ async fn create_plan(
     State(s): State<AppState>,
     Json(body): Json<PlanBody>,
 ) -> Result<Json<Value>, ApiError> {
+    s.agent.settle_peers().await;
     let started = start_plan(&s, body.text, None).map_err(bad_request)?;
     Ok(Json(
         json!({ "plan": started.plan, "steps": started.steps }),
@@ -3105,6 +3106,7 @@ async fn delete_monitor(
 /// Parses a plan and checks it against the connected peers, their folders and
 /// checks, squads, knowledge and skills, without running it.
 async fn check_plan(State(s): State<AppState>, Json(body): Json<PlanBody>) -> Json<Value> {
+    s.agent.settle_peers().await;
     Json(plan_check(&s, &body.text))
 }
 

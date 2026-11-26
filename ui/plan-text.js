@@ -20,9 +20,10 @@ const planText = (() => {
   // issue and who reviews it (an option only it has).
   const IN_PR = new Set(["timeout", "issue", "reviewers"]);
   // A @workiq step asks Microsoft 365 for an answer: context, never proof. Its agent= is a Work IQ
-  // agent id; it has no skills, MCP servers, checks, claims, patches, folder, model or search of its own.
+  // agent id; it has no skills, MCP servers, checks, claims, folder, model or search of its own.
+  // With apply=STEP it makes the Microsoft 365 changes STEP proposed, once you signed them off.
   const WORKIQ = "@workiq";
-  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "apply", "mcp", "skill", "claims", "levels", "context", "workiq", "model", "effort", "base"]);
+  const NOT_IN_WORKIQ = new Set(["verify", "attempts", "mcp", "skill", "claims", "levels", "context", "workiq", "model", "effort", "base"]);
   /// Whether `target` is Microsoft 365 Copilot (@workiq; with a folder, which it can't have).
   const isWorkiq = (target) => target === WORKIQ || Boolean(target?.startsWith(`${WORKIQ}:`));
   // What a step with workiq= searches in Microsoft 365, by source (src/plan.rs WORKIQ_SOURCES).
@@ -42,8 +43,9 @@ const planText = (() => {
     squadSignoff: "A sign-off needs a person (@name or @me), not a squad.",
     signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result, agent, model, reasoning effort or Microsoft 365 search.",
     teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers, agent, model or reasoning effort of its own.",
-    workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, patches, skills, MCP servers, model, reasoning effort or search of its own.",
+    workiqOption: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it has no checks, claims, retries, skills, MCP servers, model, reasoning effort or search of its own.",
     workiqKind: "A @workiq step is an answer from Microsoft 365, which is context and never proof: it can't be a sign-off or a team step.",
+    workiqApply: "A @workiq step doesn't start from another step's work: with apply=, it makes the Microsoft 365 changes that step proposed. Take out apply= first.",
     prOption: "A pull request step opens the pull request with the work before it: it takes only a time limit, an issue and who reviews it.",
     prTarget: "A pull request step is opened by the agent that holds the folder's clone: a peer and its folder (@peer:folder).",
     reviewersOption: "Only a pull request step asks for reviews (reviewers=).",
@@ -219,6 +221,7 @@ const planText = (() => {
       if (workiq && (step.approve || step.team)) return { error: ERRORS.workiqKind };
       if (step.pr && !/^@[^:]+:.+/.test(part)) return { error: ERRORS.prTarget };
       if (workiq && step.options.some((o) => NOT_IN_WORKIQ.has(optionOf(o)))) return { error: ERRORS.workiqOption };
+      if (workiq && !isWorkiq(step.target) && valuesOf(step, "apply").length) return { error: ERRORS.workiqApply };
       // A sign-off is by a person: the peer, not one of its folders. Work IQ has no folders.
       step.target = step.approve || workiq ? part.split(":")[0] : part;
     } else if (part.startsWith("after ")) {
@@ -367,6 +370,8 @@ const planText = (() => {
     const workiq = isWorkiq(target);
     if (workiq) {
       for (const option of NOT_IN_WORKIQ) setValues(step, option, null);
+      // The work a peer's step started from (apply=) isn't Microsoft 365 changes to make.
+      if (!isWorkiq(step.target)) setValues(step, "apply", null);
       step.using = null;
     }
     if (workiq !== isWorkiq(step.target)) setValues(step, "agent", null);
@@ -531,8 +536,10 @@ const planText = (() => {
       if (s.pr && s.options.some((o) => !IN_PR.has(optionOf(o)))) need("step", i, "target", ERRORS.prOption);
       if (!s.pr && valuesOf(s, "reviewers").length) need("step", i, "target", ERRORS.reviewersOption);
       if (!s.approve && valuesOf(s, "changes").length) need("step", i, "target", ERRORS.changesOption);
-      // A pull request step without a title takes that of the work it opens.
-      if (!s.pr && blank(taskOf(s), TODO)) {
+      // A pull request step without a title takes that of the work it opens; one that makes the
+      // Microsoft 365 changes another proposed (@workiq apply=) needs no words either.
+      const makesChanges = s.target === WORKIQ && valuesOf(s, "apply").length > 0;
+      if (!s.pr && !makesChanges && blank(taskOf(s), TODO)) {
         need("step", i, "todo", s.approve ? "Say what to check before signing off" : "Say what this step should do");
       }
       if (!s.approve && !s.team && !s.pr && s.target !== WORKIQ && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {

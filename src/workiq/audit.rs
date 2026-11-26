@@ -191,7 +191,8 @@ impl Entry {
 
 /// The text the call asks, whose hash is logged.
 fn query_of(arguments: &Value) -> String {
-    for key in ["query", "question"] {
+    // A change keeps its path's SHA-256, never the path.
+    for key in ["query", "question", "parentUrl", "entityUrl", "actionUrl"] {
         if let Some(Value::String(text)) = arguments.get(key) {
             return text.clone();
         }

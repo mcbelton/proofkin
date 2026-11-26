@@ -454,6 +454,7 @@ async fn mcp_modern(
             list
         }
         "tools/call" => {
+            settle_for_plans(s, params).await;
             if let Some(stream) = progress_stream(s, headers, id, params, true) {
                 return stream;
             }
@@ -639,6 +640,7 @@ async fn mcp_legacy(
         "ping" => json!({}),
         "tools/list" => tools(),
         "tools/call" => {
+            settle_for_plans(s, params).await;
             if let Some(stream) = progress_stream(s, headers, id, params, false) {
                 return stream;
             }
@@ -1075,6 +1077,17 @@ fn wait_arg(args: &Value) -> Duration {
         .and_then(Value::as_u64)
         .map_or(DEFAULT_WAIT, Duration::from_secs)
         .min(MAX_WAIT)
+}
+
+/// A plan checked or started while a peer reconnects waits for it (see
+/// [`crate::agent::Agent::settle_peers`]).
+async fn settle_for_plans(s: &Shared, params: &Value) {
+    if matches!(
+        params.get("name").and_then(Value::as_str),
+        Some("run_plan" | "check_plan")
+    ) {
+        s.agent.settle_peers().await;
+    }
 }
 
 /// A tool's result: its JSON as text and as structured content; problems are errors
@@ -1670,6 +1683,10 @@ pub(super) async fn a2a(
         return reply(StatusCode::OK, error.json(&id));
     }
     let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+    // Work asked for while a peer reconnects waits for it.
+    if matches!(method, "SendMessage" | "SendStreamingMessage") {
+        s.agent.settle_peers().await;
+    }
     let streamed = match method {
         "SendStreamingMessage" => Some(start_message(&s, &params, true)),
         "SubscribeToTask" => Some(subscribe_job(&s, &params)),
