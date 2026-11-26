@@ -204,6 +204,10 @@ pub struct WorkIqError {
     pub message: String,
     pub fix: Fix,
     pub ids: RequestIds,
+    /// What the tool said when it reported the failure itself (`isError`, `stoppedReason:
+    /// "error"`): on one line, redacted, at most 300 characters; empty when it said nothing.
+    /// `None` for any other failure.
+    pub tool_text: Option<String>,
 }
 
 impl WorkIqError {
@@ -226,6 +230,7 @@ impl WorkIqError {
             message,
             fix,
             ids,
+            tool_text: None,
         }
     }
 
@@ -1202,7 +1207,8 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 /// A tool result that says the call failed (`isError`, or `stoppedReason: "error"` in the
-/// payload) is an error, classified from its text and payload fields.
+/// payload) is an error, classified from its text and payload fields, that keeps what the
+/// tool said (`tool_text`).
 fn check_tool_result(tool: &str, result: &Value, ids: &RequestIds) -> Result<()> {
     let payload = Payload::of(result.get("structuredContent"));
     let is_error = result
@@ -1212,18 +1218,12 @@ fn check_tool_result(tool: &str, result: &Value, ids: &RequestIds) -> Result<()>
     if !is_error && !payload.stopped_with_error {
         return Ok(());
     }
-    let text = result
+    let content = result
         .get("content")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+        .map(Vec::as_slice)
         .unwrap_or_default();
-    let detail: String = one_line(&text).chars().take(ERROR_BODY_CHARS).collect();
+    let detail = reported_text(content);
     let mut message = format!("the {tool} tool reported an error");
     if !detail.is_empty() {
         message.push_str(&format!(": {detail}"));
@@ -1234,8 +1234,33 @@ fn check_tool_result(tool: &str, result: &Value, ids: &RequestIds) -> Result<()>
     if let Some(action) = &payload.recovery_action {
         message.push_str(&format!(" (recovery action: {action})"));
     }
-    let class = classify(&text, &payload);
-    Err(WorkIqError::new(WorkIqErrorKind::Tool, class, message, ids.clone()).into())
+    // Classified by all the tool said, before it is redacted and cut.
+    let class = classify(&content_text(content), &payload);
+    let mut failure = WorkIqError::new(WorkIqErrorKind::Tool, class, message, ids.clone());
+    failure.tool_text = Some(detail);
+    Err(failure.into())
+}
+
+/// What a tool said in the text of its `content` when it reported a failure, for an error
+/// message: on one line, without control characters, its secrets redacted, at most
+/// [`ERROR_BODY_CHARS`] characters.
+pub(crate) fn reported_text(content: &[Value]) -> String {
+    let (text, _) = crate::redact::redact(&content_text(content));
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let text: String = one_line(&text).chars().take(ERROR_BODY_CHARS).collect();
+    text.trim_end().to_owned()
+}
+
+/// The text parts of a tool's `content`, joined with spaces.
+fn content_text(content: &[Value]) -> String {
+    content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
