@@ -37,9 +37,10 @@ pub const CHECKS: &[&str] = &["agent:blueprint", "agent:evals", "agent:report"];
 /// The largest report the checks read: reports keep their runs' outputs.
 const MAX_REPORT: u64 = 32 * 1024 * 1024;
 
-/// Writes agent `name`, from `template`, into `dir` as files (see the module); `catalog`, when
-/// given, fits it to a profile (the providers it is signed in to). Returns the files written.
-/// Fails if the folder has an agent already.
+/// Writes agent `name`, from `template`, into `dir` as files (see the module), with the files
+/// the template's cases work on in `agent/fixtures/` (one there already is kept); `catalog`,
+/// when given, fits it to a profile (the providers it is signed in to). Returns the files
+/// written. Fails if the folder has an agent already.
 pub fn init(
     dir: &Path,
     name: &str,
@@ -81,6 +82,8 @@ pub fn init(
         std::fs::write(&keep, "")?;
         written.push(format!("{folder}/"));
     }
+    let fixtures = crate::factory::templates::write_fixtures(template, &dir.join(FIXTURES))?;
+    written.extend(fixtures.iter().map(|file| format!("{FIXTURES}/{file}")));
     Ok(written)
 }
 
@@ -449,6 +452,8 @@ mod tests {
             BLUEPRINT,
             EVALS,
             "agent/fixtures/.gitkeep",
+            "agent/fixtures/README.md",
+            "agent/fixtures/src/main.py",
             "agent/reports/.gitkeep",
         ] {
             assert!(dir.path().join(file).is_file(), "{file}");

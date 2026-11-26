@@ -223,6 +223,10 @@ pub(super) async fn new_draft(s: &Shared, body: NewDraft, by: &str) -> Result<Va
     store
         .create_draft(&name, &draft, by, &what)
         .map_err(|e| conflict(format!("{e:#}")))?;
+    if let Some(template) = template {
+        templates::write_fixtures(template, &store.fixtures_dir(&name))
+            .map_err(|e| internal(format!("writing its fixtures: {e:#}")))?;
+    }
     let problems = runner::draft_problems(&store, &name, &draft.blueprint, &catalog.without(&name));
     s.send(json!({ "type": "factory" }));
     Ok(draft_json(&draft, &problems))

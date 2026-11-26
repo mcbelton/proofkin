@@ -178,6 +178,17 @@ proofkin factory edit fin-analyst                                # the draft as 
   starter eval suite: code reviewer, implementer, researcher, document extractor, data
   analyst, compliance checker, support triage, project coordinator and financial analyst.
   Each passes validation unchanged.
+- **Fixtures with the templates.** The researcher and implementer ask about files, so they
+  bring them (`factory/templates/<name>/fixtures/`, in the binary too): a small Python app
+  for the researcher, and a Node project tested by `node --test` for the implementer. A draft
+  made from one (`new --template`, `init --template`, the web UI's **New agent**, with or
+  without words) gets them in its fixtures folder; a file there already is kept. The other
+  templates' cases carry their data in their input.
+- **What a template can't bring.** The implementer's cases run check `test`, and a check's
+  command comes only from a folder the owner shares, never from a blueprint. Its evaluation
+  needs a deploy folder whose `test` check runs `node --test`: `factory templates` and **New
+  agent** say so, and so does the evaluation's error when none of its deploy folders defines
+  it.
 - **Drafting** gives the owner's default model (first provider, default effort) the schema,
   the catalog it may choose from (skill, topic, folder and MCP server names with their
   descriptions, allowed models), the template and the description. It works read-only, with

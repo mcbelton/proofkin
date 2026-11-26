@@ -1367,10 +1367,11 @@
     {
       "id": "WIQ-26",
       "area": "work-iq",
-      "claim": "Microsoft 365 content never goes on GitHub through a tracked run (issue #250): the tracker comments each step's result, or why it failed, on its issue, and the repository may be public, so what a step that may hold Microsoft 365 content ended with stays in the run's record, and its comment says so and names the agent that has it. A step may hold it if it brings some (workiq=, @workiq), its model may read some (mcp=workiq), it is marked with some (a context= topic from Microsoft 365), its signed evidence names labels, or a step it waits for held some. Other steps' results, and a sign-off's note (its approver's own words), are posted as before. The plan editor's tracking note says so.",
+      "claim": "Microsoft 365 content never goes on GitHub through a tracked run (issue #250): the tracker comments each step's result, or why it failed, on its issue, and the repository may be public, so what a step that may hold Microsoft 365 content ended with stays in the run's record, and its comment says so and names the agent that has it. A step may hold it if it brings some (workiq=, @workiq), its model may read some (mcp=workiq), it is marked with some (a context= topic from Microsoft 365), its signed evidence names labels, or a step it waits for held some. Other steps' results, and a sign-off's note (its approver's own words), are posted as before. The plan editor's tracking note says so. A plan imported from a Microsoft 365 document (spec import --from, issue #261) quotes the document in its claims and steps, which a tracked run posts, so it says track: off right after its comments, after a comment saying why that names the document's sensitivity label (no label information without one): its runs aren't tracked unless the user takes that line out, and the import's summary says so. A Spec Kit or OpenSpec folder's plan has no track: line.",
       "tests": [
         "lib::tracker::microsoft_365_content_stays_off_github",
-        "ui::the_plan_editor_keeps_plans_valid"
+        "ui::the_plan_editor_keeps_plans_valid",
+        "lib::spec_import::imported_documents_are_not_tracked_on_github_and_say_why"
       ]
     },
     {
@@ -2103,6 +2104,22 @@
         "factory_api::owners_release_deploy_roll_back_and_retire_factory_agents_from_the_web_ui",
         "lib::factory::blueprint::a_name_in_use_or_reserved_is_refused",
         "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
+      "id": "FAC-28",
+      "area": "agent-factory",
+      "claim": "The researcher and implementer templates bring the files their cases work on: a small Python app, and a Node project whose tests pass with node --test as shipped. Every template's suite has the fixtures it names once they are written, and each fixture a template brings is named by one of its cases. A draft from one, made with proofkin factory new --template, factory init --template or the web UI's New agent, has them in its fixtures folder, keeping a file there already. The implementer's test check stays the owner's: factory templates and New agent say its evaluation needs a deploy folder whose test check runs node --test, and when none of its deploy folders defines the check, the evaluation's error says what to run.",
+      "tests": [
+        "lib::factory::templates::every_template_passes_validation_unchanged_with_a_case_for_every_requirement",
+        "lib::factory::templates::writing_a_templates_fixtures_keeps_the_files_already_there",
+        "lib::factory::templates::the_implementers_fixtures_pass_node_test_as_shipped",
+        "lib::factory::templates::templates_are_listed_with_their_purpose_access_and_cases",
+        "lib::factory::runner::a_check_no_deploy_folder_defines_is_named_with_the_command_its_template_needs",
+        "lib::factory::code::init_writes_a_folder_whose_blueprint_and_suite_pass",
+        "factory::a_draft_from_a_template_has_the_files_its_cases_work_on",
+        "factory::an_agent_kept_as_code_is_checked_in_its_folder_and_drafted_from_it",
+        "ui::the_factory_api_answers_as_its_contract_says"
       ]
     }
   ]

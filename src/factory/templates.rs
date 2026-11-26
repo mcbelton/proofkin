@@ -2,6 +2,11 @@
 //! eval suites, in `factory/templates/*.json`, embedded in the binary like the built-in
 //! skills. Each asks for the least access it needs and has at least three cases,
 //! covering every requirement. [`instantiate`] makes an agent's first draft from one.
+//! A template whose cases work on files brings them, from
+//! `factory/templates/<name>/fixtures/`: [`write_fixtures`] puts them in the agent's
+//! fixtures folder.
+
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -48,6 +53,77 @@ const BUILT_IN: &[(&str, &str)] = &[
     ),
 ];
 
+/// The project the researcher's cases ask about: what it is, how it is started and the
+/// one external service it calls.
+const RESEARCHER_FIXTURES: &[(&str, &str)] = &[
+    (
+        "README.md",
+        include_str!("../../factory/templates/researcher/fixtures/README.md"),
+    ),
+    (
+        "src/main.py",
+        include_str!("../../factory/templates/researcher/fixtures/src/main.py"),
+    ),
+    (
+        "config.ini",
+        include_str!("../../factory/templates/researcher/fixtures/config.ini"),
+    ),
+];
+
+/// The Node project the implementer's cases change, tested by `node --test`.
+const IMPLEMENTER_FIXTURES: &[(&str, &str)] = &[
+    (
+        "package.json",
+        include_str!("../../factory/templates/implementer/fixtures/package.json"),
+    ),
+    (
+        "src/strings.js",
+        include_str!("../../factory/templates/implementer/fixtures/src/strings.js"),
+    ),
+    (
+        "src/numbers.js",
+        include_str!("../../factory/templates/implementer/fixtures/src/numbers.js"),
+    ),
+    (
+        "src/config.js",
+        include_str!("../../factory/templates/implementer/fixtures/src/config.js"),
+    ),
+    (
+        "test/strings.test.js",
+        include_str!("../../factory/templates/implementer/fixtures/test/strings.test.js"),
+    ),
+    (
+        "test/numbers.test.js",
+        include_str!("../../factory/templates/implementer/fixtures/test/numbers.test.js"),
+    ),
+    (
+        "test/config.test.js",
+        include_str!("../../factory/templates/implementer/fixtures/test/config.test.js"),
+    ),
+];
+
+/// A check a template's cases run that a draft can't bring: a check's command comes
+/// only from a folder the owner shares, never from a blueprint.
+struct NeededCheck {
+    name: &'static str,
+    /// The command the template's fixtures need it to run.
+    command: &'static str,
+    /// What the fixtures are.
+    fixtures: &'static str,
+}
+
+/// The check template `name`'s cases run that its evaluation needs a deploy folder for.
+fn needed_check(name: &str) -> Option<NeededCheck> {
+    match name {
+        "implementer" => Some(NeededCheck {
+            name: "test",
+            command: "node --test",
+            fixtures: "a Node project",
+        }),
+        _ => None,
+    }
+}
+
 /// A template, as listed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TemplateInfo {
@@ -58,6 +134,9 @@ pub struct TemplateInfo {
     pub access: Access,
     /// How many eval cases it starts with.
     pub eval_cases: usize,
+    /// What its evaluation needs that a draft from it can't bring, if anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs: Option<String>,
 }
 
 /// The names of the built-in templates.
@@ -88,9 +167,74 @@ pub fn list() -> Vec<TemplateInfo> {
                 purpose: blueprint.purpose,
                 access: blueprint.capabilities.access,
                 eval_cases: blueprint.evals.cases.len(),
+                needs: needs(name),
             })
         })
         .collect()
+}
+
+/// What template `name`'s evaluation needs that a draft from it can't bring, if anything.
+pub fn needs(name: &str) -> Option<String> {
+    let needed = needed_check(name)?;
+    Some(format!(
+        "needs a deploy folder whose {} check runs {}",
+        needed.name, needed.command
+    ))
+}
+
+/// For an agent drafted from template `name` whose evaluation can't start because none of
+/// its deploy folders defines check `check`: what the check is to run, if the template says.
+pub fn check_hint(name: &str, check: &str) -> Option<String> {
+    let needed = needed_check(name).filter(|c| c.name == check)?;
+    Some(format!(
+        "its fixtures are {}: --check {check}=\"{}\"",
+        needed.fixtures, needed.command
+    ))
+}
+
+/// The files template `name`'s cases work on, as their paths in an agent's fixtures folder
+/// and their text: none for a template whose cases carry their data in their input.
+pub fn fixtures(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name {
+        "researcher" => RESEARCHER_FIXTURES,
+        "implementer" => IMPLEMENTER_FIXTURES,
+        _ => &[],
+    }
+}
+
+/// Writes template `name`'s fixtures into `dir`, an agent's fixtures folder. A file there
+/// already is kept, not overwritten. Returns the paths of the files it wrote.
+pub fn write_fixtures(name: &str, dir: &Path) -> Result<Vec<&'static str>> {
+    let mut written = Vec::new();
+    for (path, text) in fixtures(name) {
+        if taken(dir, path) {
+            continue;
+        }
+        let to = dir.join(path);
+        let parent = to.parent().unwrap_or(dir);
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::write(&to, text).with_context(|| format!("writing {}", to.display()))?;
+        written.push(*path);
+    }
+    Ok(written)
+}
+
+/// Whether nothing is to be written at `path` (relative, with `/`) in `dir`: something is
+/// there already, or the way there goes through a file or a symbolic link, which isn't
+/// followed.
+fn taken(dir: &Path, path: &str) -> bool {
+    let mut at = dir.to_path_buf();
+    for part in path.split('/') {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            // A folder, not a link to one: on down.
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return true,
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// The first draft of agent `name` from template `template`, for the profile `catalog`
@@ -140,6 +284,7 @@ pub fn instantiate(template: &str, name: &str, catalog: &Catalog) -> Result<Valu
 mod tests {
     use super::*;
     use crate::factory::blueprint::check_value;
+    use crate::factory::evals::check_fixtures;
 
     /// A profile with the built-in skills, signed in to every provider, with no
     /// folders, topics or peers of its own.
@@ -179,6 +324,59 @@ mod tests {
                 blueprint.capabilities.mcp.is_empty(),
                 "{name} needs no MCP server"
             );
+            // Its cases have the files they name once its fixtures are written, and it
+            // brings none they don't name.
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                write_fixtures(name, dir.path()).unwrap().len(),
+                fixtures(name).len()
+            );
+            let missing = check_fixtures(&blueprint.evals, dir.path());
+            assert!(missing.is_empty(), "{name}: {missing:#?}");
+            let cases = &blueprint.evals.cases;
+            for (path, _) in fixtures(name) {
+                let named = cases.iter().any(|c| c.fixtures.iter().any(|f| f == path));
+                assert!(named, "{name} brings {path}, which no case names");
+            }
+        }
+    }
+
+    #[test]
+    fn writing_a_templates_fixtures_keeps_the_files_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "our own notes\n").unwrap();
+        let written = write_fixtures("researcher", dir.path()).unwrap();
+        assert_eq!(written, ["src/main.py", "config.ini"]);
+        let kept = std::fs::read_to_string(dir.path().join("README.md")).unwrap();
+        assert_eq!(kept, "our own notes\n");
+        assert!(dir.path().join("src").join("main.py").is_file());
+        assert!(write_fixtures("researcher", dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_implementers_fixtures_pass_node_test_as_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixtures("implementer", dir.path()).unwrap();
+        let run = std::process::Command::new("node")
+            .arg("--test")
+            .current_dir(dir.path())
+            .output();
+        let output = match run {
+            Ok(output) => output,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("note: node isn't on PATH: the implementer's fixtures weren't run");
+                return;
+            }
+            Err(e) => panic!("running node --test: {e}"),
+        };
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "node --test failed:\n{out}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for test in ["capitalize puts", "round keeps", "readConfig refuses"] {
+            assert!(out.contains(test), "{test:?} didn't run:\n{out}");
         }
     }
 
@@ -192,6 +390,11 @@ mod tests {
         assert!(!reviewer.purpose.is_empty());
         let implementer = listed.iter().find(|t| t.name == "implementer").unwrap();
         assert_eq!(implementer.access, Access::Full, "it builds and tests");
+        assert_eq!(
+            implementer.needs.as_deref(),
+            Some("needs a deploy folder whose test check runs node --test")
+        );
+        assert_eq!(reviewer.needs, None, "its cases run no check");
         assert!(
             get("astrologer")
                 .unwrap_err()
