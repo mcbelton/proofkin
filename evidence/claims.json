@@ -1812,7 +1812,7 @@
     {
       "id": "FAC-4",
       "area": "agent-factory",
-      "claim": "An agent's eval suite has cases that each name the requirement they prove, give a task, its fixtures and what to expect, and every requirement needs a case with a deterministic expectation (AC-10). contains, not-contains, regex, json-schema, max-words, files-changed and check expectations pass and fail as the design says (check runs the folder's check in the run's folder); a judge rubric is scored by a model, never graded here. Fixtures must be files in the agent's fixtures folder, reached without links.",
+      "claim": "An agent's eval suite has cases that each name the requirement they prove, give a task, its fixtures and what to expect, and every requirement needs a case with a deterministic expectation (AC-10). contains, not-contains, regex, json-schema, max-words, files-changed and check expectations pass and fail as the design says (check runs the folder's check in the run's folder), and a failing run's note names the expectation it missed (e.g. expected no \"Not found\" (not-contains), but the answer has it); a judge rubric is scored by a model, never graded here. Fixtures must be files in the agent's fixtures folder, reached without links.",
       "tests": [
         "lib::factory::evals::cases_name_a_requirement_give_a_task_and_expect_what_the_agent_can_do",
         "lib::factory::evals::every_requirement_needs_a_case_with_a_deterministic_expectation",
@@ -2026,9 +2026,10 @@
     {
       "id": "FAC-21",
       "area": "agent-factory",
-      "claim": "A release is deployed as a digital worker named after the agent and pinned to it: the worker runs exactly that release on every task (its copy verified against its owner's signature; a changed copy refuses work), with at most the access the release asks for in each folder it is given, only the MCP servers and tools it asks for, and no delegation unless it asks for it and its owner allows it (AC-7, AC-18, TM-5). Peers, its worker's card and Run on show the release it runs.",
+      "claim": "A release is deployed as a digital worker named after the agent and pinned to it: the worker runs exactly that release on every task (its copy verified against its owner's signature; a changed copy refuses work), with at most the access the release asks for in each folder it is given, only the MCP servers and tools it asks for, and no delegation unless it asks for it and its owner allows it (AC-7, AC-18, TM-5). A deployment works in at least one folder its owner shares: none given (or an empty list) means the folders its release names, and when that names none it is refused, saying to pick one (factory deploy names --folders). Peers, its worker's card and Run on show the release it runs.",
       "tests": [
         "lib::factory::deploy::a_worker_runs_exactly_its_pinned_release_and_a_changed_copy_refuses_work",
+        "lib::factory::manage::deploying_a_release_that_names_no_folders_says_the_folders_flag",
         "deploy::a_deployed_worker_runs_its_release_on_every_task_at_the_access_it_asks_for"
       ],
       "live": [
@@ -2101,10 +2102,11 @@
     {
       "id": "FAC-27",
       "area": "agent-factory",
-      "claim": "The web UI's API for released agents answers as its contract says: releasing a passed evaluation, a release with its diff and evaluation summary, deploying (canary, start), rolling back, deprecating, reactivating and retiring, metrics and budgets, each with the status codes it lists, and the owner signs off from the web UI (AC-27); released and deployed, the agent's name stays its own. The Agent factory card configures an agent with a form whose choices come from what its owner has (JSON for all of it), releases and signs off, deploys, rolls back or forward, sets budgets, shows metrics and retires it; a deployed agent's release shows on its worker, its peer entry and Run on, the plan editor and Plugins & tools list factory agents, and the page follows the UX guidelines.",
+      "claim": "The web UI's API for released agents answers as its contract says: releasing a passed evaluation, a release with its diff and evaluation summary, deploying (canary, start), rolling back, deprecating, reactivating and retiring, metrics and budgets, each with the status codes it lists, and the owner signs off from the web UI (AC-27); released and deployed, the agent's name stays its own; a deployment whose release names no folders, with none given, is refused saying to pick a folder you share. The Agent factory card configures an agent with a form whose choices come from what its owner has (JSON for all of it), releases and signs off, deploys, rolls back or forward, sets budgets, shows metrics and retires it; its Deployments tab says why it can't deploy before anything is sent (no folder shared: share one, and Deploy is disabled; none ticked when the release names none: tick one) and what a deployment works in, approving a release redraws it at once, and Evaluate shows how the last evaluation ended until another starts, with the way to its report. A deployed agent's release shows on its worker, its peer entry and Run on, the plan editor and Plugins & tools list factory agents, and the page follows the UX guidelines.",
       "tests": [
         "factory_api::owners_release_deploy_roll_back_and_retire_factory_agents_from_the_web_ui",
         "lib::factory::blueprint::a_name_in_use_or_reserved_is_refused",
+        "ui::the_deploy_form_says_why_it_cant_deploy_before_it_sends",
         "ui::the_page_follows_the_ux_guidelines"
       ]
     }

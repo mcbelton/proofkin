@@ -47,9 +47,13 @@ fn known(store: &FactoryStore, name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// A release as the contract shows it, with what the page shows of it.
-pub(super) fn release_view(r: &Release) -> Value {
+/// A release as the contract shows it, with what the page shows of it (and the folders its
+/// deployments work in unless they're told others).
+pub(super) fn release_view(store: &FactoryStore, r: &Release) -> Value {
     let m = &r.manifest;
+    let folders = release::blueprint_of(store, &m.agent, &m.version)
+        .map(|bp| bp.deploy.folders)
+        .unwrap_or_default();
     json!({
         "agent": m.agent,
         "version": m.version,
@@ -80,6 +84,7 @@ pub(super) fn release_view(r: &Release) -> Value {
         "capabilities": release::capabilities_text(&m.capabilities),
         "origin": m.origin,
         "files": m.files,
+        "folders": folders,
     })
 }
 
@@ -190,7 +195,7 @@ pub(super) async fn request_release(
         },
     );
     s.send(json!({ "type": "factory", "agent": name }));
-    Ok((StatusCode::ACCEPTED, Json(release_view(&made))))
+    Ok((StatusCode::ACCEPTED, Json(release_view(&store, &made))))
 }
 
 pub(super) async fn get_release(
@@ -200,7 +205,7 @@ pub(super) async fn get_release(
     let store = FactoryStore::of(&s.info.profile);
     known(&store, &name)?;
     let found = release::load(&store, &name, &version).map_err(refused)?;
-    let mut view = release_view(&found);
+    let mut view = release_view(&store, &found);
     if let Some(previous) = found.manifest.previous.as_deref() {
         view["diff"] = json!(release::diff(&store, &name, previous, &version).unwrap_or_default());
     }

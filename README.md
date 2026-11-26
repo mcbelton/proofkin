@@ -1485,10 +1485,12 @@ proofkin factory retire fin-analyst --reason "replaced" --profile alice   # --pu
   one.
 - A **deployment** is a digital worker named after the agent that runs one release, in the
   folders you pick (at most the access it asks for, with only the MCP servers and tools it
-  asks for). Its **canary** first runs the release's smoke cases on it; until they pass it
-  takes only those tasks, and a canary that fails goes back to the release before (or stops
-  the worker). It keeps to its **budgets** before any model call: tasks a day, attempts and
-  a timeout; a task over them is refused and says why.
+  asks for). It needs at least one folder you share (its own data folder doesn't count):
+  without `--folders` it works in those its release names, and a release that names none is
+  refused until you pick one. Its **canary** first runs the release's smoke cases on it;
+  until they pass it takes only those tasks, and a canary that fails goes back to the
+  release before (or stops the worker). It keeps to its **budgets** before any model call:
+  tasks a day, attempts and a timeout; a task over them is refused and says why.
 - Its tasks' audit entries name the release (`fin-analyst@1.2.0`), the attempts and checks,
   and what refused them, never their text: `factory metrics` and the **Agents** section of
   `proofkin ops report` count them by release.
@@ -1506,12 +1508,16 @@ agent's dialog has:
   skills, access, MCP servers and tools, checks, Microsoft 365 sources, delegation, models,
   memory, budgets, deploy folders and approvers), with choices from what you have; **JSON**
   edits all of it, its eval suite too. Both are checked as you save.
-- **Evaluate** (the estimate first, then live progress) and **Evaluations** (the gate, each
-  model's results and the failing runs).
+- **Evaluate** (the estimate first, then live progress; once it ends, what it recommends or
+  why it failed, until you start another, with **Open in Evaluations**) and **Evaluations**
+  (the gate, each model's results and the failing runs, each with the expectation it
+  missed).
 - **Releases**: release a passed evaluation (version and note), each release's state,
   sign-offs (yours answered right there), what changed and what it holds.
-- **Deployments**: deploy a release (folders, canary, start now), each deployment's canary
-  and state, start or stop its worker, roll back with a reason, and its budgets.
+- **Deployments**: deploy a release (the folders it works in, canary, start now), each
+  deployment's canary and state, start or stop its worker, roll back with a reason, and its
+  budgets. None ticked means the folders its release names; if you share no folders and it
+  names none, the form says to share one (`proofkin share add`) and Deploy stays disabled.
 - **Metrics**: its tasks by release since 24 hours to 90 days ago.
 
 A deployed agent's worker shows the release it runs under **Digital workers** (with **Open
