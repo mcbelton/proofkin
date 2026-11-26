@@ -21,7 +21,9 @@
 //!   (`Refs: owner/repo#N`) and a pull request from its branch closes them, so the
 //!   issues show the pull request. The issue of a run that passed stays open while some
 //!   of its sub-issues are (waiting for pull requests, or other work) and is closed by
-//!   [`Tracker::settle`] once all of them are.
+//!   [`Tracker::settle`] once all of them are. Only an issue a run made is closed so
+//!   (`track: <title>`, or no `track:`): one a person named with `track: #N` may hold
+//!   other work, so it goes back where it was on the board and stays open.
 //!
 //! Everything goes through GitHub's GraphQL API with the GitHub CLI (`gh api graphql`,
 //! the request on stdin and the profile's token in `GH_TOKEN`). Issues need the
@@ -1045,7 +1047,9 @@ impl Tracker {
 
     /// Closes the run issues left open whose sub-issues are all closed now (see
     /// [`TrackerConfig::open_runs`]); returns those it closed. Keeps the rest in
-    /// `config.open_runs` (the caller saves it).
+    /// `config.open_runs` (the caller saves it), but not those closed already, nor an issue
+    /// a person named (see [`made_by_a_run`]) that an earlier version kept there: a run
+    /// never closes one.
     pub async fn settle(&mut self) -> Result<Vec<u64>> {
         let numbers = self.config.open_runs.clone();
         if numbers.is_empty() {
@@ -1067,9 +1071,11 @@ impl Tracker {
         let (mut ops, mut closed, mut open) = (Vec::new(), Vec::new(), Vec::new());
         for n in numbers {
             let Some(issue) = issues.get(&n) else {
+                // Not read now: tried again next time.
+                open.push(n);
                 continue;
             };
-            if !issue.open {
+            if !issue.open || !made_by_a_run(issue) {
                 continue;
             }
             let (completed, total) = issue.summary;
@@ -1676,9 +1682,10 @@ pub async fn settle(profile: &Profile) -> Result<Vec<u64>> {
     let Some(mut tracker) = open(profile).await? else {
         return Ok(Vec::new());
     };
+    let before = tracker.config.open_runs.clone();
     let closed = tracker.settle().await?;
-    if !closed.is_empty() {
-        save_open_runs(&profile.tracker_path(), &tracker.config.open_runs, &closed)?;
+    if tracker.config.open_runs != before {
+        save_open_runs(&profile.tracker_path(), &before, &tracker.config.open_runs)?;
     }
     Ok(closed)
 }
@@ -1735,23 +1742,24 @@ pub async fn sync(profile: &Profile) -> Result<Synced> {
             waiting: Vec::new(),
         });
     };
+    let before = tracker.config.open_runs.clone();
     let closed = tracker.settle().await?;
-    if !closed.is_empty() {
-        save_open_runs(&profile.tracker_path(), &tracker.config.open_runs, &closed)?;
+    if tracker.config.open_runs != before {
+        save_open_runs(&profile.tracker_path(), &before, &tracker.config.open_runs)?;
     }
     let waiting = tracker.waiting().await?;
     Ok(Synced { closed, waiting })
 }
 
-/// Saves `open` as the tracker's open run issues, keeping any added since it was
-/// read, but not `closed`.
-fn save_open_runs(path: &Path, open: &[u64], closed: &[u64]) -> Result<()> {
+/// Saves the tracker's open run issues: `after` (what a settle left of `before`, the list
+/// it read), and any added to the file since it was read.
+fn save_open_runs(path: &Path, before: &[u64], after: &[u64]) -> Result<()> {
     let Some(mut config) = TrackerConfig::load(path)? else {
         return Ok(());
     };
-    let mut runs: Vec<u64> = open.to_vec();
+    let mut runs: Vec<u64> = after.to_vec();
     for n in config.open_runs {
-        if !runs.contains(&n) && !closed.contains(&n) {
+        if !runs.contains(&n) && !before.contains(&n) {
             runs.push(n);
         }
     }
@@ -1827,6 +1835,9 @@ struct Run {
     issue: StepIssue,
     /// The run issue's status on the board before the run, by name.
     previous: Option<String>,
+    /// Whether a run made the run's issue (see [`made_by_a_run`]): only then does this run
+    /// close it, or set it In review or Done.
+    own_issue: bool,
     steps: BTreeMap<String, StepIssue>,
     problems: Vec<String>,
     /// Each step's last status and agent on the board.
@@ -1880,6 +1891,17 @@ pub fn issue_title(text: &str) -> Option<&str> {
 /// The marker in a step issue's body, so a later run on the same issue finds it.
 fn step_marker(step: &str) -> String {
     format!("<!-- proofkin:step={step} -->")
+}
+
+/// The start of the marker in the body of a run's issue that a run made (see [`run_body`]).
+const RUN_MARKER: &str = "<!-- proofkin:run=";
+
+/// Whether `issue` is a run's issue that a Proofkin run made (`track: <title>`, or no
+/// `track:`): only such an issue is closed when its run's work is done. An issue a person
+/// named with `track: #N` (an epic, a bucket of findings) may hold other work, so a run
+/// leaves it open.
+fn made_by_a_run(issue: &Issue) -> bool {
+    issue.body.contains(RUN_MARKER)
 }
 
 /// The step issues runs in this process work on now, by host, repository and number.
@@ -2147,6 +2169,7 @@ impl Run {
         let mut run = Run {
             issue: StepIssue::from(&run_issue),
             previous: run_issue.status.clone(),
+            own_issue: made_by_a_run(&run_issue),
             texts: plan
                 .steps
                 .iter()
@@ -2352,7 +2375,9 @@ impl Run {
     }
 
     /// Ends the run on its issue: the verdict, then done (nothing left to merge), in
-    /// review (its steps' work waits for pull requests) or back where it was.
+    /// review (its steps' work waits for pull requests) or back where it was. An issue a
+    /// person named (`track: #N`, see [`made_by_a_run`]) always goes back where it was,
+    /// and stays open.
     async fn finish(&mut self, run: &RunRecord) {
         let succeeded = run.passed()
             || (run.claims.is_empty()
@@ -2360,10 +2385,19 @@ impl Run {
                     .steps
                     .iter()
                     .all(|s| matches!(s.state, StepState::Done { .. })));
+        let mut comment = run_comment(run, &self.steps, &self.tracker.login);
+        if succeeded && !self.own_issue {
+            comment += &format!(
+                "\n\nThis issue stays open: a run closes only an issue it made (`track: <title>`, \
+                 or no `track:`), and this one was named with `track: #{}`, so it may hold other \
+                 work.",
+                self.issue.number
+            );
+        }
         let mut ops = vec![op(
             "addComment",
             "AddCommentInput",
-            json!({ "subjectId": self.issue.id, "body": run_comment(run, &self.steps, &self.tracker.login) }),
+            json!({ "subjectId": self.issue.id, "body": comment }),
         )];
         let open_subs: Vec<u64> = match self.tracker.issues(&[self.issue.number]).await {
             Ok(now) => now
@@ -2376,18 +2410,19 @@ impl Run {
             }
         };
         let ours: HashSet<u64> = self.steps.values().map(|s| s.number).collect();
-        // A run that passed leaves its issue open only while some of its sub-issues are:
-        // in review if they are all its own steps' (waiting for pull requests), else
+        // A run that passed leaves its own issue open only while some of its sub-issues
+        // are: in review if they are all its own steps' (waiting for pull requests), else
         // back where it was (other work). Either way it is closed once they all are.
-        let keep_open = succeeded && !open_subs.is_empty();
-        let status = if succeeded && open_subs.is_empty() {
+        let closes = succeeded && self.own_issue;
+        let keep_open = closes && !open_subs.is_empty();
+        let status = if closes && open_subs.is_empty() {
             ops.push(op(
                 "closeIssue",
                 "CloseIssueInput",
                 json!({ "issueId": self.issue.id, "stateReason": "COMPLETED" }),
             ));
             Some(Status::Done)
-        } else if succeeded && open_subs.iter().all(|n| ours.contains(n)) {
+        } else if closes && open_subs.iter().all(|n| ours.contains(n)) {
             Some(Status::InReview)
         } else {
             None
@@ -2428,6 +2463,7 @@ impl Run {
                     .collect();
             }
             if !others.open_runs.is_empty() {
+                let before = others.open_runs.clone();
                 let mut tracker = Tracker {
                     api: self.tracker.api.clone(),
                     config: others,
@@ -2440,9 +2476,9 @@ impl Run {
                     board_problem: None,
                     board_scope: None,
                 };
-                if let Ok(closed) = tracker.settle().await
-                    && !closed.is_empty()
-                    && let Err(e) = save_open_runs(&path, &tracker.config.open_runs, &closed)
+                if tracker.settle().await.is_ok()
+                    && tracker.config.open_runs != before
+                    && let Err(e) = save_open_runs(&path, &before, &tracker.config.open_runs)
                 {
                     self.problem(format!("saving the tracker: {e:#}"));
                 }
@@ -2538,7 +2574,7 @@ fn run_body(plan: &Plan, run_id: &str, agent: &str) -> String {
             safe(&step_title(s), 200).replace('`', "'")
         );
     }
-    md += &format!("\n<!-- proofkin:run={run_id} -->\n");
+    md += &format!("\n{RUN_MARKER}{run_id} -->\n");
     md
 }
 
@@ -3019,6 +3055,7 @@ pub async fn resume_with(
     let run = Run {
         issue: StepIssue::from(&run_issue),
         previous: run_issue.status.clone(),
+        own_issue: made_by_a_run(&run_issue),
         texts: plan
             .steps
             .iter()
@@ -3177,7 +3214,12 @@ mod tests {
                 return Value::Null;
             };
             let node = |i: &FakeIssue| {
-                json!({ "number": i.number, "title": i.body, "state": if i.open { "OPEN" } else { "CLOSED" },
+                let title = if i.title.is_empty() {
+                    &i.body
+                } else {
+                    &i.title
+                };
+                json!({ "number": i.number, "title": title, "state": if i.open { "OPEN" } else { "CLOSED" },
                         "url": format!("https://github.com/acme/app/issues/{}", i.number),
                         "closedByPullRequestsReferences": { "nodes": i.closed_by.iter().map(|p| json!({ "number": p })).collect::<Vec<_>>() } })
             };
@@ -4105,13 +4147,15 @@ mod tests {
         assert!(fake.open(10) && fake.status(10).as_deref() == Some("Todo"));
     }
 
+    /// The issue of a run that passed waits while it has other open work, then settling
+    /// closes it: here an earlier run made it (its marker), and a later run tracks it again.
     #[tokio::test]
     async fn a_passed_runs_issue_waits_for_its_other_open_work_then_closes() {
         let fake = Fake::with(&[
             FakeIssue {
                 number: 10,
                 open: true,
-                body: "The epic".into(),
+                body: format!("An earlier run's issue.\n\n{RUN_MARKER}r0 -->\n"),
                 status: Some("Todo".into()),
                 item: Some("PVTI10".into()),
                 ..FakeIssue::default()
@@ -4159,6 +4203,103 @@ mod tests {
         assert!(!fake.open(10) && fake.status(10).as_deref() == Some("Done"));
     }
 
+    /// An issue a person named with `track: #N` (an epic, a bucket of findings) may hold
+    /// other work: a run that passed comments on it and puts it back where it was, but
+    /// neither closes it nor waits to. One an earlier version left waiting is let go by
+    /// settling, still open, while a run's own issue and one that can't be read now stay.
+    #[tokio::test]
+    async fn a_run_never_closes_an_issue_a_person_named() {
+        let fake = Fake::with(&[
+            FakeIssue {
+                number: 10,
+                open: true,
+                body: "Small findings, one sub-issue each.".into(),
+                status: Some("Todo".into()),
+                item: Some("PVTI10".into()),
+                ..FakeIssue::default()
+            },
+            FakeIssue {
+                number: 11,
+                open: true,
+                body: format!("A run's issue.\n\n{RUN_MARKER}r0 -->\n"),
+                ..FakeIssue::default()
+            },
+            FakeIssue {
+                number: 12,
+                open: true,
+                body: "Its work, waiting for a pull request.".into(),
+                parent: Some(11),
+                ..FakeIssue::default()
+            },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.json");
+        config().save(&path).unwrap();
+        let text = "track: #10\nnotes @worker Write the release notes";
+        let plan = Plan::parse(text).unwrap();
+        let tracking = start_with(
+            fake.clone(),
+            config(),
+            &plan,
+            "r5",
+            "boss",
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+        tracking.update("notes", &done("worker", None));
+        let states = BTreeMap::from([("notes".to_owned(), done("worker", None))]);
+        let mut record = RunRecord::new("boss", "id", text, &plan, &states, 0);
+        record.id = "r5".into();
+        let tracked = tracking.finish(&record).await;
+        assert!(tracked.problems.is_empty(), "{:?}", tracked.problems);
+        // Its step changed no files, so its sub-issue is done: #10 has nothing open, yet it
+        // stays open, back where it was, and isn't left for settling.
+        assert!(!fake.open(tracked.steps["notes"].number));
+        assert!(fake.open(10) && fake.status(10).as_deref() == Some("Todo"));
+        assert!(
+            fake.calls("closeIssue")
+                .iter()
+                .all(|c| c["issueId"] != "I10")
+        );
+        let config_now = TrackerConfig::load(&path).unwrap().unwrap();
+        assert!(config_now.open_runs.is_empty());
+        let comments = fake.calls("addComment");
+        let end = comments
+            .iter()
+            .rfind(|c| c["subjectId"] == "I10")
+            .and_then(|c| c["body"].as_str())
+            .unwrap();
+        let stays = "This issue stays open: a run closes only an issue it made (`track: \
+                     <title>`, or no `track:`), and this one was named with `track: #10`, so \
+                     it may hold other work.";
+        assert!(end.contains("ended") && end.ends_with(stays), "{end}");
+
+        // An earlier version left #10 waiting, next to a run's own #11 and #99, which can't
+        // be read now; a run added #13 to the file meanwhile.
+        let before = vec![10, 11, 99];
+        let saved = TrackerConfig {
+            open_runs: vec![10, 11, 99, 13],
+            ..config()
+        };
+        saved.save(&path).unwrap();
+        let mut tracker = Tracker::connect(
+            fake.clone(),
+            TrackerConfig {
+                open_runs: before.clone(),
+                ..config()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(tracker.settle().await.unwrap().is_empty());
+        assert!(fake.open(10) && fake.open(11));
+        assert_eq!(tracker.config.open_runs, [11, 99]);
+        save_open_runs(&path, &before, &tracker.config.open_runs).unwrap();
+        let config_now = TrackerConfig::load(&path).unwrap().unwrap();
+        assert_eq!(config_now.open_runs, [11, 99, 13]);
+    }
+
     #[tokio::test]
     async fn a_left_open_run_lists_its_sub_issues_with_the_pull_requests_that_close_them() {
         let issue = |number, open, parent: Option<u64>| FakeIssue {
@@ -4169,7 +4310,11 @@ mod tests {
             ..FakeIssue::default()
         };
         let fake = Fake::with(&[
-            issue(10, true, None),
+            FakeIssue {
+                title: "Issue 10".into(),
+                body: format!("A run's issue.\n\n{RUN_MARKER}r0 -->\n"),
+                ..issue(10, true, None)
+            },
             issue(11, false, Some(10)),
             FakeIssue {
                 closed_by: vec![20],

@@ -1053,12 +1053,13 @@
     {
       "id": "TRK-2",
       "area": "tracking",
-      "claim": "The board follows a tracked run: a step's item is In progress while it runs (with the peer doing it, moved once however often the peer reports), In review while its committed work waits for a pull request or its sign-off for a person, and Done once closed; a step that changed no files is closed when it is done; a failed or skipped step goes back to Todo. Each result and failure is commented on its issue with its signed evidence (signer, checks, commit and branch), and the run's issue gets the verdict and its claims; it is closed once all its sub-issues are, waiting in review while its own steps' pull requests are open (and where it was while other work is), and it goes back to where it was if the run failed. Without the project scope tracking keeps to the issues and says how to grant it, and tracking never fails or holds up the plan's steps.",
+      "claim": "The board follows a tracked run: a step's item is In progress while it runs (with the peer doing it, moved once however often the peer reports), In review while its committed work waits for a pull request or its sign-off for a person, and Done once closed; a step that changed no files is closed when it is done; a failed or skipped step goes back to Todo. Each result and failure is commented on its issue with its signed evidence (signer, checks, commit and branch),       and the run's issue gets the verdict and its claims; it is closed once all its sub-issues are, waiting in review while its own steps' pull requests are open (and where it was while other work is), and it goes back to where it was if the run failed. Only an issue a run made (its body has the run marker: track: <title>, or no track: line) is closed, set In review or Done, or left for settling: an issue a person named with track: #N goes back where it was and stays open, and the run's comment says why; settling lets go of one an earlier version left waiting, without closing it. Without the project scope tracking keeps to the issues and says how to grant it, and tracking never fails or holds up the plan's steps.",
       "tests": [
         "lib::tracker::a_tracked_run_has_an_issue_with_a_sub_issue_per_step_and_the_board_follows_it",
         "lib::tracker::without_the_project_scope_tracking_keeps_to_issues_and_says_how_to_fix_it",
         "lib::tracker::a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do",
-        "lib::tracker::a_passed_runs_issue_waits_for_its_other_open_work_then_closes"
+              "lib::tracker::a_passed_runs_issue_waits_for_its_other_open_work_then_closes",
+              "lib::tracker::a_run_never_closes_an_issue_a_person_named"
       ]
     },
     {

@@ -1740,7 +1740,8 @@ is tracked on GitHub, where your team already tracks work:
   GitHub links the pull request to the issues and closes them when it merges. The run's
   issue waits *In review* until then (or, if it has other open sub-issues, where it was)
   and is closed once all its sub-issues are (checked every 10 minutes by a running
-  agent, or now with `tracker sync`). The **Tracker** card lists those run issues under
+  agent, or now with `tracker sync`), if a run made it: an issue you named with
+  `track: #N` goes back where it was and stays open. The **Tracker** card lists those run issues under
   *Left open until their sub-issues close*: each run with how many of its sub-issues are
   closed, and the open ones with the pull request that will close them, or *no pull request yet*.
   **Check now** (`tracker sync`) closes what can be closed at once and says what is still
@@ -1771,7 +1772,11 @@ Here the run works on issue #12 (reopened if it is closed; `track: <title>` make
 named after its first claim). Step `api` works on #15, made a sub-issue of #12 if it isn't
 one; `ui` and `signoff` get new sub-issues. A later run with `track: #12` takes up its
 steps' open sub-issues again: it gives each its step's title and text (the earlier run's
-stay in the issue's history) and comments that it took the issue over.
+stay in the issue's history) and comments that it took the issue over. A run closes only
+an issue a run made (`track: <title>`, or no `track:` line): an issue you name with
+`track: #12`, such as an epic or a bucket of findings, may hold other work, so when the
+run passes it says so on the issue, puts it back where it was on the board and leaves it
+open.
 In the web UI the **Tracker** card links and shows the
 tracker, and **Board items** lists what is open by status; **Plan it** starts a plan on an
 item, with a step per open sub-issue. **Add existing issues** (`tracker add`) puts the
