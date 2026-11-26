@@ -241,8 +241,9 @@ local.
 
 - **`@workiq` steps** ask Work IQ (`ask`), or a declarative agent with `agent=<id>`
   (`proofkin workiq agents` lists them), as part of a plan. The answer is the step's output:
-  cited context, never proof, so a `@workiq` step can't have `claims=`, `verify=` or
-  `apply=`. It works with `save=` and `after`.
+  cited context, never proof, so a `@workiq` step can't have `claims=` or `verify=`. It works
+  with `save=` and `after`. (`@workiq apply=STEP` is another kind of step: it makes the
+  Microsoft 365 changes step STEP proposed, once you signed them off; see section 7.)
 
   ```text
   decisions @workiq save=retention-decisions What did we decide about invoice retention in November?
@@ -292,13 +293,57 @@ token:
 
 ### 7. Changes in Microsoft 365
 
-Change tools (`create_entity`, `update_entity`, `delete_entity`, `do_action`, and
-`call_function`s that write) are off unless the folder's `workiq` server allows them. Then
-each call stops and becomes a sign-off in the web UI, like a plan's `approve` step, showing
-the exact operation (path, recipients, a preview of the body). Approved, it runs once and the
-model gets the observed outcome; a 202 is reported as accepted, not done. The tenant's policy
-still applies, and blocks changes by default. Later: sign-off requests in Teams or mail, if
-the owner opts in.
+A step's model never changes Microsoft 365 itself. In a plan, a step proposes changes, you
+sign them off, and a step with no model makes exactly those, once:
+
+```text
+draft @worker:app mcp=workiq Draft the replies to this week's open escalations from their threads
+ok after draft approve @me Send these replies?
+send after ok @workiq apply=draft
+```
+
+- **Allowed per profile.** `proofkin workiq changes on --profile NAME` sets `workiq_changes`
+  in `profile.json`; they are off by default (`workiq changes off`). The tenant's policy
+  still applies on top, and blocks changes by default. `proofkin workiq doctor` and the web
+  UI's Work IQ card say whether they are on.
+- **Proposing.** A step that a later step applies is told how to write its changes: one
+  fenced `m365-changes` block in its result, one JSON object a line, `{"tool", "path",
+  "body", "ifMatch"}`. `tool` is `create_entity`, `update_entity`, `delete_entity` or
+  `do_action`; `path` is a Microsoft Graph path (it starts with `/`, with no host, no `..` and
+  no control characters, at most 2 KB); `body` is a JSON object (none for a delete);
+  `ifMatch` is the ETag, for an update or a delete. At most 20 changes and 256 KB. A block
+  that breaks a rule fails the step, naming the line and the rule; a result without a block
+  proposes nothing, and the sign-off says so.
+- **Signing off.** The `approve @me` step between them shows each change before its own
+  words: a mail (`do_action` on `/me/sendMail` or `/users/{id}/sendMail`) as its recipients,
+  subject and first 10 lines (at most 800 characters, HTML removed), any other change as its
+  verb, path and the first 500 characters of its body; then the list's SHA-256, over its
+  canonical JSON. The text is redacted, and the web UI shows it as text. Your signed answer
+  covers the request's text (`prompt_sha256`), so it is for exactly that list. Only your own
+  sign-off counts: the changes are made with your account. *Ask for changes* does the
+  proposing step again with your note, and its new list is shown.
+- **Making them.** `@workiq apply=STEP` checks that your approval is signed by your own
+  agent, for a request whose SHA-256 is the one it signed and that shows STEP's list as it is
+  now; otherwise it makes none. Then it calls each change once, in order, through the audited
+  client (purpose `step`, within the run's budgets), and stops at the first one that fails or
+  whose outcome isn't certain (a timeout, or a failure after it was sent). Its result lists
+  each change and its outcome: *done* (a created entity's id and web link, when Work IQ gives
+  them), *accepted* (202: Microsoft 365 finishes it later), *failed* (the classified error and
+  its fix; a policy denial names where an admin changes it) or *outcome unknown* (check in
+  Microsoft 365), then the changes not made. A change is never sent again: if the agent stops
+  while the step runs, the run that goes on fails the step instead of making any again.
+- **The plan check** refuses an apply step, naming the fix, unless it runs after STEP through
+  an `approve @me` step that runs after STEP, the profile allows changes and has the Work IQ
+  sign-in, and no other step applies STEP. Its own words are optional (a note in the run). It
+  can't have `claims=`, `verify=`, `mcp=`, `skill=` or `attempts=` (context, never proof), nor
+  `agent=`, `save=`, `context=`, `workiq=` or a folder.
+- **Never on GitHub.** The proposing step's result and the apply step's stay in the run's
+  record (section 4), even when the run is tracked.
+
+In interactive tasks (to come, #272), a task you start yourself with `mcp=workiq`, on a
+folder whose `workiq` server allows changes, gets the change tools, and each call waits for
+your sign-off of exactly that change, like a plan's. Later: sign-off requests in Teams or
+mail, if the owner opts in (#61).
 
 ### 8. Plugins and enterprise skills
 
@@ -312,8 +357,8 @@ skills and plugins with Work IQ's `discover` and add them through the usual plug
 
 Every call is a line in `<profile>/workiq-audit.jsonl`: time, tool, purpose (a run's step,
 knowledge import, a gateway task, doctor), audience, the query's SHA-256 and length (not its
-text), outcome class, results and withheld counts, labels, request and correlation ids, and
-duration. Budgets in `profile.json` (`workiq_budget.calls_per_day`, default 200;
+text; for a change, its path's), outcome class, results and withheld counts, labels, request
+and correlation ids, and duration. Budgets in `profile.json` (`workiq_budget.calls_per_day`, default 200;
 `workiq_budget.calls_per_run`, default 25) stop calls with a clear error before they are
 sent, and the call is audited as refused; `proofkin workiq usage` and `proofkin workiq
 budget` show and change them. The web UI shows today's
@@ -323,7 +368,8 @@ use.
 
 `proofkin workiq doctor` checks, in order: discovery, the sign-in, the token's audience,
 tenant and scopes, `tools/list`, and one small `retrieve`. Each failure names the fix and who
-can make it (service principal, consent, user assignment, billing, MCP policy). The web UI
+can make it (service principal, consent, user assignment, billing, MCP policy). It also says
+whether Microsoft 365 changes are on (section 7). The web UI
 gets a Work IQ card in Accounts (sign in with a device code shown in the page, status, doctor,
 use against budgets), Microsoft 365 grants on peers, `workiq=` and `@workiq` in the plan
 editor, an import in Knowledge, and the sources a step used in its run.
@@ -338,6 +384,7 @@ editor, an import in Knowledge, and the sources a step used in its run.
 | Token theft | Secret store and memory only; JWTs redacted from output; per-task gateway bearers on 127.0.0.1, revoked when the task ends |
 | Runaway cost | Budgets per day and per run; every call counted |
 | Retry storms, repeated changes | Classified errors; denials and changes never retried; the server's delays honored |
+| A plan making Microsoft 365 changes you didn't mean | Off unless the profile allows them; a model only proposes; your own signed approval covers the request showing the list and its SHA-256, which the step with no model checks before it makes exactly that list, once and in order; a change is never sent again, even after a restart; neither the proposal nor the outcome goes on GitHub |
 | Stale or wrong context taken as truth | Cited, dated and marked unverified; claims are proven only by checks |
 
 ## Admin setup (summary)
@@ -398,6 +445,8 @@ each step works on one of its sub-issues (`issue=#N`).
 | [#55](https://github.com/mcbelton/proofkin/issues/55) A tool for tasks | [#56](https://github.com/mcbelton/proofkin/issues/56) The gateway | #39, #40, #45, #48 |
 | | [#57](https://github.com/mcbelton/proofkin/issues/57) Peers' tasks with a grant | #56, #46 |
 | | [#58](https://github.com/mcbelton/proofkin/issues/58) Changes with a sign-off | #56 |
+| | [#271](https://github.com/mcbelton/proofkin/issues/271) Changes in plans: proposed, signed off, made once | #58 |
+| | [#272](https://github.com/mcbelton/proofkin/issues/272) Changes in interactive tasks; `call_function` as a read tool | #271 |
 | | [#59](https://github.com/mcbelton/proofkin/issues/59) Microsoft's Work IQ plugin | #56 |
 | | [#60](https://github.com/mcbelton/proofkin/issues/60) Enterprise skills through `discover` (later) | #59 |
 | | [#61](https://github.com/mcbelton/proofkin/issues/61) Sign-off requests in Teams or mail (later) | #58 |

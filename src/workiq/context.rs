@@ -46,6 +46,17 @@ pub trait WorkContext: Send + Sync + fmt::Debug {
     async fn fetch_blob(&self, _context: &CallContext, _path: &str) -> Result<ToolResult> {
         anyhow::bail!("this Work IQ context can't fetch documents")
     }
+
+    /// Makes one Microsoft 365 change on behalf of `context`: `tool` (one of
+    /// [`super::changes::TOOLS`]) with `arguments`, sent once and never again.
+    async fn change(
+        &self,
+        _context: &CallContext,
+        _tool: &str,
+        _arguments: serde_json::Value,
+    ) -> Result<ToolResult> {
+        anyhow::bail!("this Work IQ context makes no changes")
+    }
 }
 
 /// The declarative agents Work IQ offers `client`'s account, one per line (name, then the id
@@ -126,5 +137,18 @@ impl WorkContext for ClientWork {
 
     async fn fetch_blob(&self, context: &CallContext, path: &str) -> Result<ToolResult> {
         self.client.fetch_blob_in(context, path).await
+    }
+
+    async fn change(
+        &self,
+        context: &CallContext,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolResult> {
+        if !super::changes::TOOLS.contains(&tool) {
+            anyhow::bail!("{tool} isn't a Microsoft 365 change tool");
+        }
+        // The client never sends a change tool again after a failure.
+        self.client.call_tool_in(context, tool, arguments).await
     }
 }

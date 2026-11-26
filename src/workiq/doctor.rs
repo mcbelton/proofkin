@@ -103,6 +103,8 @@ impl Check {
 pub struct Report {
     pub profile: String,
     pub checks: Vec<Check>,
+    /// Whether the profile allows Microsoft 365 changes (`workiq changes on`).
+    pub changes: bool,
 }
 
 impl Report {
@@ -128,7 +130,7 @@ impl Report {
                 })
             })
             .collect();
-        json!({ "profile": self.profile, "ok": self.passed(), "checks": checks })
+        json!({ "profile": self.profile, "ok": self.passed(), "checks": checks, "changes": self.changes })
     }
 
     /// The report as `proofkin workiq doctor` prints it.
@@ -151,6 +153,14 @@ impl Report {
                 ));
             }
         }
+        text.push_str(&if self.changes {
+            "Microsoft 365 changes: on (plans make the changes you sign off; turn them off with: proofkin workiq changes off)\n".to_owned()
+        } else {
+            format!(
+                "Microsoft 365 changes: off (turn them on with: proofkin workiq changes on --profile {})\n",
+                self.profile
+            )
+        });
         text.push_str(if self.passed() {
             "Work IQ is ready.\n"
         } else {
@@ -256,6 +266,7 @@ impl<'a> Doctor<'a> {
         Report {
             profile: self.profile.name.clone(),
             checks,
+            changes: self.profile.config.workiq_changes.is_some(),
         }
     }
 

@@ -246,6 +246,32 @@ is not sent; it fails and is recorded as refused in workiq-audit.jsonl.")]
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Allow Microsoft 365 changes, or stop them. On, a plan's `@workiq apply=STEP` step makes
+    /// the changes step STEP proposed, once you signed them off (`approve @me`). Off (the
+    /// default), plans make none.
+    #[command(after_help = "\
+examples:
+  proofkin workiq changes on --profile alice
+  proofkin workiq changes off --profile alice
+A plan proposes changes in one step, you sign them off, and a later step makes exactly
+those, once and in order:
+  draft @worker:app mcp=workiq Draft the replies to this week's open escalations
+  ok after draft approve @me Send these replies?
+  send after ok @workiq apply=draft
+Your tenant's policy still applies on top: it may deny a change.")]
+    Changes {
+        #[arg(value_enum)]
+        state: Switch,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+/// On or off.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -1810,6 +1836,23 @@ async fn run_workiq(command: WorkiqCommand) -> Result<()> {
                 budget.per_day(),
                 budget.per_run()
             );
+        }
+        WorkiqCommand::Changes { state, profile } => {
+            let mut profile = Profile::open(&profile.name)?;
+            let on = state == Switch::On;
+            profile.config.workiq_changes = on.then(Default::default);
+            profile.save()?;
+            if on {
+                println!(
+                    "profile '{}': Microsoft 365 changes are on: a plan's @workiq apply=STEP step makes the changes step STEP proposed, once you sign them off",
+                    profile.name
+                );
+            } else {
+                println!(
+                    "profile '{}': Microsoft 365 changes are off: plans make none",
+                    profile.name
+                );
+            }
         }
     }
     Ok(())

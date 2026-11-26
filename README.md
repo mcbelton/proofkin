@@ -628,10 +628,10 @@ usage by peer and provider, as providers reported it:
 Every call to [Work IQ](docs/work-iq.md) (Microsoft 365 work context), whether it is done,
 failed or refused, is one line in the profile's `workiq-audit.jsonl`: time, tool, purpose (a
 step of a run with the run id, a knowledge import, a gateway task, `doctor` or a command),
-audience (`local` or the peer's name), the query's SHA-256 and length (never its text),
-outcome (`ok`, `refused`, or the error's class), the counts of results and withheld results
-and the sensitivity labels seen when known, the request and correlation ids, and the
-duration. A write error only warns.
+audience (`local` or the peer's name), the query's SHA-256 and length (never its text; for a
+change, its path's), outcome (`ok`, `refused`, or the error's class), the counts of results
+and withheld results and the sensitivity labels seen when known, the request and correlation
+ids, and the duration. A write error only warns.
 
 Calls are limited to 200 a day (the local date) and 25 per run. A call over a budget is not
 sent: it fails saying which budget is used up and how to raise it, and is recorded as
@@ -640,9 +640,13 @@ sent: it fails saying which budget is used up and how to raise it, and is record
 ```text
 > proofkin workiq usage --profile alice
 > proofkin workiq budget --per-day 500 --per-run 40 --profile alice
+> proofkin workiq changes on --profile alice
 ```
 
 `budget` keeps a limit you leave out, and saves them in `profile.json` (`workiq_budget`).
+`changes on|off` lets the profile's plans make the Microsoft 365 changes you sign off, or
+stops them (`workiq_changes`; off by default, see [Making Microsoft 365 changes in a
+plan](#making-microsoft-365-changes-in-a-plan-workiq-apply)).
 `proofkin workiq agents --profile alice` lists the declarative agents Work IQ offers (name
 and id), for `agent=` on [`@workiq` steps](#asking-microsoft-365-in-a-step-workiq).
 
@@ -872,13 +876,50 @@ write after ask @alice Write the announcement
 - `after` hands the answer to later steps; `save=topic` writes it, with its mark, to the
   knowledge base, and the topic's source note says it was a Work IQ answer.
 - An answer is context and never proof, so a `@workiq` step can't have `claims=`, `verify=`,
-  `apply=`, `mcp=`, `skill=`, `attempts=`, `levels=`, `team` or `approve`, nor `context=`,
-  `workiq=` or a folder. The run shows it as done by `workiq` (or `workiq:<agent id>`),
+  `mcp=`, `skill=`, `attempts=`, `levels=`, `team` or `approve`, nor `context=`, `workiq=` or
+  a folder (`apply=` makes it [a step that makes Microsoft 365
+  changes](#making-microsoft-365-changes-in-a-plan-workiq-apply)). The run shows it as done by
+  `workiq` (or `workiq:<agent id>`),
   with no evidence and not verified: its report heads the step *(Work IQ) on workiq* and
   says *No evidence: an answer from Microsoft 365 Copilot is context, never proof*. In the
   web UI its task reads **Microsoft 365 Copilot (Work IQ)** (with `agent=sales:1`,
   **Microsoft 365 agent sales:1 (Work IQ)**), not the plan's provider.
 - `workiq` is reserved as a target name, so no peer can be called that in a plan.
+
+### Making Microsoft 365 changes in a plan (`@workiq apply=`)
+
+A step's model never changes Microsoft 365 itself. A step proposes the changes, you sign
+them off, and a later step with no model makes exactly those, once and in order, with your
+account:
+
+```text
+draft @worker:app mcp=workiq Draft the replies to this week's open escalations from their threads
+ok after draft approve @me Send these replies?
+send after ok @workiq apply=draft
+```
+
+- Turn changes on for the profile first: `proofkin workiq changes on --profile me` (off by
+  default; `workiq changes off` stops them). Your tenant's policy still applies on top.
+  `proofkin workiq doctor` and the Work IQ card say whether they are on.
+- The proposing step (`draft`) is told to write its changes in one fenced `m365-changes`
+  block in its result, one JSON object a line:
+  `{"tool":"do_action","path":"/me/sendMail","body":{"message":{...}}}`. `tool` is
+  `create_entity`, `update_entity`, `delete_entity` or `do_action`; `path` is a Microsoft
+  Graph path (starting with `/`, no host); `body` is a JSON object (none for a delete);
+  `ifMatch` is an entity's ETag, for an update or a delete. At most 20 changes. A block that
+  breaks a rule fails the step, naming the line and the rule; a result with no block proposes
+  nothing.
+- Your sign-off (`approve @me`) shows each change first: a mail's recipients, subject and
+  first lines, any other change's verb, path and the start of its body, and the list's
+  SHA-256. Your signed answer covers exactly that text. Only your own sign-off counts.
+- The apply step checks that your approval was for the list as it is now, then makes each
+  change once, in order, and stops at the first that fails or whose outcome is unknown. Its
+  result lists each change's outcome (*done*, *accepted* for a 202, *failed* with the fix, or
+  *outcome unknown*: check in Microsoft 365) and the changes not made. A change is never sent
+  again, even if the agent restarts.
+- The plan check refuses an apply step, naming the fix, without your sign-off between the
+  two steps, with changes off or without the Work IQ sign-in, or when another step applies
+  the same step. Both steps' results stay in the run's record, never on GitHub.
 
 ### Team steps: handing work down a level
 
@@ -2509,6 +2550,7 @@ account, `proofkin auth logout workiq --profile me` removes it.
 | A model that searches Microsoft 365 while it works | `mcp=workiq` on a step for your own worker, whose folder offers it (`proofkin mcp add <folder> workiq --workiq`) | [Work IQ as a tool for tasks](#work-iq-as-a-tool-for-tasks-mcpworkiq) |
 | Cited results kept as a knowledge topic for `context=` | `proofkin kb import workiq <topic> --query <text> [--from SOURCES]` | **Importing from Microsoft 365** under the knowledge base, and [the design](docs/work-iq.md#5-work-context-in-plans) |
 | A peer that may receive some of it | `proofkin peers allow <peer> --profile me --m365 General,Public,unlabeled` | [Security model](#security-model) |
+| Changes in Microsoft 365 a plan makes once you sign them off | `proofkin workiq changes on`, then `@workiq apply=STEP` after an `approve @me` step | [Making Microsoft 365 changes in a plan](#making-microsoft-365-changes-in-a-plan-workiq-apply) |
 | What it cost and the limits | `proofkin workiq usage`, `proofkin workiq budget --per-day N --per-run N` | [Work IQ audit file and budgets](#work-iq-audit-file-and-budgets) |
 
 A first plan to try (`/plan first.plan` in the agent, or the web UI's plan editor), with one

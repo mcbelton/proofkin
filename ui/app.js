@@ -3035,18 +3035,27 @@ function renderWorkiq() {
     nodes = [el("p", { class: "small", text: `Uses ${w.holder}'s Work IQ account, which isn't signed in. Sign it in on ${w.holder}'s Work IQ card, or in a terminal:` }),
       workiqCommand(`${w.hint} --cli`)];
   } else if (!w.own) {
-    nodes = [el("p", { class: "small", text: `Uses ${w.holder}'s account: ${w.line}` }), workiqCliPath(w),
+    nodes = [el("p", { class: "small", text: `Uses ${w.holder}'s account: ${w.line}` }), workiqCliPath(w), workiqChanges(w),
       el("div", { class: "workiq-actions" }, check())];
   } else if (!w.signed_in) {
     nodes = [el("p", { class: "muted small", text: "Microsoft 365 work context for plans: through Microsoft's Work IQ CLI, or your organization's own app." }),
       button("sign-in", "Sign in…", openWorkiqSignIn, "primary")];
   } else {
-    nodes = [el("p", { class: "small", text: `Signed in: ${w.line}` }), workiqCliPath(w), workiqUsage(w.usage),
+    nodes = [el("p", { class: "small", text: `Signed in: ${w.line}` }), workiqCliPath(w), workiqUsage(w.usage), workiqChanges(w),
       el("div", { class: "workiq-actions" }, check(), button("budget", "Budget…", openWorkiqBudget),
         button("sign-out", "Sign out", signOutWorkiq, "danger"))];
   }
   box.replaceChildren(...nodes.flat().filter(Boolean));
   if (focused !== null) focusWorkiq(focused);
+}
+
+/** Whether plans may make the Microsoft 365 changes you sign off (`workiq changes on|off`). */
+function workiqChanges(w) {
+  if (w.changes) {
+    return el("p", { class: "small", text: "Changes: on. A plan's @workiq apply= step makes the Microsoft 365 changes you signed off, once." });
+  }
+  return [el("p", { class: "muted small", text: "Changes: off. Plans make no Microsoft 365 changes; to let them make the ones you sign off, run:" }),
+    workiqCommand(`proofkin workiq changes on --profile ${w.profile ?? w.holder}`)];
 }
 
 /** Today's Work IQ calls against the budgets, and a warning once the day's are used up. */

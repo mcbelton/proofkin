@@ -84,6 +84,14 @@ const cases = [
   ["the builder says what a @workiq step can't have",
     planText.needs(planText.parsePlan("a @workiq claims=C-1 What did we decide?")).map((n) => n.message).join("|"),
     ERRORS.workiqOption],
+  // @workiq apply=STEP makes the Microsoft 365 changes STEP proposed, once you signed them off.
+  ["a step that makes changes comes back as it was",
+    planText.formatPlan(planText.parsePlan("send after ok @workiq apply=draft")).text, "send after ok @workiq apply=draft"],
+  ["a step that makes changes needs no words",
+    planText.needs(planText.parsePlan("draft @x Draft\nok after draft approve @me Send them?\nsend after ok @workiq apply=draft"))
+      .map((n) => n.message).join("|"), ""],
+  ["a step that starts from other work doesn't become @workiq", part("b after a @x apply=a Do| it", "@workiq"),
+    `error: ${ERRORS.workiqApply}`],
   ["one agent per step", part("a @x agent=old Do| it", "agent=new"), "a @x agent=new Do it[]"],
   // after: once, in its place, never on the step itself.
   ["after in its place", part("a @x do\nb @x Do| it", "after a"), "a @x do\nb after a @x Do it[]"],

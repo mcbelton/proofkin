@@ -217,6 +217,10 @@ impl WorkIqBudget {
     }
 }
 
+/// That a profile allows Microsoft 365 changes (see [`ProfileConfig::workiq_changes`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkIqChanges {}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,6 +257,12 @@ pub struct ProfileConfig {
     /// survive signing out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workiq_budget: Option<WorkIqBudget>,
+    /// Set, this profile allows Microsoft 365 changes (docs/work-iq.md, section 7): a plan's
+    /// `@workiq apply=STEP` step makes the changes step STEP proposed, once its owner signed
+    /// them off. Off by default (`proofkin workiq changes on|off`); the tenant's policy
+    /// still applies on top.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workiq_changes: Option<WorkIqChanges>,
     /// Per provider: the model tasks that name none run on, and the models tasks may ask
     /// for (see [`crate::models`] and `proofkin models`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

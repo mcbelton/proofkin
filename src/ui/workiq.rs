@@ -87,6 +87,9 @@ pub(super) async fn state(State(s): State<AppState>) -> Json<Value> {
         "not_used": not_used,
         "hint": holder.workiq_login_hint(),
         "usage": usage,
+        // Plans of this profile may make the Microsoft 365 changes you sign off.
+        "changes": profile.config.workiq_changes.is_some(),
+        "profile": profile.name,
     }))
 }
 

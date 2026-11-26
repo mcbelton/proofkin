@@ -3118,11 +3118,19 @@ fn follow(mut run: Run, plan: &Plan) -> Tracking {
 /// Whether what `step` ends with (its result, or why it failed) may hold Microsoft 365
 /// content, which never goes on GitHub: the tracker's repository may be public, and no grant
 /// covers it. So it may if the step brings some (`workiq=`, `@workiq`), its model may read
-/// some (`mcp=workiq`), it is marked with some (a `context=` topic from Microsoft 365), its
-/// peer's signed evidence names labels, or a step it waits for held some (`held`, as those
-/// ended).
+/// some (`mcp=workiq`), it proposes Microsoft 365 changes a later step makes (`@workiq
+/// apply=`), it is marked with some (a `context=` topic from Microsoft 365), its peer's
+/// signed evidence names labels, or a step it waits for held some (`held`, as those ended).
 fn holds_m365(plan: &Plan, step: &Step, state: &StepState, held: &HashSet<String>) -> bool {
-    let brings = |s: &Step| s.brings_m365() || s.uses_workiq_tools() || s.m365.is_some();
+    let brings = |s: &Step| {
+        s.brings_m365()
+            || s.uses_workiq_tools()
+            || s.m365.is_some()
+            || plan
+                .steps
+                .iter()
+                .any(|a| a.applies_changes() == Some(s.id.as_str()))
+    };
     brings(step)
         || crate::plan::result_labels(state).is_some()
         || crate::plan::ancestors(plan, &step.id)
@@ -4806,5 +4814,33 @@ mod tests {
         ] {
             assert_eq!(issue_title(other), None, "{other:?}");
         }
+    }
+
+    /// The Microsoft 365 changes a step proposes, and how the step that makes them ended,
+    /// stay off GitHub; other work doesn't.
+    #[test]
+    fn proposed_microsoft_365_changes_and_their_outcomes_stay_off_github() {
+        let plan = Plan::parse(
+            "draft @worker:app Draft the replies\n\
+             ok after draft approve @me Send them?\n\
+             send after ok @workiq apply=draft\n\
+             other @worker:app Fix the parser",
+        )
+        .unwrap();
+        let done = StepState::Done {
+            peer: "worker".into(),
+            output: "anything".into(),
+            evidence: None,
+            verified: false,
+            patch: None,
+            model: None,
+        };
+        let held = HashSet::new();
+        let holds = |id: &str| {
+            let step = plan.steps.iter().find(|s| s.id == id).unwrap();
+            holds_m365(&plan, step, &done, &held)
+        };
+        assert!(holds("draft") && holds("send"));
+        assert!(!holds("other"));
     }
 }
