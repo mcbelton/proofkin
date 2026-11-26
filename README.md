@@ -2806,8 +2806,8 @@ draft @my-worker:app mcp=workiq Write the launch FAQ from what my mail and files
   uses its owner's, when the owner turned that on), so the model never sees a token and a long
   task keeps working as tokens are refreshed.
 - Only tools that read: `retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
-  `list_agents` (`--tool` offers fewer), and never one Work IQ's own annotations say changes
-  things. A change tool is refused, and never reaches Work IQ.
+  `list_agents`, `call_function` (`--tool` offers fewer), and never one Work IQ's own
+  annotations say changes things. A change tool is refused, and never reaches Work IQ.
 - Every result goes through the [content policy](#4-what-keeps-your-work-data-yours): only
   results marked `allowed`, secrets redacted, in the external-content envelope. Every call is
   audited (purpose `gateway`) and held to the daily budget.

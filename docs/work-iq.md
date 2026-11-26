@@ -26,7 +26,7 @@ Two things make this more than another MCP server:
 | --- | --- |
 | MCP endpoint | `https://workiq.svc.cloud.microsoft/mcp` (streamable HTTP). Its metadata (`/.well-known/oauth-protected-resource/mcp`) names the authority `https://login.microsoftonline.com/organizations/v2.0` and the scope `WorkIQAgent.Ask`. |
 | A2A endpoint | `https://workiq.svc.cloud.microsoft/a2a` (A2A 1.0 with `A2A-Version: 1.0`); agent cards at `/a2a/.well-known/agent-card.json`. |
-| Tools | `retrieve` (cited search over mail, meetings, files, Teams, people and connectors), `ask` (an answer from Microsoft 365 Copilot or a declarative agent), `fetch`, `fetch_blob`, `search_paths`, `get_schema`, `list_agents`, `discover`. Changes: `create_entity`, `update_entity`, `delete_entity`, `do_action`, `call_function`. `tools/list` is the source of truth. |
+| Tools | `retrieve` (cited search over mail, meetings, files, Teams, people and connectors), `ask` (an answer from Microsoft 365 Copilot or a declarative agent), `fetch`, `fetch_blob`, `search_paths`, `get_schema`, `list_agents`, `discover`, `call_function` (read only by its annotations). Changes: `create_entity`, `update_entity`, `delete_entity`, `do_action`. `tools/list` is the source of truth. |
 | Permissions | Delegated only, each needing admin consent: `WorkIQAgent.Ask` (ask agents; reads *and* writes), `WorkIQ.Read`, `WorkIQ.Act`. Resource `api://workiq.svc.cloud.microsoft` (app id `fdcc1f02-fc51-4226-8753-f668596af7f7`). |
 | Tenant setup | The resource's service principal, a client app registration with admin consent, usage-based billing with a spending policy covering the users, and the Work IQ MCP policy (changes are blocked by default; policy changes take up to 24 hours). |
 | CLI | [`@microsoft/workiq`](https://github.com/microsoft/work-iq) (npm): `workiq mcp` is a local stdio MCP server that signs in by itself with Microsoft's Work IQ CLI app. |
@@ -282,8 +282,9 @@ token:
   gateway adds the owner's fresh token, so long tasks keep working and the model never sees
   the token.
 - Only read tools by default (`retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
-  `list_agents`), and never one whose annotations say it changes things, whatever its name.
-  Every result goes through the content policy for the task's audience;
+  `list_agents`, `call_function`), and never one whose annotations say it changes things,
+  whatever its name. `call_function`'s results carry no labels, so like `fetch` it goes only
+  to the owner's own tasks. Every result goes through the content policy for the task's audience;
   every call is audited and metered; sizes are capped.
 - The server is called `workiq`, so a plan knows a step with `mcp=workiq` reads Microsoft
   365 content whose labels it never learns: the step is marked `unknown`, and nothing made
