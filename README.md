@@ -686,8 +686,11 @@ cancels your running tasks the same way, so nothing keeps spending its accounts 
 A dropped connection doesn't lose work. If a connection is replaced (for example both peers
 dialed each other at once) or drops and comes back, running tasks carry on and their
 results arrive over the new connection. After 2 seconds the peer shows as disconnected and
-its tasks say **reconnecting to** it. They are failed (on your side) and cancelled (on the
-peer's) only if it stays away for the **task grace**: 60 seconds, or
+its tasks say **reconnecting to** it (a connection back to it still in its handshake is
+waited for first, up to 10 seconds). A plan checked or started meanwhile (`/plan`, the web
+UI, MCP, A2A or a team step) waits for a peer that is reconnecting, up to the same 10
+seconds, instead of finding it not connected. Those tasks are failed (on your side) and
+cancelled (on the peer's) only if the peer stays away for the **task grace**: 60 seconds, or
 `PROOFKIN_TASK_GRACE_SECS`. Only time the machine is awake counts, so sleep doesn't use up a
 peer's grace: the tasks that were running when a laptop went to sleep go on after it wakes.
 An agent that stops on purpose (Ctrl+C, or **Stop** on a digital worker) says so first: the

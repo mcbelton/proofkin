@@ -577,6 +577,41 @@ async fn simultaneous_dials_converge_on_one_connection() {
     );
 }
 
+/// A plan checked while a peer reconnects waits for it (`settle_peers`), instead of
+/// finding it not connected: here its connection closed and it dials again. One that
+/// doesn't come back is given up on after the disconnect grace.
+#[tokio::test]
+async fn settling_waits_for_a_reconnecting_peer_and_gives_up_on_a_gone_one() {
+    let (mut a, mut b) = (Node::new("a"), Node::new("b"));
+    mutual(&mut a, &mut b);
+    let (a, _ae) = a.start().await;
+    let (b, _be) = b.start().await;
+    b.connect(a.addr()).await.unwrap();
+    wait_for_peers(&a, 1).await;
+    wait_for_peers(&b, 1).await;
+
+    assert!(a.disconnect(b.id()));
+    wait_for_peers(&a, 0).await;
+    let redial = tokio::spawn({
+        let (b, addr) = (b.clone(), a.addr());
+        async move {
+            wait_for_peers(&b, 0).await;
+            b.connect(addr).await
+        }
+    });
+    a.settle_peers().await;
+    assert_eq!(a.peers().len(), 1, "it waited for b to come back");
+    redial.await.unwrap().unwrap();
+
+    assert!(a.disconnect(b.id()));
+    wait_for_peers(&a, 0).await;
+    let started = std::time::Instant::now();
+    a.settle_peers().await;
+    assert!(a.peers().is_empty());
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}
+
 #[tokio::test]
 async fn shutdown_disconnects_peers() {
     let (mut a, mut b) = (Node::new("a"), Node::new("b"));

@@ -28,6 +28,9 @@ pub const MAX_CONCURRENT_TASKS: usize = 2;
 const HOUR: Duration = Duration::from_secs(3600);
 /// How long a dropped peer may take to reconnect before `PeerDisconnected` is reported.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
+/// The longest wait for a peer that is reconnecting (see [`Agent::settle_peers`]), and
+/// for a connection to a dropped peer to end its handshake before it is reported gone.
+const SETTLE_WAIT: Duration = Duration::from_secs(10);
 /// How long tasks wait for a dropped peer to come back before they fail (delegated
 /// to it) or stop (asked by it), by default.
 pub const TASK_GRACE: Duration = Duration::from_secs(60);
@@ -516,6 +519,9 @@ struct Inner {
     trust: Mutex<TrustStore>,
     peers: Mutex<HashMap<EndpointId, PeerHandle>>,
     dialing: Mutex<HashSet<EndpointId>>,
+    /// Connections in their handshake (the hello each way), how many by peer: each is
+    /// registered in `peers`, refused or closed once it ends (see [`Handshake`]).
+    handshaking: Mutex<HashMap<EndpointId, usize>>,
     events: mpsc::UnboundedSender<Event>,
     next_conn_id: AtomicU64,
     shutdown: watch::Sender<bool>,
@@ -614,6 +620,7 @@ impl Agent {
             trust: Mutex::new(config.trust),
             peers: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashSet::new()),
+            handshaking: Mutex::new(HashMap::new()),
             events,
             next_conn_id: AtomicU64::new(0),
             shutdown: watch::Sender::new(false),
@@ -711,6 +718,18 @@ impl Agent {
             .map(|p| p.addr.clone())
             .ok_or_else(|| anyhow!("not connected to {}", peer.fmt_short()))?;
         dial_with(self.inner.clone(), addr, true).await
+    }
+
+    /// Waits while a peer is reconnecting, up to 10 seconds: one whose connection is in
+    /// its handshake, or that dropped moments ago and may be back within the disconnect
+    /// grace. A plan checked then ([`Agent::peers`]) sees it, not *not connected*: right
+    /// after peers connect, or while a simultaneous dial's duplicate connection is
+    /// replaced. Returns at once when none is.
+    pub async fn settle_peers(&self) {
+        let deadline = Instant::now() + SETTLE_WAIT;
+        while self.inner.reconnecting() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Dials every allowlisted peer that isn't connected, now and then every
@@ -1786,6 +1805,23 @@ impl Inner {
             .values()
             .map(|p| p.addr.clone())
             .collect()
+    }
+
+    fn is_connected(&self, id: &EndpointId) -> bool {
+        self.peers.lock().unwrap().contains_key(id)
+    }
+
+    fn in_handshake(&self, id: &EndpointId) -> bool {
+        self.handshaking.lock().unwrap().contains_key(id)
+    }
+
+    /// Whether a peer is reconnecting: it has no connection now, but one in its handshake
+    /// (the winner of a simultaneous dial whose loser closed first), or it was reported
+    /// connected and not yet reported gone (it dropped moments ago).
+    fn reconnecting(&self) -> bool {
+        let mut ids: Vec<EndpointId> = self.handshaking.lock().unwrap().keys().copied().collect();
+        ids.extend(self.announced.lock().unwrap().iter().copied());
+        ids.iter().any(|id| !self.is_connected(id))
     }
 
     /// Registers a handshaken connection. If both sides dialed each other, both
@@ -3699,6 +3735,32 @@ fn clean_models(models: crate::models::Models) -> crate::models::Models {
         .collect()
 }
 
+/// A connection to peer `id` in its handshake, counted in [`Inner::handshaking`] until
+/// this is dropped (registered, refused or failed).
+struct Handshake<'a> {
+    inner: &'a Inner,
+    id: EndpointId,
+}
+
+impl<'a> Handshake<'a> {
+    fn begin(inner: &'a Inner, id: EndpointId) -> Self {
+        *inner.handshaking.lock().unwrap().entry(id).or_default() += 1;
+        Self { inner, id }
+    }
+}
+
+impl Drop for Handshake<'_> {
+    fn drop(&mut self) {
+        let mut handshaking = self.inner.handshaking.lock().unwrap();
+        if let Some(n) = handshaking.get_mut(&self.id) {
+            *n -= 1;
+            if *n == 0 {
+                handshaking.remove(&self.id);
+            }
+        }
+    }
+}
+
 async fn run_connection(
     inner: Arc<Inner>,
     conn: Connection,
@@ -3707,6 +3769,7 @@ async fn run_connection(
     outbound: bool,
 ) -> Result<()> {
     let peer_id = conn.remote_id();
+    let handshake = Handshake::begin(&inner, peer_id);
     let mut lines = BufReader::new(recv).lines();
 
     let hello = Message::Hello {
@@ -3795,6 +3858,7 @@ async fn run_connection(
             }
         }
     }
+    drop(handshake);
     // Back before its tasks gave up on it.
     inner.left.lock().unwrap().remove(&peer_id);
     inner.received_catalog(peer_id, &name, catalog);
@@ -4119,6 +4183,14 @@ async fn run_connection(
         let inner = inner.clone();
         tokio::spawn(async move {
             crate::awake::sleep(DISCONNECT_GRACE).await;
+            // A connection back to it still in its handshake (slow under load) ends first.
+            let deadline = Instant::now() + SETTLE_WAIT;
+            while !inner.is_connected(&peer_id)
+                && inner.in_handshake(&peer_id)
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             let gone = !inner.peers.lock().unwrap().contains_key(&peer_id);
             if !gone {
                 return;

@@ -5193,6 +5193,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 let skills = profile.skills();
                 let squads_now = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                 let recipients = proofkin::plan::Recipients::of(&agent, &profile);
+                // A peer reconnecting (e.g. both agents dialed at once) is waited for.
+                agent.settle_peers().await;
                 let parsed = text.and_then(|text| {
                     let plan = Plan::parse(&text)?;
                     let problems = proofkin::plan::preflight(

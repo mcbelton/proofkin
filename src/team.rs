@@ -483,6 +483,7 @@ impl TeamRunner {
         mut observe: impl FnMut(TeamUpdate<'_>),
     ) -> Result<TeamOutcome> {
         let kit = self.kit(agent);
+        agent.settle_peers().await;
         let plan = checked(agent, &kit, template, task, request)?;
         let Kit {
             squads,
