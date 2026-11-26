@@ -203,6 +203,10 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
         team: false,
         model: None,
         usage: None,
+        agent: None,
+        attempts: None,
+        checks: None,
+        refused_by: None,
     });
     let branches = task_branches(&repo).await.unwrap();
     assert_eq!(branches[0].name, "p2p/boss/1-1");

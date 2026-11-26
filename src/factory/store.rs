@@ -7,14 +7,15 @@
 //!   agents/<name>/fixtures/     files its eval cases work on
 //!   agents/<name>/builds/<hash>/  its builds, by hash (see crate::factory::build)
 //!   agents/<name>/evaluations/<id>.json  its evaluations: each one's journal while it runs, its signed report when it ends
+//!   agents/<name>/releases/<version>/    its releases: the build's files, its report and the signed manifest (see crate::factory::release)
 //!   evaluation/                 the evaluation that runs (one at a time): its folder, and the one next to it
+//!   audit.jsonl                 every lifecycle change of every agent, one line each
 //! ```
 //!
-//! Releases go next to the state as the factory grows
-//! (docs/agent-factory/design/data-dictionary.md). Files are written atomically, and
-//! changes to an agent hold its lock ([`crate::store`]), so the CLI, the web UI and an
-//! agent can work at once without losing a change. A file that can't be read is
-//! reported with its path and left as it is, never replaced.
+//! Files are written atomically, and changes to an agent hold its lock
+//! ([`crate::store`]), so the CLI, the web UI and an agent can work at once without
+//! losing a change. A file that can't be read is reported with its path and left as it
+//! is, never replaced.
 
 use std::path::{Path, PathBuf};
 
@@ -109,6 +110,12 @@ pub struct AgentState {
     /// The digital workers that run it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deployments: Vec<DeploymentRecord>,
+    /// The agent plans are pointed to, once it is deprecated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    /// Once retired with `--purge`: when its releases, reports and builds may go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_after: Option<String>,
     /// Every change, oldest first.
     #[serde(default)]
     pub history: Vec<Change>,
@@ -122,9 +129,73 @@ impl AgentState {
             active_version: None,
             versions: Vec::new(),
             deployments: Vec::new(),
+            replacement: None,
+            purge_after: None,
             history: Vec::new(),
         }
     }
+
+    /// Its deployment on worker `worker`, if it has one.
+    pub fn deployment(&self, worker: &str) -> Option<&DeploymentRecord> {
+        self.deployments.iter().find(|d| d.worker == worker)
+    }
+
+    pub fn deployment_mut(&mut self, worker: &str) -> Option<&mut DeploymentRecord> {
+        self.deployments.iter_mut().find(|d| d.worker == worker)
+    }
+
+    /// Records a change: who, what and why, now.
+    pub fn changed(&mut self, by: &str, what: impl Into<String>, why: Option<&str>) {
+        self.history.push(Change {
+            at: now(),
+            by: by.to_owned(),
+            what: what.into(),
+            why: why.map(str::to_owned),
+        });
+    }
+}
+
+/// Where a deployment is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeployState {
+    /// Made, its worker not started yet.
+    Starting,
+    /// Its worker runs the release's smoke cases before it takes work.
+    Canary,
+    /// It takes work.
+    Running,
+    /// Its canary failed: it went back to the release before.
+    RolledBack,
+    /// Its worker is stopped: its canary failed with no release to go back to, or the
+    /// agent was retired.
+    Stopped,
+}
+
+impl std::fmt::Display for DeployState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            DeployState::Starting => "starting",
+            DeployState::Canary => "canary",
+            DeployState::Running => "running",
+            DeployState::RolledBack => "rolled-back",
+            DeployState::Stopped => "stopped",
+        })
+    }
+}
+
+/// What a deployment's canary found.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Canary {
+    pub passed: bool,
+    /// How many smoke cases it ran.
+    pub cases: usize,
+    /// The smoke cases that failed, each with why.
+    #[serde(default)]
+    pub failed: Vec<String>,
+    /// The evaluation that ran them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<String>,
 }
 
 /// A digital worker that runs a release.
@@ -132,13 +203,46 @@ impl AgentState {
 pub struct DeploymentRecord {
     pub worker: String,
     pub version: String,
-    pub state: String,
+    pub state: DeployState,
+    /// The release it ran before this one, which a failed canary goes back to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary: Option<Canary>,
+    /// The shared folders it works in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<String>,
+    /// Its budgets, where its owner changed the release's (see [`crate::factory::deploy`]).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::factory::blueprint::Budgets::is_empty"
+    )]
+    pub budgets: crate::factory::blueprint::Budgets,
+    /// Why its last change happened (a rollback's reason, a failed canary's cases).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// When it last changed.
+    #[serde(default)]
+    pub at: String,
 }
 
 /// A change to an agent: who, when, what and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     pub at: String,
+    pub by: String,
+    pub what: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+/// A lifecycle change as the factory's audit log keeps it (`factory/audit.jsonl`): every
+/// release, sign-off, deployment, rollback, budget, deprecation and retirement, with no
+/// text of any task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLine {
+    pub at: String,
+    pub agent: String,
     pub by: String,
     pub what: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -432,9 +536,122 @@ impl FactoryStore {
         self.prepare()?;
         let _lock = FileLock::acquire(&self.state_path(name))?;
         let mut state = read_json(&self.state_path(name))?.unwrap_or_else(|| AgentState::new(name));
+        let before = state.history.len();
         change(&mut state)?;
         write_json(&self.state_path(name), &state)?;
+        // What changed goes to the factory's audit log too.
+        for change in &state.history[before.min(state.history.len())..] {
+            self.audit(&AuditLine {
+                at: change.at.clone(),
+                agent: name.to_owned(),
+                by: change.by.clone(),
+                what: change.what.clone(),
+                why: change.why.clone(),
+            });
+        }
         Ok(state)
+    }
+
+    /// The factory's audit log: every lifecycle change of its agents, one JSON line each.
+    pub fn audit_path(&self) -> PathBuf {
+        self.root.join("audit.jsonl")
+    }
+
+    /// Appends `line` to the audit log; a failure is reported, never failing the change.
+    pub fn audit(&self, line: &AuditLine) {
+        let written = (|| -> Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.audit_path())?;
+            let mut bytes = serde_json::to_vec(line)?;
+            bytes.push(b'\n');
+            file.write_all(&bytes)?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            eprintln!(
+                "warning: could not write {}: {e:#}",
+                self.audit_path().display()
+            );
+        }
+    }
+
+    /// The audit log's lines about agent `name` (every agent's with `None`), oldest first.
+    pub fn audit_lines(&self, name: Option<&str>) -> Result<Vec<AuditLine>> {
+        let text = match std::fs::read_to_string(self.audit_path()) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", self.audit_path().display()));
+            }
+        };
+        Ok(text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AuditLine>(l).ok())
+            .filter(|l| name.is_none_or(|n| l.agent == n))
+            .collect())
+    }
+
+    /// Where agent `name`'s releases are kept, a folder each.
+    pub fn releases_dir(&self, name: &str) -> PathBuf {
+        self.agent_dir(name).join("releases")
+    }
+
+    /// Where agent `name`'s release `version` is kept (see [`crate::factory::release`]).
+    pub fn release_dir(&self, name: &str, version: &str) -> PathBuf {
+        self.releases_dir(name).join(version)
+    }
+
+    /// The versions agent `name` has a release folder for, whatever their state.
+    pub fn release_versions(&self, name: &str) -> Result<Vec<String>> {
+        validate_agent_name(name)?;
+        Ok(read_dir(&self.releases_dir(name))?
+            .into_iter()
+            .filter(|e| {
+                e.path()
+                    .join(crate::factory::release::RELEASE_FILE)
+                    .is_file()
+            })
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|v| v.parse::<crate::factory::release::Version>().is_ok())
+            .collect())
+    }
+
+    /// Keeps a new release of agent `name`: its folder written whole from `files` (paths
+    /// in it, `/`-separated), then renamed into place. Fails if `version` has a folder.
+    pub fn save_release(
+        &self,
+        name: &str,
+        version: &str,
+        files: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<PathBuf> {
+        validate_agent_name(name)?;
+        self.prepare()?;
+        let dir = self.release_dir(name, version);
+        if dir.exists() {
+            bail!("{version} is already a release of {name}");
+        }
+        let releases = self.releases_dir(name);
+        std::fs::create_dir_all(&releases)
+            .with_context(|| format!("creating {}", releases.display()))?;
+        let partial = releases.join(format!(".partial-{}", uuid::Uuid::new_v4().simple()));
+        let written = (|| -> Result<()> {
+            for (path, bytes) in files {
+                let file = partial.join(path);
+                if let Some(parent) = file.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&file, bytes)?;
+            }
+            rename_dir(&partial, &dir)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_dir_all(&partial);
+        }
+        written.with_context(|| format!("keeping release {version} of {name}"))?;
+        Ok(dir)
     }
 
     /// Deletes agent `name`'s draft and records (`false` if it had neither). An agent
@@ -522,7 +739,7 @@ impl FactoryStore {
     }
 }
 
-fn validate_agent_name(name: &str) -> Result<()> {
+pub(crate) fn validate_agent_name(name: &str) -> Result<()> {
     validate_name(name).map_err(|_| {
         anyhow::anyhow!(
             "{name:?} can't name an agent: use letters, digits, '-', '_' and '.' (at most 64)"
@@ -530,7 +747,7 @@ fn validate_agent_name(name: &str) -> Result<()> {
     })
 }
 
-fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
+pub(crate) fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
     match std::fs::read_dir(dir) {
         Ok(entries) => Ok(entries.flatten().collect()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -539,7 +756,7 @@ fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
 }
 
 /// The text files under `dir`, by their `/`-separated paths below it (after `prefix`).
-fn read_tree(
+pub(crate) fn read_tree(
     dir: &Path,
     prefix: &str,
     files: &mut std::collections::BTreeMap<String, String>,
@@ -561,7 +778,7 @@ fn read_tree(
 
 /// Renames folder `from` to `to`, trying again for a moment while Windows still holds the
 /// files just written in it.
-fn rename_dir(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn rename_dir(from: &Path, to: &Path) -> Result<()> {
     let mut tries = 0;
     loop {
         match std::fs::rename(from, to) {
@@ -577,7 +794,7 @@ fn rename_dir(from: &Path, to: &Path) -> Result<()> {
 
 /// The JSON file at `path` (`None` if there is none). One that can't be read or
 /// parsed is an error naming it, so it is never written over by mistake.
-fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -591,7 +808,7 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     })
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(
         path,
         (serde_json::to_string_pretty(value)? + "\n").as_bytes(),

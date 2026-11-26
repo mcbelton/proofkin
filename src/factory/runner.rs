@@ -31,14 +31,14 @@ use futures_util::stream::FuturesUnordered;
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde_json::Value;
 
-use crate::agent::{Agent, Delivered, MAX_CONCURRENT_TASKS, PeerInfo};
+use crate::agent::{Agent, Delegation, Delivered, MAX_CONCURRENT_TASKS, PeerInfo};
 use crate::factory::adversarial::{self, Seeds};
 use crate::factory::blueprint::{Blueprint, Candidate, Catalog, Problem, from_value, has_errors};
 use crate::factory::build::{AGENT_FILE, BLUEPRINT_FILE, Build};
 use crate::factory::evals::{Expect, MAX_REPETITIONS, Outcome, grade_now};
 use crate::factory::judge;
 use crate::factory::report::{
-    Estimate, EvalCase, EvalRun, EvalState, Evaluation, Gate, Grade, RunState, SentTask,
+    CanaryOf, Estimate, EvalCase, EvalRun, EvalState, Evaluation, Gate, Grade, RunState, SentTask,
     Thresholds, new_id, timestamp,
 };
 use crate::factory::routing::{self, LeftOut, Route};
@@ -59,6 +59,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
 pub const TASKS_PER_HOUR: u32 = 1000;
 /// How long the evaluation worker gets to connect and share the evaluation's folder.
 pub const READY_WAIT: Duration = Duration::from_secs(60);
+/// How many more times a run's task is sent when its worker was gone for a moment.
+const SEND_TRIES: u32 = 3;
 /// The evaluation worker's role, as its peers see it.
 const ROLE: &str = "Runs the agent factory's evaluations";
 /// In the evaluation's workspace: its folder, the one next to it no run may reach, and the
@@ -421,6 +423,76 @@ pub fn prepare(store: &FactoryStore, request: Request<'_>) -> Result<Setup> {
         gate: Gate::default(),
         recommended: None,
         error: None,
+        canary: None,
+        signer: String::new(),
+        signer_id: String::new(),
+        signature: String::new(),
+    };
+    let share = folder(store, &evaluation, bp, request.folders)?;
+    store.save_evaluation(&evaluation)?;
+    Ok(Setup { evaluation, share })
+}
+
+/// What a deployment's canary is of, and where it runs.
+pub struct CanaryRequest<'a> {
+    /// The release's blueprint and build.
+    pub blueprint: &'a Blueprint,
+    pub build: &'a Build,
+    pub version: String,
+    /// The model the release runs on.
+    pub route: Route,
+    pub by: String,
+    /// The deployed worker: its name and endpoint id.
+    pub worker: String,
+    pub worker_id: EndpointId,
+    pub folders: &'a ShareStore,
+}
+
+/// Prepares a deployment's canary: the release's smoke cases, once each, on its model, on
+/// the deployed worker (which gives each task its release's instructions), with the
+/// fixtures kept in the release. The caller holds the evaluation lock.
+pub fn prepare_canary(store: &FactoryStore, request: CanaryRequest<'_>) -> Result<Setup> {
+    let bp = request.blueprint;
+    let now = chrono::Utc::now();
+    let id = new_id(&bp.name, now);
+    if store.evaluation_path(&bp.name, &id).exists() {
+        bail!(
+            "an evaluation of {} started this second; start it again",
+            bp.name
+        );
+    }
+    let seeds = Seeds::new();
+    let cases: Vec<EvalCase> = cases(bp, &seeds, &store.evaluation_dir())
+        .into_iter()
+        .filter(|c| c.smoke && !c.is_adversarial())
+        .collect();
+    let runs = cases.iter().map(|c| EvalRun::new(0, &c.id, 1)).collect();
+    let evaluation = Evaluation {
+        id,
+        agent: bp.name.clone(),
+        build: request.build.hash.clone(),
+        state: EvalState::Running,
+        started: timestamp(now),
+        finished: None,
+        by: request.by,
+        worker: request.worker.clone(),
+        worker_id: request.worker_id.to_string(),
+        candidates: vec![request.route],
+        repetitions: 1,
+        adversarial: adversarial::VERSION.into(),
+        seeds,
+        thresholds: Thresholds::of(bp),
+        prefer: bp.model.prefer,
+        cases,
+        runs,
+        results: Vec::new(),
+        gate: Gate::default(),
+        recommended: None,
+        error: None,
+        canary: Some(CanaryOf {
+            worker: request.worker,
+            version: request.version,
+        }),
         signer: String::new(),
         signer_id: String::new(),
         signature: String::new(),
@@ -516,7 +588,13 @@ fn folder(
             remove_dir(d)?;
             std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
         }
-        let fixtures = store.fixtures_dir(&evaluation.agent);
+        let fixtures = match &evaluation.canary {
+            // A canary runs on the files its release keeps.
+            Some(c) => store
+                .release_dir(&evaluation.agent, &c.version)
+                .join(crate::factory::release::FIXTURES_DIR),
+            None => store.fixtures_dir(&evaluation.agent),
+        };
         for case in &evaluation.cases {
             for file in &case.fixtures {
                 let to = inside.join(file);
@@ -856,7 +934,12 @@ fn task_of(
     }
     let mut task = LlmTask::new(
         candidate.provider,
-        format!("Follow these instructions:\n{instructions}\n---\n{own}"),
+        if evaluation.canary.is_some() {
+            // The deployed worker gives every task its release's instructions.
+            own
+        } else {
+            format!("Follow these instructions:\n{instructions}\n---\n{own}")
+        },
     );
     task.model = candidate.model.clone();
     task.effort = candidate.effort.clone();
@@ -999,11 +1082,7 @@ impl Runner {
                             share,
                             blueprint.budgets.attempts,
                         );
-                        self.connected().await;
-                        match self
-                            .agent
-                            .send_task(self.worker, task.clone(), Some(origin))
-                        {
+                        match self.send(task.clone(), &origin).await {
                             Ok(delegation) => {
                                 let task_id = delegation.task_id();
                                 self.agent.keep_on_exit(task_id);
@@ -1088,6 +1167,26 @@ impl Runner {
         let deadline = Instant::now() + self.ready_wait;
         while !self.agent.peers().iter().any(|p| p.id == self.worker) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Sends the worker a run's task. A worker that just started (or reconnected) may drop
+    /// out for a moment while its connections settle: a send that finds it gone waits for it
+    /// and tries again, a few times, before the run fails.
+    async fn send(&self, task: LlmTask, origin: &Origin) -> Result<Delegation> {
+        let mut tries = 0;
+        loop {
+            self.connected().await;
+            match self
+                .agent
+                .send_task(self.worker, task.clone(), Some(origin.clone()))
+            {
+                Err(_) if tries < SEND_TRIES => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                sent => return sent,
+            }
         }
     }
 

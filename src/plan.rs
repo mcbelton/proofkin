@@ -741,6 +741,10 @@ impl Plan {
                 if step.model.is_none() && !step.approve && step.team.is_none() {
                     step.model = agent.model.clone();
                 }
+                // A factory agent's release, as its evidence and the run's record name it.
+                if let Some(version) = &agent.version {
+                    step.agent = Some(format!("{}@{version}", agent.name));
+                }
             }
             if step.skills.is_empty() && agent.is_none() {
                 continue;
@@ -1322,8 +1326,21 @@ fn parse_step(line: &str, continuation: &str) -> Result<Step> {
                         agent = Some(value.to_owned());
                     }
                     "agent" => {
-                        validate_name(value)
-                            .map_err(|_| anyhow!("agent= needs an agent's name, got {value:?}"))?;
+                        let (base, version) = match value.split_once('@') {
+                            Some((base, version)) => (base, Some(version)),
+                            None => (value, None),
+                        };
+                        let bad = || {
+                            anyhow!(
+                                "agent= needs an agent's name, or a factory agent's name@version (e.g. fin-analyst@1.2.0), got {value:?}"
+                            )
+                        };
+                        validate_name(base).map_err(|_| bad())?;
+                        if let Some(version) = version {
+                            version
+                                .parse::<crate::factory::release::Version>()
+                                .map_err(|_| bad())?;
+                        }
                         agent = Some(value.to_owned());
                     }
                     "levels" => {
@@ -2078,6 +2095,13 @@ pub fn preflight(
                 own.clone()
             }
         };
+        // A deprecated factory agent works, but plans are pointed to its replacement.
+        if let Some(name) = own.agent.as_ref().filter(|_| !own.is_workiq())
+            && let Ok(agent) = skills.agent(name)
+            && let Some(why) = agent.deprecated
+        {
+            report(Some(own), false, why);
+        }
         let prose = without_code_spans(&step.prompt);
         if let Some(word) = prose.split_whitespace().find(|w| is_option(w)) {
             report(
@@ -3906,6 +3930,8 @@ pub async fn run_plan_with(
                         .and_then(|text| crate::tracker::issue_title(text))
                         .map(crate::llm::title_of);
                     task.issues = ctx.issues.get(&step.id).cloned().unwrap_or_default();
+                    // The agent it acts as: a factory agent by its release (prepare() names it).
+                    task.agent = step.agent.clone().filter(|_| !step.is_workiq());
                     if let Some(share) = &step.share {
                         task = task.in_share(share.clone());
                     }
@@ -4626,6 +4652,139 @@ mod tests {
         fails("a @x agent=sec agent=sec do", "agent= is given twice");
         fails("a @x agent=../up do", "agent= needs an agent's name");
         fails("a approve @me agent=sec ok?", "can't act as an agent");
+        fails(
+            "a @x agent=sec@v2 do",
+            "name@version (e.g. fin-analyst@1.2.0)",
+        );
+    }
+
+    /// AC-21: a released factory agent works in plans by its name (its active release) or
+    /// name@version (that release); an unknown version is refused naming those there are, a
+    /// deprecated agent warns with its replacement and a retired one is refused.
+    #[test]
+    fn steps_act_as_factory_agents_by_their_active_release_or_a_version() {
+        use crate::factory::store::Lifecycle;
+        let f = crate::factory::release::tests::Fixture::new();
+        let plain = |v: &mut serde_json::Value| {
+            v["approvers"] = serde_json::json!([]);
+            v["capabilities"]["mcp"] = serde_json::json!([]);
+            v["model"]["needs_mcp"] = serde_json::json!(false);
+        };
+        let first = f.evaluated(plain, false);
+        f.release(&first.id, None).unwrap();
+        let second = f.evaluated(
+            |v| {
+                plain(v);
+                v["instructions"] = serde_json::json!("Version two: quote every figure.");
+            },
+            false,
+        );
+        f.release(&second.id, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills")).with_factory(f.store.clone());
+        assert!(
+            skills
+                .agents()
+                .iter()
+                .any(|a| a.name == "fin-analyst" && a.version.as_deref() == Some("1.0.1")),
+            "plans see it among the agents"
+        );
+
+        let ready = Plan::parse("a @x agent=fin-analyst Analyze q3")
+            .unwrap()
+            .prepare(&kb, &skills)
+            .unwrap();
+        let step = &ready.steps[0];
+        assert_eq!(
+            step.agent.as_deref(),
+            Some("fin-analyst@1.0.1"),
+            "its active release"
+        );
+        assert!(
+            step.prompt.starts_with(
+                "Follow these instructions:\n\n### Agent: fin-analyst\nVersion two: quote every figure."
+            ),
+            "{}",
+            step.prompt
+        );
+        assert!(step.prompt.contains("### Skill: fin-analyst.risk-review"));
+        assert_eq!(
+            step.model.as_deref(),
+            Some("gpt-6-sol"),
+            "the model it was released on"
+        );
+        let pinned = Plan::parse("a @x agent=fin-analyst@1.0.0 Analyze q3")
+            .unwrap()
+            .prepare(&kb, &skills)
+            .unwrap();
+        assert_eq!(pinned.steps[0].agent.as_deref(), Some("fin-analyst@1.0.0"));
+        assert!(!pinned.steps[0].prompt.contains("Version two"));
+
+        let peers = vec![PeerInfo {
+            name: "alice".into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: vec![Provider::Copilot],
+            shares: vec![crate::shares::ShareInfo {
+                name: crate::shares::DATA_SHARE.into(),
+                access: Access::ReadOnly,
+                ..Default::default()
+            }],
+            owner: None,
+            role: None,
+            agent: None,
+            load: None,
+            models: Default::default(),
+            offers: Default::default(),
+        }];
+        let check = |text: &str| {
+            preflight(
+                &Plan::parse(text).unwrap(),
+                &peers,
+                &SquadStore::default(),
+                &kb,
+                &skills,
+                &Recipients::default(),
+            )
+        };
+        let ok = check("a @alice agent=fin-analyst Analyze");
+        assert!(ok.is_empty(), "{ok:?}");
+        let unknown = check("a @alice agent=fin-analyst@9.9.9 Analyze");
+        assert!(
+            unknown[0].error
+                && unknown[0]
+                    .message
+                    .contains("fin-analyst has no release 9.9.9 (it has 1.0.1, 1.0.0)"),
+            "{unknown:?}"
+        );
+        f.store
+            .update_state("fin-analyst", |s| {
+                s.state = Lifecycle::Deprecated;
+                s.replacement = Some("fin-analyst-2".into());
+                Ok(())
+            })
+            .unwrap();
+        let deprecated = check("a @alice agent=fin-analyst Analyze");
+        assert!(
+            deprecated.len() == 1
+                && !deprecated[0].error
+                && deprecated[0].message == "agent fin-analyst is deprecated: use fin-analyst-2",
+            "{deprecated:?}"
+        );
+        f.store
+            .update_state("fin-analyst", |s| {
+                s.state = Lifecycle::Retired;
+                Ok(())
+            })
+            .unwrap();
+        let retired = check("a @alice agent=fin-analyst Analyze");
+        assert!(
+            retired.iter().any(|p| p.error
+                && p.message
+                    .contains("agent fin-analyst is retired: use fin-analyst-2")),
+            "{retired:?}"
+        );
+        assert!(!skills.agents().iter().any(|a| a.name == "fin-analyst"));
     }
 
     #[test]
@@ -4694,6 +4853,7 @@ mod tests {
             }],
             owner: None,
             role: None,
+            agent: None,
             load: None,
             models,
             offers: Default::default(),
@@ -4932,6 +5092,7 @@ mod tests {
             shares,
             owner: None,
             role: None,
+            agent: None,
             load: None,
             models: Default::default(),
             offers: Default::default(),
@@ -5229,6 +5390,7 @@ mod tests {
             }],
             owner: None,
             role: None,
+            agent: None,
             load: None,
             models: Default::default(),
             offers: Default::default(),
@@ -5341,6 +5503,7 @@ mod tests {
             }],
             owner: None,
             role: None,
+            agent: None,
             load: None,
             models: Default::default(),
             offers: Default::default(),
@@ -5869,6 +6032,7 @@ mod tests {
                 .collect(),
             owner: None,
             role: None,
+            agent: None,
             load: None,
             models: Default::default(),
             offers: Default::default(),
@@ -6284,6 +6448,7 @@ mod tests {
             }],
             owner: None,
             role: None,
+            agent: None,
             load: None,
             models: Default::default(),
             offers: Default::default(),
@@ -6443,6 +6608,7 @@ mod tests {
             }],
             owner: None,
             role: None,
+            agent: None,
             load: None,
             models: Default::default(),
             offers: Default::default(),
@@ -6569,6 +6735,7 @@ mod tests {
             }],
             owner: None,
             role: None,
+            agent: None,
             load: None,
             models: Default::default(),
             offers: Default::default(),

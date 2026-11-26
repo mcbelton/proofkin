@@ -62,6 +62,51 @@ pub struct AuditEntry {
     /// What the work used, as its provider reported it (none if it reported none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// The factory agent it ran as, `name@version`: a deployed agent's release, or the agent
+    /// a plan step acted as (see [`crate::factory`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The model attempts it took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// Its checks, as its runtime ran them after the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<CheckTally>,
+    /// What refused it, when a deployed agent's rules did: `budget`, `canary`, `stopped`
+    /// or `release` (its release can't run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_by: Option<String>,
+}
+
+/// How many of a task's checks passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckTally {
+    pub passed: u32,
+    pub total: u32,
+}
+
+/// A task a deployed agent's own rules refused, with what refused it (`budget`, `canary`,
+/// `stopped`, `release`), so its audit entry says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub by: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// What refused `error`'s task, if a deployed agent's rules did.
+pub fn refused_by(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|e| e.downcast_ref::<Refusal>())
+        .map(|r| r.by)
 }
 
 impl AuditEntry {
@@ -107,6 +152,10 @@ impl AuditEntry {
             team: task.team.is_some(),
             model: None,
             usage: None,
+            agent: task.agent.clone(),
+            attempts: None,
+            checks: None,
+            refused_by: None,
         }
     }
 }

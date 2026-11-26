@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use proofkin::factory::blueprint::{Blueprint, SCHEMA, from_value};
 use proofkin::factory::build::Build;
+use proofkin::factory::deploy::{self, Deployed, Pinned};
 use proofkin::factory::report::{EvalState, Evaluation, RunState};
 use proofkin::factory::routing::Route;
 use proofkin::factory::runner::{self, Judges, Request, Runner, SHARE, Setup};
@@ -31,6 +32,7 @@ struct Call {
     own: String,
     access: Access,
     model: Option<String>,
+    prompt: String,
 }
 
 /// A model under evaluation. A safe one does its job and keeps to its folder, by the path
@@ -200,6 +202,7 @@ impl Executor for Model {
             own: own.to_owned(),
             access: ctx.access,
             model: task.model.clone(),
+            prompt: task.prompt.clone(),
         });
         let model = task.model.as_deref().unwrap_or_default();
         if let Some(delay) = self.delay.get(model) {
@@ -305,6 +308,8 @@ struct Node {
     executor: Option<Arc<dyn Executor>>,
     grace: Duration,
     dir: PathBuf,
+    deployed: Option<Arc<Deployed>>,
+    owner_id: Option<proofkin::EndpointId>,
 }
 
 impl Node {
@@ -316,6 +321,8 @@ impl Node {
             executor: None,
             grace: Duration::from_secs(2),
             dir: dir.to_path_buf(),
+            deployed: None,
+            owner_id: None,
         }
     }
 
@@ -333,6 +340,8 @@ impl Node {
         config.task_ids = Some(self.dir.join(format!("{}.task-ids", self.name)));
         config.task_checks = Some(env!("CARGO_BIN_EXE_proofkin").into());
         config.worktrees_dir = self.dir.join("worktrees").join(self.name);
+        config.deployed = self.deployed.clone();
+        config.owner_id = self.owner_id;
         Agent::bind(config).await.unwrap()
     }
 }
@@ -352,11 +361,22 @@ struct Pair {
 
 impl Pair {
     async fn new(model: Arc<Model>, worker_grace: Duration) -> Self {
+        Self::with(model, worker_grace, None).await
+    }
+
+    /// With its worker running `deployed`, a release of its owner's.
+    async fn with(
+        model: Arc<Model>,
+        worker_grace: Duration,
+        deployed: Option<Arc<Deployed>>,
+    ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let mut boss = Node::new("boss", tmp.path());
         let mut worker = Node::new("eval", tmp.path());
         worker.executor = Some(model.clone());
         worker.grace = worker_grace;
+        worker.owner_id = Some(boss.key.public());
+        worker.deployed = deployed;
         boss.trust.allow(TrustedPeer {
             name: "eval".into(),
             id: worker.key.public(),
@@ -1027,5 +1047,102 @@ async fn a_plan_step_proves_an_agent_kept_as_code_with_the_built_in_checks() {
                 failed[check].output
             );
         }
+    }
+}
+/// AC-19: a deployment's canary runs the release's smoke cases (only those) on the deployed
+/// worker through the eval runner, on the release's model. Its tasks carry no instructions:
+/// the worker gives each its release's. A smoke case that fails fails the canary, saying why.
+#[tokio::test]
+async fn a_canary_runs_the_releases_smoke_cases_on_its_deployed_worker() {
+    let cases = json!([
+        risk_case(),
+        { "id": "E2", "requirement": "R2", "input": "Name the risk in q3.md once more.",
+          "fixtures": ["q3.md"], "expect": [{ "contains": "supplier delay" }] }
+    ]);
+    let bp = blueprint("read-only", &[], cases, &["fake-small"]);
+    for (answer, passes) in [(None, true), (Some("The risk is a strike."), false)] {
+        let mut model = Model::new(true);
+        model.risk = answer;
+        let model = Arc::new(model);
+        let pinned = Pinned {
+            agent: "notes".into(),
+            version: "1.0.0".into(),
+            state: proofkin::factory::store::DeployState::Canary,
+            instructions:
+                "\n### Agent: notes 1.0.0\nYou read project notes and report the risks they name.\n"
+                    .into(),
+            budgets: proofkin::factory::blueprint::Budgets::default(),
+            delegate: false,
+            access: Access::ReadOnly,
+        };
+        let pair = Pair::with(
+            model.clone(),
+            Duration::from_secs(2),
+            Some(Deployed::fixed(pinned)),
+        )
+        .await;
+        let skills = proofkin::skills::Skills::new(pair.tmp.path().join("skills"));
+        let build = proofkin::factory::build::build(&bp, &skills).unwrap();
+        pair.store.save_build(&build).unwrap();
+        // The release keeps its cases' fixtures.
+        let fixtures = pair.store.release_dir("notes", "1.0.0").join("fixtures");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        std::fs::copy(
+            pair.store.fixtures_dir("notes").join("q3.md"),
+            fixtures.join("q3.md"),
+        )
+        .unwrap();
+        let setup = runner::prepare_canary(
+            &pair.store,
+            runner::CanaryRequest {
+                blueprint: &bp,
+                build: &build,
+                version: "1.0.0".into(),
+                route: route("fake-small"),
+                by: "boss".into(),
+                worker: "eval".into(),
+                worker_id: pair.worker.id(),
+                folders: &pair.folders,
+            },
+        )
+        .unwrap();
+        let ids: Vec<&str> = setup
+            .evaluation
+            .cases
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, ["E1"], "its smoke cases only");
+        pair.share(&setup.share);
+        let ended = pair
+            .runner(Judges::default())
+            .run(setup.evaluation, &setup.share, |_| {})
+            .await
+            .unwrap();
+        let canary = deploy::verdict(&ended);
+        assert_eq!((canary.passed, canary.cases), (passes, 1), "{canary:?}");
+        let calls = model.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .prompt
+                .starts_with("Follow these instructions:\n\n### Agent: notes 1.0.0\n"),
+            "{}",
+            calls[0].prompt
+        );
+        assert_eq!(
+            calls[0].prompt.matches("Follow these instructions").count(),
+            1,
+            "the worker's instructions, not the runner's too"
+        );
+        assert_eq!(calls[0].model.as_deref(), Some("fake-small"));
+        if !passes {
+            assert!(canary.failed[0].starts_with("E1: "), "{:?}", canary.failed);
+        }
+        ended.verify().unwrap();
+        assert_eq!(
+            ended.canary.as_ref().map(|c| c.version.as_str()),
+            Some("1.0.0")
+        );
     }
 }

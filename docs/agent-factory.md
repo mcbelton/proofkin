@@ -10,7 +10,12 @@ model policy (candidates, recommendation, pinning) and a digital worker's memory
 Phase 3 (Evaluation) is built: the built-in adversarial suite, the eval runner on the owner's
 evaluation worker, signed reports with the release gate and the recommendation, judges,
 agents as code with the `agent:*` checks, and the web UI, API and MCP tools for drafts and
-evaluations.
+evaluations. Phase 4 (Release and run) is built: signed releases with semantic versions,
+sign-offs (peers' and the owner's for capability increases), factory agents in plans
+(`agent=name`, `agent=name@version`), deployments as digital workers pinned to a release,
+canary and rollback, deprecation and retirement, metrics by release (`factory metrics` and
+the ops report), budgets, the `agent-factory` playbook with `release --from`, and the web UI
+and API to configure an agent with a form and release, deploy, roll back, retire and watch it.
 
 The formal design package is in [agent-factory/](agent-factory/): the
 [spec](agent-factory/spec/SPEC.md) (14 user stories, 33 acceptance criteria), the

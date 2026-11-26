@@ -77,11 +77,13 @@ function workerNode(w) {
   const runs = w.providers.length ? `Runs ${w.providers.map(providerLabel).join(", ")}` : "Runs no models";
   const where = `works in ${["its data folder", ...w.folders].join(", ")}`;
   const p = w.process ?? {};
+  const release = w.release;
   return el("li", { class: "worker", "data-worker": w.name },
     avatar(w.name, workerOnline(w)),
     el("div", { class: "who" },
       el("span", { class: "worker-head" }, el("span", { class: "name", text: w.name }), el("span", { class: `status ${kind}`, text })),
       w.role ? el("span", { class: "role", text: w.role }) : null,
+      release ? el("span", { class: "sub", text: `Runs release ${release.version} of factory agent ${release.agent}${release.state === "running" ? "" : ` (${release.state})`}` }) : null,
       el("span", { class: "sub", text: `${runs} · ${where}` }),
       phase === "exited" ? el("details", { class: "worker-log" },
         el("summary", { text: p.code === null || p.code === undefined ? "Why it stopped" : `Why it stopped (exit code ${p.code})` }),
@@ -98,6 +100,11 @@ function workerNode(w) {
             : "It uses your models settings",
           onclick: (e) => openModelsDialog(w.name, e.currentTarget),
         }, "Models…") : null,
+        release ? el("button", {
+          type: "button", class: "btn small", "aria-label": `Open factory agent ${release.agent}`,
+          title: "Its releases, deployments, budgets and metrics",
+          onclick: (e) => openFactoryAgent(release.agent, e.currentTarget, "deployments"),
+        }, "Open agent") : null,
         el("label", { class: "check small", title: "Start it whenever this agent starts, and stop it when this agent stops" },
           el("input", { type: "checkbox", checked: w.start_with_owner || undefined, onchange: (e) => setStartWithOwner(w, e.currentTarget) }),
           el("span", { text: "Starts with this agent" })))),

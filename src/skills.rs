@@ -86,6 +86,11 @@ const BUILT_IN: &[(&str, &str)] = &[
         include_str!("../skills/incident-debugging.md"),
     ),
     ("write-spec", include_str!("../skills/write-spec.md")),
+    (
+        "agent-blueprint",
+        include_str!("../skills/agent-blueprint.md"),
+    ),
+    ("agent-evals", include_str!("../skills/agent-evals.md")),
     ("api-contract", include_str!("../skills/api-contract.md")),
     ("prototype-ux", include_str!("../skills/prototype-ux.md")),
     (
@@ -298,10 +303,16 @@ pub struct AgentDef {
     /// peer allows it); `inherit`, and names that aren't model names, are left out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// `profile` or `plugin`.
+    /// `profile`, `factory` or `plugin`.
     pub source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
+    /// For a factory agent: the release it is (its active one, or the one named).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// For a deprecated factory agent: what plans should use instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<String>,
     /// What its file has that isn't used here.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
@@ -364,6 +375,8 @@ pub fn parse_agent(text: &str, fallback: &str) -> Result<AgentDef> {
         model,
         source: "profile",
         plugin: None,
+        version: None,
+        deprecated: None,
         notes,
     })
 }
@@ -383,6 +396,8 @@ pub struct Skills {
     /// The profile's own agents, next to its skills (`<profile>/agents`).
     agents_dir: PathBuf,
     plugin_agents: Vec<PluginAgentRef>,
+    /// The profile's agent factory: its agents' releases (see [`crate::factory::release`]).
+    factory: Option<crate::factory::FactoryStore>,
 }
 
 impl Skills {
@@ -394,7 +409,15 @@ impl Skills {
             dir,
             plugins: Vec::new(),
             plugin_agents: Vec::new(),
+            factory: None,
         }
+    }
+
+    /// With the released agents of the profile's agent factory, after its own agents and
+    /// before its plugins'.
+    pub fn with_factory(mut self, store: crate::factory::FactoryStore) -> Self {
+        self.factory = Some(store);
+        self
     }
 
     /// With the agents of enabled plugins: (plugin, agent, its file).
@@ -591,15 +614,25 @@ impl Skills {
             })
     }
 
-    /// The agent `name` refers to (named so): the profile's own, else a plugin's. A
-    /// plugin agent's skills are its plugin's skills when it has one by that name.
+    /// The agent `name` refers to (named so): the profile's own, else the factory's active
+    /// release of it, else a plugin's; `name@version` is that release of a factory agent. A
+    /// plugin agent's skills are its plugin's skills when it has one by that name. A retired
+    /// factory agent is refused, with its replacement.
     pub fn agent(&self, name: &str) -> Result<AgentDef> {
+        if let Some((base, version)) = name.split_once('@') {
+            return self.factory_agent(base, Some(version))?.ok_or_else(|| {
+                anyhow::anyhow!("there is no factory agent '{base}' (see proofkin factory list)")
+            });
+        }
         if let Some(path) = self.own_agent(name) {
             let mut def = parse_agent(
                 &Self::read_prompt_file(&path, &format!("agent '{name}'"))?,
                 name,
             )?;
             def.name = name.to_owned();
+            return Ok(def);
+        }
+        if let Some(def) = self.factory_agent(name, None)? {
             return Ok(def);
         }
         let Some(a) = self.plugin_agent(name) else {
@@ -629,6 +662,80 @@ impl Skills {
         Ok(def)
     }
 
+    /// Factory agent `name`'s release `version` (its active one by default), verified: its
+    /// agent file's instructions with its skills', the MCP servers it asks for and the model
+    /// it was released on. `None`: the factory has no such agent, or it has no active
+    /// release. A retired agent, an unknown version and a release that doesn't verify are
+    /// errors.
+    fn factory_agent(&self, name: &str, version: Option<&str>) -> Result<Option<AgentDef>> {
+        use crate::factory::release;
+        let Some(store) = &self.factory else {
+            return Ok(None);
+        };
+        if validate_name(name).is_err() {
+            return Ok(None);
+        }
+        let Some(state) = store.state(name)? else {
+            return Ok(None);
+        };
+        let note = crate::factory::lifecycle::plan_note(&state);
+        if let Some((true, why)) = &note {
+            bail!("{why}");
+        }
+        let version = match (version, &state.active_version) {
+            (Some(v), _) => v.to_owned(),
+            (None, Some(v)) => v.clone(),
+            (None, None) => return Ok(None),
+        };
+        let found = release::load(store, name, &version)?;
+        if found.state != release::ReleaseState::Released {
+            bail!(
+                "release {version} of {name} is {}: plans use released releases",
+                found.state
+            );
+        }
+        let build = release::build_of(store, name, &version)?;
+        let model = found
+            .manifest
+            .model
+            .chosen
+            .model
+            .clone()
+            .filter(|m| crate::models::check_name(m).is_ok());
+        Ok(Some(AgentDef {
+            name: name.to_owned(),
+            description: found.manifest.purpose.clone(),
+            skills: Vec::new(),
+            mcp: found
+                .manifest
+                .capabilities
+                .mcp
+                .iter()
+                .map(|m| m.server.clone())
+                .collect(),
+            instructions: release::body(&build)?,
+            model,
+            source: "factory",
+            plugin: None,
+            version: Some(version),
+            deprecated: note.map(|(_, why)| why),
+            notes: Vec::new(),
+        }))
+    }
+
+    /// The factory's agents plans can use: each one's active release.
+    fn factory_agents(&self) -> Vec<AgentDef> {
+        let Some(store) = &self.factory else {
+            return Vec::new();
+        };
+        store
+            .names()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| self.factory_agent(name, None).ok().flatten())
+            .collect()
+    }
+
     /// Every agent: the profile's own, then plugins' (by short name when no other
     /// agent has it). One that can't be read is left out.
     pub fn agents(&self) -> Vec<AgentDef> {
@@ -645,6 +752,11 @@ impl Skills {
             .collect();
         names.sort();
         let mut agents: Vec<AgentDef> = names.iter().filter_map(|n| self.agent(n).ok()).collect();
+        for def in self.factory_agents() {
+            if !agents.iter().any(|x| x.name == def.name) {
+                agents.push(def);
+            }
+        }
         for a in &self.plugin_agents {
             let reference = if agents.iter().any(|x| x.name == a.name) {
                 format!("{}.{}", a.plugin, a.name)

@@ -1593,6 +1593,10 @@ mod tests {
                 team: false,
                 model: None,
                 usage: None,
+                agent: None,
+                attempts: None,
+                checks: None,
+                refused_by: None,
             };
         let entries = [
             entry("a", 7, 1_000_000, "step old of run r0"),

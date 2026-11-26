@@ -2170,7 +2170,7 @@ fn ops_report(profile: &Profile, hours: u64) -> Result<String> {
         .filter(|e| e.ts_ms >= since_ms)
         .collect();
     let runs = proofkin::runs::RunRecord::list(&profile.runs_dir()).unwrap_or_default();
-    Ok(report(
+    let mut md = report(
         &profile.name,
         hours,
         &monitors,
@@ -2178,7 +2178,12 @@ fn ops_report(profile: &Profile, hours: u64) -> Result<String> {
         &profile.ops_store(),
         &audit,
         &runs,
-    ))
+    );
+    let since = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+    if let Some(agents) = proofkin::factory::metrics::ops_section(profile, since)? {
+        md += &agents;
+    }
+    Ok(md)
 }
 
 async fn run_kb(command: KbCommand) -> Result<()> {
@@ -4700,6 +4705,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             config.audit = Some(Arc::new(AuditLog::new(profile.audit_path())));
             config.team = Some(Arc::new(proofkin::team::TeamRunner::new(profile.clone())));
             config.memory = proofkin::factory::memory::WorkerMemory::of(&profile);
+            // A deployed factory agent runs its pinned release, checked as it loads.
+            config.deployed = proofkin::factory::deploy::Deployed::of(&profile, config.owner_id);
             config.pulls = Some(Arc::new(proofkin::pulls::ProfilePulls::new(
                 profile.clone(),
             )));
@@ -4748,6 +4755,18 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 .map(|r| format!("; role: {r}"))
                 .unwrap_or_default()
         );
+    }
+    if let Some(deployed) = agent.deployed() {
+        match deployed.current() {
+            Ok(pinned) => println!(
+                "deployed factory agent {} {} ({})",
+                pinned.agent, pinned.version, pinned.state
+            ),
+            Err(why) => eprintln!("its release can't run, so it refuses every task: {why}"),
+        }
+        // Its owner pins another release (a rollback, a canary's verdict, budgets): taken
+        // within seconds.
+        deployed.watch(proofkin::factory::deploy::WATCH_EVERY);
     }
     if args.network == Network::Internet && !agent.online(Duration::from_secs(15)).await {
         eprintln!("warning: no relay reachable yet; peers behind NAT may not reach this agent");
@@ -4861,6 +4880,27 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         return Ok(());
     }
     start_schedules(&profile, &agent)?;
+    // The agent factory's releases waiting for sign-offs, and deployments for their canary.
+    if profile.config.owner.is_none() {
+        let changed: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|name: &str| {
+            println!("agent factory: {name} changed (proofkin factory show {name})")
+        });
+        proofkin::factory::signoff::spawn(
+            proofkin::factory::FactoryStore::of(&profile),
+            agent.clone(),
+            changed.clone(),
+        );
+        if let Some(workers) = &workers {
+            let host = Arc::new(proofkin::factory::deploy::Host {
+                owner: profile.clone(),
+                agent: agent.clone(),
+                key: profile.identity()?,
+                supervisor: workers.clone(),
+                ready_wait: proofkin::factory::runner::READY_WAIT,
+            });
+            tokio::spawn(proofkin::factory::manage::drive_canaries(host, changed));
+        }
+    }
 
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {

@@ -219,6 +219,7 @@ pub fn catalog(bp: &Blueprint, dir: &Path) -> Catalog {
         agents: BTreeSet::new(),
         profiles: BTreeSet::new(),
         factory: BTreeSet::new(),
+        deployed: BTreeMap::new(),
     }
 }
 
@@ -378,6 +379,13 @@ fn check_report(dir: &Path, report: &mut Report) {
             seen.push(format!(
                 "{rel}: evaluation {} {}",
                 evaluation.id, evaluation.state
+            ));
+            continue;
+        }
+        if evaluation.canary.is_some() {
+            seen.push(format!(
+                "{rel}: evaluation {} is a deployment's canary (its smoke cases only)",
+                evaluation.id
             ));
             continue;
         }

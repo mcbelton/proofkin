@@ -37,6 +37,7 @@ use crate::trust::{M365Grant, Ticket, TrustedPeer};
 mod connect;
 mod factory;
 mod models;
+mod releases;
 mod tools;
 mod workers;
 mod workiq;
@@ -442,6 +443,8 @@ impl Shared {
                     "capabilities": p.capabilities,
                     "owner": p.owner,
                     "role": p.role,
+                    // For a deployed factory agent: the release it runs (name@version).
+                    "agent": p.agent,
                     "shares": p.shares,
                     // How busy it says it is, with this agent's tasks there right now.
                     "load": p.load,
@@ -850,6 +853,7 @@ pub async fn start_with_work(
     start_scheduler(&shared);
     settle_tracked_runs(&shared);
     watch_workers(&shared);
+    releases::start(&shared);
 
     let pump = shared.clone();
     tokio::spawn(async move {
@@ -1112,6 +1116,34 @@ pub async fn start_with_work(
         .route(
             "/api/factory/agents/{name}/evaluations",
             post(factory::start_evaluation),
+        )
+        .route(
+            "/api/factory/agents/{name}/releases",
+            post(releases::request_release),
+        )
+        .route(
+            "/api/factory/agents/{name}/releases/{version}",
+            get(releases::get_release),
+        )
+        .route(
+            "/api/factory/agents/{name}/deployments",
+            post(releases::deploy_agent),
+        )
+        .route(
+            "/api/factory/agents/{name}/rollback",
+            post(releases::rollback_agent),
+        )
+        .route(
+            "/api/factory/agents/{name}/lifecycle",
+            post(releases::set_lifecycle),
+        )
+        .route(
+            "/api/factory/agents/{name}/metrics",
+            get(releases::get_metrics),
+        )
+        .route(
+            "/api/factory/agents/{name}/budgets",
+            put(releases::set_budgets),
         )
         .route(
             "/api/factory/evaluations/{id}",
@@ -1545,7 +1577,7 @@ fn start_task(
         Local(Arc<dyn Executor>),
         Peer(iroh::EndpointId, String),
         /// A squad (by name) and the member it goes to first.
-        Squad(String, PeerInfo),
+        Squad(String, Box<PeerInfo>),
     }
     let route = match body.target.as_str() {
         "local" => match &s.executor {
@@ -1586,7 +1618,7 @@ fn start_task(
                 &std::collections::HashSet::new(),
             )
             .map_err(|e| bad_request(format!("{e:#}")))?;
-            Route::Squad(squad.to_owned(), peer)
+            Route::Squad(squad.to_owned(), Box::new(peer))
         }
         id => {
             let peer = s
@@ -1659,7 +1691,7 @@ fn start_task(
                 settle(&shared, &name, &task, delivered, started)
             }
             Route::Squad(squad, peer) => {
-                let (name, delivered) = deliver_to_squad(&shared, id, &squad, peer, &task).await;
+                let (name, delivered) = deliver_to_squad(&shared, id, &squad, *peer, &task).await;
                 settle(&shared, &name, &task, delivered, started)
             }
         };
