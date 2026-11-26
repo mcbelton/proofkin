@@ -698,31 +698,33 @@ pub fn set_pin_state(worker: &Profile, state: DeployState) -> Result<()> {
     write_json(&path, &pin)
 }
 
-/// Ends the deployments on `owner`'s digital worker `worker`, which is being deleted: each
-/// one not stopped yet is stopped, saying why in its agent's history and the audit log, so
-/// a rollback, the drift watch and the factory card pass it by. Returns the agents it ran.
+/// Ends the deployments on `owner`'s digital worker `worker`, which is being deleted: every
+/// agent's deployment record that names it goes, with a line in that agent's history and the
+/// audit log saying why, so the Deployments list, rollbacks, budgets and the drift watch no
+/// longer count it. Returns the agents whose deployment ended (they and their releases stay).
 pub fn worker_deleted(owner: &Profile, worker: &str, by: &str) -> Result<Vec<String>> {
     let store = FactoryStore::of(owner);
-    let live = |s: &AgentState| {
-        s.deployment(worker)
-            .is_some_and(|d| d.state != DeployState::Stopped)
-    };
     let mut ended = Vec::new();
     for name in store.names()? {
-        if !store.state(&name)?.is_some_and(|s| live(&s)) {
+        if !store
+            .state(&name)?
+            .is_some_and(|s| s.deployment(worker).is_some())
+        {
             continue;
         }
         store.update_state(&name, |s| {
-            if let Some(d) = s
-                .deployment_mut(worker)
-                .filter(|d| d.state != DeployState::Stopped)
-            {
-                d.state = DeployState::Stopped;
-                d.note = Some("its worker was deleted".into());
-                d.at = now();
+            let (gone, kept): (Vec<DeploymentRecord>, Vec<DeploymentRecord>) =
+                std::mem::take(&mut s.deployments)
+                    .into_iter()
+                    .partition(|d| d.worker == worker);
+            s.deployments = kept;
+            for d in gone {
                 s.changed(
                     by,
-                    format!("deployment on {worker} ended: its worker was deleted"),
+                    format!(
+                        "its worker {worker} was deleted: its deployment of {} ended",
+                        d.version
+                    ),
                     None,
                 );
             }
@@ -791,7 +793,11 @@ pub fn rollback(
         .iter()
         .filter(|d| d.state != DeployState::Stopped)
     {
-        let mut worker = crate::workers::worker_of(owner, &deployment.worker)?;
+        // A worker deleted without ending its deployment (by an earlier version) is passed
+        // by, as retiring does.
+        let Ok(mut worker) = crate::workers::worker_of(owner, &deployment.worker) else {
+            continue;
+        };
         place(
             owner,
             &mut worker,
@@ -867,7 +873,10 @@ pub fn set_budgets(owner: &Profile, name: &str, budgets: Budgets, by: &str) -> R
     }
     let mut now_in_force = Budgets::default();
     for deployment in &state.deployments {
-        let worker = crate::workers::worker_of(owner, &deployment.worker)?;
+        // A worker that is gone has no pin to change (see `rollback`).
+        let Ok(worker) = crate::workers::worker_of(owner, &deployment.worker) else {
+            continue;
+        };
         let path = worker.dir.join(RELEASE_DIR).join(PIN_FILE);
         let Some(mut pin) = read_json::<Pin>(&path)? else {
             continue;
@@ -1575,39 +1584,38 @@ mod tests {
         );
     }
 
-    /// A worker being deleted ends its deployment: stopped, saying why in the agent's
-    /// history and the audit log, once. With the worker gone a rollback passes it by, and
-    /// the agent's other deployments stay as they were.
+    /// Deleting a deployment's worker ends its deployment: the agent's record of it goes, and
+    /// its history and the audit log say why. Rollback and budgets then work on the agent's
+    /// other deployments, and pass by one whose worker an earlier version deleted.
     #[test]
-    fn a_deleted_workers_deployment_ends_and_a_rollback_passes_it_by() {
-        let (_home, owner, _f) = deployed(&["fin-a", "fin-b"], true);
+    fn a_deleted_workers_deployment_ends_and_rollback_and_budgets_pass_it_by() {
+        let (_home, owner, _f) = deployed(&["fin-a", "fin-b", "fin-c"], true);
         assert_eq!(
             worker_deleted(&owner, "fin-a", "alice").unwrap(),
             ["fin-analyst"]
         );
         let store = FactoryStore::of(&owner);
         let state = store.state("fin-analyst").unwrap().unwrap();
-        let ended = state.deployment("fin-a").unwrap();
-        assert_eq!(
-            (ended.state, ended.note.as_deref()),
-            (DeployState::Stopped, Some("its worker was deleted"))
-        );
+        assert!(state.deployment("fin-a").is_none());
         assert_eq!(
             state.deployment("fin-b").unwrap().state,
             DeployState::Canary
         );
         let audit = store.audit_lines(Some("fin-analyst")).unwrap();
         assert!(
-            audit.iter().any(
-                |l| l.what == "deployment on fin-a ended: its worker was deleted"
-                    && l.by == "alice"
-            ),
+            audit.iter().any(|l| l.what
+                == "its worker fin-a was deleted: its deployment of 1.0.1 ended"
+                && l.by == "alice"),
             "{audit:?}"
         );
         assert!(worker_deleted(&owner, "fin-a", "alice").unwrap().is_empty());
 
-        let gone = crate::workers::worker_of(&owner, "fin-a").unwrap().dir;
-        std::fs::remove_dir_all(gone).unwrap();
+        // fin-a's profile goes, as `workers::delete` deletes it; fin-c's went under an
+        // earlier version, which left its deployment record.
+        for gone in ["fin-a", "fin-c"] {
+            let dir = crate::workers::worker_of(&owner, gone).unwrap().dir;
+            std::fs::remove_dir_all(dir).unwrap();
+        }
         let (_, workers) = rollback(
             &owner,
             "fin-analyst",
@@ -1617,5 +1625,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(workers, ["fin-b"]);
+        let budgets = Budgets {
+            tasks_per_day: Some(10),
+            ..Budgets::default()
+        };
+        let in_force = set_budgets(&owner, "fin-analyst", budgets, "alice").unwrap();
+        assert_eq!(in_force.tasks_per_day, Some(10));
+        assert_eq!(pinned_on(&owner, "fin-b").budgets.tasks_per_day, Some(10));
     }
 }

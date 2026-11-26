@@ -279,9 +279,39 @@ async fn owners_create_start_stop_and_delete_digital_workers_from_the_web_ui() {
     }
     std::fs::create_dir_all(helper.data_folder()).unwrap();
     std::fs::write(helper.data_folder().join("notes.md"), "kept").unwrap();
+    // It runs a release of a factory agent: deleting it ends that deployment.
+    let factory = proofkin::factory::FactoryStore::of(&boss);
+    factory
+        .update_state("fin-analyst", |s| {
+            s.deployments
+                .push(proofkin::factory::store::DeploymentRecord {
+                    worker: "helper".into(),
+                    version: "1.0.0".into(),
+                    state: proofkin::factory::store::DeployState::Running,
+                    previous_version: None,
+                    canary: None,
+                    folders: Vec::new(),
+                    budgets: Default::default(),
+                    note: None,
+                    at: String::new(),
+                });
+            Ok(())
+        })
+        .unwrap();
     let (status, deleted) = ui.call("DELETE", "/api/workers/helper", Value::Null).await;
     assert_eq!(status, 200, "{deleted}");
     assert_eq!(deleted["squads"], json!(["mixed", "solo"]));
+    assert_eq!(deleted["deployments_ended"], json!(["fin-analyst"]));
+    let agent_now = factory.state("fin-analyst").unwrap().unwrap();
+    assert!(agent_now.deployments.is_empty());
+    assert!(
+        agent_now
+            .history
+            .iter()
+            .any(|c| c.what == "its worker helper was deleted: its deployment of 1.0.0 ended"),
+        "{:?}",
+        agent_now.history
+    );
     assert!(!helper.dir.exists());
     assert!(helper.data_folder().join("notes.md").is_file());
     assert!(agent.trusted().get_by_name("helper").is_none());
