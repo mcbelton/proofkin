@@ -129,7 +129,12 @@ Rules that apply to every field:
 | Deployment | version | string, semantic version | Yes | Internal | Say which release runs | As long as the deployment | Pinned: the worker runs exactly this release |
 | Deployment | state | string: starting, canary, running, rolled-back or stopped | Yes | Internal | Show its health | As long as the deployment | rolled-back after a failed canary or a rollback |
 | Deployment | previous_version | string or null | No | Internal | Know what to roll back to | As long as the deployment | The release it ran before |
-| Deployment | canary | object {passed, cases, failed} or null | No | Internal | Show the canary's verdict | As long as the deployment | Smoke case ids that failed |
+| Deployment | canary | object {passed, cases, failed, evaluation} or null | No | Internal | Show the canary's verdict | As long as the deployment | Smoke case ids that failed, and the canary's evaluation (its smoke cases only: never a release's) |
+| Deployment | folders | array of folder names | No | Internal | Say where it works | As long as the deployment | The owner's shared folders it was given, at most the access each allows |
+| Deployment | budgets | object, Budgets | No | Internal | Show the owner's changes to its release's budgets | As long as the deployment | Empty: the release's own |
+| Deployment | note | string or null | No | Internal | Say why it last changed | As long as the deployment | A rollback's reason, a failed canary's cases, retired |
+| Pin | agent, version, manifest_sha256 | strings | Yes | Internal | Say exactly which release a deployed worker runs | As long as the deployment | release/pin.json in the worker's profile, with a verified copy of the release next to it |
+| Pin | state, budgets | string, Budgets | Yes | Internal | Tell the worker whether it takes work, and its limits | As long as the deployment | The worker refuses tasks while it is stopped, and others than its owner's canary while in its canary |
 | RollbackRequest | to_version | string, semantic version | No | Internal | Choose the release to go back to | Audited | Defaults to the previous active release |
 | RollbackRequest | reason | string, at most 500 characters | Yes | Internal | Explain the rollback | Audited | Shown in the audit and the agent's history |
 | LifecycleRequest | state | string: deprecated, retired or active | Yes | Internal | Move the agent through its lifecycle | Audited | active undoes a deprecation; a retired agent can't come back |
@@ -171,6 +176,10 @@ Rules that apply to every field:
 | EvalRun | verdict | string: passed or failed, per expectation | Yes | Internal | Prove the requirement | As long as the agent | Each expectation's result |
 | EvalRun | evidence | object, signed evidence | Yes | Internal | Show the task ran as reported | As long as the agent | The worker's signed evidence of the task |
 | AuditEntry | agent | string, agent@version | No | Internal | Count tasks per agent and version | 90 days (the audit's) | Added to audit.jsonl; no prompt or output text |
+| AuditEntry | attempts | integer | No | Internal | Show retries per release | 90 days (the audit's) | Model attempts the task took |
+| AuditEntry | checks | object {passed, total} | No | Internal | Show the check pass rate per release | 90 days (the audit's) | Counts only: the checks' output stays in the task's evidence |
+| AuditEntry | refused_by | string: budget, canary, stopped, release or other | No | Internal | Say what refused a task | 90 days (the audit's) | For a refused task only |
+| AgentAudit | at, by, agent, what, why | strings | Yes | Personal | Keep every release, sign-off, deployment, rollback, budget, deprecation and retirement | Until the agent is purged | factory/audit.jsonl: who changed what and why, never a task's text |
 | AuditEntry | usage | object {input_tokens, cached_input_tokens, output_tokens, premium_requests, cost_usd} | No | Internal | Show usage and cost | 90 days (the audit's) | Only what the provider reports: none when it reports none, never zero; Copilot premium requests, the Claude Agent SDK's cost estimate in US dollars |
 | Lesson | text | string (Markdown) | Yes | Confidential | Keep what verified work taught the agent | The blueprint's retention_days (90 by default) | Saved only from verified results; keeps Microsoft 365 labels |
 

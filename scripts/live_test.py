@@ -783,11 +783,52 @@ try:
     check("agent:report proves the folder's agent with its own build's passed, verified report, and nothing less",
           (code == 0 and "agent:report: passed" in out) if gate_passed
           else (code != 0 and f"evaluation {eid} failed" in out), out)
+
+    print("== worker1 releases the agent kept as code from its folder's commit, signs it off and verifies it")
+    def git(*args):
+        return subprocess.run(["git", "-C", notes, "-c", "user.name=Live", "-c", "user.email=live@example.com",
+                               "-c", "commit.gpgsign=false", *args], capture_output=True, text=True)
+    git("init", "-q"); git("add", "-A"); git("commit", "-q", "-m", "The notes agent")
+    head = git("rev-parse", "HEAD").stdout.strip()
+    code_r, released = cli("factory", "release", "notes", "--from", notes, "--note", "Live release", "--profile", "worker1")
+    code_a, approved = cli("factory", "approve", "notes", "--note", "Live sign-off", "--profile", "worker1")
+    code_v, verified = cli("factory", "verify", "notes@1.0.0", "--profile", "worker1")
+    print(released + approved + verified)
+    check("worker1 released the notes agent from its folder's commit, signed it off and verified it",
+          gate_passed and code_r == 0 and "notes 1.0.0: pending-approval" in released and f"from commit {head}" in released
+          and code_a == 0 and "notes 1.0.0: released" in approved
+          and code_v == 0 and "notes 1.0.0: verified (released;" in verified and "1 approval)" in verified,
+          released + approved + verified)
+
+    print("== worker1 deploys the notes agent as a digital worker: its canary runs with real Copilot first")
+    deployed = subprocess.run(
+        [EXE, "factory", "deploy", "notes", "--start", "--folders", "repo", "--profile", "worker1"],
+        env=ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=900, encoding="utf-8", errors="replace")
+    print(deployed.stdout + deployed.stderr)
+    check("worker1 deployed the notes agent as a digital worker whose canary passed with real Copilot",
+          deployed.returncode == 0 and "notes runs 1.0.0 (running)" in deployed.stdout
+          and "canary: passed (1 smoke case)" in deployed.stdout, deployed.stdout + deployed.stderr)
+
+    code_m, metrics = cli("factory", "metrics", "notes", "--profile", "worker1")
+    code_o, ops = cli("ops", "report", "--hours", "24", "--profile", "worker1")
+    print(metrics + ops[ops.find("## Agents"):])
+    check("the deployed agent's tasks are counted by release in factory metrics and the ops report",
+          code_m == 0 and re.search(r"1\.0\.0: 1 tasks: 1 done", metrics) and code_o == 0
+          and "| notes | 1.0.0 (active) | notes (running) | 1 | 1 | 0 | 0 |" in ops, metrics + ops)
+
+    print("== worker1 retires the notes agent: its deployment stops, and its releases stay for audit")
+    code_t, retired = cli("factory", "retire", "notes", "--reason", "The live check is over", "--profile", "worker1")
+    _, shown = cli("factory", "show", "notes", "--profile", "worker1")
+    print(retired + shown)
+    check("worker1 retired the notes agent: its deployment stopped, and its releases are kept",
+          code_t == 0 and "notes: retired; plans can't use it, and notes stopped" in retired
+          and "notes runs 1.0.0 (stopped)" in shown and "1.0.0 (active)  released" in shown, retired + shown)
 finally:
     for a in reversed(agents):
         a.stop()
-    # worker1's evaluation worker first: deleting a digital worker updates its owner's allowlist.
-    for profile in ("worker1-eval", *PROFILES):
+    # worker1's digital workers first (its evaluation worker, the deployed notes agent):
+    # deleting a digital worker updates its owner's allowlist.
+    for profile in ("worker1-eval", "notes", *PROFILES):
         cli("profile", "delete", "--profile", profile)
     shutil.rmtree(ws, ignore_errors=True)
     if svc:

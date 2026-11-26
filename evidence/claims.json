@@ -1434,9 +1434,9 @@
         "ui::the_workiq_agents_route_lists_the_agents_work_iq_offers_and_says_why_it_cannot",
         "ui::the_plan_editor_keeps_plans_valid",
         "ui::the_knowledge_section_imports_from_microsoft_365_through_a_dialog",
-              "ui::a_run_answers_its_steps_microsoft_365_sources_but_never_what_they_said",
-              "ui::the_page_words_microsoft_365_labels_and_work_iq_steps_plainly",
-              "ui::a_workiq_steps_task_and_report_say_work_iq_answered_it"
+        "ui::a_run_answers_its_steps_microsoft_365_sources_but_never_what_they_said",
+        "ui::the_page_words_microsoft_365_labels_and_work_iq_steps_plainly",
+        "ui::a_workiq_steps_task_and_report_say_work_iq_answered_it"
       ]
     },
     {
@@ -1984,6 +1984,126 @@
         "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a"
       ],
       "live": ["an MCP client lists the agent factory's templates, and releasing an agent stays with its owner"]
+    },
+    {
+      "id": "FAC-18",
+      "area": "agent-factory",
+      "claim": "An agent is released only from a passed, verified evaluation of exactly the build to release (never from a deployment's canary, which runs its smoke cases only), as a signed manifest (proofkin.agent-release/v1) of every artifact's hash, its evaluation, the model it recommended and those that passed, and what it asks for (AC-14). Its version follows what changed: a changed or removed requirement is a major version, a new requirement or capability a minor one; versions are never reused or lowered. A release whose bytes changed fails to verify, and can't be deployed or used in plans (AC-15, TM-15); factory diff says what changed between two releases.",
+      "tests": [
+        "lib::factory::release::a_release_is_made_only_from_a_passed_evaluation_of_exactly_its_build_and_signed",
+        "lib::factory::release::versions_follow_the_change_are_never_reused_and_never_lower",
+        "lib::factory::release::a_changed_byte_makes_a_release_fail_to_verify_and_unusable",
+        "lib::factory::release::a_diff_says_what_changed_between_two_releases"
+      ],
+      "live": [
+        "worker1 released the notes agent from its folder's commit, signed it off and verified it"
+      ]
+    },
+    {
+      "id": "FAC-19",
+      "area": "agent-factory",
+      "claim": "A release waits for its approvers: peers on the owner's allowlist are asked through their own agents while connected, then the owner signs off, also on every capability it asks for beyond the active release (AC-16, AC-17). Each answer is signed evidence of exactly that release's request, checked again whenever the release is loaded (TM-14); a rejection keeps the active release (AC-19), and every sign-off is in the factory's audit (TM-8).",
+      "tests": [
+        "lib::factory::release::approvers_answer_first_then_the_owner_signs_off_the_capability_increases",
+        "lib::factory::signoff::approvers_sign_off_through_their_agents_then_the_owner_on_the_new_capabilities"
+      ],
+      "live": [
+        "worker1 released the notes agent from its folder's commit, signed it off and verified it"
+      ]
+    },
+    {
+      "id": "FAC-20",
+      "area": "agent-factory",
+      "claim": "Plan steps act as factory agents by name (agent=name, its active release) or by release (agent=name@version), with that release's instructions and skills (AC-21); the plan check warns about a deprecated agent and names its replacement, and refuses a retired one (AC-20).",
+      "tests": [
+        "lib::plan::steps_act_as_factory_agents_by_their_active_release_or_a_version",
+        "lib::factory::lifecycle::plans_are_warned_about_a_deprecated_agent_and_refused_a_retired_one"
+      ]
+    },
+    {
+      "id": "FAC-21",
+      "area": "agent-factory",
+      "claim": "A release is deployed as a digital worker named after the agent and pinned to it: the worker runs exactly that release on every task (its copy verified against its owner's signature; a changed copy refuses work), with at most the access the release asks for in each folder it is given, only the MCP servers and tools it asks for, and no delegation unless it asks for it and its owner allows it (AC-7, AC-18, TM-5). Peers, its worker's card and Run on show the release it runs.",
+      "tests": [
+        "lib::factory::deploy::a_worker_runs_exactly_its_pinned_release_and_a_changed_copy_refuses_work",
+        "deploy::a_deployed_worker_runs_its_release_on_every_task_at_the_access_it_asks_for"
+      ],
+      "live": [
+        "worker1 deployed the notes agent as a digital worker whose canary passed with real Copilot"
+      ]
+    },
+    {
+      "id": "FAC-22",
+      "area": "agent-factory",
+      "claim": "A new deployment first runs its release's smoke cases on its worker (its canary), and takes only those tasks of its owner's until they pass; a canary that fails pins the release before again, or stops the worker when there is none (AC-19). factory rollback, and the web UI, make another release active on every deployment within seconds, with a reason kept in its history and the factory's audit (AC-20, AC-22).",
+      "tests": [
+        "lib::factory::deploy::a_failed_canary_goes_back_to_the_release_before_or_stops_its_worker",
+        "lib::factory::deploy::a_rollback_pins_the_release_before_on_every_deployment_and_is_audited",
+        "deploy::a_deployment_in_its_canary_takes_only_its_owners_canary_tasks",
+        "evaluation::a_canary_runs_the_releases_smoke_cases_on_its_deployed_worker"
+      ],
+      "live": [
+        "worker1 deployed the notes agent as a digital worker whose canary passed with real Copilot"
+      ]
+    },
+    {
+      "id": "FAC-23",
+      "area": "agent-factory",
+      "claim": "An agent is deprecated in favor of another agent plans can use (plan checks warn and name it), reactivated, or retired: plan checks refuse a retired agent, its deployments stop and no longer start with their owner, and its releases and reports are kept for audit (AC-28); with purge they go only once 90 days have passed (AC-23).",
+      "tests": [
+        "lib::factory::lifecycle::plans_are_warned_about_a_deprecated_agent_and_refused_a_retired_one",
+        "lib::factory::lifecycle::retired_agents_are_purged_only_after_the_retention"
+      ],
+      "live": [
+        "worker1 retired the notes agent: its deployment stopped, and its releases are kept"
+      ]
+    },
+    {
+      "id": "FAC-24",
+      "area": "agent-factory",
+      "claim": "Every task a deployed agent's worker runs or refuses is audited with its release (agent@version), its attempts, its checks' tally and what refused it, never its text. factory metrics and the web UI count them per release: tasks, done, failed, refused by reason, p50 and p95 duration, attempts, check pass rate, models and usage where providers report it (AC-22, AC-24); proofkin ops report has a section on the deployed agents.",
+      "tests": [
+        "lib::factory::metrics::metrics_are_per_version_from_the_audit_and_hold_no_text",
+        "lib::factory::metrics::since_takes_spans_dates_and_times",
+        "lib::factory::metrics::the_ops_report_lists_each_deployed_agents_releases_with_their_tasks"
+      ],
+      "live": [
+        "the deployed agent's tasks are counted by release in factory metrics and the ops report"
+      ]
+    },
+    {
+      "id": "FAC-25",
+      "area": "agent-factory",
+      "claim": "A deployed agent's worker keeps to its budgets before any model call: a task over its tasks a day, or asking for more attempts than it allows, is refused saying which budget, and a task that runs past its timeout stops (AC-23, AC-25, TM-9). Budgets out of range are refused saying the range; the owner changes them for every deployment of the agent from the CLI or the web UI.",
+      "tests": [
+        "lib::factory::deploy::budgets_refuse_tasks_before_any_model_call_and_a_canary_takes_only_its_owners",
+        "lib::factory::deploy::budgets_out_of_range_are_refused_saying_the_range",
+        "deploy::a_deployed_worker_refuses_what_its_budgets_dont_allow_before_any_model_call"
+      ]
+    },
+    {
+      "id": "FAC-26",
+      "area": "agent-factory",
+      "claim": "factory release --from FOLDER releases an agent kept as code from exactly its folder's commit (nothing uncommitted under agent/), with the passed report of its build that its owner signed and kept there; another build's report, someone else's or a canary's isn't enough, and the release names the commit (AC-33). The agent-factory playbook builds such an agent with peers: its blueprint and eval suite (skills agent-blueprint and agent-evals) proven by the agent:* checks, the owner's evaluation, a red-team squad's review, then the security champion's and the owner's sign-offs, and it needs the agent's name (AC-26).",
+      "tests": [
+        "lib::factory::manage::an_agent_kept_as_code_is_released_from_its_folders_commit_and_signed_report",
+        "lib::playbooks::every_playbook_renders_to_a_valid_plan_with_claims",
+        "lib::playbooks::outlines_say_what_a_playbook_does_before_it_is_filled_in",
+        "lib::playbooks::rendering_needs_required_values_and_rejects_bad_ones"
+      ],
+      "live": [
+        "worker1 released the notes agent from its folder's commit, signed it off and verified it"
+      ]
+    },
+    {
+      "id": "FAC-27",
+      "area": "agent-factory",
+      "claim": "The web UI's API for released agents answers as its contract says: releasing a passed evaluation, a release with its diff and evaluation summary, deploying (canary, start), rolling back, deprecating, reactivating and retiring, metrics and budgets, each with the status codes it lists, and the owner signs off from the web UI (AC-27); released and deployed, the agent's name stays its own. The Agent factory card configures an agent with a form whose choices come from what its owner has (JSON for all of it), releases and signs off, deploys, rolls back or forward, sets budgets, shows metrics and retires it; a deployed agent's release shows on its worker, its peer entry and Run on, the plan editor and Plugins & tools list factory agents, and the page follows the UX guidelines.",
+      "tests": [
+        "factory_api::owners_release_deploy_roll_back_and_retire_factory_agents_from_the_web_ui",
+        "lib::factory::blueprint::a_name_in_use_or_reserved_is_refused",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
     }
   ]
 }

@@ -14,7 +14,10 @@
 //!   audience and a customer feedback document), reviewed by each audience;
 //! - `implement-spec`: the feature built from its accepted spec, a test per criterion;
 //! - `rehearse`: the feature's reviews rehearsed before they happen: agents play each
-//!   stakeholder in parallel, then a synthesis of actions and prepared answers.
+//!   stakeholder in parallel, then a synthesis of actions and prepared answers;
+//! - `agent-factory`: an agent kept as code: its blueprint and evals proven by the
+//!   built-in `agent:*` checks, its evaluation's signed report, a red-team squad's review
+//!   and sign-offs, then a release from the folder's commit.
 
 use std::collections::BTreeMap;
 
@@ -66,6 +69,11 @@ const PLAYBOOKS: &[(&str, &str, &str)] = &[
         "Rehearse a feature's reviews: agents play each stakeholder in parallel, then actions and prepared answers",
         include_str!("../playbooks/rehearse.plan"),
     ),
+    (
+        "agent-factory",
+        "An agent kept as code: blueprint and evals proven by agent:* checks, its evaluation's report, a red-team squad, sign-offs, then a release from the folder's commit",
+        include_str!("../playbooks/agent-factory.plan"),
+    ),
 ];
 
 /// Names and descriptions of the playbooks.
@@ -94,6 +102,7 @@ fn default(playbook: &str, var: &str) -> Option<&'static str> {
         "approver" | "privacy_approver" | "product_owner" | "tech_lead" | "security_champion"
         | "leader" => "me",
         "reviewers" => "qa",
+        "change_id" if playbook == "agent-factory" => return None,
         "change_id" => "change",
         "build" => "build",
         "test" => "test",
@@ -131,6 +140,7 @@ pub fn outline(name: &str) -> Result<Outline> {
             "folder" => PICKED_FOLDER.to_owned(),
             "spec" => PICKED_SPEC.to_owned(),
             "change" => "the change you describe".to_owned(),
+            "change_id" if name == "agent-factory" => "AGENT".to_owned(),
             "project" => "your project".to_owned(),
             _ => continue,
         };
@@ -705,5 +715,12 @@ mod tests {
         let vars = variables("sdlc").unwrap();
         assert!(vars.contains(&("change".into(), None)));
         assert!(vars.contains(&("test".into(), Some("test"))));
+        let err = render(
+            "agent-factory",
+            &super::tests::vars(&[("peer", "alice"), ("change", "Answers from the notes")]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("needs: change_id"), "the agent's name: {err}");
     }
 }

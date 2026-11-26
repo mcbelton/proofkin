@@ -91,6 +91,10 @@ pub struct AgentConfig {
     /// For a digital worker: its owner's endpoint id. Its owner's tasks may have all its
     /// memory knows; names on its allowlist can change, so they never decide that.
     pub owner_id: Option<EndpointId>,
+    /// For a deployed factory agent's worker: the release it runs (see
+    /// [`crate::factory::deploy`]). Every task it serves gets the release's instructions
+    /// first, within its budgets; during its canary it takes only its owner's canary tasks.
+    pub deployed: Option<Arc<crate::factory::deploy::Deployed>>,
 }
 
 impl AgentConfig {
@@ -116,6 +120,7 @@ impl AgentConfig {
             task_ids: None,
             memory: None,
             owner_id: None,
+            deployed: None,
         }
     }
 }
@@ -319,6 +324,8 @@ pub struct PeerInfo {
     pub owner: Option<String>,
     /// What the peer is for, as its owner describes it.
     pub role: Option<String>,
+    /// For a deployed factory agent: the release it runs, `name@version`.
+    pub agent: Option<String>,
     /// How busy it says it is (newer peers report it).
     pub load: Option<PeerLoad>,
     /// Its providers' default models and the ones tasks may ask for (empty: it didn't
@@ -337,6 +344,7 @@ struct PeerHandle {
     shares: Vec<ShareInfo>,
     owner: Option<String>,
     role: Option<String>,
+    agent: Option<String>,
     load: Option<PeerLoad>,
     models: crate::models::Models,
     offers: crate::models::Offers,
@@ -539,6 +547,7 @@ struct Inner {
     left: Mutex<HashMap<EndpointId, Instant>>,
     memory: Option<Arc<crate::factory::memory::WorkerMemory>>,
     owner_id: Option<EndpointId>,
+    deployed: Option<Arc<crate::factory::deploy::Deployed>>,
 }
 
 /// A peer-to-peer agent on an iroh QUIC endpoint. Cheap to clone; all clones
@@ -605,6 +614,7 @@ impl Agent {
             left: Mutex::new(HashMap::new()),
             memory: config.memory,
             owner_id: config.owner_id,
+            deployed: config.deployed,
         });
         tokio::spawn(accept_loop(inner.clone()));
         Ok((Self { inner }, rx))
@@ -612,6 +622,11 @@ impl Agent {
 
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    /// The factory release this agent runs as a deployed worker, if it runs one.
+    pub fn deployed(&self) -> Option<Arc<crate::factory::deploy::Deployed>> {
+        self.inner.deployed.clone()
     }
 
     /// This agent's public key; how peers identify and allowlist it.
@@ -697,6 +712,7 @@ impl Agent {
                 shares: p.shares.clone(),
                 owner: p.owner.clone(),
                 role: p.role.clone(),
+                agent: p.agent.clone(),
                 load: p.load,
                 models: p.models.clone(),
                 offers: p.offers.clone(),
@@ -2067,6 +2083,18 @@ impl Inner {
                 self.name
             );
         }
+        // A deployed agent's own rules: its release must run, it takes work only after its
+        // canary (its owner's canary tasks meanwhile), and within its budgets.
+        if let Some(deployed) = &self.deployed {
+            let owners_canary = self.owner_id == Some(*id)
+                && task.share.as_deref() == Some(crate::factory::runner::SHARE);
+            deployed
+                .admit(task, owners_canary)
+                .map_err(|(by, message)| {
+                    anyhow::Error::new(crate::audit::Refusal { by, message })
+                        .context(format!("{} refused the task", self.name))
+                })?;
+        }
         recent.push_back(now);
         let mut ctx = TaskContext::new(access, share.path.clone());
         ctx.mcp = mcp;
@@ -2130,6 +2158,23 @@ impl Inner {
         entry.origin = origin.as_ref().and_then(Origin::describe);
         entry.model = result.as_ref().ok().and_then(|s| s.model.clone());
         entry.usage = result.as_ref().ok().and_then(|s| s.usage.clone());
+        // A deployed agent's tasks are its release's, whatever they asked to act as.
+        if let Some(pinned) = self.deployed.as_ref().and_then(|d| d.current().ok()) {
+            entry.agent = Some(pinned.label());
+        }
+        if let Ok(served) = &result {
+            entry.attempts = Some(served.evidence.attempts).filter(|n| *n > 0);
+            let checks = &served.evidence.checks;
+            if !checks.is_empty() {
+                entry.checks = Some(crate::audit::CheckTally {
+                    passed: checks.iter().filter(|c| c.passed).count() as u32,
+                    total: checks.len() as u32,
+                });
+            }
+        }
+        if let Err(e) = &result {
+            entry.refused_by = crate::audit::refused_by(e).map(str::to_owned);
+        }
         if let Some(audit) = &self.audit {
             audit.record(&entry);
         }
@@ -2163,6 +2208,19 @@ impl Inner {
         cancelled: &mut bool,
     ) -> Result<Served> {
         if let Some(request) = &task.team {
+            // A deployed agent whose release doesn't delegate hands work to nobody.
+            if let Some(pinned) = self.deployed.as_ref().and_then(|d| d.current().ok())
+                && !pinned.delegate
+            {
+                return Err(anyhow::Error::new(crate::audit::Refusal {
+                    by: "delegate",
+                    message: format!(
+                        "{} doesn't hand work to other agents: its release doesn't delegate",
+                        pinned.label()
+                    ),
+                })
+                .context(format!("{} refused the team step", self.name)));
+            }
             return self
                 .lead_team(
                     id, from, task_id, task, request, origin, cancel, granted, cancelled,
@@ -2196,6 +2254,25 @@ impl Inner {
             let _slot = self.take_slot(id, task_id).await?;
             self.attempt_task(executor.as_ref(), id, from, task_id, task, ctx, &share)
                 .await
+        };
+        // A deployed agent's budget: no task runs longer than it allows.
+        let limit = self
+            .deployed
+            .as_ref()
+            .and_then(|d| d.current().ok())
+            .and_then(|p| p.budgets.timeout_secs.map(|s| (p.label(), s)));
+        let work = async {
+            match limit {
+                Some((label, secs)) => tokio::time::timeout(Duration::from_secs(secs), work)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow!(
+                            "stopped after {} minutes: {label}'s budget allows no longer a task",
+                            secs.div_ceil(60)
+                        ))
+                    }),
+                None => work.await,
+            }
         };
         // Dropping `work` stops the provider run (each backend aborts on drop) and
         // any check, and removes the task's worktree.
@@ -3035,6 +3112,12 @@ impl Inner {
         // it; every attempt gets it.
         let recall = self.recall(id);
         let asked = recall.prompt(&task.prompt);
+        // A deployed agent's release comes first: its instructions and skills.
+        let pinned = self.deployed.as_ref().and_then(|d| d.current().ok());
+        let asked = match &pinned {
+            Some(pinned) => pinned.prompt(&asked),
+            None => asked,
+        };
         prompt.prompt = asked.clone();
         // The model it asked for (allowed: checked when it was admitted), else the
         // default; the same for its reasoning effort. Settings changed since it was
@@ -3242,6 +3325,11 @@ impl Inner {
         evidence.context.extend(labeled);
         evidence.attempts = used;
         evidence.checks = results;
+        // The agent it worked as: its own release, else what its requester asked for.
+        evidence.agent = pinned
+            .as_ref()
+            .map(|p| p.label())
+            .or_else(|| task.agent.clone().filter(|a| a.len() <= 140));
         let mut patch = None;
         if let Some(wt) = &worktree {
             self.send_progress(
@@ -3402,6 +3490,11 @@ async fn run_connection(
         role: inner.role.clone(),
         models: inner.models_offered(),
         offers: inner.offers_for(Some(&inner.capabilities())),
+        agent: inner
+            .deployed
+            .as_ref()
+            .and_then(|d| d.current().ok())
+            .map(|p| p.label()),
     };
     write_message(&mut send, &hello).await?;
     let first = lines
@@ -3417,6 +3510,7 @@ async fn run_connection(
         role,
         models,
         offers,
+        agent,
     } = serde_json::from_str(&first)?
     else {
         bail!("expected hello, got {first}");
@@ -3443,6 +3537,7 @@ async fn run_connection(
         shares,
         owner,
         role,
+        agent: agent.filter(|a| a.len() <= 140 && !a.chars().any(char::is_control)),
         load: None,
         models: clean_models(models),
         tx: tx.clone(),

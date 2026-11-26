@@ -154,6 +154,12 @@ pub struct LlmTask {
     /// running a model (see [`crate::pulls`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<Box<crate::pulls::PullRequestAsk>>,
+    /// The agent the task acts as, as its requester resolved it (`agent=` on a plan step):
+    /// a factory agent's `name@version`, else the agent's name. The worker's signed evidence
+    /// and its audit name it (a deployed agent names its own release instead). Older
+    /// workers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// A task's title: the first line of `text`, trimmed. It ends at the first sentence end
@@ -213,6 +219,7 @@ impl LlmTask {
             m365: Vec::new(),
             issues: Vec::new(),
             pull_request: None,
+            agent: None,
         }
     }
 

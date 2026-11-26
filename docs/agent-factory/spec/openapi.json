@@ -1190,6 +1190,73 @@
         }
       }
     },
+    "/api/factory/agents/{name}/releases/{version}": {
+      "parameters": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]{1,64}$"
+          }
+        },
+        {
+          "name": "version",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getRelease",
+        "summary": "Get a release: its manifest, sign-offs and what changed",
+        "x-acceptance": [
+          "AC-15",
+          "AC-17"
+        ],
+        "responses": {
+          "200": {
+            "description": "The release, verified (its hashes and signatures)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Release"
+                },
+                "example": {
+                  "agent": "fin-analyst",
+                  "version": "1.2.0",
+                  "build": "3f1c9a0d2b7e4c5a8f6e1d2c3b4a59687766554433221100ffeeddccbbaa9988",
+                  "state": "pending-approval",
+                  "manifest_sha256": "5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7a8b9c0d",
+                  "signer_id": "4f2a9c1e7b3d5f6a8c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f1a3c5e7b9d2f4a",
+                  "approvals": [
+                    {
+                      "approver": "carol",
+                      "approved": true,
+                      "note": "Tools look right",
+                      "at": "2026-11-24T11:02:00Z"
+                    }
+                  ],
+                  "increases": [
+                    "mcp pdf: read_pdf"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/api/factory/agents/{name}/deployments": {
       "parameters": [
         {
