@@ -23,6 +23,7 @@ Rules that apply to every field:
 | Template | purpose | string, at most 400 characters | Yes | Public | Help the owner choose | Ships with Proofkin | What agents made from it are for |
 | Template | access | string: read-only, workspace-write or full | Yes | Public | Show the most access it asks for | Ships with Proofkin | The most access its tasks need |
 | Template | eval_cases | integer | Yes | Public | Show how well it is tested | Ships with Proofkin | How many eval cases it starts with, adversarial ones not counted |
+| Template | needs | string | No | Public | Say what its evaluation needs that a draft can't bring | Ships with Proofkin | E.g. needs a deploy folder whose test check runs node --test; absent when nothing |
 | TemplateList | templates | array of Template | Yes | Public | List the templates | Not stored | Every built-in template, by name |
 | DraftRequest | description | string, 1 to 4,000 characters | No | Confidential | Tell the owner's model what agent to draft | Kept with the draft until it is deleted; only its SHA-256 goes into a release | What the agent should do, in the owner's words; may describe their business. A draft needs a description, a template or both |
 | DraftRequest | template | string, a template name | No | Public | Start the draft from a template | Kept with the draft's provenance | The template to start from |

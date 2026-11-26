@@ -245,6 +245,44 @@ fn a_template_starts_a_draft_that_is_listed_shown_checked_and_deleted() {
     assert!(out.contains("the factory has no draft 'rev'"), "{out}");
 }
 
+/// The researcher and implementer templates come with the files their cases work on: a draft
+/// from one has them in its fixtures folder, so its suite has what it names; `templates` says
+/// what the implementer's evaluation needs that a draft can't bring.
+#[test]
+fn a_draft_from_a_template_has_the_files_its_cases_work_on() {
+    let home = Home::new();
+    let templates = home.ok(&["templates"]);
+    let implementer = templates
+        .lines()
+        .find(|line| line.trim_start().starts_with("implementer "))
+        .expect(&templates);
+    assert!(
+        implementer.ends_with("; needs a deploy folder whose test check runs node --test"),
+        "{implementer}"
+    );
+
+    let out = home.ok(&[
+        "new",
+        "ask",
+        "--template",
+        "researcher",
+        "--profile",
+        "alice",
+    ]);
+    assert!(
+        out.contains("(drafted from template researcher, 3 fixtures): no problems"),
+        "{out}"
+    );
+    let fixtures = home
+        .path()
+        .join("profiles/alice/factory/agents/ask/fixtures");
+    for file in ["README.md", "src/main.py", "config.ini"] {
+        assert!(fixtures.join(file).is_file(), "{file}");
+    }
+    let main = std::fs::read_to_string(fixtures.join("src/main.py")).unwrap();
+    assert!(main.contains("https://api.example.test/rates"), "{main}");
+}
+
 #[test]
 fn edits_are_checked_when_saved_and_kept_with_their_problems() {
     let home = Home::new();
@@ -808,6 +846,10 @@ fn an_agent_kept_as_code_is_checked_in_its_folder_and_drafted_from_it() {
         out.contains("wrote agent ask (template researcher)"),
         "{out}"
     );
+    assert!(
+        out.contains("agent/fixtures/README.md, agent/fixtures/src/main.py"),
+        "the files its cases work on: {out}"
+    );
     let blueprint: Value = serde_json::from_str(
         &std::fs::read_to_string(repo.join("agent").join("blueprint.json")).unwrap(),
     )
@@ -845,7 +887,10 @@ fn an_agent_kept_as_code_is_checked_in_its_folder_and_drafted_from_it() {
     assert!(out.contains(&format!("{dir}: no problems")), "{out}");
     let out = home.ok(&["new", "ask", "--from", dir, "--profile", "alice"]);
     assert!(out.contains("created draft ask (drafted from"), "{out}");
-    assert!(out.contains("1 fixture): no problems"), "{out}");
+    assert!(
+        out.contains("4 fixtures): no problems"),
+        "the template's 3 and notes.md: {out}"
+    );
     let copied = home
         .path()
         .join("profiles/alice/factory/agents/ask/fixtures/notes.md");

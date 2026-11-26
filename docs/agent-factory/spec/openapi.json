@@ -47,6 +47,14 @@
                       "purpose": "Researches a question in the folder and knowledge, and cites every source",
                       "access": "read-only",
                       "eval_cases": 5
+                    },
+                    {
+                      "name": "implementer",
+                      "title": "Implementer",
+                      "purpose": "Implements a described change in a repository, with tests, and leaves the folder's test check passing",
+                      "access": "full",
+                      "eval_cases": 3,
+                      "needs": "needs a deploy folder whose test check runs node --test"
                     }
                   ]
                 }
@@ -2206,6 +2214,10 @@
           "eval_cases": {
             "type": "integer",
             "minimum": 0
+          },
+          "needs": {
+            "type": "string",
+            "description": "What its evaluation needs that a draft from it can't bring, such as a check only a shared folder defines; absent when nothing"
           }
         }
       },

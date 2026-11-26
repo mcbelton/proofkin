@@ -1361,7 +1361,7 @@ a case for every requirement. Asking grants nothing: the folders it works in, th
 offers and your grants decide what its tasks get.
 
 ```powershell
-proofkin factory templates                                              # code-reviewer, implementer, researcher...: purpose, most access, eval cases
+proofkin factory templates                                              # code-reviewer, implementer, researcher...: purpose, most access, eval cases, what its evaluation needs
 proofkin factory new reviewer --template code-reviewer --profile alice  # a draft from a template, with no model
 proofkin factory new fin-analyst --describe "Analyze quarterly reports, extract key metrics, flag risks, write an executive summary" --profile alice
 proofkin factory show fin-analyst --profile alice    # what it asks for, the models it is evaluated on, its builds, problems, who wrote it
@@ -1402,6 +1402,15 @@ proofkin factory list --profile alice                # delete NAME removes a dra
 - Eval cases expect `contains`, `not-contains`, `regex`, `json-schema`, `max-words`,
   `files-changed` or a folder `check`, and a `judge` rubric is scored by a model. Their
   fixtures are files in the agent's `fixtures/` folder.
+- The researcher and implementer templates come with **fixtures**, the files their cases
+  work on: a small Python app, and a Node project tested by `node --test`. `new --template`,
+  `init --template` and **New agent** write them to the agent's fixtures folder, keeping
+  any file there already; the other templates' cases carry their data in their input.
+- The implementer's cases run check `test`, and a check's command comes only from a folder
+  you share, never from a blueprint. Its evaluation needs a deploy folder (in its
+  `deploy.folders`) whose `test` check runs `node --test`, for example
+  `proofkin share add impl D:\scratch\impl --access full --check test="node --test" --profile alice`;
+  `factory templates`, **New agent** and the evaluation's error say so.
 - Drafts and builds, and each agent's state and history, are kept in the profile's
   `factory/` folder.
 
@@ -1675,7 +1684,9 @@ is tracked on GitHub, where your team already tracks work:
   step that may hold Microsoft 365 content ended with stays off GitHub (a `workiq=` or
   `@workiq` step, one with `mcp=workiq` or a Microsoft 365 knowledge topic, one whose
   evidence names labels, and the steps after them): its comment says it is in the run's
-  record instead. A sign-off's note, its approver's own words, is posted as written;
+  record instead. A sign-off's note, its approver's own words, is posted as written. A plan
+  imported from a Microsoft 365 document quotes it in its claims and steps, so it says
+  `track: off` ([Spec Kit and OpenSpec](#spec-kit-and-openspec));
 - each step's task carries its issue (and those of the steps whose work it applies). The
   worker's commit references them (`Refs: acme/shop#15` trailers), `repo branches` and the
   web UI show them, and a pull request from the branch **closes** them (`Closes #15`), so
@@ -1944,7 +1955,12 @@ external content), marked as Microsoft 365 content
 no label information, so only your own agents and digital workers get it. A peer gets the
 plan's steps only with a Microsoft 365 grant that includes that label
 (`proofkin peers allow <peer> --m365 General`), as the import's summary says. Prompts name
-the document by its file name; its link is only in the plan's comment.
+the document by its file name; its link is only in the plan's comment. Its claims and
+prompts still quote the document, and a [tracked run](#tracked-work) would post them on
+GitHub (the run's issue lists the claims and is titled after the first; each step's
+sub-issue holds its prompt). So the plan isn't tracked: it says `track: off`, after a
+comment saying why (with the document's label), and the import's summary says so. To track
+it anyway, change that line knowingly.
 
 ```powershell
 proofkin spec import --from https://contoso.sharepoint.com/sites/Team/Shared%20Documents/Photo%20albums.docx --profile boss --set peer=alice > albums.plan

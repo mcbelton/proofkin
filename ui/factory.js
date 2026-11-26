@@ -137,7 +137,7 @@ async function openFactoryNew() {
   $("#factory-templates").replaceChildren(
     option("", "No template", "Your model writes the draft from your words alone."),
     ...factoryState.templates.map((t) => option(t.name, t.title,
-      `${t.purpose} · ${(ACCESS_SHORT[t.access] ?? t.access).toLowerCase()} · ${factoryPlural(t.eval_cases, "case", "cases")}`)));
+      `${t.purpose} · ${(ACCESS_SHORT[t.access] ?? t.access).toLowerCase()} · ${factoryPlural(t.eval_cases, "case", "cases")}${t.needs ? ` · ${t.needs}` : ""}`)));
   $("#factory-new-dialog").showModal();
   $("#factory-name").focus();
 }
