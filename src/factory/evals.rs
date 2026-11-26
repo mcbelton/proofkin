@@ -365,7 +365,8 @@ pub fn grade_now(expect: &Expect, outcome: &Outcome) -> Graded {
                 kind,
                 !found,
                 if found {
-                    format!("the answer has {text:?}")
+                    // The expectation, so a failing run doesn't read as the model's mistake.
+                    format!("expected no {text:?} (not-contains), but the answer has it")
                 } else {
                     format!("the answer doesn't have {text:?}")
                 },
@@ -854,6 +855,15 @@ mod tests {
         assert_eq!(
             passed(json!({ "not-contains": "risk" }), &answer),
             Some(false)
+        );
+        // A failing run's note names the expectation, not only what the answer has.
+        let risky = grade_now(
+            &Expect::parse(&json!({ "not-contains": "risk" })).unwrap(),
+            &answer,
+        );
+        assert_eq!(
+            risky.note,
+            "expected no \"risk\" (not-contains), but the answer has it"
         );
         assert_eq!(
             passed(json!({ "regex": "p\\. ?[0-9]+" }), &answer),

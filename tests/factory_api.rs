@@ -418,6 +418,11 @@ async fn owners_release_deploy_roll_back_and_retire_factory_agents_from_the_web_
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(released["approvals"][0]["approver"], "me");
+    assert_eq!(
+        released["folders"],
+        json!([]),
+        "the folders its deployments work in unless told others: its template names none"
+    );
     assert!(
         released["eval_summary"]
             .as_str()
@@ -435,6 +440,25 @@ async fn owners_release_deploy_roll_back_and_retire_factory_agents_from_the_web_
 
     // AC-18: deployed as a digital worker pinned to it, in the folder it works in.
     let deployments = "/api/factory/agents/{name}/deployments";
+    // Its release names no folders, so a deployment names one (in the web UI's words: no flag).
+    for none in [
+        json!({ "start": false }),
+        json!({ "folders": [], "start": false }),
+    ] {
+        let refused = ui
+            .call(
+                "POST",
+                "/api/factory/agents/ask/deployments",
+                deployments,
+                none,
+                400,
+            )
+            .await;
+        assert_eq!(
+            refused["error"],
+            "ask's release names no folders to work in: pick at least one folder you share"
+        );
+    }
     let refused = ui
         .call(
             "POST",

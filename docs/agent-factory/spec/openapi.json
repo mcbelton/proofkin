@@ -1326,7 +1326,7 @@
             }
           },
           "400": {
-            "description": "Unknown version or folder",
+            "description": "Unknown version or folder, or no folder to work in (none given and its release names none)",
             "content": {
               "application/json": {
                 "schema": {
