@@ -577,6 +577,75 @@ async fn simultaneous_dials_converge_on_one_connection() {
     );
 }
 
+/// A peer being dialed isn't dialed again until that connection's handshake ends, as when
+/// the program dials a `--peer` and `keep_connected` dials it right after: two connections
+/// from one side, in their handshakes at once, could be kept differently by the two sides,
+/// each closing the one the other kept. This peer never says hello, so the first dial
+/// stays in its handshake until the peer closes it.
+#[tokio::test]
+async fn a_peer_being_dialed_is_not_dialed_again_until_its_handshake_ends() {
+    let key = SecretKey::generate();
+    let silent = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(key.clone())
+        .alpns(vec![proofkin::protocol::ALPN.to_vec()])
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn({
+        let (silent, held) = (silent.clone(), held.clone());
+        async move {
+            while let Some(incoming) = silent.accept().await {
+                if let Ok(conn) = incoming.await {
+                    held.lock().unwrap().push(conn);
+                }
+            }
+        }
+    });
+    let accepted = || held.lock().unwrap().len();
+    let mut a = Node::new("a");
+    a.trust.allow(TrustedPeer {
+        name: "silent".into(),
+        id: key.public(),
+        addrs: BTreeSet::new(),
+        can_delegate: false,
+        tasks_per_hour: 0,
+        access: Access::ReadOnly,
+        shares: Vec::new(),
+        m365: None,
+        github: None,
+        agents: Vec::new(),
+    });
+    let (a, _ae) = a.start().await;
+
+    a.connect(silent.addr()).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while accepted() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first dial reached the peer");
+    a.connect(silent.addr()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(accepted(), 1, "a second connection was opened");
+
+    // Closed before its hello, the dial ends: the peer is dialed again.
+    for conn in held.lock().unwrap().iter() {
+        conn.close(0u32.into(), b"bye");
+    }
+    timeout(Duration::from_secs(10), async {
+        while accepted() < 2 {
+            a.connect(silent.addr()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the peer was dialed again once the handshake failed");
+}
+
 /// A plan checked while a peer reconnects waits for it (`settle_peers`), instead of
 /// finding it not connected: here its connection closed and it dials again. One that
 /// doesn't come back is given up on after the disconnect grace.

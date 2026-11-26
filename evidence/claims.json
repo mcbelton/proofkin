@@ -33,9 +33,10 @@
     {
       "id": "NET-4",
       "area": "network",
-      "claim": "Two peers dialing each other at once end up with one connection and no join/leave flapping. A plan checked or started while a peer reconnects waits for it (up to 10 seconds) instead of finding it not connected, and gives up on one that doesn't come back after the disconnect grace.",
+      "claim": "Two peers dialing each other at once end up with one connection and no join/leave flapping, and a peer being dialed isn't dialed again until that connection's handshake ends (so two dials from one side can't leave both without a connection). A plan checked or started while a peer reconnects waits for it (up to 10 seconds) instead of finding it not connected, and gives up on one that doesn't come back after the disconnect grace.",
       "tests": [
         "agents::simultaneous_dials_converge_on_one_connection",
+        "agents::a_peer_being_dialed_is_not_dialed_again_until_its_handshake_ends",
         "agents::settling_waits_for_a_reconnecting_peer_and_gives_up_on_a_gone_one"
       ]
     },
