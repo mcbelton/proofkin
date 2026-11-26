@@ -2042,10 +2042,11 @@
     {
       "id": "FAC-22",
       "area": "agent-factory",
-      "claim": "A new deployment first runs its release's smoke cases on its worker (its canary), and takes only those tasks of its owner's until they pass; a canary that fails pins the release before again, or stops the worker when there is none (AC-19). factory rollback, and the web UI, make another release active on every deployment within seconds, with a reason kept in its history and the factory's audit (AC-20, AC-22).",
+      "claim": "A new deployment first runs its release's smoke cases on its worker (its canary), and takes only those tasks of its owner's until they pass; a canary that fails pins the release before again, or stops the worker when there is none (AC-19).       factory rollback, and the web UI, make another release active on every deployment within seconds, with a reason kept in its history and the factory's audit (AC-20, AC-22). Deleting a deployment's worker ends the deployment, stopped with why in the agent's history and the audit, so a rollback and the drift watch pass it by.",
       "tests": [
         "lib::factory::deploy::a_failed_canary_goes_back_to_the_release_before_or_stops_its_worker",
         "lib::factory::deploy::a_rollback_pins_the_release_before_on_every_deployment_and_is_audited",
+              "lib::factory::deploy::a_deleted_workers_deployment_ends_and_a_rollback_passes_it_by",
         "deploy::a_deployment_in_its_canary_takes_only_its_owners_canary_tasks",
         "evaluation::a_canary_runs_the_releases_smoke_cases_on_its_deployed_worker"
       ],

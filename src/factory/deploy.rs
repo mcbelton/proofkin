@@ -698,6 +698,41 @@ pub fn set_pin_state(worker: &Profile, state: DeployState) -> Result<()> {
     write_json(&path, &pin)
 }
 
+/// Ends the deployments on `owner`'s digital worker `worker`, which is being deleted: each
+/// one not stopped yet is stopped, saying why in its agent's history and the audit log, so
+/// a rollback, the drift watch and the factory card pass it by. Returns the agents it ran.
+pub fn worker_deleted(owner: &Profile, worker: &str, by: &str) -> Result<Vec<String>> {
+    let store = FactoryStore::of(owner);
+    let live = |s: &AgentState| {
+        s.deployment(worker)
+            .is_some_and(|d| d.state != DeployState::Stopped)
+    };
+    let mut ended = Vec::new();
+    for name in store.names()? {
+        if !store.state(&name)?.is_some_and(|s| live(&s)) {
+            continue;
+        }
+        store.update_state(&name, |s| {
+            if let Some(d) = s
+                .deployment_mut(worker)
+                .filter(|d| d.state != DeployState::Stopped)
+            {
+                d.state = DeployState::Stopped;
+                d.note = Some("its worker was deleted".into());
+                d.at = now();
+                s.changed(
+                    by,
+                    format!("deployment on {worker} ended: its worker was deleted"),
+                    None,
+                );
+            }
+            Ok(())
+        })?;
+        ended.push(name);
+    }
+    Ok(ended)
+}
+
 /// Pins release `version` on every deployment of agent `name` of `owner`'s that isn't
 /// stopped, and makes it the active release: an earlier release, after a bad one. Their
 /// workers take it within seconds (they watch their pin). Returns the agent's state and the
@@ -1538,5 +1573,49 @@ mod tests {
             rollback(&owner, "fin-analyst", None, " ", "alice").is_err(),
             "a reason is needed"
         );
+    }
+
+    /// A worker being deleted ends its deployment: stopped, saying why in the agent's
+    /// history and the audit log, once. With the worker gone a rollback passes it by, and
+    /// the agent's other deployments stay as they were.
+    #[test]
+    fn a_deleted_workers_deployment_ends_and_a_rollback_passes_it_by() {
+        let (_home, owner, _f) = deployed(&["fin-a", "fin-b"], true);
+        assert_eq!(
+            worker_deleted(&owner, "fin-a", "alice").unwrap(),
+            ["fin-analyst"]
+        );
+        let store = FactoryStore::of(&owner);
+        let state = store.state("fin-analyst").unwrap().unwrap();
+        let ended = state.deployment("fin-a").unwrap();
+        assert_eq!(
+            (ended.state, ended.note.as_deref()),
+            (DeployState::Stopped, Some("its worker was deleted"))
+        );
+        assert_eq!(
+            state.deployment("fin-b").unwrap().state,
+            DeployState::Canary
+        );
+        let audit = store.audit_lines(Some("fin-analyst")).unwrap();
+        assert!(
+            audit.iter().any(
+                |l| l.what == "deployment on fin-a ended: its worker was deleted"
+                    && l.by == "alice"
+            ),
+            "{audit:?}"
+        );
+        assert!(worker_deleted(&owner, "fin-a", "alice").unwrap().is_empty());
+
+        let gone = crate::workers::worker_of(&owner, "fin-a").unwrap().dir;
+        std::fs::remove_dir_all(gone).unwrap();
+        let (_, workers) = rollback(
+            &owner,
+            "fin-analyst",
+            None,
+            "Summaries got longer than 200 words",
+            "alice",
+        )
+        .unwrap();
+        assert_eq!(workers, ["fin-b"]);
     }
 }

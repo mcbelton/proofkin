@@ -440,7 +440,8 @@ of its log), with **Start**/**Stop**, **Starts with this agent** and **Delete**.
   which stops it first) deletes its key, allowlist, folder settings and audit log, and
   takes it off its owner's allowlist and out of its squads (a squad left empty goes). Its
   data folder stays. A worker running outside its owner's agent isn't deleted until it
-  stops.
+  stops. A factory agent's deployment on it ends (the agent and its releases stay; see
+  [Agent factory](docs/agent-factory.md)).
 - Work stays private unless shared: a peer reaches only the folders the worker or owner
   explicitly shares with that peer.
 - **Memory:** `proofkin worker memory tester --context glossary,architecture --lessons

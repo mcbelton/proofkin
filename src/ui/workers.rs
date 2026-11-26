@@ -205,8 +205,9 @@ pub(super) async fn edit(
     ))
 }
 
-/// Stops a worker this agent runs, deletes it, and takes it off the allowlist and
-/// out of the squads. Refused while it runs outside this agent.
+/// Stops a worker this agent runs, deletes it (ending a factory agent's deployment on it),
+/// and takes it off the allowlist and out of the squads. Refused while it runs outside
+/// this agent.
 pub(super) async fn delete(
     State(s): State<AppState>,
     Path(name): Path<String>,
@@ -221,7 +222,7 @@ pub(super) async fn delete(
         )));
     }
     sup.stop(&name).await;
-    workers::delete(&me, &name).map_err(|e| conflict(format!("{e:#}")))?;
+    let ended = workers::delete(&me, &name).map_err(|e| conflict(format!("{e:#}")))?;
     if s.agent.remove_trusted(&name) {
         s.save_trust()?;
     }
@@ -236,17 +237,27 @@ pub(super) async fn delete(
     s.system(
         "info",
         format!(
-            "Deleted digital worker {name}{}",
+            "Deleted digital worker {name}{}{}",
             if left.is_empty() {
                 String::new()
             } else {
                 format!("; it left squad(s) {}", left.join(", "))
+            },
+            if ended.is_empty() {
+                String::new()
+            } else {
+                format!("; its deployment of {} ended", ended.join(", "))
             }
         ),
     );
     s.broadcast_peers();
     s.send(json!({ "type": "workers" }));
-    Ok(Json(json!({ "deleted": name, "squads": left })))
+    for agent in &ended {
+        s.send(json!({ "type": "factory", "agent": agent }));
+    }
+    Ok(Json(
+        json!({ "deleted": name, "squads": left, "deployments_ended": ended }),
+    ))
 }
 
 #[derive(Deserialize)]

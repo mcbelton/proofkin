@@ -1971,7 +1971,8 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
     Ok(())
 }
 
-/// Deletes digital worker `name` and takes it off its owner's allowlist and squads.
+/// Deletes digital worker `name` (ending a factory agent's deployment on it) and takes it
+/// off its owner's allowlist and squads.
 fn remove_worker(name: &str) -> Result<()> {
     use proofkin::workers;
     let worker = Profile::open(name)?;
@@ -1981,7 +1982,7 @@ fn remove_worker(name: &str) -> Result<()> {
         );
     };
     let owner = Profile::open(&owner)?;
-    workers::delete(&owner, name)?;
+    let ended = workers::delete(&owner, name)?;
     let squads = workers::forget(&owner, name)?;
     println!(
         "digital worker '{name}' deleted; it left '{}''s allowlist{}",
@@ -1992,6 +1993,9 @@ fn remove_worker(name: &str) -> Result<()> {
             format!(" and squads {}", squads.join(", "))
         }
     );
+    if !ended.is_empty() {
+        println!("its deployment of factory agent {} ended", ended.join(", "));
+    }
     println!("its data folder stays: {}", worker.data_folder().display());
     if owner.is_running() {
         println!(

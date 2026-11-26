@@ -368,6 +368,10 @@ proofkin factory rollback fin-analyst --reason "Summaries got longer than 200 wo
   failed.
 - **Rollback** pins the previous release (or `--to` another) on every deployment within a
   minute, and is audited.
+- **Deleting** a deployment's worker (`worker remove`, or **Delete** in the web UI) ends the
+  deployment: it is stopped, noting that its worker was deleted, in the agent's history and
+  the audit log, so rollbacks and the drift watch pass it by. The agent and its releases
+  stay.
 - **Deprecate** (`--replacement`) makes plan checks warn and name the replacement;
   **retire** refuses the agent in plans, stops its deployments, unpublishes it and keeps its
   releases and reports for audit (`--purge` deletes them after the retention).

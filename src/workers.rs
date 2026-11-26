@@ -261,14 +261,18 @@ pub fn folders(worker: &Profile) -> Vec<String> {
 
 /// Deletes `owner`'s digital worker `name`: its identity, provider homes and
 /// profile folder (allowlist, folder settings, audit log, runs). Its data folder
-/// stays. Refused while it runs; the caller takes it off the owner's allowlist and
-/// squads (see [`forget`]).
-pub fn delete(owner: &Profile, name: &str) -> Result<()> {
+/// stays, and a factory agent's deployment on it ends first (see
+/// [`crate::factory::deploy::worker_deleted`]). Refused while it runs; the caller takes
+/// it off the owner's allowlist and squads (see [`forget`]). Returns the factory agents
+/// whose deployment ended.
+pub fn delete(owner: &Profile, name: &str) -> Result<Vec<String>> {
     let worker = worker_of(owner, name)?;
     if worker.is_running() {
         bail!("'{name}' is running; stop it before deleting it");
     }
-    worker.delete()
+    let ended = crate::factory::deploy::worker_deleted(owner, name, &owner.name)?;
+    worker.delete()?;
+    Ok(ended)
 }
 
 /// Takes deleted worker `name` off `owner`'s saved allowlist and out of its saved
