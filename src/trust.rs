@@ -4,6 +4,7 @@
 //! `can_delegate` may hand this agent LLM tasks.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -62,7 +63,35 @@ pub struct M365Grant {
 }
 
 impl M365Grant {
-    /// Reads `--m365`: comma-separated label names, or `off` for no grant.
+    /// A grant of the sensitivity labels named in `names` (`unlabeled` allows content without
+    /// a label) and, with `tools`, of this agent's Work IQ. It takes label names only: at
+    /// least one, never `unknown` or `off`, each kept once whatever its case (blank names are
+    /// left out). What it refuses, [`M365GrantError`] says without the CLI's flags.
+    pub fn from_labels(
+        names: impl IntoIterator<Item = impl AsRef<str>>,
+        tools: bool,
+    ) -> Result<Self, M365GrantError> {
+        let mut labels: Vec<String> = Vec::new();
+        for name in names {
+            let name = name.as_ref().trim();
+            if name.eq_ignore_ascii_case(crate::workiq::content::UNKNOWN) {
+                return Err(M365GrantError::Unknown(name.to_owned()));
+            }
+            if name.eq_ignore_ascii_case("off") {
+                return Err(M365GrantError::Off(name.to_owned()));
+            }
+            if !name.is_empty() && !labels.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+                labels.push(name.to_owned());
+            }
+        }
+        if labels.is_empty() {
+            return Err(M365GrantError::NoLabels);
+        }
+        Ok(Self { labels, tools })
+    }
+
+    /// Reads `--m365`: comma-separated label names, as [`Self::from_labels`] takes them, or
+    /// `off` on its own for no grant. What it refuses names the CLI's flags.
     pub fn parse(spec: &str, tools: bool) -> Result<Option<Self>> {
         if spec.trim().eq_ignore_ascii_case("off") {
             if tools {
@@ -70,21 +99,20 @@ impl M365Grant {
             }
             return Ok(None);
         }
-        let mut labels: Vec<String> = Vec::new();
-        for label in spec.split(',').map(str::trim).filter(|l| !l.is_empty()) {
-            if label.eq_ignore_ascii_case(crate::workiq::content::UNKNOWN) {
-                bail!(
-                    "--m365 can't include '{label}': it stands for Work IQ content with no label information, whose sensitivity isn't known, so no peer gets it"
-                );
-            }
-            if !labels.iter().any(|l| l.eq_ignore_ascii_case(label)) {
-                labels.push(label.to_owned());
+        match Self::from_labels(spec.split(','), tools) {
+            Ok(grant) => Ok(Some(grant)),
+            Err(M365GrantError::Unknown(label)) => bail!(
+                "--m365 can't include '{label}': it stands for Work IQ content with no label \
+                 information, whose sensitivity isn't known, so no peer gets it"
+            ),
+            Err(M365GrantError::Off(label)) => bail!(
+                "--m365 can't include '{label}' among label names: --m365 off on its own removes \
+                 the grant"
+            ),
+            Err(M365GrantError::NoLabels) => {
+                bail!("--m365 needs label names (General,Public,unlabeled) or off")
             }
         }
-        if labels.is_empty() {
-            bail!("--m365 needs label names (General,Public,unlabeled) or off");
-        }
-        Ok(Some(Self { labels, tools }))
     }
 
     /// A short description for listings.
@@ -96,6 +124,40 @@ impl M365Grant {
         )
     }
 }
+
+/// Why [`M365Grant::from_labels`] refuses a grant; it says so without the CLI's flags, as the
+/// web UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum M365GrantError {
+    /// A label is `unknown` (as given): content with no label information, which no peer gets.
+    Unknown(String),
+    /// A label is `off` (as given), which isn't a label name.
+    Off(String),
+    /// There is no label name.
+    NoLabels,
+}
+
+impl fmt::Display for M365GrantError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(label) => write!(
+                f,
+                "The labels can't include '{label}': it stands for content with no label \
+                 information, whose sensitivity isn't known, so no peer gets it"
+            ),
+            Self::Off(label) => write!(
+                f,
+                "The labels can't include '{label}': it isn't a label name; to give no \
+                 Microsoft 365 content, remove the grant"
+            ),
+            Self::NoLabels => {
+                f.write_str("Give at least one label name, e.g. General, Public, unlabeled")
+            }
+        }
+    }
+}
+
+impl std::error::Error for M365GrantError {}
 
 fn default_shares() -> Vec<String> {
     vec![crate::shares::DATA_SHARE.to_owned()]
@@ -284,13 +346,29 @@ mod tests {
     fn m365_off_removes_the_grant_and_bad_specs_are_refused() {
         assert_eq!(M365Grant::parse("off", false).unwrap(), None);
         assert_eq!(M365Grant::parse(" OFF ", false).unwrap(), None);
-        assert!(M365Grant::parse("off", true).is_err());
-        assert!(M365Grant::parse(" , ", false).is_err());
+        // What `--m365` refuses names the CLI's flags.
+        let refused =
+            |spec: &str, tools: bool| M365Grant::parse(spec, tools).unwrap_err().to_string();
+        assert_eq!(
+            refused("off", true),
+            "--m365-tools can't be combined with --m365 off"
+        );
+        assert_eq!(
+            refused(" , ", false),
+            "--m365 needs label names (General,Public,unlabeled) or off"
+        );
         // Content without label information can't be granted to anyone.
-        let error = M365Grant::parse("General, Unknown", false).unwrap_err();
+        let error = refused("General, Unknown", false);
         assert!(
-            error.to_string().contains("no label information"),
+            error.starts_with("--m365 can't include 'Unknown': ")
+                && error.contains("no label information"),
             "{error}"
+        );
+        // `off` isn't a label name: it only stands alone.
+        assert_eq!(
+            refused("General, off", false),
+            "--m365 can't include 'off' among label names: --m365 off on its own removes the \
+             grant"
         );
     }
 

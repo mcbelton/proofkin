@@ -609,14 +609,27 @@ impl RunRecord {
 
     fn render_step(&self, s: &StepRecord) -> String {
         let step = &s.step;
-        let kind = if step.approve {
-            "approval".to_owned()
-        } else if step.team.is_some() {
-            "team".to_owned()
-        } else if step.pr {
-            "pull request".to_owned()
+        let who = if step.is_workiq() {
+            // The run's own agent asks Work IQ: no provider answers it, and no peer.
+            "Work IQ".to_owned()
         } else {
-            step.provider.to_string()
+            let kind = if step.approve {
+                "approval".to_owned()
+            } else if step.team.is_some() {
+                "team".to_owned()
+            } else if step.pr {
+                "pull request".to_owned()
+            } else {
+                step.provider.to_string()
+            };
+            format!(
+                "{kind} → {}{}",
+                step.target,
+                step.share
+                    .as_ref()
+                    .map(|f| format!(":{f}"))
+                    .unwrap_or_default()
+            )
         };
         let (status, peer) = match &s.state {
             StepState::Waiting => ("waiting", None),
@@ -626,13 +639,8 @@ impl RunRecord {
             StepState::Skipped { .. } => ("skipped", None),
         };
         let mut md = format!(
-            "\n### {} ({kind} → {}{}) {}: {status}\n\n",
+            "\n### {} ({who}) {}: {status}\n\n",
             step.id,
-            step.target,
-            step.share
-                .as_ref()
-                .map(|f| format!(":{f}"))
-                .unwrap_or_default(),
             peer.map(|p| format!("on {p}")).unwrap_or_default()
         );
         if !step.after.is_empty() {
@@ -738,7 +746,11 @@ impl RunRecord {
                 );
             }
         } else if matches!(s.state, StepState::Done { .. }) {
-            md += "- No evidence (the peer runs an older version)\n";
+            md += if step.is_workiq() {
+                "- No evidence: an answer from Microsoft 365 Copilot is context, never proof\n"
+            } else {
+                "- No evidence (the peer runs an older version)\n"
+            };
         }
         if let Some(text) = text {
             md += &format!(
@@ -1081,6 +1093,52 @@ mod tests {
         later.finished_unix += 3_600;
         let err = later.verify(None)[0].1.as_ref().unwrap_err().to_string();
         assert!(err.contains("outside this run"), "{err}");
+    }
+
+    #[test]
+    fn a_workiq_steps_report_says_work_iq_answered_it_and_why_it_has_no_evidence() {
+        let text = "ask @workiq agent=sales:1 What changed?\n\
+                    notes after ask @worker Write the notes";
+        let plan = Plan::parse(text).unwrap();
+        let mut states = BTreeMap::new();
+        let answer = StepState::Done {
+            peer: "workiq:sales:1".into(),
+            output: "The launch moved to May.".into(),
+            evidence: None,
+            verified: false,
+            patch: None,
+            model: None,
+        };
+        states.insert("ask".to_owned(), answer);
+        states.insert("notes".to_owned(), done("written", None, false));
+        let run = RunRecord::new("boss", "x", text, &plan, &states, 0);
+        let md = run.render_markdown();
+        assert!(
+            md.contains("\n### ask (Work IQ) on workiq:sales:1: done\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "\n- No evidence: an answer from Microsoft 365 Copilot is context, never proof\n"
+            ),
+            "{md}"
+        );
+        // Neither its plan's default provider's, nor put down to a peer's older version.
+        let ask = md.split("### ask").nth(1).unwrap();
+        let ask = ask.split("### notes").next().unwrap();
+        assert!(
+            !ask.contains("copilot →") && !ask.contains("older version"),
+            "{ask}"
+        );
+        // A peer's step without evidence reads as before.
+        assert!(
+            md.contains("\n### notes (copilot → @worker) on worker: done\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains("\n- No evidence (the peer runs an older version)\n"),
+            "{md}"
+        );
     }
 
     #[test]

@@ -870,7 +870,10 @@ write after ask @alice Write the announcement
 - An answer is context and never proof, so a `@workiq` step can't have `claims=`, `verify=`,
   `apply=`, `mcp=`, `skill=`, `attempts=`, `levels=`, `team` or `approve`, nor `context=`,
   `workiq=` or a folder. The run shows it as done by `workiq` (or `workiq:<agent id>`),
-  with no evidence and not verified.
+  with no evidence and not verified: its report heads the step *(Work IQ) on workiq* and
+  says *No evidence: an answer from Microsoft 365 Copilot is context, never proof*. In the
+  web UI its task reads **Microsoft 365 Copilot (Work IQ)** (with `agent=sales:1`,
+  **Microsoft 365 agent sales:1 (Work IQ)**), not the plan's provider.
 - `workiq` is reserved as a target name, so no peer can be called that in a plan.
 
 ### Team steps: handing work down a level
@@ -1273,7 +1276,7 @@ where, and the plan is filled in and checked.
 | `spec` | Spec-driven: a feature's spec (user stories, testable acceptance criteria, security and privacy), its REST API contract with examples, a clickable UX prototype and a claim per criterion. Each is proven by built-in checks, then the product owner (who clicks through the prototype) and the tech lead accept it. See [Spec-driven development](#spec-driven-development) |
 | `design` | The SDLC design of an accepted spec: architecture with context, component, UML and workflow diagrams, ADRs, data dictionary and data flows, threat model, test and operations plans, then a review pack with a deck per audience and a customer feedback document. Each is proven by built-in checks, then the tech lead, security and privacy champions, product owner and leadership review it. See [Design and reviews](#design-and-reviews) |
 | `implement-spec` | The accepted spec (and design) built as specified, with a test proving each acceptance criterion (`test`, `lint`, `spec:api`, `spec:trace`), verified by a reviewer squad, then signed off |
-| `implement-speckit` | A Spec Kit feature or OpenSpec change built as specified: a claim per user story, requirement and success criterion, a test per claim (`test`), verified by a reviewer squad, then signed off ([Spec Kit and OpenSpec](#spec-kit-and-openspec)) |
+| `implement-speckit` | A Spec Kit feature, OpenSpec change or spec document on SharePoint or OneDrive built as specified: a claim per user story, requirement and success criterion, a test per claim (`test`), verified by a reviewer squad, then signed off ([Spec Kit and OpenSpec](#spec-kit-and-openspec)) |
 | `rehearse` | The feature's reviews rehearsed before they happen: agents play the tech lead, security and privacy champions, product owner, leadership and a customer in parallel, then a synthesis (`review:rehearsal`) of actions and prepared answers, and your decision. See [Rehearse the reviews first](#rehearse-the-reviews-first) |
 
 Checks the playbooks name (`build`, `test`, `lint`, `secscan`, `licenses`, `secrets`) are
@@ -1639,7 +1642,9 @@ Here the run works on issue #12 (reopened if it is closed; `track: <title>` make
 `track: off` leaves the run untracked; without a `track:` line the run gets a new issue
 named after its first claim). Step `api` works on #15, made a sub-issue of #12 if it isn't
 one; `ui` and `signoff` get new sub-issues. A later run with `track: #12` takes up its
-steps' open sub-issues again. In the web UI the **Tracker** card links and shows the
+steps' open sub-issues again: it gives each its step's title and text (the earlier run's
+stay in the issue's history) and comments that it took the issue over.
+In the web UI the **Tracker** card links and shows the
 tracker, and **Board items** lists what is open by status; **Plan it** starts a plan on an
 item, with a step per open sub-issue. **Add existing issues** (`tracker add`) puts the
 repository's issues and pull requests on the board, with a status from their state (open
@@ -1828,6 +1833,7 @@ its requirements become the plan's claims, and peers implement it with a test pe
 | A Spec Kit feature, `specs/NNN-name/` (`spec.md`, `plan.md`, `tasks.md`; the project's `.specify/memory/constitution.md`) | `US-1`... per user story (*each of its acceptance scenarios passes*), `FR-001`... per functional requirement | `SC-001`... per success criterion |
 | An OpenSpec change, `openspec/changes/<id>/` (`proposal.md`, `tasks.md`, `design.md`, deltas in `specs/<capability>/spec.md`) | `<capability>-1`... per ADDED or MODIFIED requirement (REMOVED and RENAMED ones become instructions) | `ACCEPT`: it does what the proposal says |
 | An OpenSpec capability, `openspec/specs/<capability>/` | `<capability>-1`... per requirement | `ACCEPT` |
+| A Microsoft 365 document: a Word (`.docx`), Markdown (`.md`, `.markdown`) or text (`.txt`) document on SharePoint or OneDrive, by its link (`--from <link>`), read through Work IQ | Read as a Spec Kit `spec.md`: `US-1`... per user story, `FR-001`... per requirement | `SC-001`... per success criterion; `DOC-1` for a document with neither user stories nor requirements |
 
 The plan has three steps: **impl** on the peer you pick (`implement-change` skill, the
 folder's `test` check, up to 3 attempts, the tasks done in order and ticked off),
@@ -1846,9 +1852,35 @@ proofkin spec import D:\src\shop --profile boss --set peer=alice     # a project
 proofkin spec import ~/shop/openspec/changes/add-dark-mode --profile boss --set peer=alice --out dark.plan
 ```
 
+**A spec in a document on SharePoint or OneDrive.** `--from` takes the `https://` link of
+a Word, Markdown or text document on `*.sharepoint.com`, `onedrive.live.com` or `1drv.ms`
+(a `.../Doc.aspx?sourcedoc=...` link works too) instead of a folder, and reads it through
+Work IQ with the profile's sign-in (`proofkin auth login workiq`, see
+[Work IQ](docs/work-iq.md)): its name, type, size and sensitivity label first (`fetch`),
+then its content (`fetch_blob`). Both calls are audited with purpose `spec-import` and held
+to the profile's Work IQ budgets. Another link, or a folder as well, is refused before any
+call. Other types of document are refused (save it as Word or Markdown), and so is a
+document over 4 MB, before its content is downloaded. A Word document is read as Markdown:
+its title and headings, lists, tables and text; headers, footers, comments and images are
+left out. Write each requirement on its own line as `FR-001: ...` (and each success
+criterion as `SC-001: ...`) to get a claim for each; a document with none is one claim,
+`DOC-1`, signed off, with a warning. The spec is saved as knowledge topic
+`spec-<document>` (from its file name; its text redacted and marked as external content),
+marked as Microsoft 365 content
+(`origin: workiq`) with the document's sensitivity label, or `unknown` when Work IQ gives
+no label information, so only your own agents and digital workers get it. A peer gets the
+plan's steps only with a Microsoft 365 grant that includes that label
+(`proofkin peers allow <peer> --m365 General`), as the import's summary says. Prompts name
+the document by its file name; its link is only in the plan's comment.
+
+```powershell
+proofkin spec import --from https://contoso.sharepoint.com/sites/Team/Shared%20Documents/Photo%20albums.docx --profile boss --set peer=alice > albums.plan
+```
+
 In the web UI, pick the **implement-speckit** playbook in Plan mode and give the feature's
-folder; for a folder with several features it offers them to pick from. Other agents can
-import too, with the `import_spec` MCP tool ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
+folder, or a document's SharePoint or OneDrive link (read with the profile's Work IQ
+sign-in); for a folder with several features it offers them to pick from. Other agents can
+import a folder too, with the `import_spec` MCP tool ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
 
 ### Design and reviews
 
@@ -2004,7 +2036,10 @@ proofkin --name me --providers copilot --serve --ui
   **Let this peer receive Microsoft 365 content (Work IQ)** and enter the sensitivity labels
   it may receive, comma separated (`unlabeled` allows content with no label; content without
   label information never goes to a peer), and tick **Its tasks may also use this agent's
-  Work IQ (read only)** for `--m365-tools`. **Change…** shows the peer's grant, and clearing
+  Work IQ (read only)** for `--m365-tools`. The field takes label names only: it refuses
+  `unknown` (content without label information is never granted) and `off` (clearing the
+  first box is how a peer gets none), saying why in the dialog's words rather than the
+  CLI's, and the peer keeps the grant it had. **Change…** shows the peer's grant, and clearing
   the first box removes it; adding a peer again without ticking it keeps the one it had. The
   list shows a granted peer's grant ("M365: General, Public · Work IQ tools"); see the
   [Security model](#security-model).
@@ -2124,8 +2159,11 @@ proofkin --name me --providers copilot --serve --ui
   what `proofkin kb import workiq` does: you name the topic, say what to look for and where
   (all of your Microsoft 365, or your mail, meetings, files, Teams messages, people or
   connectors) and whether to replace a topic of that name, and the dialog says how many
-  results were kept, with their labels, and how many were withheld. The topic keeps where
-  it came from, so it goes only to peers whose Microsoft 365 grant covers its labels.
+  results were kept, with their labels, and how many were withheld, or why nothing was
+  imported. The topic keeps where it came from, so it goes only to peers whose Microsoft
+  365 grant covers its labels: its line in the list shows them (*Microsoft 365 · General*),
+  and says so when hovered. The page says *no label information* where the label is
+  `unknown`; such a topic goes to no peer.
 - **Schedules**: each schedule in plain words, its next run, its last run's result (with
   a link to the evidence run), and Run now, Pause/Resume, Edit and Delete.
 - **Plugins & tools**: import [plugins](#plugins-skills-agents-and-mcp-servers-packaged-together)
@@ -2158,8 +2196,9 @@ proofkin --name me --providers copilot --serve --ui
   plan can start from it before it is merged (**Build on it…**, `base=RUN:STEP`). Results
   that carry valid signed evidence show **Signed ✓**. A step that searched Microsoft 365
   (`workiq=`) or asked it (`@workiq`) shows where its work context came from: how many
-  results were kept, with their labels, and withheld, and each source's title, kind, label
-  and link, never what it said.
+  results were kept, with their labels (*no label information* for those Work IQ gave
+  none, such as an answer without citations), and withheld, and each source's title, kind,
+  label and link, never what it said.
 - **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
 - **Get started**: a new agent (nobody on its allowlist yet) shows its first steps in
   place of the empty conversation: share your ticket, add a teammate's, or create a
@@ -2394,9 +2433,9 @@ runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
   `peers allow ... --m365 General,Public,unlabeled` lets a peer receive Work IQ context
   with only those sensitivity labels (`unlabeled` allows content Work IQ says has no label;
   content with no label information, such as meetings and chats, goes to no peer), and
-  `--m365-tools` also lets its tasks use your Work IQ, read only. `--m365 off` removes the
-  grant; allowing the peer again without `--m365` keeps it. Your own digital workers get
-  everything you can read.
+  `--m365-tools` also lets its tasks use your Work IQ, read only. `--m365 off` on its own
+  removes the grant (among label names, `off` is refused); allowing the peer again without
+  `--m365` keeps it. Your own digital workers get everything you can read.
 - Microsoft 365 content keeps its origin. A knowledge topic with `origin: workiq` and
   `labels: General, HR` in its front matter is Microsoft 365 content (a troubleshooting guide
   can be one too). A plan step that uses such a topic with `context=` is marked with its
@@ -2800,7 +2839,7 @@ Workflow for a change:
 - [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches, and the unfinished work a stopped task keeps
 - [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification
 - [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
-- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec, design, implement-spec, implement-speckit and rehearse plan templates; [src/spec_import.rs](src/spec_import.rs): Spec Kit and OpenSpec specs as claims, knowledge and plans
+- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec, design, implement-spec, implement-speckit and rehearse plan templates; [src/spec_import.rs](src/spec_import.rs): Spec Kit and OpenSpec specs, and spec documents from SharePoint or OneDrive, as claims, knowledge and plans; [src/docx.rs](src/docx.rs): a Word document's text as Markdown (headings, lists, tables), read with size limits
 - [src/spec.rs](src/spec.rs) and [spec-starter/](spec-starter): the built-in spec checks (`spec:spec`, `spec:api`, `spec:ux`, `spec:trace`) and the `spec init` starter package
 - [src/design.rs](src/design.rs) and [design-starter/](design-starter): the design and review checks (`design:arch`, `design:data`, `design:threats`, `design:tests`, `design:ops`, `review:decks`, `review:rehearsal`) and the `design init` starter
 - [src/render.rs](src/render.rs): Markdown to self-contained HTML: Marp decks as slide shows, documents as pages, without raw HTML
@@ -2810,13 +2849,13 @@ Workflow for a change:
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)
 - [src/pulls.rs](src/pulls.rs): pull request steps: the folder's agent opens the pull request with the work before it (only work it signed for the peer that asks) and follows it until it is merged or closed
 - [src/tracker.rs](src/tracker.rs): tracked work: plan runs as GitHub issues and sub-issues on a GitHub Project's board (GraphQL through `gh`)
-- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait, and the content policy (`content.rs`: only `allowed` results, label allowlist per audience, redaction, size cap, envelope), and the gateway (`gateway.rs`: a task's own MCP address on 127.0.0.1 for `mcp=workiq`, with a bearer that ends with the task); see [docs/work-iq.md](docs/work-iq.md)
+- [src/workiq/](src/workiq): the Work IQ MCP client (streamable HTTP, JSON or SSE replies, session renewal, cached `tools/list`, typed `retrieve`, `ask`, `fetch`, `fetch_blob` and `list_agents` calls, classified `WorkIqError`s with a fix and the request ids, and safe retries: one token refresh on 401, throttling waited for, transient failures of read tools backed off, changes never sent again) behind a `Transport` trait, and the content policy (`content.rs`: only `allowed` results, label allowlist per audience, redaction, size cap, envelope), the gateway (`gateway.rs`: a task's own MCP address on 127.0.0.1 for `mcp=workiq`, with a bearer that ends with the task), and spec documents (`document.rs`: a Word, Markdown or text document on SharePoint or OneDrive by its link, for `spec import --from`); see [docs/work-iq.md](docs/work-iq.md)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
 - [src/main.rs](src/main.rs): interactive CLI
 - [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events; [src/ui/tools.rs](src/ui/tools.rs): its plugins, MCP servers and skills API; [src/ui/workers.rs](src/ui/workers.rs): its digital workers API; [src/ui/models.rs](src/ui/models.rs): its Models dialog API; [src/ui/connect.rs](src/ui/connect.rs): the MCP server and A2A agent other agents connect to
-- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card, [ui/models.js](ui/models.js) the model lists and the Models dialog, [ui/connect.js](ui/connect.js) the Connect other agents card
+- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card, [ui/models.js](ui/models.js) the model lists and the Models dialog, [ui/connect.js](ui/connect.js) the Connect other agents card, [ui/m365.js](ui/m365.js) how the page words Microsoft 365 content (labels, counts, who answers a `@workiq` step)
 - [docs/ux-guidelines.md](docs/ux-guidelines.md): the UI's design guidelines and definition of done
 - [docs/work-iq.md](docs/work-iq.md): the design for Microsoft 365 work context through Work IQ (being built, tracked in [#36](https://github.com/mcbelton/proofkin/issues/36))
 - [docs/agent-factory.md](docs/agent-factory.md) and [docs/agent-factory/](docs/agent-factory): the design for the agent factory: agents described in plain words, evaluated, released signed and deployed as digital workers, with its spec, API contract, architecture, threat model and test plan (being built, tracked in [#175](https://github.com/mcbelton/proofkin/issues/175))

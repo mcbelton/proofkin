@@ -55,6 +55,8 @@ pub enum Purpose {
         step: String,
     },
     KnowledgeImport,
+    /// `proofkin spec import --from`: a spec read from a SharePoint or OneDrive document.
+    SpecImport,
     /// A task of a peer or a worker, through this agent's Work IQ gateway.
     Gateway,
     Doctor,
@@ -67,6 +69,7 @@ impl Purpose {
         match self {
             Purpose::Step { .. } => "step",
             Purpose::KnowledgeImport => "knowledge-import",
+            Purpose::SpecImport => "spec-import",
             Purpose::Gateway => "gateway",
             Purpose::Doctor => "doctor",
             Purpose::Command => "command",
@@ -120,7 +123,7 @@ pub struct Entry {
     /// Unix time in milliseconds when the call began.
     pub ts_ms: i64,
     pub tool: String,
-    /// `step`, `knowledge-import`, `gateway`, `doctor` or `command`.
+    /// `step`, `knowledge-import`, `spec-import`, `gateway`, `doctor` or `command`.
     pub purpose: String,
     /// The run a step belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]

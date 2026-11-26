@@ -3191,6 +3191,7 @@ async fn the_page_follows_the_ux_guidelines() {
     assert!(page.contains(r#"<script src="/markdown.js" defer>"#));
     assert!(page.contains(r#"<script src="/models.js" defer>"#));
     assert!(page.contains(r#"<script src="/branches.js" defer>"#));
+    assert!(page.contains(r#"<script src="/m365.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     assert!(page.contains(r#"<script src="/workers.js" defer>"#));
@@ -3263,6 +3264,7 @@ async fn the_page_follows_the_ux_guidelines() {
         "/markdown.js",
         "/models.js",
         "/branches.js",
+        "/m365.js",
         "/tools.js",
         "/plan-text.js",
         "/plan-builder.js",
@@ -3405,6 +3407,28 @@ fn task_branches_say_whether_deleting_them_loses_work() {
         .arg(&cases)
         .output()
         .expect("node must be installed to run the task branch tests");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("ok: "), "{stdout}");
+}
+
+/// The page words Microsoft 365 content plainly: a label Work IQ gave no information for
+/// reads "no label information", never the internal `unknown` (in a run's counts and sources
+/// and an import's result); a `@workiq` step's task reads as Microsoft 365 Copilot's (or its
+/// agent's) through Work IQ, not a provider's; a topic imported from Microsoft 365 shows its
+/// labels and who it may go to in the Knowledge list; and a route's error shows as a
+/// sentence. The cases (tests/m365.test.cjs) run in node, which loads ui/m365.js as the page
+/// does.
+#[test]
+fn the_page_words_microsoft_365_labels_and_work_iq_steps_plainly() {
+    let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/m365.test.cjs");
+    let out = std::process::Command::new("node")
+        .arg(&cases)
+        .output()
+        .expect("node must be installed to run the Microsoft 365 wording tests");
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
@@ -4001,6 +4025,14 @@ async fn ui_with_work_results(
     home: &std::path::Path,
     results: Vec<Value>,
 ) -> (Profile, Agent, u16, String) {
+    ui_with_work(home, Arc::new(SearchResults(results))).await
+}
+
+/// A UI whose Work IQ is `work`: its profile, agent, port and token.
+async fn ui_with_work(
+    home: &std::path::Path,
+    work: Arc<dyn proofkin::workiq::context::WorkContext>,
+) -> (Profile, Agent, u16, String) {
     let profile = Profile::open_in(home, "owner").unwrap();
     let mut config = AgentConfig::new("owner", SecretKey::generate());
     config.network = Network::Local;
@@ -4022,7 +4054,7 @@ async fn ui_with_work_results(
         info,
         None,
         "127.0.0.1:0".parse().unwrap(),
-        Some(Arc::new(SearchResults(results))),
+        Some(work),
     )
     .await
     .unwrap();
@@ -4111,6 +4143,101 @@ async fn the_workiq_import_route_saves_a_marked_topic_and_needs_replace_to_overw
     .await;
     assert_eq!(bad.status, 400);
     assert!(bad.json()["error"].as_str().unwrap().contains("slack"));
+    agent.shutdown().await;
+}
+
+const SPEC_DOCUMENT: &str = "# Albums\n\nFR-001: Users can share an album.\n";
+
+/// A Work IQ whose every document is `SPEC_DOCUMENT`, a Markdown spec labelled General.
+#[derive(Debug)]
+struct SpecDocument;
+
+/// A tool result whose structured content is `content`.
+fn structured(content: Value) -> proofkin::workiq::ToolResult {
+    proofkin::workiq::ToolResult {
+        content: Vec::new(),
+        structured_content: Some(content),
+        is_error: false,
+        ids: proofkin::workiq::RequestIds::default(),
+    }
+}
+
+#[async_trait]
+impl proofkin::workiq::context::WorkContext for SpecDocument {
+    async fn retrieve(
+        &self,
+        _context: &proofkin::workiq::audit::CallContext,
+        _query: &str,
+        _strategy: &str,
+        _capabilities: &[&str],
+    ) -> anyhow::Result<proofkin::workiq::ToolResult> {
+        anyhow::bail!("this Work IQ only has documents")
+    }
+
+    async fn fetch(
+        &self,
+        _context: &proofkin::workiq::audit::CallContext,
+        _entity_urls: &[&str],
+    ) -> anyhow::Result<proofkin::workiq::ToolResult> {
+        let data = serde_json::json!({
+            "name": "Albums.md", "size": SPEC_DOCUMENT.len(),
+            "file": { "mimeType": "text/markdown" },
+            "sensitivityLabel": { "displayName": "General" },
+        });
+        let item = serde_json::json!({ "statusCode": 200, "data": data });
+        Ok(structured(serde_json::json!({ "results": [item] })))
+    }
+
+    async fn fetch_blob(
+        &self,
+        _context: &proofkin::workiq::audit::CallContext,
+        _path: &str,
+    ) -> anyhow::Result<proofkin::workiq::ToolResult> {
+        let content = data_encoding::BASE64.encode(SPEC_DOCUMENT.as_bytes());
+        Ok(structured(serde_json::json!({
+            "statusCode": 200, "contentType": "text/markdown", "blobName": "Albums.md",
+            "sizeBytes": SPEC_DOCUMENT.len(), "base64Content": content,
+        })))
+    }
+}
+
+#[tokio::test]
+async fn plan_mode_imports_a_spec_document_from_sharepoint_through_work_iq() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, agent, port, token) = ui_with_work(home.path(), Arc::new(SpecDocument)).await;
+    let host = format!("127.0.0.1:{port}");
+    let path = "/api/playbooks/implement-speckit";
+    let link = "https://contoso.sharepoint.com/sites/Team/Shared%20Documents/Albums.md";
+    let vars = serde_json::json!({ "spec": link, "peer": "alice" });
+    let body = serde_json::json!({ "vars": vars }).to_string();
+    let filled = request(port, "POST", path, &host, Some(&token), Some(&body)).await;
+    assert_eq!(filled.status, 200, "{}", filled.body);
+
+    // Its requirement is the plan's claim, and it is saved as a topic marked with its label.
+    let filled = filled.json();
+    let text = filled["text"].as_str().unwrap();
+    let claim = "claim: FR-001 Users can share an album.\n";
+    assert!(text.contains(claim), "{text}");
+    let imported = format!("// Imported from {link}. ");
+    assert!(text.contains(&imported), "{text}");
+    assert_eq!(filled["knowledge"], serde_json::json!(["spec-albums"]));
+    let topic = profile.knowledge().read("spec-albums").unwrap();
+    assert_eq!(
+        proofkin::knowledge::parse_mark(&topic),
+        Some(vec!["General".to_owned()])
+    );
+    let summary = filled["notes"][0].as_str().unwrap();
+    let label = "Its sensitivity label is General";
+    assert!(summary.contains(label), "{summary}");
+
+    // A link off SharePoint and OneDrive is refused, in the server's words.
+    let vars = serde_json::json!({ "spec": "https://example.com/Albums.md", "peer": "alice" });
+    let body = serde_json::json!({ "vars": vars }).to_string();
+    let refused = request(port, "POST", path, &host, Some(&token), Some(&body)).await;
+    assert_eq!(refused.status, 400);
+    let error = refused.json()["error"].as_str().unwrap().to_owned();
+    let off = "is not a SharePoint or OneDrive link";
+    assert!(error.contains(off), "{error}");
     agent.shutdown().await;
 }
 
@@ -4633,6 +4760,107 @@ async fn the_workiq_agents_route_lists_the_agents_work_iq_offers_and_says_why_it
     agent.shutdown().await;
 }
 
+/// A `@workiq` step run from the web UI reads as answered by Microsoft 365 Copilot (or the
+/// Work IQ agent it asks), not by its plan's provider: its task says it is one and names who
+/// answered it as it is (`workiq:<agent id>`, an id with colons of its own). Its run's report
+/// heads it "(Work IQ)" and says why it has no evidence, and the run's counts keep the
+/// answer's `unknown` label, which the page words as "no label information".
+#[tokio::test]
+async fn a_workiq_steps_task_and_report_say_work_iq_answered_it() {
+    let home = tempfile::tempdir().unwrap();
+    let (bin, cli_state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let cli = fake_workiq_cli_at(bin.path(), cli_state.path(), "full");
+    let mut profile = Profile::open_in(home.path(), "owner").unwrap();
+    profile.config.workiq = Some(proofkin::profile::WorkIqAccount {
+        connection: proofkin::profile::WorkIqConnection::Cli {
+            account: Some("ada@contoso.example".into()),
+            program: Some(cli),
+        },
+        upn: "ada@contoso.example".into(),
+        display_name: "ada@contoso.example".into(),
+        tenant_id: "unknown".into(),
+        added: 0,
+    });
+    profile.save().unwrap();
+    let (agent, port, token) = ui_of(home.path(), "owner").await;
+    let call = |method: &'static str, path: &str, body: Value| {
+        let (token, path) = (token.clone(), path.to_owned());
+        async move { call_ui(port, Some(&token), method, &path, body).await }
+    };
+
+    let body = serde_json::json!({ "text": "ask @workiq agent=sales:1 What changed?" });
+    let started = call("POST", "/api/plans", body).await;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let task = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let state = call("GET", "/api/state", Value::Null).await.json();
+            let ended = state["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["step"] == "ask" && !t["finished_ms"].is_null())
+                .cloned();
+            if let Some(t) = ended {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the step ended");
+    assert_eq!(task["status"], "done", "{task}");
+    assert_eq!(task["workiq"], true, "{task}");
+    // Not workiq:sales:1:sales:1, as if its agent id were a folder.
+    assert_eq!(task["target"], "workiq:sales:1", "{task}");
+    let answer = task["output"].as_str().unwrap();
+    assert!(answer.contains("the launch moved to May"), "{answer}");
+
+    let id = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let runs = call("GET", "/api/runs", Value::Null).await.json();
+            if let Some(id) = runs["runs"][0]["id"].as_str() {
+                return id.to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the run was saved");
+    let path = format!("/api/runs/{id}");
+    let run = call("GET", &path, Value::Null).await.json();
+    let report = run["report"].as_str().unwrap();
+    assert!(
+        report.contains("\n### ask (Work IQ) on workiq:sales:1: done\n"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "\n- No evidence: an answer from Microsoft 365 Copilot is context, never proof\n"
+        ),
+        "{report}"
+    );
+    assert!(
+        !report.contains("copilot →") && !report.contains("older version"),
+        "{report}"
+    );
+    // An answer without citations has no label information.
+    assert_eq!(
+        run["workiq"],
+        serde_json::json!([{
+            "step": "ask",
+            "sources": [],
+            "labels": ["unknown"],
+            "kept": 1,
+            "withheld": 0,
+        }])
+    );
+    let app = call("GET", "/app.js", Value::Null).await.body;
+    for wording in ["workiqWho(t.target)", "m365Label(s.label)"] {
+        assert!(app.contains(wording), "the page doesn't use {wording}");
+    }
+    agent.shutdown().await;
+}
+
 /// A digital worker's page shows the Work IQ account it uses, its owner's, and leaves
 /// signing in, signing out and budgets to the owner; a worker its owner didn't let use the
 /// account says why.
@@ -4853,10 +5081,11 @@ async fn the_allowlist_sets_changes_and_removes_a_peers_microsoft_365_grant() {
     agent.shutdown().await;
 }
 
-/// The allowlist holds a Microsoft 365 grant to the CLI's rules: `unknown` (content with no
-/// label information) and a grant without labels are refused with a 400 in
-/// `M365Grant::parse`'s words, whether adding or changing the peer, which keeps the grant it
-/// had, in `peers.json` too.
+/// The allowlist holds a Microsoft 365 grant to the CLI's rules but says what is wrong in the
+/// dialog's words, without the CLI's flags: it takes label names only, so `unknown` (content
+/// with no label information), `off` (which isn't read as `--m365 off`, alone or among other
+/// labels, with Work IQ tools or without) and a grant without labels are refused with a 400,
+/// whether adding or changing the peer, which keeps the grant it had, in `peers.json` too.
 #[tokio::test]
 async fn microsoft_365_grants_with_unknown_or_without_labels_are_refused() {
     let home = tempfile::tempdir().unwrap();
@@ -4873,12 +5102,30 @@ async fn microsoft_365_grants_with_unknown_or_without_labels_are_refused() {
     assert_eq!(added.status, 200, "{}", added.body);
     let profile = Profile::open_in(home.path(), "boss").unwrap();
     let before = std::fs::read_to_string(profile.trust_path()).unwrap();
-    let cases: [&[&str]; 4] = [&["General", "unknown"], &["Unknown"], &[], &[" ", ""]];
-    for labels in cases {
-        let words = proofkin::M365Grant::parse(&labels.join(","), true)
-            .unwrap_err()
-            .to_string();
-        let m365 = serde_json::json!({ "labels": labels, "tools": true });
+    let unknown = |label: &str| {
+        format!(
+            "The labels can't include '{label}': it stands for content with no label \
+             information, whose sensitivity isn't known, so no peer gets it"
+        )
+    };
+    let off = |label: &str| {
+        format!(
+            "The labels can't include '{label}': it isn't a label name; to give no \
+             Microsoft 365 content, remove the grant"
+        )
+    };
+    let none = "Give at least one label name, e.g. General, Public, unlabeled";
+    let cases: [(&[&str], bool, String); 7] = [
+        (&["General", "unknown"], true, unknown("unknown")),
+        (&["Unknown"], false, unknown("Unknown")),
+        (&["off"], false, off("off")),
+        (&[" Off "], true, off("Off")),
+        (&["General", "OFF"], false, off("OFF")),
+        (&[], true, none.to_owned()),
+        (&[" ", ""], false, none.to_owned()),
+    ];
+    for (labels, tools, words) in cases {
+        let m365 = serde_json::json!({ "labels": labels, "tools": tools });
         let add_body = serde_json::json!({ "ticket": ticket, "name": "pal", "m365": m365 });
         let change_body = serde_json::json!({ "m365": m365 });
         for (method, path, body) in [

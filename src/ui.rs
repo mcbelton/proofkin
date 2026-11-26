@@ -49,6 +49,7 @@ const PLAN_TEXT_JS: &str = include_str!("../ui/plan-text.js");
 const MARKDOWN_JS: &str = include_str!("../ui/markdown.js");
 const MODELS_JS: &str = include_str!("../ui/models.js");
 const BRANCHES_JS: &str = include_str!("../ui/branches.js");
+const M365_JS: &str = include_str!("../ui/m365.js");
 const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
 const WORKERS_JS: &str = include_str!("../ui/workers.js");
 const CONNECT_JS: &str = include_str!("../ui/connect.js");
@@ -111,6 +112,11 @@ struct TaskView {
     /// A pull request step: its peer opens the pull request with the work before it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pull_request: bool,
+    /// A `@workiq` step: Microsoft 365 Copilot (or the agent it names) answers it through
+    /// Work IQ, asked by this agent, so no provider or peer does (`target` is `workiq` or
+    /// `workiq:<agent id>`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    workiq: bool,
     /// For peers' results: "verified" (signed by the peer for this output) or "unverified".
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<&'static str>,
@@ -205,6 +211,8 @@ struct StoredTask {
     team_step: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pull_request: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    workiq: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evidence: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +262,7 @@ impl From<&TaskView> for StoredTask {
             approval: t.approval,
             team_step: t.team_step,
             pull_request: t.pull_request,
+            workiq: t.workiq,
             evidence: t.evidence.map(str::to_owned),
             via: t.via.map(str::to_owned),
             run: t.run.clone(),
@@ -298,6 +307,7 @@ impl StoredTask {
             approval: self.approval,
             team_step: self.team_step,
             pull_request: self.pull_request,
+            workiq: self.workiq,
             evidence: known(self.evidence.as_deref(), &["verified", "unverified"]),
             preview: None,
             preview_label: None,
@@ -614,14 +624,7 @@ impl Shared {
                 model: None,
                 usage: None,
                 prompt: step.prompt.clone(),
-                target: format!(
-                    "{}{}",
-                    step.target,
-                    step.share
-                        .as_ref()
-                        .map(|f| format!(":{f}"))
-                        .unwrap_or_default()
-                ),
+                target: first_target(step),
                 status: "waiting",
                 output: None,
                 started_ms: now_ms(),
@@ -632,6 +635,7 @@ impl Shared {
                 approval: step.approve,
                 team_step: step.team.is_some(),
                 pull_request: step.pr,
+                workiq: step.is_workiq(),
                 evidence: None,
                 preview: None,
                 preview_label: None,
@@ -1168,6 +1172,10 @@ pub async fn start_with_work(
             get(|| async { asset("text/javascript; charset=utf-8", BRANCHES_JS) }),
         )
         .route(
+            "/m365.js",
+            get(|| async { asset("text/javascript; charset=utf-8", M365_JS) }),
+        )
+        .route(
             "/plan-builder.js",
             get(|| async { asset("text/javascript; charset=utf-8", PLAN_BUILDER_JS) }),
         )
@@ -1621,6 +1629,7 @@ fn start_task(
         approval: false,
         team_step: false,
         pull_request: false,
+        workiq: false,
         evidence: None,
         preview: None,
         preview_label: None,
@@ -1956,9 +1965,30 @@ struct StartedPlan {
     done: tokio::task::JoinHandle<crate::schedule::Outcome>,
 }
 
-/// Names `peer` in the target of a plan step, keeping the folder the target already has.
-fn step_target(target: &str, peer: &str) -> String {
-    match target.split_once(':') {
+/// The target a plan step's task shows before the step starts: its peer or squad and its
+/// folder, or for a `@workiq` step who answers it (`workiq` or `workiq:<agent id>`).
+fn first_target(step: &crate::plan::Step) -> String {
+    if step.is_workiq() {
+        return step.workiq_name();
+    }
+    format!(
+        "{}{}",
+        step.target,
+        step.share
+            .as_ref()
+            .map(|f| format!(":{f}"))
+            .unwrap_or_default()
+    )
+}
+
+/// Names `peer` in the target of plan step `t`, keeping the folder its target already has.
+/// A `@workiq` step has no folder: its "peer" is who answered it, whose agent id may have
+/// colons of its own.
+fn step_target(t: &TaskView, peer: &str) -> String {
+    if t.workiq {
+        return peer.to_owned();
+    }
+    match t.target.split_once(':') {
         Some((_, folder)) => format!("{peer}:{folder}"),
         None => peer.to_owned(),
     }
@@ -1975,7 +2005,7 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
                 t.started_ms = now_ms();
             }
             t.status = "running";
-            t.target = step_target(&t.target, peer);
+            t.target = step_target(t, peer);
             t.progress = progress.clone();
         }
         StepState::Done {
@@ -1987,7 +2017,7 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
             model,
         } => {
             t.status = "done";
-            t.target = step_target(&t.target, peer);
+            t.target = step_target(t, peer);
             t.output = Some(output.clone());
             t.finished_ms = Some(now_ms());
             t.progress = None;
@@ -2014,7 +2044,7 @@ fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
         } => {
             t.status = "failed";
             if let Some(peer) = peer {
-                t.target = step_target(&t.target, peer);
+                t.target = step_target(t, peer);
             }
             t.output = Some(error.clone());
             t.finished_ms = Some(now_ms());
@@ -2107,14 +2137,7 @@ fn start_plan(
             model: None,
             usage: None,
             prompt: step.prompt.clone(),
-            target: format!(
-                "{}{}",
-                step.target,
-                step.share
-                    .as_ref()
-                    .map(|f| format!(":{f}"))
-                    .unwrap_or_default()
-            ),
+            target: first_target(step),
             status: "waiting",
             output: None,
             started_ms: now_ms(),
@@ -2125,6 +2148,7 @@ fn start_plan(
             approval: step.approve,
             team_step: step.team.is_some(),
             pull_request: step.pr,
+            workiq: step.is_workiq(),
             evidence: None,
             preview: None,
             preview_label: None,
@@ -3741,7 +3765,8 @@ struct PlaybookBody {
 }
 
 /// Fills in a playbook. The implement-speckit playbook also saves the spec it imports
-/// as knowledge; a folder with several specs lists them (`candidates`) to pick from.
+/// as knowledge; a folder with several specs lists them (`candidates`) to pick from, and a
+/// document's link is read through Work IQ.
 async fn render_playbook(
     State(s): State<AppState>,
     Path(name): Path<String>,
@@ -3753,14 +3778,18 @@ async fn render_playbook(
         .filter(|(_, v)| !v.trim().is_empty())
         .collect();
     let kb = s.info.profile.knowledge();
-    // An imported spec's files are read (and a project searched for one): that blocks.
-    let done = tokio::task::spawn_blocking(move || {
-        let rendered = crate::playbooks::render_full(&name, &vars)?;
-        let saved = rendered.save_knowledge(&kb)?;
-        anyhow::Ok((rendered, saved))
-    })
-    .await
-    .map_err(internal)?;
+    let done = if crate::playbooks::reads_document(&name, &vars) {
+        render_document(&s, &vars, &kb).await
+    } else {
+        // An imported spec's files are read (and a project searched for one): that blocks.
+        tokio::task::spawn_blocking(move || {
+            let rendered = crate::playbooks::render_full(&name, &vars)?;
+            let saved = rendered.save_knowledge(&kb)?;
+            anyhow::Ok((rendered, saved))
+        })
+        .await
+        .map_err(internal)?
+    };
     let (rendered, saved) = done.map_err(|e| {
         let mut body = json!({ "error": format!("{e:#}") });
         if let Some(several) = e.downcast_ref::<crate::spec_import::SeveralSpecs>() {
@@ -3775,6 +3804,27 @@ async fn render_playbook(
     Ok(Json(
         json!({ "text": rendered.text, "notes": rendered.notes, "knowledge": saved }),
     ))
+}
+
+/// The implement-speckit playbook filled in from a spec document on SharePoint or OneDrive,
+/// read through Work IQ with the profile's sign-in, and its spec saved as knowledge. A link
+/// that isn't one is refused before anything else.
+async fn render_document(
+    s: &AppState,
+    vars: &std::collections::BTreeMap<String, String>,
+    kb: &crate::knowledge::KnowledgeBase,
+) -> anyhow::Result<(crate::playbooks::Rendered, Vec<String>)> {
+    let link = vars.get("spec").map(String::as_str).unwrap_or_default();
+    crate::workiq::document::share_path(link)?;
+    let work: Arc<dyn crate::workiq::context::WorkContext> = match &s.work {
+        Some(work) => work.clone(),
+        None => Arc::new(crate::workiq::context::ClientWork::for_profile(
+            &s.profile_now(),
+        )?),
+    };
+    let rendered = crate::playbooks::render_document(vars, work.as_ref()).await?;
+    let saved = rendered.save_knowledge(kb)?;
+    Ok((rendered, saved))
 }
 
 #[derive(Deserialize)]
@@ -4072,6 +4122,7 @@ async fn open_run_pull_request(
         approval: false,
         team_step: false,
         pull_request: true,
+        workiq: false,
         evidence: None,
         preview: None,
         preview_label: None,
@@ -4211,8 +4262,8 @@ struct AllowBody {
     github: Option<String>,
 }
 
-/// A peer's Microsoft 365 grant as the allowlist dialog sends it: `--m365`'s sensitivity
-/// labels and `--m365-tools`.
+/// A peer's Microsoft 365 grant as the allowlist dialog sends it: the sensitivity labels it
+/// may receive (as `--m365` gives them, but never `off`) and `--m365-tools`.
 #[derive(Deserialize)]
 struct M365Body {
     #[serde(default)]
@@ -4231,13 +4282,19 @@ where
     Option::<T>::deserialize(de).map(Some)
 }
 
-/// The grant `m365` gives (null: none) by the CLI's rules, through [`M365Grant::parse`]: at
-/// least one label, never `unknown`, each label once whatever its case.
+/// The grant `m365` gives (null: none) by the CLI's rules, through
+/// [`M365Grant::from_labels`]: label names only, at least one, never `unknown` or `off` (null
+/// is how a peer gets no grant), each once whatever its case. What it refuses it says in the
+/// dialog's words, without the CLI's flags.
 fn m365_grant(given: Option<M365Body>) -> Result<Option<M365Grant>, ApiError> {
-    match given {
-        Some(body) => M365Grant::parse(&body.labels.join(","), body.tools).map_err(bad_request),
-        None => Ok(None),
-    }
+    let Some(body) = given else {
+        return Ok(None);
+    };
+    // A label with commas in it is several, as `--m365` and the dialog's field read them.
+    let labels = body.labels.iter().flat_map(|label| label.split(','));
+    M365Grant::from_labels(labels, body.tools)
+        .map(Some)
+        .map_err(bad_request)
 }
 
 /// The GitHub account a peer's entry gets from `given` (see [`AllowBody::github`]), else
@@ -4470,6 +4527,7 @@ mod tests {
             approval: false,
             team_step: false,
             pull_request: false,
+            workiq: false,
             evidence: None,
             preview: None,
             preview_label: None,

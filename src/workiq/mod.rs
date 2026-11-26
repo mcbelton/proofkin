@@ -3,6 +3,7 @@
 //! [`client`] is the MCP client. It talks to a [`Transport`] (streamable HTTP, or [`stdio`]
 //! for Microsoft's CLI) with a bearer from a [`TokenSource`]. [`connect`] builds the client
 //! for a profile's account. [`content`] is the content policy for what the client returns.
+//! [`document`] reads a spec in a SharePoint or OneDrive document for `spec import --from`.
 
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ pub mod client;
 pub mod content;
 pub mod context;
 pub mod doctor;
+pub mod document;
 pub mod gateway;
 pub mod import;
 pub mod login;

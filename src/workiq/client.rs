@@ -258,27 +258,27 @@ impl WorkIqError {
         });
         let class = if challenged {
             Class::SignInAgain
-        } else if let Some(class) = class_from_text(&snippet) {
-            class
         } else {
-            match status.as_u16() {
-                401 => Class::SignInAgain,
-                402 => Class::Billing,
-                403 => Class::DeniedByPolicy,
-                429 => Class::Throttled(
-                    retry_after
-                        .and_then(parse_retry_after)
-                        .or(payload.retry_after),
-                ),
-                500..=599 => Class::Transient,
-                _ => classify(&snippet, &payload),
-            }
+            let retry_after = retry_after.and_then(parse_retry_after);
+            class_of_status(status.as_u16(), &snippet, &payload, retry_after)
         };
         let mut message = format!("the server answered {status}: {}", snippet.trim());
         if let Some(header) = www_authenticate.filter(|_| challenged) {
             message.push_str(&format!(" (WWW-Authenticate: {header})"));
         }
         Self::new(WorkIqErrorKind::Http(status.as_u16()), class, message, ids)
+    }
+
+    /// An entity a tool gave with a failed `statusCode` (`fetch` and `fetch_blob` give one per
+    /// entity), classified as an HTTP answer with that status would be.
+    pub(crate) fn entity(tool: &str, status: u16, detail: &str, ids: RequestIds) -> Self {
+        let detail: String = one_line(detail).chars().take(ERROR_BODY_CHARS).collect();
+        let class = class_of_status(status, &detail, &Payload::default(), None);
+        let mut message = format!("the {tool} tool answered {status}");
+        if !detail.is_empty() {
+            message.push_str(&format!(": {detail}"));
+        }
+        Self::new(WorkIqErrorKind::Tool, class, message, ids)
     }
 }
 
@@ -367,6 +367,27 @@ impl Payload {
 }
 
 const RETRIEVAL_TYPE: &str = "application/vnd.ms-workiq.retrieval";
+
+/// The class of a failure with HTTP status `status`: signals in `text` decide first, then the
+/// status, then the words and payload fields.
+fn class_of_status(
+    status: u16,
+    text: &str,
+    payload: &Payload,
+    retry_after: Option<Duration>,
+) -> Class {
+    if let Some(class) = class_from_text(text) {
+        return class;
+    }
+    match status {
+        401 => Class::SignInAgain,
+        402 => Class::Billing,
+        403 => Class::DeniedByPolicy,
+        429 => Class::Throttled(retry_after.or(payload.retry_after)),
+        500..=599 => Class::Transient,
+        _ => classify(text, payload),
+    }
+}
 
 /// The class of a failure Work IQ reported in words and payload fields.
 fn classify(text: &str, payload: &Payload) -> Class {
@@ -916,7 +937,23 @@ impl Client {
 
     /// Entities by their Work IQ paths (Microsoft Graph paths such as `/me/messages`).
     pub async fn fetch(&self, entity_urls: &[&str]) -> Result<ToolResult> {
-        self.call_offered("fetch", json!({ "entityUrls": entity_urls }))
+        self.fetch_in(&self.context, entity_urls).await
+    }
+
+    /// [`Client::fetch`] for a given purpose and audience.
+    pub async fn fetch_in(
+        &self,
+        context: &CallContext,
+        entity_urls: &[&str],
+    ) -> Result<ToolResult> {
+        self.call_offered_in(context, "fetch", json!({ "entityUrls": entity_urls }))
+            .await
+    }
+
+    /// A file's bytes by its Work IQ path (such as `/shares/{id}/driveItem/content`), for a
+    /// given purpose and audience; Work IQ gives them base64-encoded, up to 4 MB.
+    pub async fn fetch_blob_in(&self, context: &CallContext, path: &str) -> Result<ToolResult> {
+        self.call_offered_in(context, "fetch_blob", json!({ "path": path }))
             .await
     }
 

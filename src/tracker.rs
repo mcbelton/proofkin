@@ -5,7 +5,9 @@
 //! (unless its plan says `track: off`):
 //!
 //! - the run gets an issue (`track: #N` works on an existing one, `track: <title>`
-//!   names a new one), and each step a sub-issue (`issue=#N` uses an existing issue).
+//!   names a new one), and each step a sub-issue (`issue=#N` uses an existing issue;
+//!   a later run on the same issue takes up an earlier run's open sub-issue for a step
+//!   of the same name, giving it the step's title and text and saying so on it).
 //!   A step's issue is "blocked by" the issues of the steps it runs after, assigned to
 //!   the profile's GitHub account, and on the board with the agent that does it (the
 //!   board's `Agent` text field, added if it has none);
@@ -2037,10 +2039,12 @@ impl Run {
             ));
         }
         // The steps' issues: named ones, earlier runs' sub-issues (unless a run at the
-        // same time works on them), else new ones.
+        // same time works on them), else new ones. An earlier run's sub-issue gets the
+        // step's title and text in this run, and a comment that this run took it over.
         let mut claim = Claim::new(&tracker.config);
         let mut steps: BTreeMap<String, Issue> = BTreeMap::new();
         let mut new = Vec::new();
+        let mut taken = Vec::new();
         for step in &plan.steps {
             if let Some(n) = step.issue {
                 claim.take(n);
@@ -2063,7 +2067,29 @@ impl Run {
                 .iter()
                 .find(|s| s.open && s.body.contains(&step_marker(&step.id)) && claim.take(s.number))
             {
-                steps.insert(step.id.clone(), sub.clone());
+                let (title, body) = (step_title(step), step_body(step, run_id, agent));
+                let said = format!(
+                    "🔁 Run `{run_id}` of **{agent}** took this issue over for its step `{}`: the title and text above are that step's now (the earlier run's are in the issue's history).",
+                    step.id
+                );
+                taken.push(op(
+                    "updateIssue",
+                    "UpdateIssueInput",
+                    json!({ "id": sub.id, "title": title, "body": body }),
+                ));
+                taken.push(op(
+                    "addComment",
+                    "AddCommentInput",
+                    json!({ "subjectId": sub.id, "body": said }),
+                ));
+                steps.insert(
+                    step.id.clone(),
+                    Issue {
+                        title,
+                        body,
+                        ..sub.clone()
+                    },
+                );
             } else {
                 new.push((
                     step.id.clone(),
@@ -2143,6 +2169,8 @@ impl Run {
             _claim: claim,
         };
         run.issue.open = true;
+        run.apply_ops("TakeOver", taken, "taking over earlier runs' sub-issues")
+            .await;
         run.apply_ops("LinkIssues", ops, "linking the issues").await;
         if run.tracker.board.is_some() {
             run.put_on_board(plan).await;
@@ -3252,6 +3280,12 @@ mod tests {
                     issues.get_mut(&Fake::number(&s("issueId"))).unwrap().open = true;
                     json!({ "clientMutationId": null })
                 }
+                "updateIssue" => {
+                    let issue = issues.get_mut(&Fake::number(&s("id"))).unwrap();
+                    issue.title = s("title");
+                    issue.body = s("body");
+                    json!({ "clientMutationId": null })
+                }
                 _ => json!({ "clientMutationId": null }),
             }
         }
@@ -3888,6 +3922,76 @@ mod tests {
         drop((second, third));
     }
 
+    /// A run that takes over an earlier run's sub-issue for a step of the same name gives it
+    /// that step's title and text in this run, and says so on it (#247); the issue a step
+    /// names keeps its own words, as the run's does.
+    #[tokio::test]
+    async fn a_run_that_takes_over_an_earlier_runs_sub_issue_gives_it_its_steps_title_and_text() {
+        let earlier = Plan::parse("review @worker:app Review Work IQ in the web UI").unwrap();
+        let fake = Fake::with(&[
+            FakeIssue {
+                number: 10,
+                title: "Work IQ".into(),
+                open: true,
+                body: "The epic".into(),
+                ..FakeIssue::default()
+            },
+            FakeIssue {
+                number: 11,
+                title: step_title(&earlier.steps[0]),
+                open: true,
+                body: step_body(&earlier.steps[0], "r1", "boss"),
+                parent: Some(10),
+                ..FakeIssue::default()
+            },
+            FakeIssue {
+                number: 12,
+                title: "Document the API".into(),
+                open: true,
+                body: "Every endpoint, with an example.".into(),
+                ..FakeIssue::default()
+            },
+        ]);
+        // A repository of its own: claims are per process, and tests run at once.
+        let config = TrackerConfig {
+            repo: "acme/takeover".into(),
+            ..config()
+        };
+        let text = "track: #10\nreview @worker:app Review the plan builder and Knowledge parts\n\
+                    docs @worker:app issue=#12 Document it";
+        let plan = Plan::parse(text).unwrap();
+        let tracking = start_with(fake.clone(), config, &plan, "r2", "boss", None)
+            .await
+            .unwrap();
+        assert!(
+            tracking.tracked.problems.is_empty(),
+            "{:?}",
+            tracking.tracked.problems
+        );
+        assert_eq!(tracking.refs["review"], ["acme/takeover#11"]);
+        assert!(fake.calls("createIssue").is_empty());
+        // #11 is run r2's step now: its title, and its text (with the marker a later run
+        // finds it by).
+        let issue = |n: u64| fake.issues.lock().unwrap()[&n].clone();
+        assert_eq!(
+            issue(11).title,
+            "Review the plan builder and Knowledge parts"
+        );
+        assert_eq!(issue(11).body, step_body(&plan.steps[0], "r2", "boss"));
+        let comments = fake.calls("addComment");
+        assert_eq!(comments.len(), 1, "{comments:?}");
+        assert_eq!(comments[0]["subjectId"], "I11");
+        let took = "🔁 Run `r2` of **boss** took this issue over for its step `review`: \
+                    the title and text above are that step's now (the earlier run's are in \
+                    the issue's history).";
+        assert_eq!(comments[0]["body"], took);
+        // The issue the docs step names, and the run's, are people's: they stay as they are.
+        assert_eq!(fake.calls("updateIssue").len(), 1);
+        assert_eq!(issue(12).title, "Document the API");
+        assert_eq!(issue(12).body, "Every endpoint, with an example.");
+        assert_eq!(issue(10).body, "The epic");
+    }
+
     #[tokio::test]
     async fn a_run_on_an_issue_uses_its_steps_issues_and_a_failure_sends_them_back_to_do() {
         let fake = Fake::with(&[
@@ -3984,14 +4088,15 @@ mod tests {
         assert!(fake.open(11) && fake.status(11).as_deref() == Some("Todo"));
         assert_eq!(fake.status(12).as_deref(), Some("Todo"));
         let comments = fake.calls("addComment");
+        // #11 was an earlier run's: the first comment says this run took it over.
         assert!(
-            comments[0]["body"]
+            comments[1]["body"]
                 .as_str()
                 .unwrap()
                 .starts_with("❌ Step `api` of run `r3` failed on **worker**")
         );
         assert!(
-            comments[1]["body"]
+            comments[2]["body"]
                 .as_str()
                 .unwrap()
                 .starts_with("⏭️ Step `docs` of run `r3` was skipped")

@@ -58,7 +58,7 @@ const PLAYBOOKS: &[(&str, &str, &str)] = &[
     ),
     (
         SPEC_IMPORT,
-        "Implement a Spec Kit feature or OpenSpec change: a claim per user story, requirement and success criterion, each proven by a test or a sign-off",
+        "Implement a Spec Kit feature, an OpenSpec change or a spec document on SharePoint or OneDrive: a claim per user story, requirement and success criterion, each proven by a test or a sign-off",
         include_str!("../playbooks/implement-speckit.plan"),
     ),
     (
@@ -117,7 +117,8 @@ pub struct Outline {
 const PICKED_PEER: &str = "PICKED-PEER";
 const PICKED_FOLDER: &str = "PICKED-FOLDER";
 const PICKED_SPEC: &str = "PICKED-SPEC";
-/// The playbook that imports a Spec Kit or OpenSpec spec (see [`crate::spec_import`]).
+/// The playbook that imports a Spec Kit or OpenSpec spec, or a spec document on SharePoint
+/// or OneDrive (see [`crate::spec_import`]).
 pub const SPEC_IMPORT: &str = "implement-speckit";
 
 /// Describes playbook `name` step by step, before any value is filled in.
@@ -360,32 +361,24 @@ fn values(name: &str, vars: &BTreeMap<String, String>) -> Result<BTreeMap<String
 }
 
 /// The playbook as plan text with `vars` (and defaults) filled in, and the knowledge
-/// it needs. For [`SPEC_IMPORT`], `spec` is read and becomes the claims.
+/// it needs. For [`SPEC_IMPORT`], `spec` is read and becomes the claims; a spec that is a
+/// document's link is read through Work IQ, by [`render_document`] only.
 pub fn render_full(name: &str, vars: &BTreeMap<String, String>) -> Result<Rendered> {
     let values = values(name, vars)?;
     if name == SPEC_IMPORT
         && let Some(spec) = values.get("spec").filter(|s| *s != PICKED_SPEC)
     {
+        if crate::workiq::document::is_link(spec) {
+            crate::workiq::document::share_path(spec)?;
+            bail!(
+                "the {name} playbook reads a spec on SharePoint or OneDrive through Work IQ, \
+                 with a profile's sign-in: run proofkin spec import --from <link> --profile NAME \
+                 --set peer=..., or pick it in the web UI's Plan mode"
+            );
+        }
         let import = crate::spec_import::read(std::path::Path::new(spec))?;
-        let roles = crate::spec_import::Roles {
-            peer: &values["peer"],
-            folder: &values["folder"],
-            reviewers: &values["reviewers"],
-            test: &values["test"],
-            approver: &values["approver"],
-        };
-        let text = crate::spec_import::plan_text(&import, &roles)?;
-        let mut notes = vec![crate::spec_import::summary(&import)];
-        notes.extend(import.warnings.iter().map(|w| format!("Warning: {w}")));
-        return Ok(Rendered {
-            text,
-            knowledge: vec![(
-                import.topic.clone(),
-                import.knowledge.clone(),
-                format!("{} {}", import.kind.label(), import.dir.display()),
-            )],
-            notes,
-        });
+        let source = format!("{} {}", import.kind.label(), import.dir.display());
+        return rendered(&import, &values, source);
     }
     let mut text = template(name)?.to_owned();
     for (var, value) in &values {
@@ -396,6 +389,54 @@ pub fn render_full(name: &str, vars: &BTreeMap<String, String>) -> Result<Render
         text,
         knowledge: Vec::new(),
         notes: Vec::new(),
+    })
+}
+
+/// Whether filling in playbook `name` with `vars` reads a document through Work IQ
+/// ([`render_document`]): the [`SPEC_IMPORT`] playbook with a link as its spec.
+pub fn reads_document(name: &str, vars: &BTreeMap<String, String>) -> bool {
+    name == SPEC_IMPORT
+        && vars
+            .get("spec")
+            .is_some_and(|spec| crate::workiq::document::is_link(spec))
+}
+
+/// The [`SPEC_IMPORT`] playbook filled in with `vars`, whose spec is the link of a Word,
+/// Markdown or text document on SharePoint or OneDrive. The document is read through `work`
+/// (audited, held to the profile's Work IQ budgets); a link that isn't one is refused before
+/// any call. The knowledge's source names the document by its file name, not its link.
+pub async fn render_document(
+    vars: &BTreeMap<String, String>,
+    work: &dyn crate::workiq::context::WorkContext,
+) -> Result<Rendered> {
+    let values = values(SPEC_IMPORT, vars)?;
+    let url = values.get("spec").map(String::as_str).unwrap_or_default();
+    let doc = crate::workiq::document::read(work, url).await?;
+    let import = crate::spec_import::from_document(&doc)?;
+    let source = format!("{} {} (Work IQ)", import.kind.label(), import.rel);
+    rendered(&import, &values, source)
+}
+
+/// The plan and knowledge of a spec `import`, with the playbook's `values` as its roles.
+fn rendered(
+    import: &crate::spec_import::Import,
+    values: &BTreeMap<String, String>,
+    source: String,
+) -> Result<Rendered> {
+    let roles = crate::spec_import::Roles {
+        peer: &values["peer"],
+        folder: &values["folder"],
+        reviewers: &values["reviewers"],
+        test: &values["test"],
+        approver: &values["approver"],
+    };
+    let text = crate::spec_import::plan_text(import, &roles)?;
+    let mut notes = vec![crate::spec_import::summary(import)];
+    notes.extend(import.warnings.iter().map(|w| format!("Warning: {w}")));
+    Ok(Rendered {
+        text,
+        knowledge: vec![(import.topic.clone(), import.knowledge.clone(), source)],
+        notes,
     })
 }
 

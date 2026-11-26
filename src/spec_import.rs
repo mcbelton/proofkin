@@ -9,6 +9,9 @@
 //!   deltas in `specs/<capability>/spec.md`) gives a claim per added or modified
 //!   requirement (`<capability>-N`), proven by tests, and one for accepting the change.
 //!   A capability's spec (`openspec/specs/<capability>/`) gives one per requirement.
+//! - A Word, Markdown or text document on SharePoint or OneDrive, read through Work IQ
+//!   ([`crate::workiq::document`]), is read as a Spec Kit `spec.md` ([`from_document`]).
+//!   Its knowledge topic is marked as Microsoft 365 content with its sensitivity label.
 //!
 //! The spec (condensed to fit a prompt) becomes a knowledge topic that the plan's
 //! steps are given (`context=`), so the peers that implement it need no copy of it.
@@ -43,6 +46,8 @@ pub enum Kind {
     SpecKit,
     OpenspecChange,
     OpenspecSpec,
+    /// A Word, Markdown or text document on SharePoint or OneDrive, read through Work IQ.
+    Document,
 }
 
 impl Kind {
@@ -51,6 +56,7 @@ impl Kind {
             Self::SpecKit => "Spec Kit feature",
             Self::OpenspecChange => "OpenSpec change",
             Self::OpenspecSpec => "OpenSpec spec",
+            Self::Document => "Microsoft 365 document",
         }
     }
 }
@@ -74,12 +80,22 @@ pub struct Claim {
 #[derive(Debug, Clone, Serialize)]
 pub struct Import {
     pub kind: Kind,
-    /// The feature's folder name (`001-photo-albums`), change id or capability.
+    /// The feature's folder name (`001-photo-albums`), change id or capability; for a
+    /// document, its file name as a plain name.
     pub id: String,
     pub title: String,
+    /// The folder; empty for a document.
     pub dir: PathBuf,
-    /// The folder relative to its project, with `/` (what the prompts point at).
+    /// The folder relative to its project, with `/` (what the prompts point at); for a
+    /// document, its file name.
     pub rel: String,
+    /// The link a document was read from; only the plan's comment shows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The sensitivity label a document's knowledge topic is marked with
+    /// ([`crate::workiq::content::UNKNOWN`] when Work IQ gave no label information).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// The knowledge topic the spec is saved as.
     pub topic: String,
     #[serde(skip)]
@@ -172,6 +188,7 @@ fn read_kind(dir: &Path, kind: Kind) -> Result<Import> {
     match kind {
         Kind::SpecKit => read_speckit(dir),
         Kind::OpenspecChange | Kind::OpenspecSpec => read_openspec(dir, kind),
+        Kind::Document => bail!("a Microsoft 365 document is read through Work IQ, not a folder"),
     }
 }
 
@@ -453,10 +470,16 @@ struct Story {
     scenarios: usize,
 }
 
-fn read_speckit(dir: &Path) -> Result<Import> {
-    let spec = read_file(&dir.join("spec.md"), dir)?;
-    let id = dir_name(dir);
-    let title = heading(&spec).unwrap_or_else(|| id.clone());
+/// What a Spec Kit `spec.md` (named `file` in warnings) specifies: its claims (user stories,
+/// then `FR-` and `SC-` lines), edge cases and warnings. A `document` (Word, Markdown or text
+/// read through Work IQ) is read more leniently, as people write them: headings of any
+/// level, section names in any case and with a colon, `FR-001: ...` lines without a bullet,
+/// and scenarios in bullet lists.
+fn speckit_claims(
+    spec: &str,
+    file: &str,
+    document: bool,
+) -> (Vec<Claim>, Vec<String>, Vec<String>) {
     let mut stories: Vec<Story> = Vec::new();
     let mut claims = Vec::new();
     let mut warnings = Vec::new();
@@ -465,10 +488,11 @@ fn read_speckit(dir: &Path) -> Result<Import> {
     let mut in_edge_cases = false;
     for line in spec.lines() {
         let t = line.trim();
-        if let Some(h) = t.strip_prefix("### ").or_else(|| t.strip_prefix("## ")) {
-            in_edge_cases = h.trim().eq_ignore_ascii_case("Edge Cases");
+        if let Some(h) = section_heading(t, document) {
+            let edge = h.trim().eq_ignore_ascii_case("Edge Cases");
+            in_edge_cases = edge || is_section(h, "Edge Cases", document);
             in_story = false;
-            if let Some(rest) = h.strip_prefix("User Story") {
+            if let Some(rest) = story_heading(h, document) {
                 let rest = rest.trim();
                 let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
                 let rest = rest[n.len()..].trim_start_matches([' ', '-', '–', '—', ':']);
@@ -488,7 +512,7 @@ fn read_speckit(dir: &Path) -> Result<Import> {
                     scenarios: 0,
                 });
                 in_story = true;
-            } else if h.trim() == "Primary User Story" {
+            } else if is_section(h, "Primary User Story", document) {
                 stories.push(Story {
                     n: "1".into(),
                     title: "the primary user story".into(),
@@ -496,7 +520,7 @@ fn read_speckit(dir: &Path) -> Result<Import> {
                     scenarios: 0,
                 });
                 in_story = true;
-            } else if h.trim() == "Acceptance Scenarios" && !stories.is_empty() {
+            } else if is_section(h, "Acceptance Scenarios", document) && !stories.is_empty() {
                 // The older template keeps the scenarios in their own section.
                 in_story = true;
             }
@@ -508,17 +532,19 @@ fn read_speckit(dir: &Path) -> Result<Import> {
         let numbered = t
             .split_once(". ")
             .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        // A Word document's numbered list reads as a bullet list.
+        let listed = numbered || (document && (t.starts_with("- ") || t.starts_with("* ")));
         if in_story
-            && numbered
+            && listed
             && t.to_lowercase().contains("given")
             && let Some(story) = stories.last_mut()
         {
             story.scenarios += 1;
         }
-        if let Some((id, text)) = requirement_line(t) {
+        if let Some((id, text)) = requirement_line(t, document) {
             if claims.iter().any(|c: &Claim| c.id == id) {
                 warnings.push(format!(
-                    "{id} is defined twice in spec.md; the first is used"
+                    "{id} is defined twice in {file}; the first is used"
                 ));
                 continue;
             }
@@ -565,7 +591,66 @@ fn read_speckit(dir: &Path) -> Result<Import> {
     }
     story_claims.dedup_by(|a, b| a.id == b.id);
     story_claims.append(&mut claims);
-    let mut claims = story_claims;
+    let open = spec.matches("[NEEDS CLARIFICATION").count();
+    if open > 0 {
+        warnings.push(format!(
+            "{file} has {open} open question{} ([NEEDS CLARIFICATION]); settle them first (/speckit.clarify)",
+            if open == 1 { "" } else { "s" }
+        ));
+    }
+    if [
+        "[FEATURE NAME]",
+        "[Brief Title]",
+        "[Describe this user journey",
+    ]
+    .iter()
+    .any(|p| spec.contains(p))
+    {
+        warnings.push(format!("{file} still has parts of the template to fill in"));
+    }
+    (story_claims, edge_cases, warnings)
+}
+
+/// The text of the heading `line`, if it is a section's heading: `## ` or `### ` in a Spec
+/// Kit spec, any level in a document.
+fn section_heading(line: &str, document: bool) -> Option<&str> {
+    if !document {
+        return line
+            .strip_prefix("### ")
+            .or_else(|| line.strip_prefix("## "));
+    }
+    let level = line.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    line[level..].strip_prefix(' ')
+}
+
+/// Whether heading `h` is the section `name`: as Spec Kit's template writes it, or in a
+/// document in any case and with a colon after it.
+fn is_section(h: &str, name: &str, document: bool) -> bool {
+    let h = h.trim();
+    let loose = h.trim_end_matches(':').trim_end();
+    h == name || (document && loose.eq_ignore_ascii_case(name))
+}
+
+/// What follows `User Story` in heading `h` (`1 - Create an album (Priority: P1)`), if it is
+/// a user story's; in a document in any case, and not a longer word (`User Storyboard`).
+fn story_heading(h: &str, document: bool) -> Option<&str> {
+    const STORY: &str = "User Story";
+    if !document {
+        return h.strip_prefix(STORY);
+    }
+    let rest = h.get(STORY.len()..)?;
+    let story = h[..STORY.len()].eq_ignore_ascii_case(STORY);
+    (story && !rest.starts_with(char::is_alphabetic)).then_some(rest)
+}
+
+fn read_speckit(dir: &Path) -> Result<Import> {
+    let spec = read_file(&dir.join("spec.md"), dir)?;
+    let id = dir_name(dir);
+    let title = heading(&spec).unwrap_or_else(|| id.clone());
+    let (mut claims, edge_cases, mut warnings) = speckit_claims(&spec, "spec.md", false);
     if !claims.iter().any(|c| c.proof == Proof::Tests) {
         bail!(
             "{}/spec.md has no user stories (### User Story 1 - ...) or functional requirements \
@@ -579,23 +664,6 @@ fn read_speckit(dir: &Path) -> Result<Import> {
             text: format!("{title} is accepted as specified"),
             proof: Proof::SignOff,
         });
-    }
-    let open = spec.matches("[NEEDS CLARIFICATION").count();
-    if open > 0 {
-        warnings.push(format!(
-            "spec.md has {open} open question{} ([NEEDS CLARIFICATION]); settle them first (/speckit.clarify)",
-            if open == 1 { "" } else { "s" }
-        ));
-    }
-    if [
-        "[FEATURE NAME]",
-        "[Brief Title]",
-        "[Describe this user journey",
-    ]
-    .iter()
-    .any(|p| spec.contains(p))
-    {
-        warnings.push("spec.md still has parts of the template to fill in".into());
     }
     let plan = read_optional(&dir.join("plan.md"), dir)?;
     let tasks = read_optional(&dir.join("tasks.md"), dir)?;
@@ -650,6 +718,8 @@ fn read_speckit(dir: &Path) -> Result<Import> {
         title,
         dir: dir.to_owned(),
         rel,
+        url: None,
+        label: None,
         claims,
         tasks: total,
         tasks_done: done,
@@ -658,22 +728,103 @@ fn read_speckit(dir: &Path) -> Result<Import> {
     })
 }
 
-/// `- **FR-001**: text` (or `SC-001`) as (id, text).
-fn requirement_line(line: &str) -> Option<(String, String)> {
-    let rest = line
-        .strip_prefix("- ")
-        .or_else(|| line.strip_prefix("* "))?
-        .trim_start_matches('*');
+/// The spec in `doc`, a document read through Work IQ ([`crate::workiq::document`]), read as
+/// a Spec Kit `spec.md`. A document with neither a user story nor a requirement is one
+/// claim, `DOC-1`, proven by a sign-off. Its knowledge topic is marked as Microsoft 365
+/// content with its sensitivity label, or [`crate::workiq::content::UNKNOWN`] without one, so
+/// only peers granted that label get it.
+pub fn from_document(doc: &crate::workiq::document::Document) -> Result<Import> {
+    let name = one_line(&doc.name);
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.trim().is_empty() => stem,
+        _ => name.as_str(),
+    };
+    let id = plain_name(stem);
+    let title = heading(&doc.markdown).unwrap_or_else(|| one_line(stem));
+    let (mut claims, edge_cases, mut warnings) = speckit_claims(&doc.markdown, &name, true);
+    if !claims.iter().any(|c| c.proof == Proof::Tests) {
+        claims.insert(
+            0,
+            Claim {
+                id: "DOC-1".into(),
+                text: statement(&format!("{title}: what it asks for is done")),
+                proof: Proof::SignOff,
+            },
+        );
+        warnings.push(format!(
+            "{name} has no user stories (User Story 1 - ...) or requirements, so it is one claim, \
+             DOC-1, proven by a sign-off: write each requirement on its own line as FR-001: ... \
+             (and each success criterion as SC-001: ...) to get a claim for each"
+        ));
+    }
+    if !claims.iter().any(|c| c.proof == Proof::SignOff) {
+        claims.push(Claim {
+            id: "ACCEPT".into(),
+            text: format!("{title} is accepted as specified"),
+            proof: Proof::SignOff,
+        });
+    }
+    let label = doc
+        .label
+        .as_deref()
+        .map(one_line)
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| crate::workiq::content::UNKNOWN.to_owned());
+    // Like everything Work IQ returns, the text is external content: it sits in the envelope,
+    // whose source is the file name (the link stays out of prompts).
+    let body = doc.markdown.trim();
+    let body = if body.chars().count() <= KNOWLEDGE_BUDGET {
+        body.to_owned()
+    } else {
+        let cut: String = body.chars().take(KNOWLEDGE_BUDGET).collect();
+        format!("{cut}\n\n[... cut to fit a prompt: the full document is {name}]")
+    };
+    let text = format!(
+        "# {} {name}: {title}\n\nImported from {name} through Work IQ.\n\n## {name}\n\n{}",
+        Kind::Document.label(),
+        crate::boundary::wrap(&format!("workiq:document:{name}"), &body)
+    );
+    let notes = edge_cases
+        .into_iter()
+        .map(|e| format!("edge case: {e}"))
+        .collect();
+    Ok(Import {
+        kind: Kind::Document,
+        topic: plain_name(&format!("spec-{id}")),
+        knowledge: crate::knowledge::with_mark(&text, std::slice::from_ref(&label)),
+        id,
+        title,
+        dir: PathBuf::new(),
+        rel: name,
+        url: Some(doc.url.clone()),
+        label: Some(label),
+        claims,
+        tasks: 0,
+        tasks_done: 0,
+        notes,
+        warnings,
+    })
+}
+
+/// `- **FR-001**: text` (or `SC-001`) as (id, text). With `bare`, a line without the bullet
+/// is one too when a colon follows the id (`FR-001: text`), as documents have them.
+fn requirement_line(line: &str, bare: bool) -> Option<(String, String)> {
+    let (rest, bulleted) = match line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        Some(rest) => (rest, true),
+        None if bare => (line, false),
+        None => return None,
+    };
+    let rest = rest.trim_start_matches('*');
     let kind = ["FR-", "SC-"].into_iter().find(|k| rest.starts_with(k))?;
     let digits: String = rest[3..].chars().take_while(char::is_ascii_digit).collect();
     if digits.is_empty() {
         return None;
     }
-    let text = rest[3 + digits.len()..]
-        .trim_start_matches('*')
-        .trim_start_matches(':')
-        .trim_start_matches('*')
-        .trim();
+    let after = rest[3 + digits.len()..].trim_start_matches('*');
+    if !bulleted && !after.starts_with(':') {
+        return None;
+    }
+    let text = after.trim_start_matches(':').trim_start_matches('*').trim();
     (!text.is_empty()).then(|| (format!("{kind}{digits}"), text.to_owned()))
 }
 
@@ -905,6 +1056,8 @@ fn read_openspec(dir: &Path, kind: Kind) -> Result<Import> {
         title,
         dir: dir.to_owned(),
         rel,
+        url: None,
+        label: None,
         claims,
         tasks: total,
         tasks_done: done,
@@ -953,9 +1106,13 @@ pub fn plan_text(import: &Import, who: &Roles) -> Result<String> {
     // plan lines.
     let comment = |line: String| format!("// {}\n", one_line(&line));
     let mut text = comment(format!("{label} {rel}: {title}"));
+    // A document's link is only here: prompts name it by its file name.
+    let from = match &import.url {
+        Some(url) => url.clone(),
+        None => import.dir.display().to_string(),
+    };
     text += &comment(format!(
-        "Imported from {}. The spec is knowledge topic {topic}, given to impl and verify.",
-        import.dir.display()
+        "Imported from {from}. The spec is knowledge topic {topic}, given to impl and verify."
     ));
     if import.tasks > 0 {
         text += &comment(format!(
@@ -981,13 +1138,26 @@ pub fn plan_text(import: &Import, who: &Roles) -> Result<String> {
         format!(" Also: {}.", notes.join("; "))
     };
     let example = import.claims[0].id.to_lowercase().replace(['-', '.'], "_");
-    let accept = if signed == "ACCEPT" {
-        format!("Accept {title} ({rel}), implemented as specified.")
-    } else {
-        format!(
+    // A document without user stories or requirements is one sign-off claim, DOC-1.
+    let whole = import.kind == Kind::Document && import.claims.iter().any(|c| c.id == "DOC-1");
+    let criteria: Vec<&str> = import
+        .claims
+        .iter()
+        .filter(|c| c.proof == Proof::SignOff && !["ACCEPT", "DOC-1"].contains(&c.id.as_str()))
+        .map(|c| c.id.as_str())
+        .collect();
+    let accept = match (whole, criteria.is_empty()) {
+        (false, true) => format!("Accept {title} ({rel}), implemented as specified."),
+        (false, false) => format!(
             "Accept {title} ({rel}): its success criteria ({}) are met.",
-            signed.replace(',', ", ")
-        )
+            criteria.join(", ")
+        ),
+        (true, true) => format!("Accept {title} ({rel}): what it asks for is done."),
+        (true, false) => format!(
+            "Accept {title} ({rel}): what it asks for is done, and its success criteria ({}) \
+             are met.",
+            criteria.join(", ")
+        ),
     };
     let (impl_prompt, verify_prompt, signoff_prompt) = match import.kind {
         Kind::SpecKit => (
@@ -1022,17 +1192,45 @@ pub fn plan_text(import: &Import, who: &Roles) -> Result<String> {
             ),
             accept,
         ),
+        // Named by its file name: its link is only in the plan's comment.
+        Kind::Document if whole => (
+            format!(
+                "Implement what {label} {rel} ({title}) asks for: knowledge topic {topic} has its text. Add tests that prove it works, and cover the edge cases it names.{extra} Don't change the document: if it is wrong or unclear, say so in your summary."
+            ),
+            format!(
+                "Review this change against {label} {rel} (knowledge topic {topic}): does it do what the document asks for, with tests that really prove it? Report each gap."
+            ),
+            accept,
+        ),
+        Kind::Document => (
+            format!(
+                "Implement {label} {rel} ({title}) as specified: knowledge topic {topic} has its text. Add a test for every acceptance scenario and requirement, with its claim id in the test's name (e.g. {example}_...), and cover the edge cases.{extra} Don't change the document: if it is wrong or unclear, say so in your summary."
+            ),
+            format!(
+                "Review this change against {label} {rel} (knowledge topic {topic}): does every user story's acceptance scenarios and every requirement have a test that really proves it? Report each gap with its claim id."
+            ),
+            accept,
+        ),
     };
+    // A step that proves no claim names none.
+    let proves = |ids: &str| {
+        if ids.is_empty() {
+            String::new()
+        } else {
+            format!(" claims={ids}")
+        }
+    };
+    let (tested, signed) = (proves(&tested), proves(&signed));
     text += &format!(
-        "impl @{peer}:{folder} skill=implement-change verify={test} attempts=3 context={topic} claims={tested} {}\n",
+        "impl @{peer}:{folder} skill=implement-change verify={test} attempts=3 context={topic}{tested} {}\n",
         one_line(&impl_prompt)
     );
     text += &format!(
-        "verify after impl #{reviewers}:{folder} skill=code-review apply=impl verify={test} context={topic} claims={tested} {}\n",
+        "verify after impl #{reviewers}:{folder} skill=code-review apply=impl verify={test} context={topic}{tested} {}\n",
         one_line(&verify_prompt)
     );
     text += &format!(
-        "signoff after verify approve @{approver} claims={signed} {}\n",
+        "signoff after verify approve @{approver}{signed} {}\n",
         one_line(&signoff_prompt)
     );
     crate::plan::Plan::parse(&text).context("the imported plan is not valid")?;
@@ -1054,6 +1252,20 @@ pub fn summary(import: &Import) -> String {
         s += &format!("; {} of {} tasks done", import.tasks_done, import.tasks);
     }
     s += &format!(". The spec is saved as knowledge topic {}.", import.topic);
+    match import.label.as_deref() {
+        Some(crate::workiq::content::UNKNOWN) => {
+            s += " Work IQ gave no sensitivity label information for it, so it is marked \
+                  unknown: only your own agents and digital workers get it.";
+        }
+        Some(label) => {
+            s += &format!(
+                " Its sensitivity label is {label}: peers that implement or review it need a \
+                 Microsoft 365 grant that includes {label} (proofkin peers allow <peer> --m365 \
+                 <labels>)."
+            );
+        }
+        None => {}
+    }
     s
 }
 
