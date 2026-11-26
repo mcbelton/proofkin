@@ -36,6 +36,16 @@ pub trait WorkContext: Send + Sync + fmt::Debug {
     ) -> Result<ToolResult> {
         anyhow::bail!("this Work IQ context can't ask")
     }
+
+    /// Entities by their Work IQ paths (`fetch`) on behalf of `context`.
+    async fn fetch(&self, _context: &CallContext, _entity_urls: &[&str]) -> Result<ToolResult> {
+        anyhow::bail!("this Work IQ context can't fetch documents")
+    }
+
+    /// A file's bytes by its Work IQ path (`fetch_blob`) on behalf of `context`.
+    async fn fetch_blob(&self, _context: &CallContext, _path: &str) -> Result<ToolResult> {
+        anyhow::bail!("this Work IQ context can't fetch documents")
+    }
 }
 
 /// The declarative agents Work IQ offers `client`'s account, one per line (name, then the id
@@ -108,5 +118,13 @@ impl WorkContext for ClientWork {
         agent_id: Option<&str>,
     ) -> Result<ToolResult> {
         self.client.ask_in(context, question, agent_id, None).await
+    }
+
+    async fn fetch(&self, context: &CallContext, entity_urls: &[&str]) -> Result<ToolResult> {
+        self.client.fetch_in(context, entity_urls).await
+    }
+
+    async fn fetch_blob(&self, context: &CallContext, path: &str) -> Result<ToolResult> {
+        self.client.fetch_blob_in(context, path).await
     }
 }

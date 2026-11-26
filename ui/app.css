@@ -598,6 +598,9 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .team-step-text { margin: 2px 0 0; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .team-step > .team-steps { margin-top: 4px; }
 .kb-list li { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 10px; background: var(--surface); }
+/* A topic's facts: where it came from (Microsoft 365, with its labels), and its size or guide status. */
+.kb-facts { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 2px 8px; min-width: 0; text-align: right; }
+.kb-origin { overflow-wrap: anywhere; }
 .incident-log { margin-top: 6px; font-size: 12.5px; }
 .incident-log .incident.resolved strong, .incident-log .incident.learned strong { color: var(--success); }
 .incident-log .incident.opened strong, .incident-log .incident.escalated strong { color: var(--danger); }

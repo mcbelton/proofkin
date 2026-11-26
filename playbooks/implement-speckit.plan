@@ -1,10 +1,12 @@
-// Import a spec written with Spec Kit or OpenSpec: {{spec}}
-// A Spec Kit feature (specs/NNN-name: spec.md, plan.md, tasks.md) or an OpenSpec change
-// (openspec/changes/<id>: proposal.md, tasks.md, spec deltas) becomes the claims: one
+// Import a spec written with Spec Kit or OpenSpec, or in a document: {{spec}}
+// A Spec Kit feature (specs/NNN-name: spec.md, plan.md, tasks.md), an OpenSpec change
+// (openspec/changes/<id>: proposal.md, tasks.md, spec deltas) or a Word or Markdown document
+// on SharePoint or OneDrive (read through Work IQ) becomes the claims: one
 // per user story, functional requirement and success criterion (or per added and
 // modified requirement), each proven by the folder's tests or a sign-off. The spec is
 // saved as knowledge the steps are given, so the peers need no copy of it.
-// Vars: spec (the feature's folder), peer, folder, reviewers (a squad), test, approver
+// Vars: spec (the feature's folder, or the document's https:// link), peer, folder,
+// reviewers (a squad), test, approver
 claim: STORIES Every user story works as its acceptance scenarios say
 claim: RULES Every functional requirement holds, each proven by a test named after it
 claim: OUTCOMES The success criteria are met

@@ -795,24 +795,35 @@ examples:
         #[arg(long)]
         force: bool,
     },
-    /// Turn a Spec Kit feature or OpenSpec change into a plan: a claim per user story,
-    /// requirement and success criterion, proven by the folder's tests or a sign-off.
+    /// Turn a Spec Kit feature, an OpenSpec change or a spec document on SharePoint or
+    /// OneDrive into a plan: a claim per user story, requirement and success criterion,
+    /// proven by the folder's tests or a sign-off.
     #[command(after_help = "\
 What it reads:
   Spec Kit   specs/NNN-name/ (spec.md, plan.md, tasks.md; .specify/memory/constitution.md)
              claims US-1.. (user stories), FR-001.. (requirements), SC-001.. (success criteria)
   OpenSpec   openspec/changes/<id>/ (proposal.md, tasks.md, specs/<capability>/spec.md)
              claims <capability>-1.. (added and modified requirements), ACCEPT
+  --from     a Word (.docx), Markdown (.md) or text (.txt) document on SharePoint or OneDrive,
+             read through Work IQ with the profile's sign-in, as a Spec Kit spec.md: claims
+             US-1.., FR-001.., SC-001.., or DOC-1 (a sign-off) if it has none of them
 Give a feature's folder, or a project folder with one feature. The spec is saved as
-knowledge topic spec-<feature> (openspec-<change>) in the profile; the plan's steps
-are given it, so peers need no copy. The plan goes to stdout (or --out): run it with
-/plan <file>, or paste it in the web UI's Plan mode (or pick the implement-speckit playbook).
+knowledge topic spec-<feature> (openspec-<change>, spec-<document>) in the profile; the
+plan's steps are given it, so peers need no copy. A document's topic keeps its sensitivity
+label: peers need a Microsoft 365 grant that includes it. The plan goes to stdout (or
+--out): run it with /plan <file>, or paste it in the web UI's Plan mode (or pick the
+implement-speckit playbook).
 examples:
   proofkin spec import D:\\src\\shop\\specs\\001-photo-albums --profile boss --set peer=alice > albums.plan
-  proofkin spec import ~/src/shop/openspec/changes/add-dark-mode --profile boss --set peer=alice --set reviewers=qa --out dark.plan")]
+  proofkin spec import ~/src/shop/openspec/changes/add-dark-mode --profile boss --set peer=alice --set reviewers=qa --out dark.plan
+  proofkin spec import --from https://contoso.sharepoint.com/sites/Shop/Shared%20Documents/Albums.docx --profile boss --set peer=alice --out albums.plan")]
     Import {
         /// The feature's folder (or a project folder with one feature).
-        path: PathBuf,
+        path: Option<PathBuf>,
+        /// The https:// link of a Word, Markdown or text document on SharePoint or OneDrive
+        /// to read through Work IQ, instead of a folder.
+        #[arg(long, value_name = "URL")]
+        from: Option<String>,
         /// Who and where: peer=NAME (required), folder=app, reviewers=qa (a squad),
         /// test=test (the folder's check), approver=me.
         #[arg(long = "set", value_name = "NAME=VALUE")]
@@ -1606,7 +1617,7 @@ async fn main() -> Result<()> {
         Some(Command::Skill(command)) => run_skill(command),
         Some(Command::Agent(command)) => run_agent_command(command),
         Some(Command::Factory(command)) => proofkin::factory::cli::run(command).await,
-        Some(Command::Spec(command)) => run_spec(command),
+        Some(Command::Spec(command)) => run_spec(command).await,
         Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command).await,
         Some(Command::Models(command)) => run_models(command).await,
@@ -3068,7 +3079,7 @@ fn run_connect(profile: &str, new: bool, off: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_spec(command: SpecCommand) -> Result<()> {
+async fn run_spec(command: SpecCommand) -> Result<()> {
     use proofkin::spec;
     match command {
         SpecCommand::Check { part, dir } => {
@@ -3106,15 +3117,39 @@ fn run_spec(command: SpecCommand) -> Result<()> {
         }
         SpecCommand::Import {
             path,
+            from,
             set,
             out,
             profile,
         } => {
-            let profile = Profile::open(&profile.name)?;
             let mut vars = set_vars(&set)?;
-            vars.insert("spec".into(), path.display().to_string());
-            let rendered =
-                proofkin::playbooks::render_full(proofkin::playbooks::SPEC_IMPORT, &vars)?;
+            let link = match (path, from) {
+                (Some(_), Some(_)) => bail!(
+                    "give a folder or --from <link>, not both: --from reads a spec document on \
+                     SharePoint or OneDrive instead of a folder"
+                ),
+                (None, None) => bail!(
+                    "give the spec to import: a feature's folder, or --from <link> for a \
+                     document on SharePoint or OneDrive"
+                ),
+                (Some(path), None) => {
+                    vars.insert("spec".into(), path.display().to_string());
+                    false
+                }
+                (None, Some(link)) => {
+                    // A link that isn't one is refused before the sign-in is looked at.
+                    proofkin::workiq::document::share_path(&link)?;
+                    vars.insert("spec".into(), link);
+                    true
+                }
+            };
+            let profile = Profile::open(&profile.name)?;
+            let rendered = if link {
+                let work = proofkin::workiq::context::ClientWork::for_profile(&profile)?;
+                proofkin::playbooks::render_document(&vars, &work).await?
+            } else {
+                proofkin::playbooks::render_full(proofkin::playbooks::SPEC_IMPORT, &vars)?
+            };
             rendered.save_knowledge(&profile.knowledge())?;
             for note in &rendered.notes {
                 eprintln!("{note}");

@@ -627,9 +627,12 @@ function taskNode(t) {
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
   // The model that did the work, after the provider, once its provider (or peer) said.
   const runs = (label) => t.model ? `${label} · ${t.model}` : label;
-  const title = t.step
-    ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : t.pull_request ? "Pull request" : runs(providerLabel(t.provider))} → ${t.target}`
-    : `#${t.id} · ${runs(providerLabel(t.provider))} → ${t.target}${t.squad ? ` · #${t.squad}` : ""}`;
+  // A @workiq step: Microsoft 365 Copilot answers it through Work IQ, no provider or peer.
+  const title = t.workiq
+    ? `Step ${t.step} · ${workiqWho(t.target)}`
+    : t.step
+      ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : t.pull_request ? "Pull request" : runs(providerLabel(t.provider))} → ${t.target}`
+      : `#${t.id} · ${runs(providerLabel(t.provider))} → ${t.target}${t.squad ? ` · #${t.squad}` : ""}`;
   // Started by another agent (over MCP or A2A), not in this UI; or a step of a team
   // run this agent leads for a peer.
   const via = t.via ? ` · asked by another agent (${t.via})` : t.for_peer ? ` · for ${t.for_peer}'s team step` : "";
@@ -1580,13 +1583,6 @@ function renderRunPulls(runId, works) {
         w.why ? `; no pull request now: ${w.why}.` : w.approval ? `; ${w.peer} approves a pull request first.` : "."))));
 }
 
-/** How many Microsoft 365 results were kept, with their labels, and how many were withheld
- * ("3 results kept (General), 2 withheld"). */
-function workiqCounts(kept, labels, withheld) {
-  const named = labels?.length ? ` (${labels.join(", ")})` : "";
-  return `${nOf(kept, "result")} kept${named}, ${withheld ? `${withheld} withheld` : "none withheld"}`;
-}
-
 /** `link` if it is a web address (http or https), else null: a source's link is what Work IQ
  * said, so nothing else (a script, or a Microsoft Graph path) becomes a link. */
 function webAddressOf(link) {
@@ -1615,7 +1611,7 @@ function renderRunWorkiq(steps) {
       ...w.sources.map((s) => {
         const title = s.title || "Untitled";
         const href = webAddressOf(s.link);
-        const about = [s.kind, s.label, href ? null : s.link].filter(Boolean).join(" · ");
+        const about = [s.kind, m365Label(s.label), href ? null : s.link].filter(Boolean).join(" · ");
         return el("li", {},
           href ? externalLink(href, title, `${title} in Microsoft 365`, { rel: "noopener noreferrer" }) : el("span", { text: title }),
           about ? el("span", { class: "muted", text: ` · ${about}` }) : null);
@@ -1763,7 +1759,7 @@ const VAR_HELP = {
   change: "What to change, in a sentence",
   change_id: "A short id for this change (letters, digits, -)",
   project: "The project's name",
-  spec: "The feature's folder on this computer: specs/NNN-name in a Spec Kit project, or openspec/changes/<id> (a project folder with one feature works too)",
+  spec: "The feature's folder on this computer: specs/NNN-name in a Spec Kit project, or openspec/changes/<id> (a project folder with one feature works too). Or the https:// link of a Word, Markdown or text document on SharePoint or OneDrive, read through Work IQ with this profile's sign-in",
 };
 /// Help that differs in one playbook.
 const PLAYBOOK_VAR_HELP = {
@@ -2294,11 +2290,20 @@ async function loadOps() {
   const kb = $("#kb-list");
   state.knowledge = ops.knowledge;
   $("#kb-count").textContent = ops.knowledge.length;
-  kb.replaceChildren(...(ops.knowledge.length ? ops.knowledge.map((k) => el("li", {},
-    el("button", { type: "button", class: "run-open", onclick: () => openTopic(k.name), "aria-label": `Open knowledge topic ${k.name}` },
+  kb.replaceChildren(...(ops.knowledge.length ? ops.knowledge.map((k) => {
+    // Imported from Microsoft 365: its labels decide which peers it may go to.
+    const origin = knowledgeOrigin(k.workiq);
+    return el("li", {},
+      el("button", {
+        type: "button", class: "run-open", onclick: () => openTopic(k.name),
+        "aria-label": `Open knowledge topic ${k.name}${origin ? ` (${origin.text})` : ""}`,
+      },
       el("span", { class: "task-title", text: k.name }),
-      k.tsg ? el("span", { class: `badge ${k.tsg.status === "active" ? "ok" : "neutral"}`, text: `TSG · ${k.tsg.status}` })
-        : el("span", { class: "muted small", text: `${k.chars} chars` })))) :
+      el("span", { class: "kb-facts" },
+        origin ? el("span", { class: "muted small kb-origin", title: origin.title, text: origin.text }) : null,
+        k.tsg ? el("span", { class: `badge ${k.tsg.status === "active" ? "ok" : "neutral"}`, text: `TSG · ${k.tsg.status}` })
+          : el("span", { class: "muted small", text: `${k.chars} chars` }))));
+  }) :
     [el("li", { class: "empty" }, "Nothing yet. Try the ", el("strong", { text: "discover" }), " playbook on an existing project.")]));
 }
 
@@ -2502,9 +2507,11 @@ async function submitKbImport(e) {
     }
     await loadOps().catch((err) => toast(err.message, "error"));
   } catch (err) {
+    // The route words its error to follow a colon; here it is a sentence of its own.
+    const message = asSentence(err.message);
     // Closed while it ran: the error is the toast's.
-    if (dialog.open) error.textContent = err.message;
-    else toast(err.message, "error");
+    if (dialog.open) error.textContent = message;
+    else toast(message, "error");
   } finally {
     button.disabled = false;
     button.textContent = "Import topic";

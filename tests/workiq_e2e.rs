@@ -33,6 +33,8 @@ const SCRIPT: &str = concat!(
     "/tests/fixtures/workiq_cli_mcp.py"
 );
 const TENANT_ID: &str = "11111111-2222-3333-4444-555555555555";
+/// The spec document on SharePoint that `fetch_blob` gives: Markdown, labelled General.
+const SPEC_DOC: &str = "# Albums\n\nFR-001: Users can share an album.\n";
 /// How long a running agent has to print what a test waits for.
 const WAIT: Duration = Duration::from_secs(120);
 
@@ -175,7 +177,8 @@ fn work_file(id: &str, protection: &str, label: &str, text: &str) -> Value {
 /// What a tool answers, in the shapes Work IQ (CLI 1.0.1) uses: `retrieve` a General file,
 /// a Confidential one and a General one that may not be handed out; `ask` the answer as
 /// text and structured, with the conversation id; `list_agents` one agent, as JSON in the
-/// text content and nothing structured.
+/// text content and nothing structured; `fetch` the driveItem of a Markdown spec labelled
+/// General, and `fetch_blob` its bytes ([`SPEC_DOC`]).
 fn tool_answer(name: &str) -> Value {
     let (structured, text) = match name {
         "retrieve" => (
@@ -200,6 +203,31 @@ fn tool_answer(name: &str) -> Value {
         "list_agents" => (
             Value::Null,
             json!([{ "agentId": "sales:1", "name": "Sales", "provider": "Contoso" }]).to_string(),
+        ),
+        "fetch" => (
+            json!({
+                "results": [{
+                    "statusCode": 200,
+                    "data": {
+                        "id": "spec-1",
+                        "name": "Albums.md",
+                        "size": SPEC_DOC.len(),
+                        "file": { "mimeType": "text/markdown" },
+                        "sensitivityLabel": { "displayName": "General", "id": "label-General" },
+                    },
+                }],
+            }),
+            String::new(),
+        ),
+        "fetch_blob" => (
+            json!({
+                "statusCode": 200,
+                "contentType": "text/markdown",
+                "blobName": "Albums.md",
+                "sizeBytes": SPEC_DOC.len(),
+                "base64Content": data_encoding::BASE64.encode(SPEC_DOC.as_bytes()),
+            }),
+            String::new(),
         ),
         other => panic!("unexpected tool {other}"),
     };
@@ -238,7 +266,7 @@ async fn mcp(
             "serverInfo": { "name": "fake-workiq", "version": "0" },
         }),
         "tools/list" => {
-            let tools = ["retrieve", "ask", "list_agents"]
+            let tools = ["retrieve", "ask", "list_agents", "fetch", "fetch_blob"]
                 .map(|name| json!({ "name": name, "inputSchema": { "type": "object" } }));
             json!({ "tools": tools })
         }
@@ -657,6 +685,66 @@ async fn the_work_iq_commands_run_through_the_program_with_a_hosted_account() {
     let (worked, out) = away.run(&["workiq", "doctor", "--profile", "boss"]).await;
     assert!(!worked && out.contains("only for tests"), "{out}");
     assert_eq!(fake.calls().len(), 5);
+
+    // A spec document on SharePoint, read through Work IQ: its requirement is the plan's claim,
+    // and it is saved as a topic marked with its label. Both calls are audited as spec-import.
+    let link = "https://contoso.sharepoint.com/sites/Shop/Shared%20Documents/Albums.md";
+    let from = [
+        "spec",
+        "import",
+        "--from",
+        link,
+        "--profile",
+        "boss",
+        "--set",
+        "peer=helper",
+    ];
+    let out = env.ok(&from).await;
+    let claim = "claim: FR-001 Users can share an album.";
+    assert!(out.contains(claim), "{out}");
+    assert!(out.contains(&format!("Imported from {link}.")), "{out}");
+    assert!(out.contains("Its sensitivity label is General"), "{out}");
+    let topic = home.path().join("profiles/boss/knowledge/spec-albums.md");
+    let topic = std::fs::read_to_string(topic).unwrap();
+    assert_eq!(
+        proofkin::knowledge::parse_mark(&topic),
+        Some(vec!["General".to_owned()])
+    );
+    let requirement = "FR-001: Users can share an album.";
+    assert!(topic.contains(requirement), "{topic}");
+    let audit = home.path().join("profiles/boss/workiq-audit.jsonl");
+    let audit = std::fs::read_to_string(audit).unwrap();
+    let rows: Vec<Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row["purpose"] == "spec-import")
+        .collect();
+    let tools: Vec<&str> = rows.iter().map(|r| r["tool"].as_str().unwrap()).collect();
+    assert_eq!(tools, ["fetch", "fetch_blob"], "{audit}");
+    assert!(rows.iter().all(|row| row["outcome"] == "ok"), "{audit}");
+
+    // Refused before any call: a link that isn't https, and a folder as well as a link.
+    let mut http = from;
+    http[3] = "http://contoso.sharepoint.com/sites/Shop/Shared%20Documents/Albums.md";
+    let (worked, out) = env.run(&http).await;
+    let off = "is not a SharePoint or OneDrive link";
+    assert!(!worked && out.contains(off), "{out}");
+    let both = [
+        "spec",
+        "import",
+        "specs/001-albums",
+        "--from",
+        link,
+        "--profile",
+        "boss",
+        "--set",
+        "peer=helper",
+    ];
+    let (worked, out) = env.run(&both).await;
+    assert!(!worked && out.contains("not both"), "{out}");
+    let calls = fake.calls();
+    let names: Vec<&str> = calls[5..].iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["fetch", "fetch_blob"]);
 
     env.ok(&["auth", "logout", "workiq", "--profile", "boss"])
         .await;

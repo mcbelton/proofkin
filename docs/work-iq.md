@@ -246,8 +246,15 @@ local.
 - **Evidence**: the local run record keeps each call's sources, withheld counts and ids. The
   signed evidence, which can be shared, keeps only a hash of the context, the number of
   results and their labels.
-- **Specs from documents** (later): `proofkin spec import --from <SharePoint or OneDrive
-  URL>`.
+- **Specs from documents**: `proofkin spec import --from <SharePoint or OneDrive URL>`
+  reads a Word, Markdown or text document through `fetch` (its driveItem at
+  `/shares/u!<base64url of the URL>`, with its sensitivity label) and `fetch_blob` (its
+  bytes, at most 4 MB), audited as `spec-import`. Its requirements become the plan's claims,
+  as a Spec Kit `spec.md`'s do, and the document becomes knowledge topic `spec-<document>`
+  (its text redacted, in an external-content envelope `workiq:document:<file name>`),
+  marked `origin: workiq` with its label (`unknown` without one), so only peers granted that
+  label get the steps that use it. The implement-speckit playbook takes the link in Plan
+  mode too.
 
 ### 6. Work IQ as a tool for tasks (gateway)
 
@@ -374,7 +381,7 @@ each step works on one of its sub-issues (`issue=#N`).
 | | [#51](https://github.com/mcbelton/proofkin/issues/51) `@workiq` steps | #50 |
 | | [#52](https://github.com/mcbelton/proofkin/issues/52) Knowledge import | #40, #45, #47 |
 | | [#53](https://github.com/mcbelton/proofkin/issues/53) Context in evidence | #50 |
-| | [#54](https://github.com/mcbelton/proofkin/issues/54) Specs from SharePoint or OneDrive (later) | #52 |
+| | [#54](https://github.com/mcbelton/proofkin/issues/54) Specs from SharePoint or OneDrive | #52 |
 | [#55](https://github.com/mcbelton/proofkin/issues/55) A tool for tasks | [#56](https://github.com/mcbelton/proofkin/issues/56) The gateway | #39, #40, #45, #48 |
 | | [#57](https://github.com/mcbelton/proofkin/issues/57) Peers' tasks with a grant | #56, #46 |
 | | [#58](https://github.com/mcbelton/proofkin/issues/58) Changes with a sign-off | #56 |

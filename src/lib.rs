@@ -11,6 +11,7 @@ pub mod awake;
 pub mod boundary;
 pub mod checks_mcp;
 pub mod design;
+pub mod docx;
 pub mod evidence;
 pub mod factory;
 pub mod gh_auth;
