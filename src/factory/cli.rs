@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::agent::{Agent, AgentConfig, MAX_CONCURRENT_TASKS, Network};
 use crate::factory::blueprint::{
-    Blueprint, Catalog, Problem, check_value, from_value, has_errors, name_problem, summary,
+    Blueprint, Catalog, Problem, from_value, has_errors, name_problem, summary,
 };
 use crate::factory::evals::check_fixtures;
 use crate::factory::report::{EvalState, Evaluation, RunState};
@@ -29,8 +29,8 @@ pub struct ProfileOpt {
 
 #[derive(Subcommand, Debug)]
 pub enum FactoryCommand {
-    /// List the built-in templates: what each is for, the most access it asks for and
-    /// how many eval cases it starts with.
+    /// List the built-in templates: what each is for, the most access it asks for, how
+    /// many eval cases it starts with and what its evaluation needs, if anything.
     Templates,
     /// Start an agent: a draft from a template, or one the profile's model writes
     /// from your words (read-only, in an empty folder; it grants nothing), or from a
@@ -44,7 +44,8 @@ examples:
     New {
         /// The agent's name.
         name: String,
-        /// Start from this template (proofkin factory templates lists them).
+        /// Start from this template (proofkin factory templates lists them); the files its
+        /// cases work on go in the agent's fixtures folder, keeping any there already.
         #[arg(long)]
         template: Option<String>,
         /// What the agent should do, in your words: the profile's model writes the draft.
@@ -170,7 +171,7 @@ evaluation of the same build that didn't end; Ctrl+C cancels it.")]
 writes:
   agent/blueprint.json   its blueprint, without its eval suite
   agent/evals.json       its eval suite
-  agent/fixtures/        files its cases work on
+  agent/fixtures/        files its cases work on (the template's, if it has any)
   agent/skills/          skills of its own (<name>.md), next to the built-in ones
   agent/reports/         its evaluations' signed reports
 examples:
@@ -368,8 +369,9 @@ pub async fn run(command: FactoryCommand) -> Result<()> {
                 "template", "most access", "cases"
             );
             for t in templates::list() {
+                let needs = t.needs.map(|n| format!("; {n}")).unwrap_or_default();
                 println!(
-                    "  {:<20} {:<16} {:>5}  {}",
+                    "  {:<20} {:<16} {:>5}  {}{needs}",
                     t.name, t.access, t.eval_cases, t.purpose
                 );
             }
@@ -604,7 +606,7 @@ async fn new(
     if let Some(from) = from {
         return new_from(&profile, &catalog, name, from);
     }
-    let (draft, problems, what) = match (describe, template) {
+    let (draft, what) = match (describe, template) {
         (Some(words), template) => {
             let provider = match using {
                 Some(provider) => provider,
@@ -658,14 +660,13 @@ async fn new(
                     .map(|t| format!(" and template {t}"))
                     .unwrap_or_default()
             );
-            (written.draft, written.problems, what)
+            (written.draft, what)
         }
         (None, Some(template)) => {
             if let Some(problem) = name_problem(name, &catalog) {
                 bail!("{problem}");
             }
             let blueprint = templates::instantiate(&template, name, &catalog)?;
-            let problems = check_value(&blueprint, &catalog);
             let draft = Draft {
                 blueprint,
                 provenance: Provenance {
@@ -676,15 +677,26 @@ async fn new(
                 },
                 tries: 0,
             };
-            (draft, problems, format!("drafted from template {template}"))
+            (draft, format!("drafted from template {template}"))
         }
         (None, None) => bail!(
             "give --template NAME (proofkin factory templates lists them), --describe \"what the agent should do\" or --from FOLDER"
         ),
     };
-    FactoryStore::of(&profile).create_draft(name, &draft, &profile.name, &what)?;
+    let store = FactoryStore::of(&profile);
+    store.create_draft(name, &draft, &profile.name, &what)?;
+    // The files the template's cases work on.
+    let fixtures = match &draft.provenance.template {
+        Some(template) => templates::write_fixtures(template, &store.fixtures_dir(name))?,
+        None => Vec::new(),
+    };
+    let with = match fixtures.len() {
+        0 => String::new(),
+        n => format!(", {}", plural(n, "fixture", "fixtures")),
+    };
+    let problems = problems_of(&store, name, &draft.blueprint, &catalog.without(name));
     println!(
-        "profile '{}': created draft {name} ({what}): {}",
+        "profile '{}': created draft {name} ({what}{with}): {}",
         profile.name,
         summary(&problems)
     );

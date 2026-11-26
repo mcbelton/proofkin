@@ -11,7 +11,8 @@
 //!   A capability's spec (`openspec/specs/<capability>/`) gives one per requirement.
 //! - A Word, Markdown or text document on SharePoint or OneDrive, read through Work IQ
 //!   ([`crate::workiq::document`]), is read as a Spec Kit `spec.md` ([`from_document`]).
-//!   Its knowledge topic is marked as Microsoft 365 content with its sensitivity label.
+//!   Its knowledge topic is marked as Microsoft 365 content with its sensitivity label, and
+//!   its plan isn't tracked on GitHub (`track: off`), since its claims and steps quote it.
 //!
 //! The spec (condensed to fit a prompt) becomes a knowledge topic that the plan's
 //! steps are given (`context=`), so the peers that implement it need no copy of it.
@@ -1077,7 +1078,8 @@ pub struct Roles<'a> {
 
 /// The plan that implements `import`: `impl` on the peer (with the folder's test check
 /// and retries), an independent `verify` by a reviewer applying its commit, and a
-/// sign-off of what tests can't prove.
+/// sign-off of what tests can't prove. A document's plan says `track: off`, with a comment
+/// saying why: its claims and steps quote the document, which is Microsoft 365 content.
 pub fn plan_text(import: &Import, who: &Roles) -> Result<String> {
     let ids = |proof: Proof| {
         import
@@ -1122,6 +1124,19 @@ pub fn plan_text(import: &Import, who: &Roles) -> Result<String> {
     }
     for w in &import.warnings {
         text += &comment(format!("Warning: {w}"));
+    }
+    // A tracked run posts the claims and the steps' text on GitHub (only what steps end with
+    // is kept off it), and these quote the document: tracking it is the user's choice.
+    if import.kind == Kind::Document {
+        let sensitivity = match import.label.as_deref() {
+            Some(crate::workiq::content::UNKNOWN) | None => "no label information",
+            Some(label) => label,
+        };
+        text += &comment(format!(
+            "Not tracked on GitHub: its claims and steps quote the document, which is \
+             Microsoft 365 content ({sensitivity}). Tracking it would put them there."
+        ));
+        text += "track: off\n";
     }
     for c in &import.claims {
         text += &format!("claim: {} {}\n", c.id, one_line(&c.text));
@@ -1265,6 +1280,10 @@ pub fn summary(import: &Import) -> String {
             );
         }
         None => {}
+    }
+    if import.kind == Kind::Document {
+        s += " The plan isn't tracked on GitHub (track: off): its claims and steps quote the \
+              document, which is Microsoft 365 content, and tracking it would put them there.";
     }
     s
 }
@@ -1425,6 +1444,53 @@ mod tests {
                 .iter()
                 .all(|s| !matches!(&s.target, crate::plan::Target::Peer(p) if p == "mallory"))
         );
+    }
+
+    #[test]
+    fn imported_documents_are_not_tracked_on_github_and_say_why() {
+        let document = |label: Option<&str>| crate::workiq::document::Document {
+            name: "Falcon plan.docx".into(),
+            url: "https://contoso.sharepoint.com/sites/Team/Falcon%20plan.docx".into(),
+            label: label.map(str::to_owned),
+            markdown: "# Project Falcon\n\nFR-001: Pilots file a flight plan \
+                       [NEEDS CLARIFICATION: on paper?].\n"
+                .into(),
+        };
+        let untracked = " The plan isn't tracked on GitHub (track: off): its claims and steps \
+                         quote the document, which is Microsoft 365 content, and tracking it \
+                         would put them there.";
+        for (label, named) in [
+            (Some("Confidential"), "Confidential"),
+            (None, "no label information"),
+        ] {
+            let import = from_document(&document(label)).unwrap();
+            let text = plan_text(&import, &roles()).unwrap();
+            // Right after the plan's other comments (its warning too), before its claims.
+            let why = format!(
+                "// Not tracked on GitHub: its claims and steps quote the document, which is \
+                 Microsoft 365 content ({named}). Tracking it would put them there.\n\
+                 track: off\nclaim: FR-001 "
+            );
+            let at = text.find(&why).unwrap_or_else(|| panic!("{text}"));
+            assert!(text[..at].contains("\n// Warning: "), "{text}");
+            assert!(text[..at].lines().all(|l| l.starts_with("// ")), "{text}");
+            let plan = crate::plan::Plan::parse(&text).unwrap();
+            assert_eq!(plan.track, Some(crate::plan::Track::Off));
+            let said = summary(&import);
+            assert!(said.ends_with(untracked), "{said}");
+        }
+        // A Spec Kit or OpenSpec folder's plan is tracked as before.
+        for folder in [
+            "speckit/specs/001-photo-albums",
+            "openspec/openspec/changes/add-dark-mode",
+        ] {
+            let import = read(&fixture(folder)).unwrap();
+            let text = plan_text(&import, &roles()).unwrap();
+            assert!(!text.lines().any(|l| l.starts_with("track:")), "{text}");
+            assert_eq!(crate::plan::Plan::parse(&text).unwrap().track, None);
+            let said = summary(&import);
+            assert!(!said.contains("track: off"), "{said}");
+        }
     }
 
     /// Links folder `link` to `target` (on Windows a junction, which needs no privileges).
