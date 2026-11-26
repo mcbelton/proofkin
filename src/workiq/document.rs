@@ -1,17 +1,18 @@
 //! A spec in a Word, Markdown or text document on SharePoint or OneDrive, read through Work
 //! IQ for `proofkin spec import --from` (docs/work-iq.md, section 5). The document's
 //! metadata comes first (`fetch`: its name, type, size and sensitivity label); then, if it
-//! is a type that is read and isn't too big, its bytes (`fetch_blob`), as Markdown. Both
-//! calls go through the audited client as `spec-import`, held to the profile's budgets.
-//! What the document holds is external content: its text is redacted here, and it leaves
-//! only as a knowledge topic marked with its label.
+//! is a type that is read, isn't too big and isn't encrypted by its label's protection, its
+//! bytes (`fetch_blob`), as Markdown. Both calls go through the audited client as
+//! `spec-import`, held to the profile's budgets. What the document holds is external
+//! content: its text is redacted here, and it leaves only as a knowledge topic marked with
+//! its label.
 
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::{BASE64, BASE64_NOPAD, BASE64URL_NOPAD};
 use serde_json::Value;
 
 use super::audit::{CallContext, Purpose};
-use super::client::{RequestIds, ToolResult, WorkIqError};
+use super::client::{RequestIds, ToolResult, Who, WorkIqError, reported_text};
 use super::context::WorkContext;
 
 /// The largest document read: what `fetch_blob` gives at most.
@@ -23,7 +24,11 @@ const SELECT: &str = "id,name,size,file,webUrl,lastModifiedDateTime,sensitivityL
 
 const WORD: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
-/// OneDrive's hosts; SharePoint's are `*.sharepoint.com`.
+/// SharePoint's hosts, by their suffix: `*.sharepoint.com`, and `*.sharepoint-df.com`,
+/// Microsoft's own pre-production SharePoint (`retrieve` gives its documents' links too).
+const SHAREPOINT_DOMAINS: [&str; 2] = [".sharepoint.com", ".sharepoint-df.com"];
+
+/// OneDrive's hosts.
 const ONEDRIVE_HOSTS: [&str; 2] = ["onedrive.live.com", "1drv.ms"];
 
 const TYPES_READ: &str =
@@ -96,13 +101,15 @@ pub fn is_link(spec: &str) -> bool {
 
 /// The Work IQ path of the document at `url`, as Microsoft Graph addresses a shared item:
 /// `/shares/u!` and the link in base64url without padding. Only an `https` link on
-/// SharePoint (`*.sharepoint.com`) or OneDrive (`onedrive.live.com`, `1drv.ms`) is taken.
+/// SharePoint (`*.sharepoint.com`, `*.sharepoint-df.com`) or OneDrive (`onedrive.live.com`,
+/// `1drv.ms`) is taken.
 pub fn share_path(url: &str) -> Result<String> {
     let url = url.trim();
     let refuse = || {
         anyhow!(
             "{url} is not a SharePoint or OneDrive link: a spec is read from the https:// link \
-             of a document on *.sharepoint.com, onedrive.live.com or 1drv.ms"
+             of a document on *.sharepoint.com, *.sharepoint-df.com, onedrive.live.com or \
+             1drv.ms"
         )
     };
     // URL parsers disagree on these, so the link could name another host elsewhere.
@@ -111,7 +118,8 @@ pub fn share_path(url: &str) -> Result<String> {
     }
     let parsed = reqwest::Url::parse(url).map_err(|_| refuse())?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    let known = host.ends_with(".sharepoint.com") || ONEDRIVE_HOSTS.contains(&host.as_str());
+    let sharepoint = SHAREPOINT_DOMAINS.iter().any(|d| host.ends_with(d));
+    let known = sharepoint || ONEDRIVE_HOSTS.contains(&host.as_str());
     let credentials = !parsed.username().is_empty() || parsed.password().is_some();
     if parsed.scheme() != "https" || !known || credentials {
         return Err(refuse());
@@ -121,14 +129,18 @@ pub fn share_path(url: &str) -> Result<String> {
 }
 
 /// Reads the document at the SharePoint or OneDrive link `url` through `work`: its metadata
-/// first; then, if it is a Word, Markdown or text document of at most [`MAX_DOCUMENT`], its
-/// content as Markdown. A link that isn't one is refused before any call.
+/// first; then, if it is a Word, Markdown or text document of at most [`MAX_DOCUMENT`] that
+/// its sensitivity label doesn't protect, its content as Markdown. A link that isn't one is
+/// refused before any call.
 pub async fn read(work: &dyn WorkContext, url: &str) -> Result<Document> {
     let url = url.trim();
     let share = share_path(url)?;
     let context = CallContext::local(Purpose::SpecImport);
     let item = format!("{share}/driveItem?$select={SELECT}");
-    let result = work.fetch(&context, &[item.as_str()]).await?;
+    let result = work
+        .fetch(&context, &[item.as_str()])
+        .await
+        .map_err(|e| tool_failed("fetch", e))?;
     let item = fetched(&result)?;
     let name = file_name(item);
     let mime = item
@@ -156,9 +168,20 @@ pub async fn read(work: &dyn WorkContext, url: &str) -> Result<Document> {
         .and_then(Value::as_str)
         .map(one_line)
         .filter(|label| !label.is_empty());
+    // The label's protection encrypts the content, so there would be no text to read.
+    if item.pointer("/sensitivityLabel/protectionEnabled") == Some(&Value::Bool(true)) {
+        let label = label.map(|label| format!(" {label}")).unwrap_or_default();
+        bail!(
+            "{name} is protected by its sensitivity label{label}: its content is encrypted, so \
+             it can't be read. Save a copy without protection (or as Markdown) and import that"
+        );
+    }
 
     let path = format!("{share}/driveItem/content");
-    let blob = work.fetch_blob(&context, &path).await?;
+    let blob = work
+        .fetch_blob(&context, &path)
+        .await
+        .map_err(|e| tool_failed("fetch_blob", e))?;
     let (kind, bytes) = blob_of(&blob, &name)?;
     let markdown = if kind == Type::Word {
         crate::docx::to_markdown(&bytes).with_context(|| format!("reading {name}"))?
@@ -181,7 +204,7 @@ pub async fn read(work: &dyn WorkContext, url: &str) -> Result<Document> {
 /// is 200.
 fn fetched(result: &ToolResult) -> Result<&Value> {
     if result.is_error {
-        bail!("Work IQ's fetch tool reported an error for the document");
+        return Err(reported("fetch", &reported_text(&result.content)));
     }
     let entity = result
         .structured_content
@@ -202,7 +225,7 @@ fn fetched(result: &ToolResult) -> Result<&Value> {
 /// as its `sizeBytes`.
 fn blob_of(result: &ToolResult, name: &str) -> Result<(Type, Vec<u8>)> {
     if result.is_error {
-        bail!("Work IQ's fetch_blob tool reported an error for the document");
+        return Err(reported("fetch_blob", &reported_text(&result.content)));
     }
     let blob = result
         .structured_content
@@ -249,6 +272,30 @@ fn blob_of(result: &ToolResult, name: &str) -> Result<(Type, Vec<u8>)> {
         return Err(too_big(name, Some(size)));
     }
     Ok((kind, bytes))
+}
+
+/// `error`, a failed call of Work IQ's `tool` for the document. A failure the tool reported
+/// itself that only support can help with says what the tool said; any other (one you or an
+/// admin can fix: signing in again, a policy, billing, waiting) keeps the client's error.
+fn tool_failed(tool: &str, error: anyhow::Error) -> anyhow::Error {
+    let said = error
+        .downcast_ref::<WorkIqError>()
+        .filter(|failure| failure.fix.who == Who::Support)
+        .and_then(|failure| failure.tool_text.as_deref());
+    match said {
+        Some(said) => reported(tool, said),
+        None => error,
+    }
+}
+
+/// The error for a failure Work IQ's `tool` reported for the document, with what it said
+/// (`text`, on one line and redacted) when it said anything.
+fn reported(tool: &str, text: &str) -> anyhow::Error {
+    let mut message = format!("Work IQ's {tool} tool reported an error for the document");
+    if !text.is_empty() {
+        message.push_str(&format!(": {text}"));
+    }
+    anyhow!(message)
 }
 
 /// Fails unless `value`'s `statusCode` is 200, with the class of Work IQ's errors for that
@@ -351,11 +398,13 @@ mod tests {
         "https://contoso.sharepoint.com/sites/Team/Shared%20Documents/Photo%20albums.docx";
 
     /// A fake Work IQ server that offers `fetch` and `fetch_blob`: `fetch` gives `item` (an
-    /// entity's `{statusCode, data}`) and `fetch_blob` gives `blob`. It counts the requests
-    /// it gets and keeps the tool calls.
+    /// entity's `{statusCode, data}`) and `fetch_blob` gives `blob`, except for the tool
+    /// [`FakeWorkIq::fail`] names. It counts the requests it gets and keeps the tool calls.
     struct FakeWorkIq {
         item: Value,
         blob: Value,
+        /// The tool that answers `isError`, and the `content` it answers with.
+        failing: Mutex<Option<(&'static str, Value)>>,
         requests: AtomicUsize,
         calls: Mutex<Vec<(String, Value)>>,
     }
@@ -365,6 +414,12 @@ mod tests {
         fn tools(&self) -> Vec<String> {
             let calls = self.calls.lock().unwrap();
             calls.iter().map(|(tool, _)| tool.clone()).collect()
+        }
+
+        /// Makes `tool`, from now on, report an error (`isError`) with `content`; the other
+        /// tool answers as before.
+        fn fail(&self, tool: &'static str, content: Value) {
+            *self.failing.lock().unwrap() = Some((tool, content));
         }
     }
 
@@ -389,13 +444,20 @@ mod tests {
             }
             "tools/call" => {
                 let tool = message["params"]["name"].as_str().unwrap().to_owned();
-                let structured = match tool.as_str() {
-                    "fetch" => json!({ "results": [fake.item] }),
-                    _ => fake.blob.clone(),
+                let failing = fake.failing.lock().unwrap().clone();
+                let result = match failing.filter(|(name, _)| *name == tool) {
+                    Some((_, content)) => json!({ "content": content, "isError": true }),
+                    None => {
+                        let structured = match tool.as_str() {
+                            "fetch" => json!({ "results": [fake.item] }),
+                            _ => fake.blob.clone(),
+                        };
+                        json!({ "content": [], "structuredContent": structured, "isError": false })
+                    }
                 };
                 let arguments = message["params"]["arguments"].clone();
                 fake.calls.lock().unwrap().push((tool, arguments));
-                json!({ "content": [], "structuredContent": structured, "isError": false })
+                result
             }
             other => panic!("unexpected method {other}"),
         };
@@ -409,6 +471,7 @@ mod tests {
         let fake = Arc::new(FakeWorkIq {
             item,
             blob,
+            failing: Mutex::default(),
             requests: AtomicUsize::new(0),
             calls: Mutex::default(),
         });
@@ -665,6 +728,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_documents_are_refused_with_their_label_before_their_content_is_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "Photo albums.docx";
+        let word = docx(&para("", "FR-001: Users can create albums."));
+        let mut item = drive_item(name, WORD, word.len(), Some("Highly Confidential"));
+        item["data"]["sensitivityLabel"]["protectionEnabled"] = json!(true);
+        let content = file_content(name, WORD, &word);
+        let (fake, work) = fake_work(dir.path(), item, content).await;
+        let err = import(&work, LINK).await.unwrap_err().to_string();
+        let refused = "Photo albums.docx is protected by its sensitivity label Highly \
+                       Confidential: its content is encrypted, so it can't be read. Save a copy \
+                       without protection (or as Markdown) and import that";
+        assert!(err.contains(refused), "{err}");
+        assert_eq!(fake.tools(), ["fetch"]);
+    }
+
+    #[tokio::test]
     async fn a_document_work_iq_cannot_find_fails_with_its_error_class() {
         let dir = tempfile::tempdir().unwrap();
         let error = json!({ "code": "itemNotFound", "message": "The item was not found." });
@@ -676,6 +756,48 @@ mod tests {
         let detail = "the fetch tool answered 404: itemNotFound: The item was not found.";
         assert_eq!(err.message, detail);
         assert_eq!(fake.tools(), ["fetch"]);
+    }
+
+    #[tokio::test]
+    async fn a_tool_error_on_the_document_says_what_work_iq_said_on_one_line_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (name, mime) = ("Albums.md", "text/markdown");
+        let markdown = "# Albums\n\nFR-001: Users can share an album.\n";
+        let item = drive_item(name, mime, markdown.len(), Some("General"));
+        let content = file_content(name, mime, markdown.as_bytes());
+        let (fake, work) = fake_work(dir.path(), item, content).await;
+        let token = format!("ghp_{}", "a1B2".repeat(9));
+        let said = format!(
+            "The item could not be opened.\nToken {token} was refused. {}",
+            "More details follow. ".repeat(20)
+        );
+        fake.fail("fetch", json!([{ "type": "text", "text": said }]));
+        let err = import(&work, LINK).await.unwrap_err().to_string();
+        let start = "Work IQ's fetch tool reported an error for the document: ";
+        let why = err.strip_prefix(start).expect(&err);
+        let redacted = "The item could not be opened. Token [REDACTED:github-token] was refused. \
+                        More details follow. More";
+        assert!(why.starts_with(redacted), "{err}");
+        assert!(!err.contains(&token), "{err}");
+        assert!(why.chars().count() <= 300, "{err}");
+        assert_eq!(fake.tools(), ["fetch"]);
+
+        // When it says nothing, the error ends there.
+        fake.fail("fetch_blob", json!([]));
+        let err = import(&work, LINK).await.unwrap_err().to_string();
+        let ends = "Work IQ's fetch_blob tool reported an error for the document";
+        assert_eq!(err, ends);
+        assert_eq!(fake.tools(), ["fetch", "fetch", "fetch_blob"]);
+
+        // A failure that you or an admin can fix keeps the client's class and fix.
+        let billing = format!("Billing is not set up for this tenant ({token})");
+        fake.fail("fetch", json!([{ "type": "text", "text": billing }]));
+        let err = import(&work, LINK).await.unwrap_err();
+        let failure = err.downcast_ref::<WorkIqError>().expect("a Work IQ error");
+        assert_eq!(failure.class, Class::Billing);
+        let shown = failure.to_string();
+        let redacted = "Billing is not set up for this tenant ([REDACTED:github-token])";
+        assert!(shown.contains(redacted), "{shown}");
     }
 
     #[tokio::test]
@@ -836,6 +958,8 @@ mod tests {
             "https://contoso.sharepoint.com/sites/Team/Shared%20Documents/Spec.docx",
             doc_aspx,
             "https://contoso-my.sharepoint.com/:w:/g/personal/ada_contoso_com/EaBcD?e=x1Y2z3",
+            // Microsoft's own pre-production SharePoint.
+            "https://contoso.sharepoint-df.com/sites/Team/Shared%20Documents/Spec.docx",
             "https://onedrive.live.com/edit?id=ABC123!101&resid=ABC123!101",
             "https://1drv.ms/w/s!AbCdEfGh",
         ] {
@@ -849,6 +973,11 @@ mod tests {
             "http://contoso.sharepoint.com/sites/Team/Spec.docx",
             "https://example.com/Spec.docx",
             "https://contoso.sharepoint.com.evil.example/Spec.docx",
+            "https://contoso.sharepoint-df.com.example.com/Spec.docx",
+            // Other clouds' SharePoint, until one is seen.
+            "https://contoso.sharepoint.us/Spec.docx",
+            "https://contoso.sharepoint-mil.us/Spec.docx",
+            "https://contoso.sharepoint.cn/Spec.docx",
             "https://evil.example/?next=https://contoso.sharepoint.com/Spec.docx",
             "https://ada:secret@contoso.sharepoint.com/Spec.docx",
             "https://contoso.sharepoint.com\\@evil.example/Spec.docx",
@@ -858,6 +987,9 @@ mod tests {
         ] {
             let err = share_path(refused).unwrap_err().to_string();
             assert!(err.contains("not a SharePoint or OneDrive link"), "{err}");
+            let hosts = "the https:// link of a document on *.sharepoint.com, \
+                         *.sharepoint-df.com, onedrive.live.com or 1drv.ms";
+            assert!(err.ends_with(hosts), "{err}");
         }
         assert!(is_link("https://contoso.sharepoint.com/Spec.docx"));
         assert!(is_link(" http://example.com "));

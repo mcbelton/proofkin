@@ -810,9 +810,10 @@ What it reads:
 Give a feature's folder, or a project folder with one feature. The spec is saved as
 knowledge topic spec-<feature> (openspec-<change>, spec-<document>) in the profile; the
 plan's steps are given it, so peers need no copy. A document's topic keeps its sensitivity
-label: peers need a Microsoft 365 grant that includes it. The plan goes to stdout (or
---out): run it with /plan <file>, or paste it in the web UI's Plan mode (or pick the
-implement-speckit playbook).
+label: peers need a Microsoft 365 grant that includes it. Its plan says track: off, since
+its claims and steps quote it and a tracked run would put them on GitHub. The plan goes to
+stdout (or --out): run it with /plan <file>, or paste it in the web UI's Plan mode (or pick
+the implement-speckit playbook).
 examples:
   proofkin spec import D:\\src\\shop\\specs\\001-photo-albums --profile boss --set peer=alice > albums.plan
   proofkin spec import ~/src/shop/openspec/changes/add-dark-mode --profile boss --set peer=alice --set reviewers=qa --out dark.plan

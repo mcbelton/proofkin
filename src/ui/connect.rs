@@ -739,7 +739,7 @@ fn tools() -> Value {
             }),
             &["path", "peer"], false),
         tool("factory_templates", "List agent templates",
-            "The agent factory's built-in templates: what each agent is for, the most access it asks for and how many eval cases it starts with.",
+            "The agent factory's built-in templates: what each agent is for, the most access it asks for, how many eval cases it starts with and what its evaluation needs, if anything.",
             json!({}), &[], true),
         tool("factory_list", "List the factory's agents",
             "The agents and drafts of this profile's agent factory: each one's state, its draft's errors and warnings, and its latest evaluation.",

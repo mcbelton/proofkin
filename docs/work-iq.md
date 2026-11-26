@@ -169,6 +169,8 @@ Only the read tools (`retrieve`, `ask`, `fetch`, `fetch_blob`, `search_paths`, `
 tool, or any tool not in that list, is sent once; the one exception is a 401, which is
 rejected before it runs, so it is sent once more after the token is refreshed. Each error
 has a class, a fix (what to do and who can do it) and the ids, and its message is one line.
+When a tool reports the failure itself (`isError`), the message keeps what it said: redacted,
+at most 300 characters.
 
 ### 3. Content policy
 
@@ -217,7 +219,14 @@ local.
   repository may be public, so what a step that may hold Microsoft 365 content ended with
   (one that brings it, reads it through the gateway or is marked with it, one whose evidence
   names labels, and the steps after them) stays in the run's record: its comment says so
-  ([#250](https://github.com/mcbelton/proofkin/issues/250)).
+  ([#250](https://github.com/mcbelton/proofkin/issues/250)). That covers what steps end
+  with, not the plan's text, which a tracked run posts too: the run's issue lists the
+  claims (a new one is titled after the first), and each step's sub-issue holds its prompt.
+  A plan imported from a document (`spec import --from`) quotes the document in its claims
+  and steps, so the import writes `track: off` after a comment saying why (with the
+  document's label, or "no label information"), and its summary says the plan isn't
+  tracked. Tracking it takes changing that line knowingly; the plan check doesn't
+  second-guess that ([#261](https://github.com/mcbelton/proofkin/issues/261)).
 
 ### 5. Work context in plans
 
@@ -247,14 +256,18 @@ local.
   signed evidence, which can be shared, keeps only a hash of the context, the number of
   results and their labels.
 - **Specs from documents**: `proofkin spec import --from <SharePoint or OneDrive URL>`
+  (`*.sharepoint.com`, `*.sharepoint-df.com`, `onedrive.live.com` or `1drv.ms`)
   reads a Word, Markdown or text document through `fetch` (its driveItem at
   `/shares/u!<base64url of the URL>`, with its sensitivity label) and `fetch_blob` (its
-  bytes, at most 4 MB), audited as `spec-import`. Its requirements become the plan's claims,
-  as a Spec Kit `spec.md`'s do, and the document becomes knowledge topic `spec-<document>`
+  bytes, at most 4 MB), audited as `spec-import`. A document whose label protects it
+  (`sensitivityLabel.protectionEnabled`) is refused after `fetch`, before `fetch_blob`: its
+  content is encrypted. When either tool reports an error for the document, the error gives
+  what it said. Its requirements become the plan's claims, as a Spec Kit `spec.md`'s do, and
+  the document becomes knowledge topic `spec-<document>`
   (its text redacted, in an external-content envelope `workiq:document:<file name>`),
   marked `origin: workiq` with its label (`unknown` without one), so only peers granted that
-  label get the steps that use it. The implement-speckit playbook takes the link in Plan
-  mode too.
+  label get the steps that use it. Its plan says `track: off` (see **Never on GitHub**). The
+  implement-speckit playbook takes the link in Plan mode too.
 
 ### 6. Work IQ as a tool for tasks (gateway)
 

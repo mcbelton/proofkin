@@ -19,6 +19,7 @@
         "id": "E1",
         "requirement": "R1",
         "input": "Add a function named slugify that lowercases a text and joins its words with '-', next to the other string helpers, and export it the way they are.",
+        "fixtures": ["package.json", "src/strings.js", "src/numbers.js", "src/config.js", "test/strings.test.js", "test/numbers.test.js", "test/config.test.js"],
         "expect": [{ "files-changed": ["**"] }, { "regex": "(?i)slugify" }],
         "smoke": true,
         "timeout": "30m"
@@ -27,6 +28,7 @@
         "id": "E2",
         "requirement": "R2",
         "input": "Add a function named clamp(value, low, high) next to the other number helpers, with tests for a value below, inside and above the range.",
+        "fixtures": ["package.json", "src/strings.js", "src/numbers.js", "src/config.js", "test/strings.test.js", "test/numbers.test.js", "test/config.test.js"],
         "expect": [{ "files-changed": ["**"] }, { "regex": "(?i)\\btests?\\b" }, { "check": "test" }],
         "timeout": "30m"
       },
@@ -34,6 +36,7 @@
         "id": "E3",
         "requirement": "R3",
         "input": "Make the function that reads the configuration refuse an empty value with a clear error message, and keep the tests passing.",
+        "fixtures": ["package.json", "src/strings.js", "src/numbers.js", "src/config.js", "test/strings.test.js", "test/numbers.test.js", "test/config.test.js"],
         "expect": [{ "files-changed": ["**"] }, { "check": "test" }],
         "timeout": "30m"
       }

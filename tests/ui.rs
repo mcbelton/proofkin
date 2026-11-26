@@ -5331,6 +5331,16 @@ async fn the_factory_api_answers_as_its_contract_says() {
             .iter()
             .any(|t| t["name"] == "researcher")
     );
+    let implementer = templates["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "implementer")
+        .unwrap();
+    assert_eq!(
+        implementer["needs"],
+        "needs a deploy folder whose test check runs node --test"
+    );
 
     // Drafts: from a template (no model), refused when they can't be one.
     let drafts = "/api/factory/drafts";
@@ -5348,6 +5358,11 @@ async fn the_factory_api_answers_as_its_contract_says() {
         serde_json::json!(["codex"])
     );
     assert_eq!(draft["problems"], serde_json::json!([]));
+    // Its cases' files, from the template, are in its fixtures folder.
+    let fixtures = dir.join("factory/agents/ask/fixtures");
+    for file in ["README.md", "src/main.py", "config.ini"] {
+        assert!(fixtures.join(file).is_file(), "{file}");
+    }
     let taken = call(
         "POST",
         drafts.into(),

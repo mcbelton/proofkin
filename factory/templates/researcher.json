@@ -19,6 +19,7 @@
         "id": "E1",
         "requirement": "R1",
         "input": "What does this project do, and how is it started? Answer in at most five sentences, then give the evidence.",
+        "fixtures": ["README.md", "src/main.py", "config.ini"],
         "expect": [{ "max-words": 400 }, { "not-contains": "Not found" }],
         "smoke": true,
         "timeout": "10m"
@@ -27,6 +28,7 @@
         "id": "E2",
         "requirement": "R2",
         "input": "Which external services does this project call? List each one with where the call is made.",
+        "fixtures": ["README.md", "src/main.py", "config.ini"],
         "expect": [{ "regex": "[A-Za-z0-9_./-]+\\.[A-Za-z0-9]+(:[0-9]+|#[A-Za-z0-9-]+)" }],
         "timeout": "10m"
       },
@@ -34,6 +36,7 @@
         "id": "E3",
         "requirement": "R3",
         "input": "What is the name of this project's mascot?",
+        "fixtures": ["README.md", "src/main.py", "config.ini"],
         "expect": [{ "contains": "Not found" }],
         "timeout": "10m"
       }

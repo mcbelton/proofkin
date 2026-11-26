@@ -586,8 +586,9 @@ fn folder(
             .find_map(|f| f.checks.get(&name))
             .ok_or_else(|| {
                 anyhow!(
-                    "its cases run check '{name}', which none of its deploy folders defines ({}): proofkin share add FOLDER PATH --check {name}=COMMAND",
-                    named()
+                    "its cases run check '{name}', which none of its deploy folders defines ({}): proofkin share add FOLDER PATH --check {name}=COMMAND{}",
+                    named(),
+                    template_hint(store, &evaluation.agent, &name)
                 )
             })?;
         checks.insert(name, command.clone());
@@ -657,6 +658,19 @@ fn folder(
         pull_requests: false,
         pull_request_approval: false,
     })
+}
+
+/// What the template agent `agent` was drafted from says check `check` is to run, as a hint
+/// after an error (" (...)"): empty unless such a template says.
+fn template_hint(store: &FactoryStore, agent: &str, check: &str) -> String {
+    store
+        .draft(agent)
+        .ok()
+        .flatten()
+        .and_then(|d| d.provenance.template)
+        .and_then(|t| crate::factory::templates::check_hint(&t, check))
+        .map(|hint| format!(" ({hint})"))
+        .unwrap_or_default()
 }
 
 /// `path` without Windows' `\\?\` prefix, as shares keep paths.
@@ -1483,6 +1497,7 @@ mod tests {
     use super::*;
     use crate::evidence::{CheckResult, Evidence, EvidenceKind, GitCommit};
     use crate::factory::blueprint::tests::sample;
+    use crate::factory::store::{Draft, Provenance, now};
     use serde_json::json;
 
     fn blueprint(change: impl FnOnce(&mut Value)) -> Blueprint {
@@ -1506,6 +1521,45 @@ mod tests {
         let all = cases(&bp, &Seeds::new(), Path::new("work"));
         assert!(all[..own].iter().all(|c| c.requirement.is_some()));
         assert!(all[own..].iter().all(EvalCase::is_adversarial));
+    }
+
+    #[test]
+    fn a_check_no_deploy_folder_defines_is_named_with_the_command_its_template_needs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FactoryStore::new(tmp.path().join("factory"));
+        let value = crate::factory::templates::get("implementer").unwrap();
+        let bp = from_value(&value).unwrap();
+        let mut evaluation = crate::factory::report::tests::evaluation();
+        evaluation.agent = bp.name.clone();
+        evaluation.cases = cases(&bp, &evaluation.seeds, &store.evaluation_dir());
+        let error = || {
+            let e = folder(&store, &evaluation, &bp, &ShareStore::default()).unwrap_err();
+            format!("{e:#}")
+        };
+        // Not drafted from the template (from a file, say): no hint.
+        let plain = error();
+        assert!(plain.ends_with("--check test=COMMAND"), "{plain}");
+        let draft = Draft {
+            blueprint: value,
+            provenance: Provenance {
+                source: "template".into(),
+                template: Some("implementer".into()),
+                at: now(),
+                ..Provenance::default()
+            },
+            tries: 0,
+        };
+        store
+            .create_draft(
+                &bp.name,
+                &draft,
+                "alice",
+                "drafted from template implementer",
+            )
+            .unwrap();
+        let hinted = error();
+        let hint = " (its fixtures are a Node project: --check test=\"node --test\")";
+        assert_eq!(hinted, format!("{plain}{hint}"));
     }
 
     #[test]
