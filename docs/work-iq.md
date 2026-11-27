@@ -362,6 +362,14 @@ sign-off of exactly that change:
   `jsonBody`, an object or a JSON-encoded string; `headers` with `If-Match`, for an update or
   a delete. The session lists them, though their annotations say they change things: that's
   what they are for. Any other tool whose annotations say it changes things stays refused.
+- **Work IQ's `sessionId` and `agentId`.** Work IQ's schemas give the change tools two more
+  optional arguments: `sessionId`, its telemetry ID for a task, which it asks for with every
+  call, and `agentId`, null by default. The session lists the change tools without them (in
+  each one's `inputSchema`, its `properties` and `required`), so the model isn't asked for
+  them; the read tools' schemas are listed as Work IQ gives them. A change call that sends
+  them anyway is taken: a `sessionId` (a string) and a null `agentId` are left out of the
+  change, so they aren't signed off, shown in the sign-off or sent to Work IQ. An `agentId`
+  that isn't null is refused before anyone is asked: a change can't name a Work IQ agent.
 - **Checked.** Each call is held to the rules above. One that breaks a rule gets a tool error
   that names the rule, and nobody is asked.
 - **Signed off.** The call becomes a signed approval request from the worker to your agent,
@@ -371,9 +379,10 @@ sign-off of exactly that change:
   200 characters of its prompt). The model's call waits for your answer for up to `--wait` of
   awake time (`workiq_changes.wait_minutes`: 1 to 10 minutes, as `5m` or `5`; 5 by default).
 - **Approved** (a verified approval signed by you, approving, whose `prompt_sha256` is the
-  SHA-256 of the request's text): the change is made once, with exactly the call's arguments,
-  through the session's audited client. The model gets its outcome: *done* (a created
-  entity's id and link), *accepted* (202), *failed*, or *outcome unknown*.
+  SHA-256 of the request's text): the change is made once, with exactly the call's arguments
+  but `sessionId` and `agentId`, through the session's audited client. The model gets its
+  outcome: *done* (a created entity's id and link), *accepted* (202), *failed*, or *outcome
+  unknown*.
 - **Rejected, or asked for changes:** nothing is sent to Work IQ. The model gets *You didn't
   approve this change, so nothing was changed*, then your note.
 - **No answer in time:** the request is withdrawn from your agent, so a late answer finds no

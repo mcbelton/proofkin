@@ -2974,8 +2974,12 @@ never gets them (plans [propose changes](#making-microsoft-365-changes-in-a-plan
 nor does a peer's, whatever its grant.
 
 - The session also lists Work IQ's change tools: `create_entity`, `update_entity`,
-  `delete_entity` and `do_action` (`parentUrl`, `entityUrl` or `actionUrl`; `jsonBody`;
-  `headers` with `If-Match` for an update or a delete).
+  `delete_entity` and `do_action`. A change call takes `parentUrl`, `entityUrl` or
+  `actionUrl`; `jsonBody`; and `headers` with `If-Match` for an update or a delete. Work IQ's
+  optional `sessionId` (its telemetry ID, a string) and `agentId` when null are accepted too,
+  and left out of the change: never signed off, shown or sent to Work IQ (the session lists
+  the tools without them). An `agentId` that isn't null is refused: a change can't name a
+  Work IQ agent.
 - Each call is checked with the rules of a plan's changes (a path with no host, a JSON body,
   and so on); one that breaks a rule gets a tool error naming it, and nobody is asked.
 - Then it waits for your sign-off under **Waiting for your approval**: *Microsoft 365 change

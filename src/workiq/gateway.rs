@@ -421,7 +421,9 @@ async fn handle(
 impl Session {
     /// Work IQ's tools that this task may call: allowed for the session, and not ones Work
     /// IQ itself says change things (its annotations), whatever their name, but for the
-    /// change tools a session offers, whose changes its task's owner signs off.
+    /// change tools a session offers, whose changes its task's owner signs off. Those are
+    /// listed without the arguments a change leaves out ([`change_schema`]); the others'
+    /// schemas are as Work IQ gives them.
     async fn tools_list(&self) -> Result<Value, (i64, String)> {
         let tools = self
             .client
@@ -435,13 +437,18 @@ impl Session {
                     && (!tool.says_it_changes() || self.signs_off(&tool.name))
             })
             .map(|tool| {
+                let schema = if tool.input_schema.is_object() {
+                    tool.input_schema.clone()
+                } else {
+                    json!({ "type": "object" })
+                };
                 json!({
                     "name": tool.name,
                     "description": tool.description.clone().unwrap_or_default(),
-                    "inputSchema": if tool.input_schema.is_object() {
-                        tool.input_schema.clone()
+                    "inputSchema": if self.signs_off(&tool.name) {
+                        change_schema(schema)
                     } else {
-                        json!({ "type": "object" })
+                        schema
                     },
                 })
             })
@@ -590,6 +597,19 @@ impl Session {
 /// how it ended (never its body).
 fn made_line(change: &Change, outcome: &Outcome) -> String {
     redact(&format!("{}: {}", change.label(), outcome.describe())).0
+}
+
+/// A change tool's input `schema` as a session lists it: without the arguments a change
+/// leaves out ([`changes::LEFT_OUT`]) in its `properties` and `required`, so the model isn't
+/// asked to send them.
+fn change_schema(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.retain(|name, _| !changes::LEFT_OUT.contains(&name.as_str()));
+    }
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|name| !changes::LEFT_OUT.iter().any(|left| name == left));
+    }
+    schema
 }
 
 /// What a task's owner signs off for `change`: the change as a person reads it, its SHA-256,

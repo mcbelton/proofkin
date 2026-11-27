@@ -23,6 +23,10 @@ pub const TOOLS: [&str; 4] = [
     "delete_entity",
     "do_action",
 ];
+/// The optional arguments Work IQ's change tools take besides the change, which a change
+/// leaves out: `sessionId`, Work IQ's telemetry ID for a task, and `agentId`, only when null
+/// (a change can't name a Work IQ agent). They aren't signed off, shown or sent to Work IQ.
+pub const LEFT_OUT: [&str; 2] = ["sessionId", "agentId"];
 /// The most changes a step proposes.
 pub const MAX_CHANGES: usize = 20;
 /// The largest block, in bytes.
@@ -68,7 +72,8 @@ impl Change {
     /// The change a call of Work IQ's change tool `tool` with `arguments` makes: the inverse
     /// of [`Change::arguments`]. Its path is `parentUrl`, `entityUrl` or `actionUrl`;
     /// `jsonBody` is a JSON object or one encoded as a string; `headers` has only
-    /// `If-Match`. An error says what is wrong; [`check`] then holds it to the rules.
+    /// `If-Match`. Work IQ's `sessionId` (a string) and a null `agentId` are taken and left
+    /// out ([`LEFT_OUT`]). An error says what is wrong; [`check`] then holds it to the rules.
     pub fn from_arguments(tool: &str, arguments: &Value) -> std::result::Result<Change, String> {
         let url = match tool {
             "create_entity" => "parentUrl",
@@ -84,16 +89,29 @@ impl Change {
         let Some(given) = arguments.as_object() else {
             return Err(format!("{tool}'s arguments are a JSON object"));
         };
+        let takes = [url, "jsonBody", "headers"];
         let unknown: Vec<&str> = given
             .keys()
             .map(String::as_str)
-            .filter(|key| ![url, "jsonBody", "headers"].contains(key))
+            .filter(|key| !takes.contains(key) && !LEFT_OUT.contains(key))
             .collect();
         if !unknown.is_empty() {
             return Err(format!(
                 "{tool} takes {url}, jsonBody and headers, not {}",
                 cut(&unknown.join(", "), 200)
             ));
+        }
+        match given.get("sessionId") {
+            None | Some(Value::Null | Value::String(_)) => {}
+            Some(_) => return Err("sessionId is Work IQ's telemetry ID, as a string".into()),
+        }
+        match given.get("agentId") {
+            None | Some(Value::Null) => {}
+            Some(_) => {
+                return Err(
+                    "a change can't name a Work IQ agent, so agentId is null or left out".into(),
+                );
+            }
         }
         let Some(Value::String(path)) = given.get(url) else {
             return Err(format!(
@@ -982,6 +1000,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(check(&deleted), Err("delete_entity has no body".into()));
+    }
+
+    #[test]
+    fn work_iqs_session_id_and_a_null_agent_id_are_left_out_of_the_change() {
+        let mut changes = proposed(&block(&[MAIL, UPDATE])).unwrap().unwrap();
+        for other in [
+            r#"{"tool":"create_entity","path":"/me/events","body":{"subject":"Sync"}}"#,
+            r#"{"tool":"delete_entity","path":"/me/messages/AAMk2"}"#,
+        ] {
+            changes.push(serde_json::from_str(other).unwrap());
+        }
+        for change in changes {
+            let without = change.arguments();
+            let mut with = without.clone();
+            with["sessionId"] = json!("5d1f0c4e-7b2a-4c3e-9f10-2a6b8c9d0e1f");
+            with["agentId"] = Value::Null;
+            let read = Change::from_arguments(&change.tool, &with).unwrap();
+            let plain = Change::from_arguments(&change.tool, &without).unwrap();
+            assert_eq!(read, plain);
+            assert_eq!(check(&read), Ok(()));
+            assert_eq!(read.arguments(), without, "neither is sent");
+        }
+
+        // A sessionId is what Work IQ's schema says it is: a string.
+        let err = Change::from_arguments(
+            "create_entity",
+            &json!({ "parentUrl": "/me/events", "jsonBody": {}, "sessionId": 7 }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "sessionId is Work IQ's telemetry ID, as a string");
+    }
+
+    #[test]
+    fn a_change_call_that_names_a_work_iq_agent_is_refused() {
+        let refused = "a change can't name a Work IQ agent, so agentId is null or left out";
+        for agent in [json!("sales:1"), json!(""), json!({ "id": "sales:1" })] {
+            let arguments = json!({
+                "actionUrl": "/me/sendMail",
+                "jsonBody": {},
+                "sessionId": "s1",
+                "agentId": agent,
+            });
+            assert_eq!(
+                Change::from_arguments("do_action", &arguments),
+                Err(refused.to_owned()),
+                "{arguments}"
+            );
+        }
     }
 
     #[test]
