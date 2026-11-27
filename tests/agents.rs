@@ -18,6 +18,7 @@ use proofkin::{
     Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Profile, Provider,
     Ran, SecretKey, TaskContext, TrustStore, TrustedPeer, Usage,
 };
+use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -1439,6 +1440,54 @@ async fn wait_stopped(stopped: &AtomicUsize, count: usize) {
 }
 
 #[tokio::test]
+async fn a_requester_gone_past_the_task_grace_stops_its_tasks_with_a_reason() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    worker.grace = Duration::from_secs(3);
+    // Keep waiting on the requester's end so we can see the worker's result on return.
+    boss.grace = Duration::from_secs(60);
+    mutual(&mut worker, &mut boss);
+    let stopped = worker.stopped.clone();
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let pending = boss
+        .send_task(worker.id(), LlmTask::new(Provider::Copilot, "hang"), None)
+        .unwrap();
+    let task_id = pending.task_id();
+    let received = Event::TaskReceived {
+        from: "boss".into(),
+        task_id,
+        provider: Provider::Copilot,
+        origin: None,
+        team: false,
+    };
+    next_matching(&mut worker_events, |e| e == &received).await;
+
+    let lost = std::time::Instant::now();
+    assert!(boss.disconnect(worker.id()));
+    let completed = Event::TaskCompleted {
+        from: "boss".into(),
+        task_id,
+        outcome: Outcome::Cancelled,
+        stop: Some("stopped: boss was gone for 3 s".into()),
+    };
+    next_matching(&mut worker_events, |e| e == &completed).await;
+    assert!(lost.elapsed() >= Duration::from_secs(3));
+    wait_stopped(&stopped, 1).await;
+
+    boss.connect(worker.addr()).await.unwrap();
+    let result = timeout(Duration::from_secs(10), pending.finish(|_| {}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!result.ok && !result.refused, "{result:?}");
+    assert_eq!(result.output, "task stopped: boss was gone for 3 s");
+}
+
+#[tokio::test]
 async fn cancelling_a_delegated_task_stops_it_on_the_worker() {
     let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
     let mut boss = Node::new("boss");
@@ -1453,13 +1502,13 @@ async fn cancelling_a_delegated_task_stops_it_on_the_worker() {
     wait_for_peers(&boss, 1).await;
 
     // Fill both task slots with hanging tasks, then cancel them from the requester.
+    let request = LlmTask::new(Provider::Copilot, "hang");
     let mut hanging = Vec::new();
+    let mut task_ids = Vec::new();
     for _ in 0..2 {
-        let (boss, id) = (boss.clone(), worker.id());
-        hanging.push(tokio::spawn(async move {
-            boss.delegate(id, LlmTask::new(Provider::Copilot, "hang"))
-                .await
-        }));
+        let delegation = boss.send_task(worker.id(), request.clone(), None).unwrap();
+        task_ids.push(delegation.task_id());
+        hanging.push(tokio::spawn(delegation.finish(|_| {})));
         next_matching(&mut worker_events, |e| {
             matches!(e, Event::TaskReceived { .. })
         })
@@ -1475,9 +1524,28 @@ async fn cancelling_a_delegated_task_stops_it_on_the_worker() {
         })
         .await;
         assert!(
-            matches!(completed, Event::TaskCompleted { outcome: Outcome::Cancelled, ref from, .. } if from == "boss"),
+            matches!(
+                completed,
+                Event::TaskCompleted {
+                    outcome: Outcome::Cancelled,
+                    ref from,
+                    stop: Some(ref stop),
+                    task_id: _,
+                } if from == "boss" && stop == "cancelled by boss"
+            ),
             "{completed:?}"
         );
+    }
+
+    // Dropping the waits sent TaskCancel. The worker keeps that result for replays.
+    for task_id in task_ids {
+        let delegation = boss.rejoin_task(worker.id(), task_id, request.clone(), None);
+        let result = timeout(Duration::from_secs(10), delegation.finish(|_| {}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!result.ok && !result.refused, "{result:?}");
+        assert_eq!(result.output, "task cancelled by boss");
     }
 
     // The slots are free again: a new task runs right away.
@@ -1913,6 +1981,99 @@ async fn plan_steps_after_a_failure_are_skipped() {
     assert!(matches!(&states["independent"], StepState::Done { .. }));
     assert!(
         matches!(&states["away"], StepState::Failed { peer: None, error, .. } if error.contains("not connected"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_served_task_runs_once_through_replacement_and_repeated_disconnects() {
+    #[derive(Default)]
+    struct GatedRun {
+        starts: AtomicUsize,
+        finish: Notify,
+    }
+
+    #[async_trait]
+    impl Executor for GatedRun {
+        fn providers(&self) -> Vec<Provider> {
+            vec![Provider::Copilot]
+        }
+
+        async fn execute(&self, _task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<Ran> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.finish.notified().await;
+            Ok(Ran::new("finished the original run", None))
+        }
+    }
+
+    let run = Arc::new(GatedRun::default());
+    let mut worker = Node::new("worker");
+    worker.executor = Some(run.clone());
+    let mut boss = Node::new("boss");
+    worker.grace = Duration::from_secs(15);
+    boss.grace = worker.grace;
+    mutual(&mut worker, &mut boss);
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, mut boss_events) = boss.start().await;
+    let (low, high) = if boss.id() < worker.id() {
+        (&boss, &worker)
+    } else {
+        (&worker, &boss)
+    };
+    high.connect(low.addr()).await.unwrap();
+    // Wait until the initial handshake's replay pass is done before sending the task.
+    wait_until(|| {
+        boss.peers()
+            .iter()
+            .any(|peer| peer.id == worker.id() && peer.load.is_some())
+    })
+    .await;
+
+    let delegation = boss
+        .send_task(worker.id(), LlmTask::new(Provider::Copilot, "wait"), None)
+        .unwrap();
+    let task_id = delegation.task_id();
+    let reports = Arc::new(AtomicUsize::new(0));
+    let running = reports.clone();
+    let task = tokio::spawn(delegation.finish(move |p| {
+        if p.phase == Phase::Running && p.attempt == Some(1) {
+            running.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    wait_until(|| run.starts.load(Ordering::SeqCst) == 1 && reports.load(Ordering::SeqCst) == 1)
+        .await;
+    // The second connection replaces the first while its reader is still live.
+    // Each replay of the model's progress proves the request reached the worker again.
+    low.reconnect(high.id()).await.unwrap();
+    wait_until(|| reports.load(Ordering::SeqCst) == 2).await;
+
+    let lost_boss = Event::PeerDisconnected {
+        name: "boss".into(),
+        id: boss.id(),
+    };
+    let lost_worker = Event::PeerDisconnected {
+        name: "worker".into(),
+        id: worker.id(),
+    };
+    for copies in [3, 4, 5] {
+        assert!(boss.disconnect(worker.id()));
+        next_matching(&mut worker_events, |e| e == &lost_boss).await;
+        next_matching(&mut boss_events, |e| e == &lost_worker).await;
+        boss.connect(worker.addr()).await.unwrap();
+        wait_until(|| reports.load(Ordering::SeqCst) == copies).await;
+    }
+
+    run.finish.notify_one();
+    let delivered = timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(delivered.ok && delivered.verified, "{delivered:?}");
+    assert_eq!(delivered.output, "finished the original run");
+    assert_eq!(
+        run.starts.load(Ordering::SeqCst),
+        1,
+        "task #{task_id} ran twice"
     );
 }
 

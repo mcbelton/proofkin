@@ -156,7 +156,15 @@ def main():
     if not args.no_gates:
         gates.append(("fmt", *run("fmt", ["cargo", "fmt", "--check"])[:1]))
         gates.append(("clippy", *run("clippy", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"])[:1]))
-    tests_ok, test_out = run("test", ["cargo", "test", "--locked", "--no-fail-fast", "--color", "never"])
+    test_env = None
+    if os.name == "nt" and "CARGO_TARGET_DIR" not in os.environ:
+        # A running debug agent can hold proofkin.exe open on Windows. Separate
+        # test executables from it without moving Cargo's cached intermediates.
+        test_env = {
+            "CARGO_TARGET_DIR": os.path.join(OUT, "cargo-target"),
+            "CARGO_BUILD_BUILD_DIR": os.environ.get("CARGO_BUILD_BUILD_DIR", os.path.dirname(OUT)),
+        }
+    tests_ok, test_out = run("test", ["cargo", "test", "--locked", "--no-fail-fast", "--color", "never"], env=test_env)
     gates.append(("tests", tests_ok))
     tests = parse_tests(test_out)
     sections = failed_output(test_out)
@@ -305,4 +313,6 @@ def render_markdown(report):
 
 
 if __name__ == "__main__":
+    # Report failures even on legacy console encodings; the logs stay UTF-8.
+    sys.stdout.reconfigure(errors="backslashreplace")
     sys.exit(main())
