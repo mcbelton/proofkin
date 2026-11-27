@@ -838,8 +838,10 @@ plan, then run it yourself.
 - **In the web UI:** in Plan mode, **Draft with a model…** (beside **Start from a
   playbook…**) opens the plan editor on its **Describe** view:
   - Say *What should the plan do?*, name an issue of the [tracker's](#tracked-work)
-    repository if you like (`#42`), and pick the model that writes it: each provider the
-    profile is signed in to, at its default model. Then press **Draft plan**.
+    repository if you like (`#42`), and pick **Provider**, **Model** and **Reasoning** as
+    in **Run task** on **This agent**. Choose a provider your profile is signed in to,
+    then keep its defaults or pick an allowed model and reasoning level. Then press
+    **Draft plan**.
   - While the model writes, the view says so: *copilot's model (claude-opus-5.5) is
     writing the plan*, then *try 2 of 3: fixing 2 problems*.
   - The plan goes into the editor's Builder and Text views, checked as usual, with the
@@ -850,21 +852,25 @@ plan, then run it yourself.
     writes the whole plan again.
   - **Run plan** stays your click, with the editor's check and tracking choice.
 - **From the command line:** `plan draft` prints the plan, or writes it to `--out`, then
-  its problems. It exits 1 while errors remain.
+  its problems. It exits 1 while errors remain. Choose a provider with `--using`, or
+  override its defaults with `--model <name>` and `--effort <level>`.
 
   ```powershell
-  proofkin plan draft "Add CSV export to the reports page, with tests" --profile boss > csv.plan
+  proofkin plan draft "Add CSV export to the reports page, with tests" --using copilot --model claude-sonnet-5.5 --effort low --profile boss > csv.plan
   proofkin plan draft --issue 42 --using claude --profile boss --out issue-42.plan
   proofkin plan draft --from csv.plan --note "add a review by #qa before the sign-off" --profile boss --out csv.plan
   ```
 
-- **For other agents:** the `draft_plan` MCP tool (`goal`, `issue`, `plan`, `note`) answers
-  the plan and its problems ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
+- **For other agents:** the `draft_plan` MCP tool (`goal`, `issue`, `plan`, `note`, and
+  optional `provider`, `model`, `effort`) answers the plan and its problems
+  ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
   `run_plan` still runs a plan, so an agent can draft one, show it to its user, then run
   it.
-- **The API:** `POST /api/plans/draft` with `{goal, issue?, provider?, plan?, note?}`
-  answers `{plan, problems, provider, model, effort, tries}`. Its progress goes out as
-  events.
+- **The API:** `POST /api/plans/draft` with `{goal, issue?, provider?, model?, effort?, plan?, note?}`
+  answers `{plan, problems, provider, model, effort, tries}`. With no provider named, the
+  first signed-in provider writes it. Omit model or effort to use the profile's default.
+  Invalid or disallowed model and reasoning choices are refused with HTTP 400 before
+  looking up an issue or asking a model. Progress goes out as events.
 
 **What the model gets:**
 - The goal, at most 4,000 characters, with secrets redacted. With an issue, the issue's
@@ -895,8 +901,8 @@ goal's first line (redacted): `// Drafted by copilot (claude-opus-5.5): <goal>`.
 **A draft is data.** Drafting runs, grants, sends and changes nothing. Running it is a
 separate action, through the usual check and tracking choice (a tracked run posts its steps
 on GitHub, as the editor says). Each draft goes in the activity and the
-[audit log](#audit-log), with who asked, the provider and model, the tries and the goal's
-SHA-256 (never its text).
+[audit log](#audit-log), with who asked, the provider, model and reasoning effort, the tries
+and the goal's SHA-256 (never its text).
 
 #### Live status
 

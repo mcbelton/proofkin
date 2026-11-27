@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{Network, PeerInfo};
 use crate::audit::{AuditEntry, AuditLog, Outcome};
 use crate::boundary::{guard, wrap};
-use crate::factory::draft::{Reading, ask_until};
+use crate::factory::draft::{DraftModel, Reading, ask_until};
 use crate::knowledge::KnowledgeBase;
 use crate::llm::{Access, Executor, ExecutorConfig, Provider, SdkExecutor};
 use crate::plan::{FORMAT, Plan, Problem, Recipients, SquadStore, preflight};
@@ -49,6 +49,12 @@ pub struct Ask {
     /// The provider whose model writes it (default: the first the profile is signed in to).
     #[serde(default)]
     pub provider: Option<Provider>,
+    /// The model that writes it (none: the profile's default for the provider).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Its reasoning effort (none: the profile's default for the provider).
+    #[serde(default)]
+    pub effort: Option<String>,
     /// A plan to change, with `note`.
     #[serde(default)]
     pub plan: Option<String>,
@@ -120,6 +126,16 @@ impl Ask {
             );
         }
         Ok(())
+    }
+
+    /// Checks the model and effort before reading an issue or asking a model.
+    pub(crate) fn pick_model(&self, profile: &Profile, provider: Provider) -> Result<DraftModel> {
+        DraftModel::pick(
+            &profile.models(),
+            provider,
+            self.model.as_deref(),
+            self.effort.as_deref(),
+        )
     }
 
     /// The request this asks for, with issue text `issue` (see [`issue_text`]).
@@ -384,17 +400,16 @@ fn errors_text(problems: &[Problem]) -> String {
     errors.join("; ")
 }
 
-/// Has `executor`'s model of `provider` (at the profile's default model and effort, as
-/// `models` allows them) write the plan `request` asks for, for what `available` holds.
-/// `progress` hears each try.
-pub async fn write(
+/// Has `executor`'s chosen model write the plan `request` asks for, for what `available`
+/// holds. `progress` hears each try.
+pub(crate) async fn write(
     executor: &dyn Executor,
-    provider: Provider,
-    models: &crate::models::Models,
+    model: DraftModel,
     request: &Request,
     available: &Available,
     progress: &(dyn Fn(String) + Send + Sync),
 ) -> Result<Drafted> {
+    let provider = model.provider;
     let mut base = prompt(request, available);
     if let Some(change) = &request.change {
         base = changes_prompt(
@@ -426,7 +441,7 @@ pub async fn write(
             written: Some(plan),
         }
     };
-    let tried = ask_until(executor, provider, models, &base, "plan", &read, progress).await?;
+    let tried = ask_until(executor, model, &base, "plan", &read, progress).await?;
     let Some(plan) = tried.written else {
         bail!("the model didn't write a plan in {TRIES} tries: its answers held none");
     };
@@ -490,8 +505,8 @@ pub async fn issue_text(profile: &Profile, n: u64) -> Result<String> {
 }
 
 /// Records `drafted`, which `by` asked for at `started`, in the profile's audit (whose own
-/// id is `own_id`): who asked, the provider, model and tries, and the goal's SHA-256, not
-/// its text.
+/// id is `own_id`): who asked, the provider, model, effort and tries, and the goal's
+/// SHA-256, not its text.
 pub fn record(profile: &Profile, drafted: &Drafted, by: &str, own_id: &str, started: SystemTime) {
     AuditLog::new(profile.audit_path()).record(&AuditEntry {
         ts_ms: started
@@ -510,7 +525,7 @@ pub fn record(profile: &Profile, drafted: &Drafted, by: &str, own_id: &str, star
         error: None,
         origin: Some("a plan draft".into()),
         team: false,
-        model: drafted.model.clone(),
+        model: crate::models::with_effort(drafted.model.clone(), drafted.effort.as_deref()),
         usage: None,
         agent: None,
         attempts: Some(drafted.tries),
@@ -521,11 +536,14 @@ pub fn record(profile: &Profile, drafted: &Drafted, by: &str, own_id: &str, star
 
 /// What the activity says of `drafted`, which `by` asked for.
 pub fn activity(drafted: &Drafted, by: &str) -> String {
-    let model = drafted
+    let mut model = drafted
         .model
         .as_deref()
         .map(|m| format!(" ({m})"))
         .unwrap_or_default();
+    if let Some(effort) = &drafted.effort {
+        model.push_str(&format!(" at {effort} reasoning"));
+    }
     let errors = drafted.errors();
     let warnings = drafted.problems.len() - errors;
     let tries = if drafted.tries == 1 { "try" } else { "tries" };
@@ -590,6 +608,7 @@ pub async fn draft_offline(
     let started = SystemTime::now();
     ask.validate()?;
     let provider = provider_for(profile, ask.provider)?;
+    let model = ask.pick_model(profile, provider)?;
     let issue = match ask.issue {
         Some(n) => Some(issue_text(profile, n).await?),
         None => None,
@@ -604,15 +623,7 @@ pub async fn draft_offline(
     })
     .await?;
     let request = ask.request(issue);
-    let drafted = write(
-        executor.as_ref(),
-        provider,
-        &profile.models(),
-        &request,
-        &available,
-        progress,
-    )
-    .await;
+    let drafted = write(executor.as_ref(), model, &request, &available, progress).await;
     executor.stop().await;
     let drafted = drafted?;
     let own_id = profile
@@ -629,13 +640,14 @@ mod tests {
 
     use super::*;
     use crate::factory::draft::tests::Scripted;
+    use crate::models::ModelChoice;
     use crate::plan::Squad;
     use crate::shares::ShareInfo;
 
     const SECRET: &str = "ghp_a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2a1B2";
 
     struct Fixture {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         available: Available,
     }
 
@@ -685,10 +697,7 @@ mod tests {
             recipients: Recipients::default(),
             tracker: Some("acme/app".into()),
         };
-        Fixture {
-            _dir: dir,
-            available,
-        }
+        Fixture { dir, available }
     }
 
     fn fenced(plan: &str) -> String {
@@ -704,6 +713,10 @@ mod tests {
 
     const GOOD: &str = "fix @alice:app Fix the parser";
     const BAD: &str = "fix @ghost:app Fix the parser";
+
+    fn default_model() -> DraftModel {
+        DraftModel::pick(&Default::default(), Provider::Copilot, None, None).unwrap()
+    }
 
     #[test]
     fn the_prompt_has_the_format_and_what_the_agent_may_use_but_no_secret_or_knowledge_text() {
@@ -743,8 +756,7 @@ mod tests {
         let lines = Mutex::new(Vec::new());
         let drafted = write(
             &model,
-            Provider::Copilot,
-            &Default::default(),
+            default_model(),
             &goal("Fix the parser"),
             &f.available,
             &|line| lines.lock().unwrap().push(line),
@@ -780,6 +792,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_try_uses_the_requested_model_and_effort_or_the_profiles_defaults() {
+        let f = fixture();
+        let mut profile = Profile::open_in(f.dir.path(), "owner").unwrap();
+        profile.config.models.insert(
+            Provider::Copilot,
+            ModelChoice {
+                default: Some("claude-opus-5.5".into()),
+                effort: Some("medium".into()),
+                ..ModelChoice::default()
+            },
+        );
+        for (model, effort, (expected_model, expected_effort)) in [
+            (
+                Some("claude-sonnet-5.5"),
+                Some("low"),
+                ("claude-sonnet-5.5", "low"),
+            ),
+            (None, None, ("claude-opus-5.5", "medium")),
+        ] {
+            let ask = Ask {
+                goal: Some("Fix the parser".into()),
+                model: model.map(str::to_owned),
+                effort: effort.map(str::to_owned),
+                ..Ask::default()
+            };
+            let executor = Scripted::new(&[fenced(BAD), fenced(GOOD)]).report_task_settings();
+            let model = ask.pick_model(&profile, Provider::Copilot).unwrap();
+            let lines = Mutex::new(Vec::new());
+            let progress = |line| lines.lock().unwrap().push(line);
+            let drafted = write(
+                &executor,
+                model,
+                &ask.request(None),
+                &f.available,
+                &progress,
+            )
+            .await
+            .unwrap();
+            assert_eq!(drafted.tries, 2);
+            for (task, _) in executor.asked() {
+                assert_eq!(task.model.as_deref(), Some(expected_model));
+                assert_eq!(task.effort.as_deref(), Some(expected_effort));
+            }
+            assert_eq!(drafted.model.as_deref(), Some(expected_model));
+            assert_eq!(drafted.effort.as_deref(), Some(expected_effort));
+            assert_eq!(
+                lines.into_inner().unwrap()[0],
+                format!("copilot's model ({expected_model}) is writing the plan")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn after_three_failing_tries_the_last_plan_comes_back_with_its_problems() {
         let f = fixture();
         let last = "fix @nobody:app Fix the parser";
@@ -790,8 +855,7 @@ mod tests {
         ]);
         let drafted = write(
             &model,
-            Provider::Copilot,
-            &Default::default(),
+            default_model(),
             &goal("Fix the parser"),
             &f.available,
             &|_| {},
@@ -827,8 +891,7 @@ mod tests {
         )]);
         let drafted = write(
             &model,
-            Provider::Copilot,
-            &Default::default(),
+            default_model(),
             &goal("Fix the parser\nand more words"),
             &f.available,
             &|_| {},
@@ -853,16 +916,9 @@ mod tests {
             ..Ask::default()
         }
         .request(None);
-        let drafted = write(
-            &model,
-            Provider::Copilot,
-            &Default::default(),
-            &request,
-            &f.available,
-            &|_| {},
-        )
-        .await
-        .unwrap();
+        let drafted = write(&model, default_model(), &request, &f.available, &|_| {})
+            .await
+            .unwrap();
         let prompt = &model.asked()[0].0.prompt;
         assert!(
             prompt.contains(&format!(
@@ -891,7 +947,7 @@ mod tests {
             issue,
             plan: Some(plan.into()),
             note: Some(note.into()),
-            provider: None,
+            ..Ask::default()
         };
         assert!(ask("Ship it", None, "", "").validate().is_ok());
         assert!(ask("", Some(4), "", "").validate().is_ok());

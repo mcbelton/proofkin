@@ -497,10 +497,11 @@
     {
       "id": "PLAN-4",
       "area": "plans",
-      "claim": "The profile's own model drafts a plan (the plan editor's Describe view, POST /api/plans/draft, plan draft and the draft_plan MCP tool) from a goal (at most 4,000 characters, secrets redacted), a GitHub issue of the tracker's repository (its text as external content), or a plan and a note saying what should change. Its prompt has the plan format reference, which names every step kind and option the parser takes, and what this agent may use as the plan check sees it (peers, their folders, checks and flags, squads, skills, agents, knowledge topic and MCP server names, Work IQ, the tracker, playbooks), never a knowledge topic's text. The plan is read from the answer's fenced block, checked as Run plan checks it and, while it has errors, written again with them, at most 3 tries; the last plan comes back with its problems, headed by a comment naming the model and the goal. Drafting runs, grants and sends nothing: it starts no task or run, and is recorded in the activity and the audit with who asked, the provider and model, the tries and the goal's SHA-256, not its text (TM-16).",
+      "claim": "The profile's own model drafts a plan (the plan editor's Describe view, POST /api/plans/draft, plan draft and the draft_plan MCP tool) from a goal (at most 4,000 characters, secrets redacted), a GitHub issue of the tracker's repository (its text as external content), or a plan and a note saying what should change. Describe shares the Model and Reasoning choices of Run task on this agent, from the profile's settings and account offers. The requested model and effort are checked against the profile before an issue is read or a model runs; omissions use its defaults. Every try uses those choices and the answer gives the model and effort that ran. Its prompt has the plan format reference, which names every step kind and option the parser takes, and what this agent may use as the plan check sees it (peers, their folders, checks and flags, squads, skills, agents, knowledge topic and MCP server names, Work IQ, the tracker, playbooks), never a knowledge topic's text. The plan is read from the answer's fenced block, checked as Run plan checks it and, while it has errors, written again with them, at most 3 tries; the last plan comes back with its problems, headed by a comment naming the model and the goal. Drafting runs, grants and sends nothing: it starts no task or run, and is recorded in the activity and the audit with who asked, the provider, model and reasoning, the tries and the goal's SHA-256, not its text (TM-16).",
       "tests": [
         "lib::plan_draft::the_prompt_has_the_format_and_what_the_agent_may_use_but_no_secret_or_knowledge_text",
         "lib::plan_draft::a_plan_with_errors_goes_back_with_them_until_one_passes",
+        "lib::plan_draft::every_try_uses_the_requested_model_and_effort_or_the_profiles_defaults",
         "lib::plan_draft::after_three_failing_tries_the_last_plan_comes_back_with_its_problems",
         "lib::plan_draft::the_plan_is_read_from_the_fenced_block_and_the_prose_around_it_dropped",
         "lib::plan_draft::changing_a_plan_gives_the_model_the_plan_and_the_note",
@@ -508,7 +509,10 @@
         "lib::tracker::a_plan_drafted_for_an_issue_gets_its_text_as_external_content",
         "lib::plan::the_format_reference_names_every_step_kind_and_option_the_parser_takes",
         "ui::the_owner_drafts_a_plan_with_the_profiles_model_through_the_api",
+        "ui::plan_draft_refuses_disallowed_models_and_efforts_before_reading_an_issue",
+        "ui::task_forms_offer_the_models_and_levels_the_worker_allows",
         "connect::other_agents_draft_plans_over_mcp_and_drafting_runs_nothing",
+        "plan_draft::plan_draft_passes_the_model_and_effort_flags_to_the_bridge_and_refuses_bad_values",
         "plan_draft::plan_draft_prints_the_plan_then_its_problems_and_fails_while_errors_remain"
       ]
     },
