@@ -4,9 +4,9 @@
 //! Results are read from the tool result's `structuredContent`, never from the MCP `content`
 //! array, except where Work IQ gives what is asked for only there: an `ask` answer's text
 //! (when it has no structured answer) and the `list_agents` list. Fail closed: only
-//! `contentProtection: "allowed"` is kept, a peer gets only the labels
-//! its allowlist names, secrets are redacted, and every result sits in the external-content
-//! envelope.
+//! `contentProtection: "allowed"` is kept (People results, which come without one, only for
+//! the owner's own agent and digital workers), a peer gets only the labels its allowlist
+//! names, secrets are redacted, and every result sits in the external-content envelope.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -320,6 +320,40 @@ fn assemble(parts: Vec<String>, withheld: &Withheld, kept: usize) -> String {
     out.join("\n\n") + "\n"
 }
 
+/// Work IQ's decision on handing out a result, as the content policy reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Protection {
+    Allowed,
+    /// No `contentProtection` value.
+    Missing,
+    Blocked,
+    /// Any other `contentProtection` value.
+    Other,
+}
+
+/// What a result's `contentProtection` decides for `audience`: only `allowed` (after trimming)
+/// lets it through, with one exception (#241). Work IQ gives People results no
+/// `contentProtection` at all, and they are directory entries (name, title, link) the owner
+/// can already see, so the `Local` audience gets such a result as if it said `allowed`. A peer
+/// never does, whatever its label.
+fn protection(value: &Value, audience: &Audience) -> Protection {
+    match text(value, "contentProtection").as_deref() {
+        Some("allowed") => Protection::Allowed,
+        None if local_person(value, audience) => Protection::Allowed,
+        None => Protection::Missing,
+        Some(other) if other.eq_ignore_ascii_case("blocked") => Protection::Blocked,
+        Some(_) => Protection::Other,
+    }
+}
+
+/// Whether `value` is a People result without any `contentProtection` (as Work IQ's CLI 1.0.1
+/// gives them) and `audience` is the owner's own.
+fn local_person(value: &Value, audience: &Audience) -> bool {
+    matches!(audience, Audience::Local)
+        && value.get("contentProtection").is_none()
+        && text(value, "entityType").as_deref() == Some("People")
+}
+
 /// What a result held, for the audit log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
@@ -343,8 +377,8 @@ pub fn summarize(result: &ToolResult, audience: &Audience) -> Option<Summary> {
     };
     for value in results {
         let label = label_of(value);
-        let allowed = text(value, "contentProtection").as_deref() == Some("allowed")
-            && audience.allows_label(&label);
+        let allowed =
+            protection(value, audience) == Protection::Allowed && audience.allows_label(&label);
         if !allowed {
             summary.withheld += 1;
         }
@@ -371,17 +405,17 @@ pub fn retrieval_section(result: &ToolResult, audience: &Audience, cap: usize) -
         .map(Vec::as_slice)
         .unwrap_or_default();
     for value in results {
-        match text(value, "contentProtection").as_deref() {
-            Some("allowed") => {}
-            None => {
+        match protection(value, audience) {
+            Protection::Allowed => {}
+            Protection::Missing => {
                 withheld.missing += 1;
                 continue;
             }
-            Some(other) if other.eq_ignore_ascii_case("blocked") => {
+            Protection::Blocked => {
                 withheld.blocked += 1;
                 continue;
             }
-            Some(_) => {
+            Protection::Other => {
                 withheld.other += 1;
                 continue;
             }
@@ -699,6 +733,15 @@ mod tests {
             value["sensitivityLabel"] = json!({ "displayName": label });
         }
         value
+    }
+
+    /// A People result as Work IQ (CLI 1.0.1) gives one: no `contentProtection`, no label.
+    fn person(name: &str) -> Value {
+        json!({
+            "id": name, "entityType": "People", "markdown": format!("{name}, engineer."),
+            "webUrl": format!("https://people.example/{name}"), "resourceId": name,
+            "resourceMetadata": { "web": { "title": name } },
+        })
     }
 
     #[test]
@@ -1035,9 +1078,9 @@ mod tests {
     }
 
     #[test]
-    fn real_retrieve_results_keep_their_titles_dates_and_labels_and_people_are_withheld() {
+    fn real_retrieve_results_keep_their_titles_dates_and_labels_and_people_stay_local() {
         // As Work IQ (CLI 1.0.1) answers: no relevanceScore; files and emails carry a label
-        // object, meetings and chats none; people come without contentProtection.
+        // object, meetings and chats none; people come without contentProtection or a label.
         let label = json!({
             "color": "#13A10E", "displayName": "General", "id": "7d4f5e3a-0000-0000-0000-000000000001",
             "isEncrypted": false, "priority": 1, "tooltip": "Business data that isn't for the public.",
@@ -1076,8 +1119,8 @@ mod tests {
         }));
 
         let local = retrieval_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
-        assert_eq!(local.kept, 3);
-        assert_eq!(local.withheld.missing, 1, "people: no protection decision");
+        assert_eq!(local.kept, 4);
+        assert_eq!(local.withheld, Withheld::default(), "people are kept");
         let text = &local.text;
         assert!(
             text.contains("- Budget (Emails, 2026-11-20T09:00:00Z, General)"),
@@ -1091,7 +1134,11 @@ mod tests {
             text.contains("- Launch chat (Chats, no date, no label information)"),
             "{text}"
         );
-        assert!(!text.contains("Ada, engineer."), "{text}");
+        assert!(
+            text.contains("- Ada (People, no date, no label information)"),
+            "{text}"
+        );
+        assert!(text.contains("Ada, engineer."), "{text}");
         // In Work IQ's order (there are no scores).
         let (budget, sync) = (
             text.find("Budget is final").unwrap(),
@@ -1101,12 +1148,91 @@ mod tests {
         assert_eq!(local.labels, ["General", UNKNOWN]);
 
         // A peer granted General and unlabeled gets the email only: meetings and chats have
-        // no label information, so their sensitivity isn't known.
+        // no label information, so their sensitivity isn't known, and people come without a
+        // protection decision, so they go only to the owner's own agent and digital workers.
         let peer = Audience::peer(["General", "unlabeled"]);
         let theirs = retrieval_section(&result, &peer, DEFAULT_CAP).unwrap();
         assert_eq!(theirs.kept, 1);
         assert_eq!((theirs.withheld.by_label, theirs.withheld.missing), (2, 1));
         assert!(theirs.text.contains("Budget is final."));
+        assert!(!theirs.text.contains("Ada"), "{}", theirs.text);
+    }
+
+    #[test]
+    fn people_without_protection_keep_their_label_locally_and_never_go_to_a_peer() {
+        // Were People results labeled, they would keep their label; a peer still gets none of
+        // them, whatever its grant.
+        let mut general = person("Ada");
+        general["sensitivityLabel"] = json!({ "displayName": "General" });
+        let mut unlabeled = person("Grace");
+        unlabeled["sensitivityLabel"] = json!({});
+        let result = retrieval(json!([general, unlabeled]));
+
+        let local = retrieval_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
+        assert_eq!(local.kept, 2);
+        assert_eq!(local.labels, ["General", UNLABELED]);
+        assert!(
+            local.text.contains("- Ada (People, no date, General)"),
+            "{}",
+            local.text
+        );
+
+        let peer = Audience::peer(["General", "unlabeled"]);
+        let theirs = retrieval_section(&result, &peer, DEFAULT_CAP).unwrap();
+        assert_eq!(theirs.kept, 0);
+        assert_eq!(
+            theirs.withheld,
+            Withheld {
+                missing: 2,
+                ..Withheld::default()
+            }
+        );
+        assert!(!theirs.text.contains("engineer"), "{}", theirs.text);
+    }
+
+    #[test]
+    fn blocked_people_and_other_results_without_protection_are_still_withheld_locally() {
+        let mut blocked = person("Bob");
+        blocked["contentProtection"] = json!("blocked");
+        let mut pending = person("Pat");
+        pending["contentProtection"] = json!("pending");
+        // A null is a value, not the missing contentProtection People results come with.
+        let mut nulled = person("Nil");
+        nulled["contentProtection"] = Value::Null;
+        let file = document("f1", None, Some("General"), 0.9);
+        let result = retrieval(json!([person("Ada"), blocked, pending, nulled, file]));
+
+        let local = retrieval_section(&result, &Audience::Local, DEFAULT_CAP).unwrap();
+        assert_eq!(local.kept, 1);
+        assert!(local.text.contains("workiq:People:Ada"), "{}", local.text);
+        assert_eq!(
+            local.withheld,
+            Withheld {
+                missing: 2,
+                blocked: 1,
+                other: 1,
+                by_label: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn the_audit_counts_people_without_protection_as_kept_locally_and_withheld_for_a_peer() {
+        // One carries a label the peer is granted: it is withheld from the peer all the same.
+        let mut general = person("Ada");
+        general["sensitivityLabel"] = json!({ "displayName": "General" });
+        let result = retrieval(json!([general, person("Grace")]));
+        let local = summarize(&result, &Audience::Local).unwrap();
+        assert_eq!((local.results, local.withheld), (2, 0));
+        assert_eq!(local.labels, ["General", UNKNOWN]);
+        let peer = Audience::peer(["General", "unlabeled"]);
+        assert_eq!(summarize(&result, &peer).unwrap().withheld, 2);
+        // As the prompt section has it.
+        for audience in [Audience::Local, peer] {
+            let section = retrieval_section(&result, &audience, DEFAULT_CAP).unwrap();
+            let summary = summarize(&result, &audience).unwrap();
+            assert_eq!(summary.withheld, section.withheld.total(), "{audience:?}");
+        }
     }
 
     #[test]

@@ -950,9 +950,14 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
   labels beyond the peer's grant.
 - Work IQ labels files and mail, but gives meetings, Teams chats and people no label
   information, so those go only to your own workers, never to a peer. People results also
-  come without Work IQ's decision on whether they may be handed out, so they are withheld
-  (`people` finds nothing usable for now, [#241](https://github.com/mcbelton/proofkin/issues/241);
-  see [docs/work-iq.md](docs/work-iq.md#what-work-iq-offers)).
+  come without Work IQ's decision on whether they may be handed out (`contentProtection`).
+  They are directory entries (name, title, link) you can already see, so your own workers
+  get them as if Work IQ had allowed them, and nothing made from them goes to a peer (they
+  have no label information). A peer never gets them, whatever its grant (`unlabeled`
+  included). A person Work IQ marks anything other than `allowed` (`blocked`, say), and any
+  other result without that decision, are withheld
+  ([#241](https://github.com/mcbelton/proofkin/issues/241); see
+  [docs/work-iq.md](docs/work-iq.md#3-content-policy)).
 - Searches are audited and held to the profile's Work IQ budgets. A Work IQ error or a budget
   refusal fails the step with its one-line message.
 - The run record keeps, for each step, the sources (title, type, label, link), how many
@@ -2005,8 +2010,8 @@ proofkin kb import workiq invoice-retention --query "invoice retention decisions
   `connectors`) with the same rules.
 - The topic is marked as Microsoft 365 content with the labels of the results kept (`unknown`
   for a result without label information), so a peer only gets it if its `--m365` grant
-  includes those labels. Its front matter also has `query:` and `retrieved:` (the date), and
-  it has the source note `Work IQ retrieve`.
+  includes those labels: a topic with people results goes to no peer. Its front matter also
+  has `query:` and `retrieved:` (the date), and it has the source note `Work IQ retrieve`.
 - An existing topic is only overwritten with `--replace`. If every result was withheld
   (blocked, or without a protection status), nothing is written and the error says how many
   were withheld and why.
@@ -2699,7 +2704,8 @@ ask @workiq What changed in the launch plan this week?
 
 ### 4. What keeps your work data yours
 
-- Only results Work IQ marks `allowed` are used; the rest are withheld and counted.
+- Only results Work IQ marks `allowed` are used, and people, which it leaves unmarked, only by
+  your own agent and digital workers; the rest are withheld and counted.
 - Your own agent and digital workers get what Work IQ allows. A peer gets nothing unless you
   grant it sensitivity labels, and then only results with those labels. The plan check
   stops a step that would send more, and the agent checks again when it sends.
