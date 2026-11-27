@@ -584,7 +584,7 @@ impl Session {
             .call_tool_in(&self.context, name, change.arguments())
             .await
         {
-            Ok(result) => Outcome::of(&result),
+            Ok(result) => Outcome::of(name, &result),
             Err(e) => Outcome::of_error(&e),
         };
         let line = made_line(&change, &outcome);
@@ -718,6 +718,8 @@ fn withheld_anywhere(result: &ToolResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workiq::audit::Purpose;
+    use crate::workiq::client::{FixedToken, Incoming, Outgoing, Transport, WorkIqError};
 
     /// The owner's own tasks get every read tool, `call_function` too, and with changes
     /// allowed the change tools; a peer's task gets only the tools whose results carry labels
@@ -745,5 +747,71 @@ mod tests {
         let named = vec!["ask".to_owned(), "do_action".to_owned()];
         assert_eq!(session_tools(&named, &Audience::Local, true), named);
         assert_eq!(session_tools(&named, &Audience::Local, false), ["ask"]);
+    }
+
+    #[tokio::test]
+    async fn a_signed_off_change_answered_400_is_an_error_to_the_model_and_in_the_changes_list() {
+        struct Approver;
+
+        #[async_trait::async_trait]
+        impl ChangeApprover for Approver {
+            async fn approve(&self, _: &str, _: &str, _: Duration) -> Approval {
+                Approval::Approved
+            }
+        }
+
+        struct FakeWork;
+
+        #[async_trait::async_trait]
+        impl Transport for FakeWork {
+            async fn send(&self, outgoing: Outgoing) -> Result<Incoming, WorkIqError> {
+                let result = match outgoing.message["method"].as_str().unwrap() {
+                    "initialize" | "notifications/initialized" => json!({}),
+                    "tools/list" => json!({ "tools": [{ "name": "create_entity" }] }),
+                    "tools/call" => json!({ "structuredContent": { "statusCode": 400 } }),
+                    method => panic!("unexpected method: {method}"),
+                };
+                let body = outgoing
+                    .expect_id
+                    .map(|id| json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                Ok(Incoming {
+                    body,
+                    session_id: None,
+                    ids: Default::default(),
+                })
+            }
+        }
+
+        let client =
+            Client::with_transport(Arc::new(FakeWork), Arc::new(FixedToken("test".into())));
+        let session = Session {
+            bearer: "test".into(),
+            tools: vec!["create_entity".into()],
+            context: CallContext::local(Purpose::Gateway),
+            client: Arc::new(client),
+            sign_off: Some((
+                ChangeSignOff {
+                    approver: Arc::new(Approver),
+                    worker: "worker".into(),
+                    task: None,
+                    prompt: "Create a meeting".into(),
+                },
+                Duration::from_secs(60),
+            )),
+            notices: None,
+            made: Mutex::default(),
+            closed: watch::channel(false).0,
+        };
+        let result = session
+            .call(&json!({
+                "name": "create_entity",
+                "arguments": { "parentUrl": "/me/events", "jsonBody": { "subject": "Sync" } },
+            }))
+            .await;
+        assert_eq!(result["isError"], true);
+        let line = result["content"][0]["text"].as_str().unwrap();
+        assert!(line.starts_with("Create /me/events: failed:"), "{line}");
+        assert!(line.contains("create_entity tool answered 400"), "{line}");
+        assert_eq!(*session.made.lock().unwrap(), [line]);
     }
 }

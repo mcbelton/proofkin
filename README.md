@@ -632,7 +632,9 @@ sign-off's `notice`, with its run and step when it has them),
 audience (`local` or the peer's name), the query's SHA-256 and length (never its text; for a
 change, its path's), outcome (`ok`, `refused`, or the error's class), the counts of results
 and withheld results and the sensitivity labels seen when known, the request and correlation
-ids, and the duration. A write error only warns.
+ids, and the duration. An answer with a status of 400 or more is recorded with its error
+class, even when Work IQ doesn't flag the call as an error, and still counts toward the
+budgets. A write error only warns.
 
 Calls are limited to 200 a day (the local date) and 25 per run. A call over a budget is not
 sent: it fails saying which budget is used up and how to raise it, and is recorded as
@@ -1039,8 +1041,9 @@ send after ok @workiq apply=draft
 - The apply step checks that your approval was for the list as it is now, then makes each
   change once, in order, and stops at the first that fails or whose outcome is unknown. Its
   result lists each change's outcome (*done*, *accepted* for a 202, *failed* with the fix, or
-  *outcome unknown*: check in Microsoft 365) and the changes not made. A change is never sent
-  again, even if the agent restarts.
+  *outcome unknown*) and the changes not made. A 4xx status in Work IQ's answer means
+  *failed*. With a status of 500 or more, the outcome is unknown: check in Microsoft 365
+  before trying again. A change is never sent again, even if the agent restarts.
 - The plan check refuses an apply step, naming the fix, without your sign-off between the
   two steps, with changes off or without the Work IQ sign-in, or when another step applies
   the same step. Both steps' results stay in the run's record, never on GitHub.
@@ -2990,6 +2993,8 @@ nor does a peer's, whatever its grant.
   call was held either way.
 - Approved, it is made once, exactly as shown, and the model gets the outcome (*done*, with a
   created entity's id and link; *accepted* for a 202; *failed*; or *outcome unknown*).
+  As in plans, a 4xx answer from Work IQ fails and a 5xx or higher answer leaves the outcome
+  unknown. Both are tool errors for the model.
   Rejected, or asked for changes, nothing is sent, and the model gets your note. Not answered
   in time, the request is withdrawn, and a late answer makes nothing. A change is never sent
   again: the same call again is a sign-off of its own.

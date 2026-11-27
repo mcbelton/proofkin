@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::document::failure;
 use crate::workiq::{Class, ToolResult, WorkIqError};
 
 /// The language of the fenced block a step proposes its changes in.
@@ -542,7 +543,7 @@ pub fn shown_in(text: &str, step: &str, digest: &str) -> bool {
 /// How a change ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Made (a 2xx), with a created entity's id and web link when Work IQ gave them.
+    /// Made, with a created entity's id and web link when Work IQ gave them.
     Done {
         status: Option<u16>,
         id: Option<String>,
@@ -562,26 +563,25 @@ impl Outcome {
         matches!(self, Outcome::Done { .. } | Outcome::Accepted)
     }
 
-    /// The outcome of a change call that Work IQ answered without an error: its status, and a
-    /// created entity's id and web link (never its content).
-    pub fn of(result: &ToolResult) -> Outcome {
-        let found = result.structured_content.clone().or_else(|| {
-            result
-                .content
-                .iter()
-                .filter_map(|c| c.get("text")?.as_str())
-                .find_map(|t| serde_json::from_str::<Value>(t).ok())
-        });
-        let found = found.unwrap_or(Value::Null);
-        let status = ["status", "statusCode", "httpStatusCode"]
-            .iter()
-            .find_map(|k| found.get(*k).and_then(Value::as_u64))
-            .and_then(|s| u16::try_from(s).ok());
-        if status == Some(202) {
-            return Outcome::Accepted;
+    /// The outcome of an answered change call; Work IQ can give a failure status without
+    /// reporting a tool error. A server error doesn't tell us whether the change was made.
+    pub fn of(tool: &str, result: &ToolResult) -> Outcome {
+        let (answer, status) = result.answer_with_status();
+        match status {
+            Some(202) => return Outcome::Accepted,
+            Some(status @ 400..) => {
+                let why = WorkIqError::entity(tool, status, &failure(&answer), result.ids.clone())
+                    .to_string();
+                return if status >= 500 {
+                    Outcome::Uncertain(why)
+                } else {
+                    Outcome::Failed(why)
+                };
+            }
+            _ => {}
         }
         let text = |key: &str| {
-            found
+            answer
                 .get(key)
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
@@ -623,7 +623,7 @@ impl Outcome {
             Outcome::Accepted => "accepted (202): Microsoft 365 finishes it later".to_owned(),
             Outcome::Failed(why) => format!("failed: {why}"),
             Outcome::Uncertain(why) => format!(
-                "outcome unknown: {why}. Check in Microsoft 365 whether it was made; it isn't sent again"
+                "outcome unknown: {why}. Check in Microsoft 365 whether it was made before trying again"
             ),
         }
     }
@@ -832,25 +832,84 @@ mod tests {
         assert!(none.contains("Step draft proposes no changes: step send makes none."));
     }
 
-    #[test]
-    fn outcomes_say_done_accepted_failed_or_unknown_and_what_was_not_made() {
-        let result = |structured: Value| ToolResult {
+    fn reply(answer: Value) -> ToolResult {
+        ToolResult {
             content: Vec::new(),
-            structured_content: Some(structured),
+            structured_content: Some(answer),
+            is_error: false,
+            ids: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_answered_403_fails_with_the_redacted_error_and_fix() {
+        let token = format!("ghp_{}", "a1".repeat(20));
+        let outcome = Outcome::of(
+            "update_entity",
+            &reply(json!({
+                "statusCode": 403,
+                "error": {
+                    "code": "ErrorAccessDenied",
+                    "message": format!("Access denied for {token}"),
+                },
+            })),
+        );
+        let Outcome::Failed(why) = &outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert!(!outcome.made());
+        assert!(
+            why.contains("update_entity tool answered 403: ErrorAccessDenied"),
+            "{why}"
+        );
+        assert!(
+            why.contains("Access denied for [REDACTED:github-token]"),
+            "{why}"
+        );
+        assert!(why.contains("Fix (admin)"), "{why}");
+        assert!(!why.contains(&token));
+    }
+
+    #[test]
+    fn a_404_given_as_text_in_a_json_text_reply_fails() {
+        let result = ToolResult {
+            content: vec![json!({ "type": "text", "text": r#"{"statusCode":"404"}"# })],
+            structured_content: None,
             is_error: false,
             ids: Default::default(),
         };
+        let outcome = Outcome::of("update_entity", &result);
+        assert!(!outcome.made());
+        assert!(matches!(outcome, Outcome::Failed(why) if why.contains("answered 404")));
+    }
+
+    #[test]
+    fn an_answered_503_leaves_the_outcome_unknown_and_says_to_check_before_retrying() {
+        let outcome = Outcome::of("create_entity", &reply(json!({ "statusCode": 503 })));
+        assert!(!outcome.made());
+        assert!(matches!(&outcome, Outcome::Uncertain(why) if why.contains("answered 503")));
+        let text = outcome.describe();
+        assert!(
+            text.contains("Check in Microsoft 365 whether it was made before trying again"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outcomes_say_done_accepted_failed_or_unknown_and_what_was_not_made() {
         assert_eq!(
-            Outcome::of(&result(json!({ "statusCode": 202 }))),
+            Outcome::of("do_action", &reply(json!({ "statusCode": 202 }))),
             Outcome::Accepted
         );
-        let created = Outcome::of(&result(json!({
+        let answer = reply(json!({
+            "statusCode": 201,
             "id": "AAMk9", "webLink": "https://outlook.office.com/x", "subject": "never shown"
-        })));
+        }));
+        let created = Outcome::of("create_entity", &answer);
         assert_eq!(
             created,
             Outcome::Done {
-                status: None,
+                status: Some(201),
                 id: Some("AAMk9".into()),
                 link: Some("https://outlook.office.com/x".into())
             }
@@ -862,7 +921,7 @@ mod tests {
             ids: Default::default(),
         };
         assert_eq!(
-            Outcome::of(&text_reply),
+            Outcome::of("delete_entity", &text_reply),
             Outcome::Done {
                 status: Some(204),
                 id: None,

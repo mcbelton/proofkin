@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use super::client::{Class, RequestIds, ToolResult, WorkIqError, WorkIqErrorKind};
 use super::content::{Audience, summarize};
+use super::document::failure;
 use crate::profile::{Profile, WorkIqBudget};
 
 /// The audit file's name in a profile's folder.
@@ -503,7 +504,19 @@ impl Pending<'_> {
     pub fn finish(mut self, result: &Result<ToolResult>) {
         match result {
             Ok(done) => {
-                self.entry.outcome = "ok".to_owned();
+                let (answer, status) = done.answer_with_status();
+                let outcome = if let Some(status @ 400..) = status {
+                    let error = WorkIqError::entity(
+                        &self.entry.tool,
+                        status,
+                        &failure(&answer),
+                        done.ids.clone(),
+                    );
+                    class_name(&error.class)
+                } else {
+                    "ok"
+                };
+                self.entry.outcome = outcome.to_owned();
                 self.entry.set_ids(&done.ids);
                 if let Some(summary) = summarize(done, &self.audience) {
                     self.entry.results = Some(summary.results);
