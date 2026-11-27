@@ -3262,6 +3262,16 @@ async fn the_page_follows_the_ux_guidelines() {
     }
     // Playbooks need explaining, so they're picked from cards, not a native dropdown.
     assert!(!page.contains(r#"<select id="playbook""#));
+    for prefix in ["plan", "plan-editor"] {
+        for (setting, label) in [("model", "Model"), ("effort", "Reasoning")] {
+            let id = format!("{prefix}-{setting}");
+            assert!(
+                page.contains(&format!(r#"<label for="{id}">{label}"#)),
+                "{id}"
+            );
+            assert!(page.contains(&format!(r#"<select id="{id}""#)), "{id}");
+        }
+    }
     let confirm = regex::Regex::new(r"\bconfirm\(").unwrap();
     let html =
         regex::Regex::new(r"\.(inner|outer)HTML\b|insertAdjacentHTML|document\.write").unwrap();

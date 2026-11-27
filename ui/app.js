@@ -429,6 +429,7 @@ function renderPeers() {
     if (state.trusted.some((t) => t.id === b.dataset.peer)) b.remove();
   }
   renderTaskOptions();
+  syncEditorModels();
 }
 
 function feedNode(item) {
@@ -1773,6 +1774,7 @@ function playbookText(p) {
 
 /// Explains the playbook the plan came from (or what a plan is) above the plan box.
 function renderPlanExplain() {
+  syncPlanModels();
   const box = $("#plan-explain");
   if (state.mode !== "plan") {
     box.hidden = true;
@@ -2185,6 +2187,86 @@ function trackChoice(box, input, changed, shown) {
 let planTrack = { sync() {}, ready: () => true };
 let editorTrack = { sync() {}, ready: () => true };
 
+function stepAgents(target, provider) {
+  if (!target) return [];
+  const [who] = target.slice(1).split(":");
+  if (target.startsWith("#")) {
+    const squad = state.squads?.find((s) => s.name === who);
+    return squad ? squadServing(squad, provider) : [];
+  }
+  return state.peers.filter((p) => p.name === who && p.capabilities.includes(provider));
+}
+
+function planModelChoice(prefix, input, changed, shown) {
+  const box = $(`#${prefix}models`);
+  const model = $(`#${prefix}model`);
+  const effort = $(`#${prefix}effort`);
+  const name = $(`#${prefix}model-name`);
+  const mixed = $(`#${prefix}models-mixed`);
+  let naming = false;
+  let lastText = input.value;
+  const sync = () => {
+    if (input.value !== lastText) naming = false;
+    lastText = input.value;
+    const steps = shown() ? planText.modelSteps(input.value) : [];
+    box.hidden = !steps.length;
+    if (box.hidden) {
+      naming = false;
+      return;
+    }
+    const byProvider = new Map();
+    for (const step of steps) {
+      const provider = step.using ?? "copilot";
+      if (!byProvider.has(provider)) byProvider.set(provider, new Set());
+      for (const peer of stepAgents(step.target, provider)) byProvider.get(provider).add(peer);
+    }
+    const providers = [...byProvider.keys()];
+    const different = providers.length > 1;
+    const current = planText.modelsOf(input.value);
+    const pick = planModelOptions(byProvider, current);
+    model.replaceChildren(...modelOptionNodes(pick.models));
+    model.disabled = different;
+    naming = naming && !different && pick.models.some((o) => o.value === OTHER_MODEL);
+    model.value = naming ? OTHER_MODEL : pick.model;
+    name.closest("label").hidden = !naming;
+    effort.replaceChildren(...modelOptionNodes(pick.efforts));
+    effort.value = pick.effort;
+    effort.disabled = pick.fixed;
+    mixed.hidden = !different;
+    if (different) {
+      const list = `${providers.slice(0, -1).join(", ")} and ${providers.at(-1)}`;
+      mixed.textContent = `Its steps use ${list}: pick each step's model in the editor`
+        + (current.model !== null ? ". Remove the model: line in Text." : "");
+    }
+  };
+  const write = (value) => {
+    naming = false;
+    input.value = planText.setModels(input.value, value);
+    changed();
+  };
+  model.addEventListener("change", () => {
+    if (model.value === OTHER_MODEL) {
+      naming = true;
+      name.value = planText.modelsOf(input.value).model ?? "";
+      sync();
+      name.focus();
+    } else write({ model: model.value || null });
+  });
+  const nameModel = () => { if (naming) write({ model: name.value.trim() || null }); };
+  name.addEventListener("change", nameModel);
+  name.addEventListener("keydown", (event) => {
+    const { key, isComposing } = event;
+    if (key !== "Enter" || isComposing) return;
+    event.preventDefault();
+    nameModel();
+    model.focus();
+  });
+  effort.addEventListener("change", () => write({ effort: effort.value || null }));
+  return sync;
+}
+let syncPlanModels = () => {};
+let syncEditorModels = () => {};
+
 // ---------- plan editor ----------
 /// Opens the plan in a large editor: as forms (the builder) or as text with what can go
 /// into it beside it, whichever was used last.
@@ -2195,6 +2277,7 @@ function openPlanEditor() {
   $("#plan-editor").showModal();
   planBuilder.setView(planBuilder.view());
   editorTrack.sync();
+  syncEditorModels();
 }
 
 // ---------- drafting a plan with a model ----------
@@ -2401,6 +2484,7 @@ function renderPalette() {
 
 let editorTimer = null;
 function onPlanEditorInput() {
+  syncEditorModels();
   clearTimeout(editorTimer);
   editorTimer = setTimeout(() => {
     renderPalette();
@@ -4239,15 +4323,21 @@ function init() {
     // An emptied plan no longer comes from a playbook.
     if (!$("#composer-input").value.trim()) state.playbook = null;
     if (!state.playbook) renderPlanExplain();
+    else syncPlanModels();
   });
-  planTrack = trackChoice($("#plan-track"), $("#composer-input"),
-    () => $("#composer-input").dispatchEvent(new Event("input", { bubbles: true })),
-    () => state.mode === "plan");
-  editorTrack = trackChoice($("#plan-editor-track"), $("#plan-editor-text"), () => {
-    const editor = $("#plan-editor-text");
+  const composer = $("#composer-input");
+  const composerChanged = () => composer.dispatchEvent(new Event("input", { bubbles: true }));
+  const inPlanMode = () => state.mode === "plan";
+  const editor = $("#plan-editor-text");
+  const editorChanged = () => {
     if (planBuilder.active()) planBuilder.load(editor.value);
     editor.dispatchEvent(new Event("input", { bubbles: true }));
-  }, () => $("#plan-editor").open);
+  };
+  const editingPlan = () => $("#plan-editor").open;
+  planTrack = trackChoice($("#plan-track"), composer, composerChanged, inPlanMode);
+  editorTrack = trackChoice($("#plan-editor-track"), editor, editorChanged, editingPlan);
+  syncPlanModels = planModelChoice("plan-", composer, composerChanged, inPlanMode);
+  syncEditorModels = planModelChoice("plan-editor-", editor, editorChanged, editingPlan);
   loadPlaybooks().catch((err) => toast(err.message, "error"));
   loadSkills().catch((err) => toast(err.message, "error"));
   loadGithub().catch((err) => toast(err.message, "error"));

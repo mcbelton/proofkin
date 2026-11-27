@@ -6,6 +6,7 @@ const planText = (() => {
   const NAME = /^(?!\.)[A-Za-z0-9._-]{1,64}$/;
   // Words that start a part of a step line, so never its name.
   const KEYWORDS = new Set(["after", "approve", "team", "pr", "using"]);
+  const MODEL_HEADERS = ["model", "effort"];
   // Step options (before what to do), by the option they set. Repeating a list
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
@@ -98,12 +99,11 @@ const planText = (() => {
     return lines;
   }
 
-  /// How the parser reads a line on its own: "empty", "comment", "claim", "track" (how
-  /// the run is tracked on GitHub) or "step".
+  /// How the parser reads a line on its own, before matching step continuations.
   function kindOf(line) {
     const t = line.trim();
     return !t ? "empty" : t.startsWith("//") ? "comment" : t.startsWith("claim:") ? "claim"
-      : t.startsWith("track:") ? "track" : "step";
+      : t.startsWith("track:") ? "track" : MODEL_HEADERS.find((key) => t.startsWith(`${key}:`)) ?? "step";
   }
 
   /// Sets an option on `step`: a list option adds its values (skill=a, then skill=b,
@@ -400,11 +400,10 @@ const planText = (() => {
   }
 
   /// The plan as the builder edits it: notes (comments before the first claim or step,
-  /// and after the last), how its run is tracked (`track:`, kept as written), claims
-  /// and steps, each with the comments just above it. Lenient, like the palette: a
-  /// half-written line is a step with parts missing.
+  /// and after the last), settings, claims and steps, with their comments. Lenient,
+  /// like the palette: a half-written line is a step with parts missing.
   function parsePlan(text) {
-    const plan = { notes: [], track: null, claims: [], steps: [] };
+    const plan = { notes: [], track: null, modelLines: [], claims: [], steps: [] };
     let comments = [];
     const all = linesOf(text);
     for (const [index, { line, kind: lineKind }] of all.entries()) {
@@ -416,8 +415,10 @@ const planText = (() => {
         comments.push(t.replace(/^\/\/ ?/, ""));
         continue;
       }
-      if (kind === "track") {
-        plan.track = t.slice("track:".length).trim();
+      if (kind === "track" || MODEL_HEADERS.includes(kind)) {
+        if (kind === "track") plan.track = t.slice("track:".length).trim();
+        // Keep invalid lines, too, so unrelated Builder changes don't silently fix them.
+        else plan.modelLines.push(t);
         plan.notes.push(...comments);
         comments = [];
         continue;
@@ -438,7 +439,7 @@ const planText = (() => {
     plan.notes.push(...comments);
     for (const c of plan.claims) c.id ??= freeId(plan.claims.map((x) => x.id), (n) => `C-${n}`, 1);
     for (const s of plan.steps) s.id ??= freeId(plan.steps.map((x) => x.id), (n) => `step${n}`, 1);
-    return plan;
+    return Object.assign(plan, modelsFrom(plan.modelLines));
   }
 
   /// The text of `plan` (notes, claims, then steps), and what each line is: {claim}
@@ -454,6 +455,9 @@ const planText = (() => {
     const gap = () => lines.length && lines.at(-1) !== "" && add("");
     plan.notes.forEach((n) => note(n));
     if (plan.track) add(`track: ${plan.track}`);
+    for (const key of MODEL_HEADERS) {
+      for (const line of plan.modelLines ?? []) if (line.startsWith(`${key}:`)) add(line);
+    }
     if (plan.claims.length) gap();
     for (const c of plan.claims) {
       c.notes?.forEach((n) => note(n, { claim: c.id }));
@@ -567,11 +571,54 @@ const planText = (() => {
     const have = linesOf(text).find((l) => l.kind === "track");
     if (!have) return value == null ? text : `track: ${value}\n${text}`;
     if (value != null) return text.slice(0, have.start) + `track: ${value}` + text.slice(have.end);
+    return removeLine(text, have);
+  }
+
+  function removeLine(text, have) {
     // The line and the line break after it (before it, for the last line).
     return have.end < text.length
       ? text.slice(0, have.start) + text.slice(have.end + 1)
       : text.slice(0, Math.max(0, have.start - 1));
   }
+
+  function modelsFrom(lines) {
+    return Object.fromEntries(MODEL_HEADERS.map((key) => [key,
+      lines.find((line) => line.startsWith(`${key}:`))?.slice(key.length + 1).trim() ?? null]));
+  }
+
+  /// The plan's model and effort (null when absent); a step's own text isn't a setting.
+  function modelsOf(text) {
+    return modelsFrom(linesOf(text).filter((l) => MODEL_HEADERS.includes(l.kind)).map((l) => l.line.trim()));
+  }
+
+  /// Set or remove either header without rewriting the rest of the plan. Omit a key to
+  /// leave it alone; null removes it. New headers go after track: and before the body.
+  function setModels(text, values) {
+    for (const key of MODEL_HEADERS) {
+      if (!(key in values)) continue;
+      const value = values[key]?.trim();
+      const lines = linesOf(text);
+      const [first, ...duplicates] = lines.filter((l) => l.kind === key);
+      for (const line of duplicates.reverse()) text = removeLine(text, line);
+      if (first) {
+        text = value ? text.slice(0, first.start) + `${key}: ${value}` + text.slice(first.end) : removeLine(text, first);
+      } else if (value) {
+        const body = lines.find((l) => l.kind === "claim" || l.kind === "step");
+        const before = lines.filter((l) => !body || l.start < body.start);
+        const prior = before.filter((l) => l.kind === "track" || (key === "effort" && l.kind === "model")).at(-1);
+        if (prior) {
+          text = text.slice(0, prior.end) + `\n${key}: ${value}` + text.slice(prior.end);
+        } else {
+          text = `${key}: ${value}${text ? `\n${text}` : ""}`;
+        }
+      }
+    }
+    return text;
+  }
+
+  const modelSteps = (text) => linesOf(text).filter((l) => l.kind === "step")
+    .map((l) => parseStep(l.line))
+    .filter((s) => s.target && !s.approve && !s.pr && !s.team && !isWorkiq(s.target));
 
   /// What running the plan does on GitHub, for the line under the tracking choice:
   /// `track` as trackOf reads it (an issue without a number: its number isn't typed
@@ -620,5 +667,6 @@ const planText = (() => {
     dependents, needs, isTodo: (text) => blank(text, TODO), isTodoClaim: (text) => blank(text, TODO_CLAIM),
     taskOf, setTask, lineKinds: (text) => linesOf(text).map((l) => ({ kind: l.kind, head: l.head })),
     trackOf, setTrack, trackNote, WORKIQ, WORKIQ_SOURCES, isWorkiq, toggleSource, setTarget,
+    modelsOf, setModels, modelSteps,
   };
 })();
