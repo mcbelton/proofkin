@@ -215,6 +215,10 @@ impl StdioTransport {
 
 #[async_trait]
 impl Transport for StdioTransport {
+    fn is_cli(&self) -> bool {
+        true
+    }
+
     async fn send(&self, outgoing: Outgoing) -> Result<Incoming, WorkIqError> {
         let ids = RequestIds {
             client_request_id: Some(outgoing.client_request_id.clone()),

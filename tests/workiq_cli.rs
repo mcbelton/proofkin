@@ -194,6 +194,27 @@ async fn a_cli_that_wants_its_eula_accepted_says_to_run_accept_eula_yourself() {
 }
 
 #[tokio::test]
+async fn a_cli_still_listing_only_local_tools_fails_after_one_relist_with_a_hint() {
+    let state = tempfile::tempdir().unwrap();
+    let client = client(fake(state.path(), "local-tools", None));
+
+    let failed = client.retrieve("budget", None, &[]).await.unwrap_err();
+    let text = format!("{failed:#}");
+    assert!(
+        text.starts_with("Work IQ does not offer the retrieve tool"),
+        "{text}"
+    );
+    assert!(
+        text.contains("it offers: accept_eula, ask, list_agents, get_debug_link"),
+        "{text}"
+    );
+    assert!(text.contains("may still be loading its tools"), "{text}");
+    assert!(text.contains("run `workiq accept-eula` yourself"), "{text}");
+    assert_eq!(count(state.path(), "tools/list"), 2);
+    assert_eq!(count(state.path(), "tools/call"), 0);
+}
+
+#[tokio::test]
 async fn the_cli_does_not_inherit_the_credentials_the_providers_lose() {
     let state = tempfile::tempdir().unwrap();
     let client = client(fake(state.path(), "ok", None));
