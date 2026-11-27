@@ -477,6 +477,25 @@ Agents connect with [iroh](https://iroh.computer):
 - **Discovery:** connected agents share each other's addresses; an agent auto-dials every
   allowlisted peer at startup and every 30 seconds, so the mesh reforms after restarts.
 
+A dropped connection doesn't fail tasks at once. If a connection is replaced (for example
+both peers dialed each other at once) or comes back after a drop, running tasks carry on
+and their results arrive over the new connection. After 2 seconds the peer shows as
+disconnected and its tasks say they are reconnecting (a connection back to it still in
+its handshake is waited for first, up to 10 seconds). A plan checked or started meanwhile
+(`/plan`, the web UI, MCP, A2A or a team step) waits for a peer that is reconnecting, up to
+the same 10 seconds, instead of finding it not connected.
+
+The **task grace** is 60 seconds by default (`PROOFKIN_TASK_GRACE_SECS`). Every confirmed
+reconnect ends the outage; a later drop gets its own grace. Only awake time counts, so
+sleep doesn't use up a peer's grace. If the peer stays away, the tasks you gave it fail
+and the tasks it gave you stop. The worker's activity and the stopped task's result say
+**stopped: boss was gone for 60 s**, rather than **cancelled by boss**, which means the
+requester actually sent a cancellation. A stop for another reason says what happened.
+
+An agent that stops on purpose (Ctrl+C, or **Stop** on a digital worker) says so first:
+the tasks it runs for you fail at once ("worker stopped before it finished the task"),
+and it cancels the tasks it gave its peers.
+
 ### Connect two machines
 
 ```powershell
@@ -739,22 +758,8 @@ the connection) without calling Work IQ.
 
 `/cancel <n>` (or **Cancel** in the web UI) stops a task you started. For a delegated task
 the peer is told to stop: it aborts the Copilot session (or the Claude/Codex run), frees the
-task slot and records the task as `cancelled` in its audit log. If you disconnect, the peer
-cancels your running tasks the same way, so nothing keeps spending its accounts for you.
-
-A dropped connection doesn't lose work. If a connection is replaced (for example both peers
-dialed each other at once) or drops and comes back, running tasks carry on and their
-results arrive over the new connection. After 2 seconds the peer shows as disconnected and
-its tasks say **reconnecting to** it (a connection back to it still in its handshake is
-waited for first, up to 10 seconds). A plan checked or started meanwhile (`/plan`, the web
-UI, MCP, A2A or a team step) waits for a peer that is reconnecting, up to the same 10
-seconds, instead of finding it not connected. Those tasks are failed (on your side) and
-cancelled (on the peer's) only if the peer stays away for the **task grace**: 60 seconds, or
-`PROOFKIN_TASK_GRACE_SECS`. Only time the machine is awake counts, so sleep doesn't use up a
-peer's grace: the tasks that were running when a laptop went to sleep go on after it wakes.
-An agent that stops on purpose (Ctrl+C, or **Stop** on a digital worker) says so first: the
-tasks it runs for you fail at once ("worker stopped before it finished the task"), and it
-cancels the tasks it gave its peers.
+task slot and records the task as `cancelled` in its audit log. A dropped connection
+isn't a cancellation; see [Internet P2P](#internet-p2p) for the task grace and stop messages.
 
 ### Squads and plans
 
@@ -1423,8 +1428,10 @@ web UI lists runs under **Evidence runs** and opens each report with a fresh sig
 Checks run your folder's code (tests, builds) with **your** rights and without the OS
 sandbox, like a CI job on your machine. So only peers with `full` access to that folder may
 request them. Their environment has no inherited credential variables (`GH_TOKEN`,
-`ANTHROPIC_API_KEY`, ...). Each check may run for up to 30 minutes, and on a timeout or
-cancellation everything it started is killed.
+`ANTHROPIC_API_KEY`, ...). Check commands and the processes they start run at below-normal
+priority (Below Normal on Windows, niceness 10 or lower priority on Unix), so builds and
+tests leave CPU time for the agent's connections. Each check may run for up to 30 minutes,
+and on a timeout or cancellation everything it started is killed.
 
 ### The lifecycle: from a fresh project to operations
 

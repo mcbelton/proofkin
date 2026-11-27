@@ -5411,12 +5411,14 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     from,
                     task_id,
                     outcome,
+                    stop,
                 } => {
                     let outcome = match outcome {
                         Outcome::Done => "done",
                         Outcome::Cancelled => "cancelled",
                         _ => "failed",
                     };
+                    let outcome = stop.as_deref().unwrap_or(outcome);
                     println!("> task #{task_id} from {from} {outcome}")
                 }
                 Event::TaskRefused {

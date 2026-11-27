@@ -965,12 +965,14 @@ pub async fn start_with_work(
                     from,
                     task_id,
                     outcome,
+                    stop,
                 } => {
                     let (level, verb) = match outcome {
                         Outcome::Done => ("task", "finished"),
                         Outcome::Cancelled => ("warn", "was cancelled"),
                         _ => ("warn", "failed"),
                     };
+                    let verb = stop.as_deref().unwrap_or(verb);
                     pump.system(level, format!("Task #{task_id} from {from} {verb}"));
                     pump.end_team_run(&from, task_id, verb);
                     pump.send(json!({ "type": "audit" }));

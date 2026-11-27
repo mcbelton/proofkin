@@ -78,6 +78,7 @@
       "claim": "A task in flight survives its connection being replaced (e.g. both peers dialed each other at once): it keeps running and its result arrives over the connection that is kept. Requests sent while connections converge are re-sent on the kept connection and run exactly once.",
       "tests": [
         "agents::delegated_tasks_survive_a_connection_being_replaced",
+        "agents::a_served_task_runs_once_through_replacement_and_repeated_disconnects",
         "agents::requests_are_resent_on_a_new_connection_and_run_only_once",
         "agents::tasks_delegated_while_peers_dial_each_other_are_not_lost"
       ],
@@ -317,9 +318,10 @@
     {
       "id": "EDD-1",
       "area": "evidence",
-      "claim": "A task can ask the worker's runtime (not the model) to run the folder owner's checks after the model; the result carries their exit codes and output, failures are retried with the failure output, timed-out or cancelled checks are killed with everything they started, and only peers with full access may request them (peers see check names, never commands).",
+      "claim": "A task can ask the worker's runtime (not the model) to run the folder owner's checks after the model; the result carries their exit codes and output, failures are retried with the failure output, timed-out or cancelled checks are killed with everything they started, and only peers with full access may request them (peers see check names, never commands). Check commands run at below-normal priority (BELOW_NORMAL_PRIORITY_CLASS on Windows, niceness 10 on Unix unless already lower priority) so builds and tests do not starve the agent's connections.",
       "tests": [
         "lib::evidence::checks_report_exit_codes_and_output",
+        "lib::evidence::check_commands_run_at_below_normal_priority",
         "lib::evidence::checks_time_out",
         "lib::evidence::timed_out_checks_kill_only_their_own_processes",
         "agents::checks_run_by_the_worker_prove_results_and_failures_are_retried"
@@ -989,19 +991,24 @@
     {
       "id": "NET-7",
       "area": "network",
-      "claim": "A dropped connection doesn't fail tasks at once: they say they are reconnecting, and carry on if the peer comes back within the task grace (60 s of awake time by default, NET-8), their results arriving over the new connection. An agent that stops on purpose tells its peers first: the tasks it runs for them fail at once, saying it stopped, and the tasks it gave them are cancelled.",
+      "claim": "A dropped connection doesn't fail tasks at once: they say they are reconnecting, and run once through repeated reconnects and replacements within the task grace (60 s of awake time by default, NET-8), their results arriving over the new connection. A requester that stays gone stops its tasks with 'stopped: boss was gone for 60 s' (using its name and grace); a TaskCancel says 'cancelled by boss', and the worker's activity reports the same reason. An agent that stops on purpose tells its peers first: the tasks it runs for them fail at once, saying it stopped, and the tasks it gave them are cancelled.",
       "tests": [
         "agents::tasks_survive_a_dropped_connection_when_the_peer_comes_back_in_time",
+        "agents::a_served_task_runs_once_through_replacement_and_repeated_disconnects",
+        "agents::a_requester_gone_past_the_task_grace_stops_its_tasks_with_a_reason",
+        "agents::cancelling_a_delegated_task_stops_it_on_the_worker",
         "agents::delegated_task_fails_at_once_when_the_worker_stops"
       ]
     },
     {
       "id": "NET-8",
       "area": "network",
-      "claim": "Waits count only the time the machine is awake (src/awake.rs; issue #243): they go in ticks of at most 10 s, and a tick that ends more than 15 s later than asked for (the machine was suspended) counts nothing, so a suspension costs a wait at most one tick. The task grace (NET-7), a Copilot model run's hour (EDD-12; the SDK's own wait is a week, so it never stops a run first) and a step's timeout= use them: time spent asleep doesn't use up a peer's grace, a model's run or a step's timeout, so the tasks running when a laptop goes to sleep go on after it wakes.",
+      "claim": "Waits count only the time the machine is awake (src/awake.rs; issue #243): they go in ticks of at most 10 s, and a tick that ends more than 15 s later than asked for (the machine was suspended) counts nothing, so a suspension costs a wait at most one tick. The task grace (NET-7), a Copilot model run's hour (EDD-12; the SDK's own wait is a week, so it never stops a run first) and a step's timeout= use them: time spent asleep doesn't use up a peer's grace, a model's run or a step's timeout, so the tasks running when a laptop goes to sleep go on after it wakes. Only the current outage's grace can stop a task; an earlier disconnect's timer cannot act after a reconnect, even if the peer is gone again.",
       "tests": [
         "lib::awake::time_the_machine_was_suspended_doesnt_count",
-        "lib::awake::a_timeout_counts_only_awake_time_and_lets_work_that_ends_in_time_finish"
+        "lib::awake::a_timeout_counts_only_awake_time_and_lets_work_that_ends_in_time_finish",
+        "lib::agent::an_old_disconnect_cannot_report_or_expire_a_newer_disconnect",
+        "agents::a_requester_gone_past_the_task_grace_stops_its_tasks_with_a_reason"
       ]
     },
     {

@@ -434,8 +434,8 @@ pub async fn run_built_in(name: &str, dir: &Path) -> CheckResult {
 }
 
 /// Runs `command` (an owner-defined check) in `dir` with the shell, without the
-/// inherited credential variables, for at most `timeout`. If it times out or the
-/// task is cancelled, the whole process tree is killed.
+/// inherited credential variables and at below-normal priority, for at most `timeout`.
+/// If it times out or the task is cancelled, the whole process tree is killed.
 pub async fn run_check(name: &str, command: &str, dir: &Path, timeout: Duration) -> CheckResult {
     let started = Instant::now();
     let mut cmd = shell(command);
@@ -527,17 +527,30 @@ impl Drop for TreeGuard {
 fn shell(command: &str) -> Command {
     #[cfg(windows)]
     {
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
         let mut cmd = Command::new("cmd");
-        cmd.arg("/D")
+        cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS)
+            .arg("/D")
             .arg("/S")
             .arg("/C")
             .raw_arg(format!("\"{command}\""));
         cmd
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).process_group(0);
+        // SAFETY: In the child before exec, these libc calls read or lower only its
+        // own priority. They don't allocate or take locks.
+        unsafe {
+            cmd.pre_exec(|| {
+                let nice = libc::getpriority(libc::PRIO_PROCESS, 0);
+                if nice < 10 && libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         cmd
     }
 }
@@ -755,6 +768,27 @@ mod tests {
         assert!(
             leak.command.contains("[REDACTED:url-password]") && !leak.command.contains("S3cretPw")
         );
+    }
+
+    #[tokio::test]
+    async fn check_commands_run_at_below_normal_priority() {
+        #[cfg(windows)]
+        let (command, expected) = (
+            r#"powershell -NoProfile -NonInteractive -Command "(Get-Process -Id $PID).PriorityClass""#,
+            "BelowNormal".to_owned(),
+        );
+        #[cfg(unix)]
+        let (command, expected) = (
+            "ps -o ni= -p $$",
+            // SAFETY: This only reads the calling thread's inherited niceness.
+            unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+                .max(10)
+                .to_string(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_check("priority", command, dir.path(), Duration::from_secs(30)).await;
+        assert!(result.passed, "{result:?}");
+        assert_eq!(result.output.trim(), expected);
     }
 
     #[tokio::test]
