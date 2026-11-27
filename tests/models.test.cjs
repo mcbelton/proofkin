@@ -68,6 +68,20 @@ assert.deepStrictEqual(defaults.models.map((o) => o.options ? [o.label, ...o.opt
 ]);
 assert.deepStrictEqual(defaults.efforts.map((o) => o.text), ["max (default)", "low", "medium", "high"]);
 assert.deepStrictEqual([defaults.model, defaults.effort], ["", ""]);
+
+// Describe can use the default or a named model while the account's list loads.
+const delegating = { ...local, offers: {} };
+const previous = { model: "", effort: "", name: "" };
+const pending = modelPickerOptions([delegating], "copilot", previous, true, true);
+assert.deepStrictEqual(pending.models, [
+  { value: "", text: "claude-opus-5.5 (default)" },
+  { value: "*listing*", text: "Listing the models your account offers…", disabled: true },
+  { value: OTHER_MODEL, text: "Another model…" },
+]);
+assert.strictEqual(pending.model, "", "drafting with the default stays possible");
+assert.deepStrictEqual(pick(delegating).models, [pending.models[0], pending.models[2]]);
+assert.deepStrictEqual(modelPickerOptions([local], "copilot", previous, true, true).models, defaults.models);
+
 const other = pick(local, "claude", OTHER_MODEL, "low", "claude-sonnet-5.5");
 assert.deepStrictEqual(other.models, [{ value: "", text: "Its default" }, { value: OTHER_MODEL, text: "Another model…" }]);
 assert.deepStrictEqual([other.model, other.effort], [OTHER_MODEL, "low"]);

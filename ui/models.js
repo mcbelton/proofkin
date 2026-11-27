@@ -125,12 +125,14 @@ function modelOptionNodes(options) {
 const namedModel = (value, name) => value === OTHER_MODEL ? name.trim() : value;
 
 /** Choices and values for the Model and Reasoning lists, keeping a pick still offered. */
-function modelPickerOptions(agents, provider, previous, local = false) {
+function modelPickerOptions(agents, provider, previous, local = false, listing = false) {
   const menu = modelMenu(agents, provider, local);
   const theirs = agents.length > 1 ? "Each peer's default" : "Its default";
   const rest = menu.models.filter((m) => !menu.defaultModel || !sameModel(m.id, menu.defaultModel));
+  const pending = listing && !agents.some((agent) => agent?.offers?.[provider]?.length);
   const models = [
     { value: "", text: menu.defaultModel ? `${menu.defaultModel} (default)` : theirs },
+    ...(pending ? [{ value: "*listing*", text: "Listing the models your account offers…", disabled: true }] : []),
     ...modelOptionData(rest),
     ...(menu.other ? [{ value: OTHER_MODEL, text: "Another model…" }] : []),
   ];
@@ -201,9 +203,9 @@ function modelPicker(prefix) {
   const name = $(`#${prefix}model-name`);
   const nameField = $(`#${prefix}model-name-field`);
   const effort = $(`#${prefix}effort`);
-  let agents = [], provider = "", local = false;
+  let agents = [], provider = "", local = false, listing = false;
   function draw(redrawModel) {
-    const pick = modelPickerOptions(agents, provider, { model: model.value, name: name.value, effort: effort.value }, local);
+    const pick = modelPickerOptions(agents, provider, { model: model.value, name: name.value, effort: effort.value }, local, listing);
     if (redrawModel) {
       model.replaceChildren(...modelOptionNodes(pick.models));
       model.value = pick.model;
@@ -220,10 +222,11 @@ function modelPicker(prefix) {
   });
   name.addEventListener("input", () => draw(false));
   return {
-    render(nextAgents, nextProvider, localAgent = false) {
+    render(nextAgents, nextProvider, localAgent = false, listingModels = false) {
       agents = nextAgents;
       provider = nextProvider;
       local = localAgent;
+      listing = listingModels;
       draw(true);
     },
     selected: () => ({

@@ -852,7 +852,8 @@ dialog.editor-dialog { width: min(1240px, calc(100vw - 32px)); height: calc(100v
 .plan-describe h3 { font-size: 15px; margin: 0; }
 .plan-describe p { margin: 0; }
 .plan-describe textarea { resize: vertical; }
-#plan-draft-status:empty { display: none; }
+#plan-draft-status:empty,
+#plan-draft-list-error:empty { display: none; }
 .plan-builder {
   flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 2px 6px 8px 2px;
   display: flex; flex-direction: column; gap: 22px;

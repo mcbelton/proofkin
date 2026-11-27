@@ -853,6 +853,9 @@ plan, then run it yourself.
     in **Run task** on **This agent**. Choose a provider your profile is signed in to,
     then keep its defaults or pick an allowed model and reasoning level. Then press
     **Draft plan**.
+  - **Model** lists what your profile's accounts offer. On an agent that only delegates,
+    Copilot's list starts loading the first time you open **Describe**. You can draft
+    with the default while it loads. If listing fails, opening **Describe** again retries it.
   - While the model writes, the view says so: *copilot's model (claude-opus-5.5) is
     writing the plan*, then *try 2 of 3: fixing 2 problems*.
   - The plan goes into the editor's Builder and Text views, checked as usual, with the

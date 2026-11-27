@@ -686,6 +686,80 @@ impl Slots {
     }
 }
 
+type OfferResult = Result<(), String>;
+type OfferReady = watch::Receiver<Option<OfferResult>>;
+
+#[derive(Default)]
+struct OfferListings {
+    active: BTreeMap<Provider, OfferReady>,
+    errors: BTreeMap<Provider, String>,
+}
+
+#[derive(Default, serde::Serialize)]
+pub(crate) struct OfferListStatus {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) listing: Vec<Provider>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) list_errors: BTreeMap<Provider, String>,
+}
+
+pub(crate) struct OfferListing {
+    pub(crate) previous_error: Option<String>,
+    ready: OfferReady,
+}
+
+impl OfferListing {
+    pub(crate) async fn wait(mut self) -> OfferResult {
+        match self.ready.wait_for(Option::is_some).await {
+            Ok(ready) => ready.as_ref().expect("listing finished").clone(),
+            Err(_) => Err("model listing stopped before it finished".into()),
+        }
+    }
+}
+
+/// Held only by the caller that starts the listing; other callers share its result.
+pub(crate) struct OfferListRun {
+    agent: Agent,
+    provider: Provider,
+    done: Option<watch::Sender<Option<OfferResult>>>,
+}
+
+impl OfferListRun {
+    pub(crate) fn finish(mut self, found: Result<Vec<crate::models::Offered>>) {
+        self.complete(found);
+    }
+
+    fn complete(&mut self, found: Result<Vec<crate::models::Offered>>) {
+        let Some(done) = self.done.take() else {
+            return;
+        };
+        let mut listings = self.agent.inner.offer_listings.lock().unwrap();
+        listings.active.remove(&self.provider);
+        let result = match found {
+            Ok(offered) => {
+                listings.errors.remove(&self.provider);
+                self.agent.set_offers(self.provider, offered);
+                Ok(())
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                listings.errors.insert(self.provider, error.clone());
+                let _ = self.agent.inner.events.send(Event::ModelsChanged);
+                Err(error)
+            }
+        };
+        done.send_replace(Some(result));
+    }
+}
+
+impl Drop for OfferListRun {
+    fn drop(&mut self) {
+        if self.done.is_some() {
+            self.complete(Err(anyhow!("model listing stopped before it finished")));
+        }
+    }
+}
+
 struct Inner {
     name: String,
     endpoint: Endpoint,
@@ -708,6 +782,7 @@ struct Inner {
     models: Mutex<crate::models::Models>,
     /// The models its accounts offer, as last listed (see [`Agent::set_offers`]).
     offers: Mutex<crate::models::Offers>,
+    offer_listings: Mutex<OfferListings>,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
     served: Mutex<ServedTasks>,
@@ -801,6 +876,7 @@ impl Agent {
             role: config.role,
             models: Mutex::new(config.models),
             offers: Mutex::new(crate::models::Offers::new()),
+            offer_listings: Mutex::new(OfferListings::default()),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             served: Mutex::default(),
@@ -1074,6 +1150,8 @@ impl Agent {
         {
             let mut offers = self.inner.offers.lock().unwrap();
             if offers.get(&provider) == Some(&offered) {
+                // The page still needs to know that listing finished.
+                let _ = self.inner.events.send(Event::ModelsChanged);
                 return;
             }
             if offered.is_empty() {
@@ -1085,16 +1163,71 @@ impl Agent {
         self.inner.models_changed();
     }
 
+    /// Reserves a listing, observes one already running, or skips a cached list if
+    /// the caller only needs to fill in missing offers.
+    pub(crate) fn begin_offer_listing(
+        &self,
+        provider: Provider,
+        missing_only: bool,
+    ) -> Option<(OfferListing, Option<OfferListRun>)> {
+        let mut listings = self.inner.offer_listings.lock().unwrap();
+        let previous_error = listings.errors.get(&provider).cloned();
+        let (ready, run) = if let Some(ready) = listings.active.get(&provider) {
+            (ready.clone(), None)
+        } else {
+            if missing_only && self.inner.offers.lock().unwrap().contains_key(&provider) {
+                return None;
+            }
+            let (done, ready) = watch::channel(None);
+            listings.active.insert(provider, ready.clone());
+            let run = OfferListRun {
+                agent: self.clone(),
+                provider,
+                done: Some(done),
+            };
+            let _ = self.inner.events.send(Event::ModelsChanged);
+            (ready, Some(run))
+        };
+        let listing = OfferListing {
+            previous_error,
+            ready,
+        };
+        Some((listing, run))
+    }
+
+    pub(crate) fn offers_with_list_status(
+        &self,
+        providers: &[Provider],
+    ) -> (crate::models::Offers, OfferListStatus) {
+        let listings = self.inner.offer_listings.lock().unwrap();
+        let status = OfferListStatus {
+            listing: listings
+                .active
+                .keys()
+                .filter(|p| providers.contains(p))
+                .copied()
+                .collect(),
+            list_errors: listings
+                .errors
+                .iter()
+                .filter(|(p, _)| providers.contains(p))
+                .map(|(p, e)| (*p, e.clone()))
+                .collect(),
+        };
+        (self.offers(), status)
+    }
+
     /// Lists the models each of `executor`'s providers offers this agent's accounts
     /// (see [`Agent::set_offers`]); returns why a list failed, per provider.
     pub async fn learn_offers(&self, executor: &dyn Executor) -> BTreeMap<Provider, String> {
         let mut failed = BTreeMap::new();
         for provider in executor.providers() {
-            match executor.list_models(provider).await {
-                Ok(offered) => self.set_offers(provider, offered),
-                Err(e) => {
-                    failed.insert(provider, format!("{e:#}"));
-                }
+            let (listing, run) = self.begin_offer_listing(provider, false).unwrap();
+            if let Some(run) = run {
+                run.finish(executor.list_models(provider).await);
+            }
+            if let Err(error) = listing.wait().await {
+                failed.insert(provider, error);
             }
         }
         failed

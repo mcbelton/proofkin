@@ -6,6 +6,7 @@
 //! when it changes (see [`crate::agent::Agent::watch_models`]).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -13,11 +14,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{ApiError, AppState, Shared, bad_request, internal};
-use crate::llm::{CopilotBackend, Provider};
-use crate::models::{ModelChoice, Offers};
+use crate::agent::{OfferListStatus, OfferListing};
+use crate::llm::{CopilotBackend, Executor, Provider};
+use crate::models::{ModelChoice, Offered, Offers};
 use crate::profile::Profile;
 
 const PROVIDERS: [Provider; 3] = [Provider::Copilot, Provider::Claude, Provider::Codex];
+pub(super) const LISTS_MODELS: &[Provider] = &[Provider::Copilot];
 
 /// A provider's name as the page shows it.
 fn label(provider: Provider) -> &'static str {
@@ -40,37 +43,73 @@ fn own_providers(s: &Shared, me: &Profile) -> Vec<Provider> {
         .collect()
 }
 
-/// The models `providers` offer this agent's accounts: as listed already, else listed
-/// now (by its own Copilot, or one started for the purpose); and why a list failed.
+/// Lists with the running executor, or starts a Copilot just to get its account's list.
+async fn list_provider(
+    executor: Option<Arc<dyn Executor>>,
+    me: Profile,
+    provider: Provider,
+) -> anyhow::Result<Vec<Offered>> {
+    if let Some(executor) = executor
+        && executor.providers().contains(&provider)
+    {
+        return executor.list_models(provider).await;
+    }
+    match provider {
+        Provider::Copilot => {
+            let creds = tokio::task::spawn_blocking(move || me.copilot_credentials()).await??;
+            CopilotBackend::list_models_with(creds).await
+        }
+        Provider::Claude | Provider::Codex => Ok(Vec::new()),
+    }
+}
+
+/// Starts a missing list, or joins the one already running for this provider.
+fn start_listing(shared: &Shared, me: &Profile, provider: Provider) -> Option<OfferListing> {
+    if !LISTS_MODELS.contains(&provider) {
+        return None;
+    }
+    let (listing, run) = shared.agent.begin_offer_listing(provider, true)?;
+    if let Some(run) = run {
+        let fetch = list_provider(shared.executor.clone(), me.clone(), provider);
+        tokio::spawn(async move { run.finish(fetch.await) });
+    }
+    Some(listing)
+}
+
+/// Describe starts the lists it needs without waiting for them. The last error stays
+/// available until a list succeeds, including in the response that starts the retry.
+pub(super) fn list_in_background(
+    shared: &Shared,
+    me: &Profile,
+    providers: &[Provider],
+) -> OfferListStatus {
+    let mut status = OfferListStatus::default();
+    for &provider in providers {
+        if let Some(listing) = start_listing(shared, me, provider) {
+            status.listing.push(provider);
+            if let Some(error) = listing.previous_error {
+                status.list_errors.insert(provider, error);
+            }
+        }
+    }
+    status
+}
+
+/// The Models dialog waits for the full list and shows any errors from that attempt.
 async fn listed(
-    s: &Shared,
+    shared: &Shared,
     me: &Profile,
     providers: &[Provider],
 ) -> (Offers, BTreeMap<Provider, String>) {
     let mut errors = BTreeMap::new();
-    let copilot = Provider::Copilot;
-    if providers.contains(&copilot) && !s.agent.listed().contains_key(&copilot) {
-        let found = match &s.executor {
-            Some(executor) if executor.providers().contains(&copilot) => {
-                executor.list_models(copilot).await
-            }
-            _ => {
-                let me = me.clone();
-                match tokio::task::spawn_blocking(move || me.copilot_credentials()).await {
-                    Ok(Ok(creds)) => CopilotBackend::list_models_with(creds).await,
-                    Ok(Err(e)) => Err(e),
-                    Err(e) => Err(e.into()),
-                }
-            }
-        };
-        match found {
-            Ok(offered) => s.agent.set_offers(copilot, offered),
-            Err(e) => {
-                errors.insert(copilot, format!("{e:#}"));
-            }
+    for &provider in providers {
+        if let Some(listing) = start_listing(shared, me, provider)
+            && let Err(error) = listing.wait().await
+        {
+            errors.insert(provider, error);
         }
     }
-    let listed = s
+    let listed = shared
         .agent
         .listed()
         .into_iter()
