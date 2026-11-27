@@ -371,10 +371,12 @@ shows which): a model that supports fewer levels takes the nearest it supports b
 one asked for, and one that supports none runs at its own. Claude takes `low` to `max`
 (`minimal` is `low`); Codex takes them all.
 
-A task picks its model and effort with `model=` and `effort=` in a plan step (or its agent's
-`model:`), `/ask` and `/delegate --model <name> --effort <level>`, the **Model** and
-**Reasoning** fields of the web UI's Run task form and plan builder, or the `model` and
-`effort` arguments of the MCP and A2A `delegate`. The web UI lists exactly what the chosen
+A task picks its model and effort with `model=` and `effort=` in a plan step,
+`/ask` and `/delegate --model <name> --effort <level>`, the **Model** and **Reasoning**
+fields of the web UI's Run task form and plan builder, or the `model` and `effort`
+arguments of the MCP and A2A `delegate`. Each plan step uses its own settings first,
+then the plan's `model:` and `effort:` for any it doesn't set. Without those, it uses
+its named agent's model if set, then its peer's defaults. The web UI lists what the chosen
 peer lets you pick: the models it allows, or all its account offers when it allows any (by
 vendor, with their cost multiplier; a name typed by hand only for a peer that lists none,
 such as Claude, Codex or an older version), and the levels it allows that the chosen model
@@ -1278,6 +1280,16 @@ review after fix #qa:app apply=fix verify=test claims=PARSE-1 Review the change 
 signoff after review approve @carol claims=PARSE-2 Approve the parser change for release
 ```
 
+| Plan option (before claims and steps) | What it does |
+| --- | --- |
+| `track: #N`, `track: title` or `track: off` | Chooses how the run is [tracked on GitHub](#tracked-work). |
+| `model: name` | Sets the model for steps that don't have `model=`, e.g. `model: claude-sonnet-5.5`. Use it only when all model steps use the same provider. |
+| `effort: level` | Sets reasoning for steps that don't have `effort=`: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. It can span providers. |
+
+Use each of these lines at most once. `model:` and `effort:` don't apply to sign-offs,
+pull requests, team steps or `@workiq` steps. The plan check warns about an unused
+choice or one a step's peer doesn't allow.
+
 | Step option | What it does |
 | --- | --- |
 | `verify=a,b` | After the model finishes, the **worker's runtime** (not the model) runs those checks in the task's folder. It records exit codes, durations and the end of their output. The step fails if any check fails. |
@@ -1286,9 +1298,9 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
 | `base=RUN:STEP` | Starts from the commit step STEP of an earlier evidence run RUN made, merged or not: its patch, from the run's signed record (which must check out), is applied in this step's worktree first. The plan check says when the run, its step or its patch isn't there. Not with `apply=`; needs edit access in a `--worktrees` folder. A run's card has **Build on it…**, which starts such a plan. |
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
-| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step names one). Not on sign-offs. |
-| `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (default: the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
-| `effort=level` | The reasoning effort its model works at: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (default: the peer's default; a model that supports fewer takes the nearest below, see [Models](#models)). The peer refuses an effort its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it. Not on sign-offs, team steps or `@workiq` steps. |
+| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step or plan names one). Not on sign-offs. |
+| `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (otherwise the plan's model, the named agent's, or the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
+| `effort=level` | The reasoning effort its model works at: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (otherwise the plan's effort or the peer's default; a model that supports fewer takes the nearest below, see [Models](#models)). The peer refuses an effort its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it. Not on sign-offs, team steps or `@workiq` steps. |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results, or asks for changes: the steps it waits for are done again with their note, then they are asked again. |
@@ -1304,12 +1316,12 @@ A step line is `name [after steps] [team|pr] @peer[:folder] or #squad [options] 
 go before the task text (the plan check warns about one typed after it, but not text in
 backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
-`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout`, `issue` and `model` are given once.
+`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout`, `issue`, `model` and `effort` are given once.
 
 A step's task text can go on over the lines after it: lines indented more than the step line continue
 it, with their common indentation removed (deeper indentation is kept, so nested lists work), and a
 blank line between them is a paragraph break. A line that isn't indented more ends the step. Options
-still go only on the step line, and lines after a `claim:`, `track:` or `//` line are not continuations.
+still go only on the step line, and lines after a plan setting, claim or comment are not continuations.
 
 ```
 review @alice:app verify=test Check the change:
@@ -2475,6 +2487,12 @@ proofkin --name me --providers copilot --serve --ui
 
   The plan is checked as you go, and problems with a clear fix come with a button that
   makes it (in the builder, on the card they are about).
+  Beside **Run plan** in Plan mode and the editor, **Model** and **Reasoning** choose
+  defaults for the whole plan. The choices write `model:` and `effort:` into the plan
+  before its claims and steps; choosing a peer default removes the corresponding line.
+  The menu offers the models the steps' peers allow in common, counting online squad
+  members. If the steps use different providers, choose each step's model in the editor;
+  you can still pick reasoning for the plan. A step's own `model=` or `effort=` always wins.
   Steps show which steps they wait for, and skipped steps are flagged. **Schedule…** runs
   the plan on its own at set times ([scheduled plans](#scheduled-plans)). With a
   [tracker](#tracked-work) linked, **Track on GitHub** beside it chooses where the run is

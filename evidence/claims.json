@@ -1771,6 +1771,21 @@
       ]
     },
     {
+      "id": "MDL-11",
+      "area": "models",
+      "claim": "A plan can set model: and effort: once each for its model steps. A step's own model= or effort= wins; sign-off, pull request, team and @workiq steps don't inherit either. The parser refuses duplicate or invalid settings and a model: line with mixed providers. The check warns when a step would be refused or when no step uses a setting. In Plan mode and the editor, labeled Model and Reasoning choices read and write those lines beside Run plan. The model menu offers what the steps' peers allow in common and names their shared default; only reasoning is selectable with mixed providers. The Builder keeps the lines and names the inherited choices, and each dispatched task and signed result use the effective settings.",
+      "tests": [
+        "lib::plan::plan_model_defaults_apply_only_to_model_steps_and_each_override_wins",
+        "lib::plan::plan_model_headers_reject_duplicates_bad_values_and_models_for_mixed_providers",
+        "lib::plan::plan_check_warns_about_refused_and_unused_model_defaults",
+        "lib::plan::the_format_reference_names_every_step_kind_and_option_the_parser_takes",
+        "agents::plan_defaults_reach_the_worker_and_its_signed_result",
+        "ui::the_plan_editor_keeps_plans_valid",
+        "ui::task_forms_offer_the_models_and_levels_the_worker_allows",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
       "id": "MDL-4",
       "area": "models",
       "claim": "A task works at a reasoning effort (minimal, low, medium, high, xhigh or max): the one it asks for (a plan step's effort=, given once and not on sign-offs, team steps or @workiq steps; /ask and /delegate --effort with --model in either order; the web UI's Reasoning field; the MCP and A2A delegate's effort), else the profile's default for the provider (proofkin models effort, or models default --effort), which peers learn from the hello (a hello without one reads as none). The worker refuses a name that isn't an effort, and one its owner doesn't allow (MDL-7). Copilot gets it fitted to what the task's model supports (the nearest it supports below the one asked for, none if it supports none, and the task runs at the model's own if the CLI refuses it); Claude gets low to max (minimal is low) and Codex all of them, through the bridge. The result names the model with its effort, e.g. claude-opus-5.5 (max reasoning), in characters every version of Proofkin shows as they are, and so do the signed output, the audit log and the CLI; models list shows the efforts each Copilot model supports.",

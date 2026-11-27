@@ -236,12 +236,25 @@
           <label for="composer-input" class="visually-hidden" id="composer-label">Message</label>
           <textarea id="composer-input" rows="2" placeholder="Message all connected peers…"></textarea>
           <div id="plan-problems" class="plan-problems" role="status" aria-live="polite" hidden></div>
+          <div class="plan-track" id="plan-track" hidden></div>
+          <div class="plan-models small" id="plan-models" hidden>
+            <label for="plan-model">Model
+              <select id="plan-model" aria-describedby="plan-models-note plan-models-mixed"></select>
+            </label>
+            <label for="plan-model-name" hidden>Model name
+              <input id="plan-model-name" type="text" placeholder="e.g. claude-sonnet-5.5" autocomplete="off" spellcheck="false" maxlength="100">
+            </label>
+            <label for="plan-effort">Reasoning
+              <select id="plan-effort" aria-describedby="plan-models-note"></select>
+            </label>
+            <p class="muted small" id="plan-models-mixed" hidden></p>
+            <p class="muted small" id="plan-models-note">Steps with their own <code>model=</code> or <code>effort=</code> keep their choices.</p>
+          </div>
           <button type="submit" class="btn primary" id="send-btn">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12l16-8-6 16-2-7-8-1z"></path></svg><span>Send</span>
           </button>
         </div>
         <p class="hint" id="composer-hint">Enter to send · Shift+Enter for a new line</p>
-        <div class="plan-track" id="plan-track" hidden></div>
       </form>
     </main>
     </div>
@@ -522,6 +535,19 @@
       </div>
       <div class="editor-foot">
         <div class="plan-track" id="plan-editor-track" hidden></div>
+        <div class="plan-models small" id="plan-editor-models" hidden>
+          <label for="plan-editor-model">Model
+            <select id="plan-editor-model" aria-describedby="plan-editor-models-note plan-editor-models-mixed"></select>
+          </label>
+          <label for="plan-editor-model-name" hidden>Model name
+            <input id="plan-editor-model-name" type="text" placeholder="e.g. claude-sonnet-5.5" autocomplete="off" spellcheck="false" maxlength="100">
+          </label>
+          <label for="plan-editor-effort">Reasoning
+            <select id="plan-editor-effort" aria-describedby="plan-editor-models-note"></select>
+          </label>
+          <p class="muted small" id="plan-editor-models-mixed" hidden></p>
+          <p class="muted small" id="plan-editor-models-note">Steps with their own <code>model=</code> or <code>effort=</code> keep their choices.</p>
+        </div>
         <button type="button" class="btn" id="plan-editor-schedule">Schedule…</button>
         <button type="button" class="btn primary" id="plan-editor-run">Run plan</button>
       </div>

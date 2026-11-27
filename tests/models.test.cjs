@@ -141,4 +141,31 @@ assert.deepStrictEqual(squadMember({ capabilities: ["codex"], shares: [], owner:
 assert.deepStrictEqual(squadMember({ capabilities: [], shares: [{ name: "demo", team: true }] }, label),
   { takes: true, text: "team steps only · folders demo (team plan)" });
 
+const { planModelOptions } = vm.runInThisContext("({ planModelOptions })");
+const also = {
+  models: { copilot: { default: "CLAUDE-OPUS-5.5", allowed: [opus.id, gpt.id, "o9"], efforts: ["low", "high"] } },
+  offers: { copilot: [opus, gpt] },
+};
+const planPick = (agents, model = null, effort = null) =>
+  planModelOptions(new Map([["copilot", agents]]), { model, effort });
+const common = planPick([worker, also], gpt.id, "HIGH");
+assert.deepStrictEqual(common.models.map((o) => o.options ? [o.label, ...o.options.map((m) => m.value)] : [o.value, o.text]), [
+  ["", "claude-opus-5.5 (each peer's default)"],
+  ["Anthropic", opus.id],
+  ["OpenAI", gpt.id],
+]);
+assert.deepStrictEqual([common.model, common.effort], [gpt.id, "high"]);
+assert.deepStrictEqual(common.efforts.map((o) => o.value), ["", "low", "high"]);
+assert.strictEqual(planPick([worker, picky]).models[0].text, "Each step's peer default");
+assert.strictEqual(planPick([worker, {}]).models.at(-1).value, OTHER_MODEL, "one peer lists nothing");
+assert.strictEqual(planPick([worker], mini.id).fixed, true, "reasoning follows the model");
+const typed = planPick([worker, also], mini.id, "max");
+assert.deepStrictEqual([typed.model, typed.effort], [mini.id, "max"], "keep explicit lines even if not offered together");
+const mixed = planModelOptions(new Map([
+  ["copilot", [also]],
+  ["claude", [{ models: { claude: { efforts: ["low"] } } }]],
+]), { model: null, effort: null });
+assert.deepStrictEqual(mixed.models, [{ value: "", text: "Each step's peer default" }]);
+assert.deepStrictEqual(mixed.efforts.map((o) => o.value), ["", "low"], "reasoning spans providers");
+
 console.log("ok: model lists");

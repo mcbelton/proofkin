@@ -1062,6 +1062,29 @@ async fn tasks_work_at_the_owners_reasoning_effort_unless_they_ask_for_another()
     );
 }
 
+#[tokio::test]
+async fn plan_defaults_reach_the_worker_and_its_signed_result() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let plan = Plan::parse(
+        "model: fake-big\neffort: high\na @worker Hello\nb @worker model=fake-other effort=low Hi",
+    )
+    .unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert_eq!(states["a"].model(), Some("fake-big (high reasoning)"));
+    assert_eq!(states["b"].model(), Some("fake-other (low reasoning)"));
+    let StepState::Done { output, .. } = &states["a"] else {
+        panic!("the inherited choice should run: {:?}", states["a"]);
+    };
+    assert!(output.contains("**Model** `fake-big` (copilot), high reasoning"));
+}
+
 /// A worker lets tasks ask only for some reasoning efforts (it refuses others, and one
 /// that asks for none works at the least of them), and tells peers the models its
 /// account offers and can use, with the efforts each supports.
