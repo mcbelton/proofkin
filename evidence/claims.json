@@ -270,13 +270,15 @@
     {
       "id": "DW-3",
       "area": "digital workers",
-      "claim": "From its web UI (or the command line) an owner creates digital workers that run on its sign-ins (it can sign in to Copilot there with a GitHub CLI account, refused unless it works) in folders it picks, which a worker shares as its owner does. The owner's agent runs each as a background agent that dials it, starts the ones that start with it whenever it starts, and stops them cleanly when it stops. The owner starts, stops and deletes them there: deleting stops a worker, takes it off the owner's allowlist and out of its squads (a squad left empty goes) and deletes its profile, keeping its data folder; one running outside the owner's agent isn't deleted until it stops, one that stops on its own shows why, and a profile runs in one agent at a time.",
+      "claim": "From its web UI (or the command line) an owner creates digital workers that run on its sign-ins (it can sign in to Copilot there with a GitHub CLI account, refused unless it works) in folders it picks, which a worker shares as its owner does. The owner's agent runs each as a background agent that dials it, starts the ones that start with it whenever it starts, and stops them cleanly when it stops. The owner starts, stops and deletes them there: deleting stops a worker, takes it off the owner's allowlist and out of its squads (a squad left empty goes) and deletes its profile, keeping its data folder, in one request (a stop waits, up to 5 seconds, until the worker's process has let go of its profile); one whose process didn't end once stopped isn't deleted, saying so; one running outside the owner's agent isn't deleted until it stops, one that stops on its own shows why, and a profile runs in one agent at a time.",
       "tests": [
         "lib::workers::workers_are_refused_what_they_could_not_run_with",
         "lib::workers::a_profile_runs_in_one_agent_at_a_time",
         "lib::workers::leaving_squads_removes_those_left_empty",
         "lib::workers::the_last_lines_of_a_log_are_kept",
         "workers::owners_create_start_stop_and_delete_digital_workers_from_the_web_ui",
+        "workers::a_running_worker_is_deleted_in_one_request_though_its_lock_outlasts_its_process",
+        "workers::a_worker_whose_lock_stays_held_is_not_deleted_and_the_refusal_says_why",
         "ui::the_page_follows_the_ux_guidelines"
       ],
       "live": [

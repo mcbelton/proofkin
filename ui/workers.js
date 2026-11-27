@@ -162,12 +162,13 @@ async function setStartWithOwner(w, input) {
 }
 
 async function deleteWorker(w) {
+  const running = w.process?.state === "running" ? "It's running, so it's stopped first. " : "";
   const release = w.release
     ? ` It runs release ${w.release.version} of factory agent ${w.release.agent}: that deployment ends (the agent and its releases stay).`
     : "";
   const ok = await confirmDialog({
     title: `Delete digital worker ${w.name}?`,
-    body: `It stops, leaves your allowlist and squads, and its profile goes: its key, its allowlist, the folders it shares and its audit log. Its data folder stays (${w.data_folder}).${release}`,
+    body: `${running}It leaves your allowlist and squads, and its profile goes: its key, its allowlist, the folders it shares and its audit log. Its data folder stays (${w.data_folder}).${release}`,
     confirm: "Delete worker",
     danger: true,
   });

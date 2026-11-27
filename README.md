@@ -439,9 +439,11 @@ of its log), with **Start**/**Stop**, **Starts with this agent** and **Delete**.
 - **Deleting** a worker (`worker remove`, `profile delete`, or **Delete** in the web UI,
   which stops it first) deletes its key, allowlist, folder settings and audit log, and
   takes it off its owner's allowlist and out of its squads (a squad left empty goes). Its
-  data folder stays. A worker running outside its owner's agent isn't deleted until it
-  stops. A factory agent's deployment on it ends (the agent and its releases stay; see
-  [Agent factory](docs/agent-factory.md)).
+  data folder stays. Stopping a worker waits (up to 5 seconds) until its process has let
+  go of its profile, so the web UI deletes a running worker in one go; one whose process
+  didn't end isn't deleted, and the web UI says so. A worker running outside its owner's
+  agent isn't deleted until it stops. A factory agent's deployment on it ends (the agent
+  and its releases stay; see [Agent factory](docs/agent-factory.md)).
 - Work stays private unless shared: a peer reaches only the folders the worker or owner
   explicitly shares with that peer.
 - **Memory:** `proofkin worker memory tester --context glossary,architecture --lessons

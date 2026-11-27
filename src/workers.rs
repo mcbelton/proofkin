@@ -30,6 +30,9 @@ use crate::trust::{DEFAULT_TASKS_PER_HOUR, Ticket, TrustStore, TrustedPeer};
 pub const MAX_ROLE_CHARS: usize = 200;
 /// How long a worker gets to quit when asked, before it is ended.
 const STOP_GRACE: Duration = Duration::from_secs(10);
+/// How long a stop waits, once a worker's process has ended, for its instance lock to be
+/// free (the system can release it a moment after the process ends).
+const UNLOCK_WAIT: Duration = Duration::from_secs(5);
 /// Lines of a worker's log kept when it ends on its own.
 const LOG_TAIL_LINES: usize = 40;
 
@@ -312,6 +315,8 @@ pub enum Process {
 }
 
 struct Running {
+    /// Its profile, whose instance lock a stop waits for.
+    worker: Profile,
     since_ms: u128,
     /// The worker's input: `/quit` asks it to stop, and it stops when this closes.
     input: Option<ChildStdin>,
@@ -454,6 +459,7 @@ impl Supervisor {
         running.insert(
             name.to_owned(),
             Running {
+                worker: worker.clone(),
                 since_ms: now_ms(),
                 input: child.stdin.take(),
                 kill: Some(kill),
@@ -496,16 +502,23 @@ impl Supervisor {
     }
 
     /// Stops worker `name` if this agent started it: asks it to quit (it says
-    /// goodbye to its peers), and ends it if it hasn't quit after a while. Returns
-    /// whether it was running here.
+    /// goodbye to its peers), and ends it if it hasn't quit after a while. Then it
+    /// waits, up to 5 seconds, until the worker's instance lock is free, so a worker
+    /// it stopped can be deleted or started again at once. Returns whether it was
+    /// running here.
     pub async fn stop(&self, name: &str) -> bool {
-        let (input, kill, mut ended) = {
+        let (worker, input, kill, mut ended) = {
             let mut running = self.running.lock().unwrap();
             let Some(r) = running.get_mut(name) else {
                 return false;
             };
             r.stopping = true;
-            (r.input.take(), r.kill.take(), r.ended.clone())
+            (
+                r.worker.clone(),
+                r.input.take(),
+                r.kill.take(),
+                r.ended.clone(),
+            )
         };
         if let Some(mut input) = input {
             let _ = input.write_all(b"/quit\n").await;
@@ -520,6 +533,7 @@ impl Supervisor {
             }
             let _ = tokio::time::timeout(Duration::from_secs(5), ended.wait_for(|e| *e)).await;
         }
+        until_unlocked(&worker, UNLOCK_WAIT).await;
         true
     }
 
@@ -540,6 +554,14 @@ impl Supervisor {
     pub async fn stop_all(&self) {
         let names: Vec<String> = self.running.lock().unwrap().keys().cloned().collect();
         futures_util::future::join_all(names.iter().map(|n| self.stop(n))).await;
+    }
+}
+
+/// Waits until no agent holds `worker`'s instance lock, for at most `within`.
+async fn until_unlocked(worker: &Profile, within: Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    while worker.is_running() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
