@@ -391,7 +391,49 @@ sign-off of exactly that change:
   activity and the task's card show them. Each change call is audited like any gateway call:
   purpose `gateway`, with its path's SHA-256.
 
-Later: sign-off requests in Teams or mail, if the owner opts in (#61).
+**Sign-off notices in Teams or mail** (opt-in). When a sign-off waits for you, Proofkin can
+tell you in Microsoft 365 as well, so you don't have to watch the web UI. You still answer it
+in Proofkin: in the web UI, or with `/approve` in the agent's terminal.
+
+- **What is sent.** One notice per sign-off that waits for you: a plan's `approve @me` step
+  (including one that shows Microsoft 365 changes) and an interactive task's held change
+  call. It holds the sign-off's title, the run's id and the step (or your task's number), the
+  agent's name and how to answer; never the change's content, recipients or body, nor any
+  step's result.
+- **A change Proofkin makes with your account**, as an apply step makes one you signed off.
+  You opted in once, so it needs no sign-off of its own: it goes through the audited client
+  with purpose `notice` and counts against the budgets (a plan's, against its run's too); it
+  is sent once and never sent again. A notice whose call Work IQ fails or refuses is told in
+  the activity and recorded in the audit. A notice that can't be sent at all (no usable
+  Work IQ account, an account address that isn't an email address, a chat id that isn't one)
+  makes no call, so it is told in the activity only. Either way, the sign-off still waits.
+- **It never lengthens the wait.** It is sent in the background, and a held call's wait runs
+  from when the call was held.
+- **Where it goes.** Off by default; you opt in once per profile:
+  - `proofkin workiq notices mail --profile NAME`: mail to the signed-in account's own
+    address (its UPN), with `do_action` on `/me/sendMail` and `jsonBody: {message: {subject,
+    body: {contentType: Text, content}, toRecipients: [{emailAddress: {address: <UPN>}}]},
+    saveToSentItems: false}`.
+  - `proofkin workiq notices teams --chat <id> --profile NAME`: a message in a chat you
+    choose, with `create_entity` on `/chats/{id}/messages` and `jsonBody: {body:
+    {contentType: text, content}}`. Before keeping the chat, Proofkin checks you are a member
+    with `fetch` on `/me/chats/{id}?$select=id,topic,chatType`. `proofkin workiq notices teams
+    --list` shows your recent chats (`fetch` on `/me/chats?$select=id,topic,chatType&$top=20`)
+    to pick from. Both reads are audited as the command's own.
+  - Teams' "chat with yourself" (`48:notes`) isn't in the Microsoft Graph reference, so it
+    isn't offered (not until a live check shows it works).
+  - `proofkin workiq notices off --profile NAME` turns them off again.
+- **The setting** is `workiq_notices` in `profile.json`: `{"to": "mail"}` or `{"to": "teams",
+  "chat": "<id>"}`. A digital worker that uses its owner's Work IQ uses its owner's setting
+  and account, so its owner gets the notice (`workiq notices` on the worker is refused: its
+  owner sets it). `proofkin workiq doctor` and the web UI's Work IQ card say where notices
+  go.
+- **The message**, plain text. By mail, the subject is `Proofkin: sign-off waiting: <title>`.
+  The text, for mail and Teams: `<agent> waits for your sign-off of "<title>" (run <run id>,
+  step <step>). Answer it in Proofkin's web UI or with /approve in the agent's terminal. This
+  message holds nothing of what you are asked to sign off.` A held change call's says `(task
+  #N)` instead of the run and step. The title is cut to 200 characters, redacted, and
+  stripped of control characters (and of characters that change how text around them shows).
 
 ### 8. Plugins and enterprise skills
 
@@ -404,7 +446,8 @@ skills and plugins with Work IQ's `discover` and add them through the usual plug
 ### 9. Audit, usage and budgets
 
 Every call is a line in `<profile>/workiq-audit.jsonl`: time, tool, purpose (a run's step,
-knowledge import, a gateway task, doctor), audience, the query's SHA-256 and length (not its
+knowledge import, a gateway task, doctor, a sign-off's notice), audience, the query's SHA-256
+and length (not its
 text; for a change, its path's), outcome class, results and withheld counts, labels, request
 and correlation ids, and duration. Budgets in `profile.json` (`workiq_budget.calls_per_day`, default 200;
 `workiq_budget.calls_per_run`, default 25) stop calls with a clear error before they are
@@ -417,8 +460,8 @@ use.
 `proofkin workiq doctor` checks, in order: discovery, the sign-in, the token's audience,
 tenant and scopes, `tools/list`, and one small `retrieve`. Each failure names the fix and who
 can make it (service principal, consent, user assignment, billing, MCP policy). It also says
-whether Microsoft 365 changes are on, and how long a task's change waits for its sign-off
-(section 7). The web UI
+whether Microsoft 365 changes are on, how long a task's change waits for its sign-off, and
+where sign-off notices go (section 7). The web UI
 gets a Work IQ card in Accounts (sign in with a device code shown in the page, status, doctor,
 use against budgets), Microsoft 365 grants on peers, `workiq=` and `@workiq` in the plan
 editor, an import in Knowledge, and the sources a step used in its run.
@@ -435,6 +478,7 @@ editor, an import in Knowledge, and the sources a step used in its run.
 | Retry storms, repeated changes | Classified errors; denials and changes never retried; the server's delays honored |
 | A plan making Microsoft 365 changes you didn't mean | Off unless the profile allows them; a model only proposes; your own signed approval covers the request showing the list and its SHA-256, which the step with no model checks before it makes exactly that list, once and in order; a change is never sent again, even after a restart; neither the proposal nor the outcome goes on GitHub |
 | A task's model making Microsoft 365 changes you didn't mean | Off unless both the profile and the folder's `workiq` server allow them; only a digital worker's task for its owner, never a plan step's or a peer's; each call is checked, then waits for your own signed approval of a request showing exactly that change and its SHA-256, and is withdrawn when you don't answer in time; made once and never sent again; the task's signed result names each change |
+| A sign-off notice leaking what you sign off | Off unless you opt in; it holds only the sign-off's title (cut, redacted, plain text), its run and step or task, the agent and how to answer; it goes only to your account's own address or a Teams chat Microsoft Graph says you are a member of; sent once, audited |
 | Stale or wrong context taken as truth | Cited, dated and marked unverified; claims are proven only by checks |
 
 ## Admin setup (summary)
@@ -459,8 +503,8 @@ The step-by-step guide, with a check after each step and troubleshooting, is in 
 - Tests against a fake Work IQ server (sessions, SSE, `structuredContent`, every error class,
   delays), fake Entra endpoints, and a fake stdio server for the CLI connection.
 - The commands through the program itself (`tests/workiq_e2e.rs`): sign-in, `workiq doctor`,
-  `workiq agents`, `kb import workiq`, and a plan's `@workiq` and `workiq=` steps run by
-  `proofkin`'s own agent, against the fakes. The test-only settings
+  `workiq agents`, `workiq notices`, `kb import workiq`, and a plan's `@workiq` and `workiq=`
+  steps run by `proofkin`'s own agent, against the fakes. The test-only settings
   `PROOFKIN_TEST_WORKIQ_URL` and `PROOFKIN_TEST_ENTRA_URL` point it at them; they take only a
   loopback address. The CLI connection is tested the same way with `--cli-path`.
 - A `WIQ-*` claim in `evidence/claims.json` for each behavior above.
@@ -499,7 +543,7 @@ each step works on one of its sub-issues (`issue=#N`).
 | | [#272](https://github.com/mcbelton/proofkin/issues/272) Changes in interactive tasks; `call_function` as a read tool | #271 |
 | | [#59](https://github.com/mcbelton/proofkin/issues/59) Microsoft's Work IQ plugin | #56 |
 | | [#60](https://github.com/mcbelton/proofkin/issues/60) Enterprise skills through `discover` (later) | #59 |
-| | [#61](https://github.com/mcbelton/proofkin/issues/61) Sign-off requests in Teams or mail (later) | #58 |
+| | [#61](https://github.com/mcbelton/proofkin/issues/61) Sign-off requests in Teams or mail (opt-in) | #58, #271, #272 |
 | [#62](https://github.com/mcbelton/proofkin/issues/62) Web UI, docs and release | [#63](https://github.com/mcbelton/proofkin/issues/63) Work IQ account card | #41, #43, #48 |
 | | [#64](https://github.com/mcbelton/proofkin/issues/64) Grants, plan editor, import, sources | #46, #50, #51, #52 |
 | | [#65](https://github.com/mcbelton/proofkin/issues/65) Docs, admin guide, claims, live check | #50, #56, #63 |

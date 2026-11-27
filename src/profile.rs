@@ -265,6 +265,27 @@ impl WorkIqChanges {
     }
 }
 
+/// Where a profile's sign-off notices go (see [`ProfileConfig::workiq_notices`]): in
+/// profile.json `{"to": "mail"}` or `{"to": "teams", "chat": "<id>"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "to", rename_all = "lowercase")]
+pub enum WorkIqNotices {
+    /// Mail to the signed-in account's own address.
+    Mail,
+    /// A message in a Teams chat the account is a member of.
+    Teams { chat: String },
+}
+
+impl WorkIqNotices {
+    /// Where notices go, in words: `by mail to <address>` or `in Teams chat <id>`.
+    pub fn describe(&self, address: &str) -> String {
+        match self {
+            WorkIqNotices::Mail => format!("by mail to {address}"),
+            WorkIqNotices::Teams { chat } => format!("in Teams chat {chat}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +329,12 @@ pub struct ProfileConfig {
     /// (`proofkin workiq changes on|off`); the tenant's policy still applies on top.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workiq_changes: Option<WorkIqChanges>,
+    /// Set, a sign-off that waits for this profile's owner is also told in Microsoft 365, by
+    /// mail or in a Teams chat, with the profile's Work IQ account (docs/work-iq.md, section
+    /// 7). Off by default (`proofkin workiq notices off|mail|teams`). A digital worker that
+    /// uses its owner's Work IQ uses its owner's setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workiq_notices: Option<WorkIqNotices>,
     /// Per provider: the model tasks that name none run on, and the models tasks may ask
     /// for (see [`crate::models`] and `proofkin models`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

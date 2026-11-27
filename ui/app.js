@@ -3035,13 +3035,13 @@ function renderWorkiq() {
     nodes = [el("p", { class: "small", text: `Uses ${w.holder}'s Work IQ account, which isn't signed in. Sign it in on ${w.holder}'s Work IQ card, or in a terminal:` }),
       workiqCommand(`${w.hint} --cli`)];
   } else if (!w.own) {
-    nodes = [el("p", { class: "small", text: `Uses ${w.holder}'s account: ${w.line}` }), workiqCliPath(w), workiqChanges(w),
+    nodes = [el("p", { class: "small", text: `Uses ${w.holder}'s account: ${w.line}` }), workiqCliPath(w), workiqChanges(w), workiqNotices(w),
       el("div", { class: "workiq-actions" }, check())];
   } else if (!w.signed_in) {
     nodes = [el("p", { class: "muted small", text: "Microsoft 365 work context for plans: through Microsoft's Work IQ CLI, or your organization's own app." }),
       button("sign-in", "Sign in…", openWorkiqSignIn, "primary")];
   } else {
-    nodes = [el("p", { class: "small", text: `Signed in: ${w.line}` }), workiqCliPath(w), workiqUsage(w.usage), workiqChanges(w),
+    nodes = [el("p", { class: "small", text: `Signed in: ${w.line}` }), workiqCliPath(w), workiqUsage(w.usage), workiqChanges(w), workiqNotices(w),
       el("div", { class: "workiq-actions" }, check(), button("budget", "Budget…", openWorkiqBudget),
         button("sign-out", "Sign out", signOutWorkiq, "danger"))];
   }
@@ -3058,6 +3058,17 @@ function workiqChanges(w) {
   }
   return [el("p", { class: "muted small", text: "Changes: off. Plans and digital workers' tasks make no Microsoft 365 changes; to let them make the ones you sign off, run:" }),
     workiqCommand(`proofkin workiq changes on --profile ${w.profile ?? w.holder}`)];
+}
+
+/** Where sign-off notices go (`workiq notices`): by mail or in a Teams chat, once for each
+ *  sign-off that waits for you; you still answer it in Proofkin. A digital worker that uses
+ *  its owner's account follows its owner's setting. */
+function workiqNotices(w) {
+  if (w.notices_line) {
+    return el("p", { class: "small", text: `Sign-off notices: ${w.notices_line}. Each sign-off that waits for you is also told there, once (never what you sign off); you still answer it in Proofkin.` });
+  }
+  return [el("p", { class: "muted small", text: "Sign-off notices: off. To also be told by mail (or in a Teams chat) when a sign-off waits for you, run:" }),
+    workiqCommand(`proofkin workiq notices mail --profile ${w.holder}`)];
 }
 
 /** Today's Work IQ calls against the budgets, and a warning once the day's are used up. */

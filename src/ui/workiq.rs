@@ -18,6 +18,7 @@ use crate::workiq::content::read_agents;
 use crate::workiq::context::client_for_profile;
 use crate::workiq::doctor::Doctor;
 use crate::workiq::login::CliLogin;
+use crate::workiq::notice::Setting;
 
 fn refused(e: anyhow::Error) -> ApiError {
     bad_request(format!("{e:#}"))
@@ -76,6 +77,7 @@ pub(super) async fn state(State(s): State<AppState>) -> Json<Value> {
         }),
         Err(_) => Value::Null,
     };
+    let notices = Setting::of(&profile);
     Json(json!({
         "signed_in": account.is_some(),
         "line": account.as_ref().map(account_line),
@@ -95,6 +97,10 @@ pub(super) async fn state(State(s): State<AppState>) -> Json<Value> {
             .workiq_changes
             .as_ref()
             .map(|changes| changes.wait_minutes()),
+        // Where the sign-off notices of this profile go (its holder's setting), or null when
+        // they are off.
+        "notices": notices.to_json(),
+        "notices_line": notices.to.is_some().then(|| notices.describe()),
         "profile": profile.name,
     }))
 }

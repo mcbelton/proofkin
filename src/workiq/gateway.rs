@@ -9,7 +9,9 @@
 //! A digital worker's task for its owner, in a folder whose server allows changes, with the
 //! profile whose account it uses allowing them, also gets Work IQ's change tools
 //! (docs/work-iq.md, section 7): each change call is held to the rules of changes, waits for
-//! the owner's sign-off of exactly that change ([`ChangeApprover`]), and is made once.
+//! the owner's sign-off of exactly that change ([`ChangeApprover`]), and is made once. When the
+//! owner turned on sign-off notices, each such sign-off is also told in Microsoft 365 (see
+//! [`crate::workiq::notice`]).
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -33,6 +35,7 @@ use super::content::{
     Audience, DEFAULT_CAP, answer_section, read_agents, retrieval_section, summarize,
 };
 use super::login::random_token;
+use super::notice::{Notifier, SignOff};
 use super::{Endpoints, connect_at};
 use crate::boundary;
 use crate::mcp::McpServer;
@@ -71,6 +74,10 @@ pub trait ChangeApprover: Send + Sync {
     /// Asks for a sign-off of `text`, titled `title`, and waits up to `wait` of awake time for
     /// the answer; without one in time, the request is withdrawn.
     async fn approve(&self, title: &str, text: &str, wait: Duration) -> Approval;
+
+    /// Tells that the notice in Microsoft 365 of the sign-off titled `title` wasn't sent, and
+    /// why (see [`crate::workiq::notice`]); the sign-off still waits.
+    fn notice_failed(&self, _title: &str, _error: &str) {}
 }
 
 /// How the sign-off of a change ended.
@@ -115,9 +122,12 @@ struct Session {
     bearer: String,
     tools: Vec<String>,
     context: CallContext,
-    client: Client,
+    client: Arc<Client>,
     /// Who signs off its changes, and how long each waits: set when it offers change tools.
     sign_off: Option<(ChangeSignOff, Duration)>,
+    /// Where each change's sign-off is also told in Microsoft 365, when the owner turned
+    /// that on (see [`crate::workiq::notice`]).
+    notices: Option<Arc<Notifier>>,
     /// The changes it made: each one's verb and path, and how it ended.
     made: Mutex<Vec<String>>,
     /// True once the task ended: a change still waiting for its sign-off is dropped.
@@ -221,6 +231,7 @@ impl Gateway {
             .context("the task asked for Work IQ (mcp=workiq), but this agent can't use it")?
             .client
             .with_audit(Arc::new(Audit::for_profile(&profile)));
+        let client = Arc::new(client);
         // Changes only for the owner's own task, in a folder whose server allows them, and with
         // the profile whose account the session uses allowing them.
         let owners = sign_off.is_some() && matches!(context.audience, Audience::Local);
@@ -238,6 +249,10 @@ impl Gateway {
         let sign_off = sign_off
             .zip(wait)
             .filter(|_| tools.iter().any(|t| TOOLS.contains(&t.as_str())));
+        // Its owner's notices, with the account the session uses.
+        let notices = sign_off
+            .as_ref()
+            .and_then(|_| Notifier::with_client(&profile, client.clone()));
         let addr = self.listen().await?;
         let (id, bearer) = (random_token(16), random_token(32));
         let mut server = McpServer::remote(format!("http://{addr}/mcp/workiq/{id}"), false);
@@ -257,6 +272,7 @@ impl Gateway {
             context,
             client,
             sign_off,
+            notices,
             made: Mutex::default(),
             closed: watch::Sender::new(false),
         });
@@ -509,6 +525,17 @@ impl Session {
         };
         let title = format!("Microsoft 365 change from {}", sign_off.worker);
         let text = sign_off_text(&change, sign_off);
+        // Told in Microsoft 365 too, in the background: the wait runs from now all the same.
+        if let Some(notices) = &self.notices {
+            let notice = SignOff {
+                agent: sign_off.worker.clone(),
+                title: title.clone(),
+                task: sign_off.task,
+                ..SignOff::default()
+            };
+            let (approver, failed) = (sign_off.approver.clone(), title.clone());
+            notices.spawn(notice, move |error| approver.notice_failed(&failed, &error));
+        }
         // The task ending drops a sign-off still waiting, which withdraws its request.
         let mut closed = self.closed.subscribe();
         let approval = tokio::select! {

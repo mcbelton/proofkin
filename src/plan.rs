@@ -55,6 +55,7 @@ use crate::workiq::content::{
     Audience, DEFAULT_CAP, Source, UNLABELED, answer_section, retrieval_section,
 };
 use crate::workiq::context::{ClientWork, WorkContext};
+use crate::workiq::notice::{Notifier, SignOff};
 
 /// Longest prerequisite result passed on to a dependent step.
 const MAX_DEP_CHARS: usize = 8_000;
@@ -3126,6 +3127,7 @@ pub struct ReadyRun {
     recipients: Recipients,
     profile: crate::profile::Profile,
     work: Option<Arc<dyn WorkContext>>,
+    notices: Option<Arc<Notifier>>,
 }
 
 /// Checks plan `text` as `/plan` and the web UI do (preflight against connected
@@ -3150,6 +3152,7 @@ pub fn start(agent: &Agent, profile: &crate::profile::Profile, text: &str) -> Re
     }
     let ready = plan.prepare(&kb, &skills)?;
     let work = work_context(profile, &plan)?;
+    let notices = notices(profile, &plan);
     Ok(ReadyRun {
         text: text.to_owned(),
         plan,
@@ -3159,6 +3162,7 @@ pub fn start(agent: &Agent, profile: &crate::profile::Profile, text: &str) -> Re
         recipients,
         profile: profile.clone(),
         work,
+        notices,
     })
 }
 
@@ -3200,6 +3204,7 @@ impl ReadyRun {
             recipients: self.recipients.clone(),
             work_context: self.work.clone(),
             work_log: WorkLog::default(),
+            notices: self.notices.clone(),
             ..RunContext::default()
         };
         let states = run_plan_with(agent, &self.squads, &self.ready, &ctx, |step, state| {
@@ -3280,6 +3285,9 @@ pub struct RunContext {
     /// Told each step's work as it is sent, so the run can go on after a restart (see
     /// [`SentStep`]); with one, that work is also left running when the agent stops.
     pub journal: Option<Journal>,
+    /// Where each `approve @me` sign-off is also told in Microsoft 365, when the profile
+    /// turned that on (see [`notices`]).
+    pub notices: Option<Arc<Notifier>>,
 }
 
 /// A step's work as it was sent: a run keeps it to go on after its agent restarts,
@@ -3394,6 +3402,16 @@ pub fn work_context(
         return Ok(None);
     }
     Ok(Some(Arc::new(ClientWork::for_profile(profile)?)))
+}
+
+/// Where `plan`'s `approve @me` sign-offs are also told in Microsoft 365 (see
+/// [`crate::workiq::notice`]): none if no step is one or `profile` didn't turn notices on.
+pub fn notices(profile: &crate::profile::Profile, plan: &Plan) -> Option<Arc<Notifier>> {
+    let yours = |s: &Step| s.approve && matches!(&s.target, Target::Peer(name) if name == "me");
+    if !plan.steps.iter().any(yours) {
+        return None;
+    }
+    Notifier::of(profile)
 }
 
 /// Runs `plan` with `agent`, reporting every state change to `on_update`, and
@@ -4140,9 +4158,30 @@ pub async fn run_plan_with(
                                 changes,
                             };
                             asked_texts.insert(step.id.clone(), ask.text.clone());
+                            // One that waits for you is also told in Microsoft 365, in the
+                            // background, when the profile turned that on.
+                            let notice = match &ctx.notices {
+                                Some(notices) if approver.is_none() => {
+                                    let notice = SignOff {
+                                        agent: agent.name().to_owned(),
+                                        title: ask.title.clone(),
+                                        run: ctx.run_id.clone(),
+                                        step: Some(step.id.clone()),
+                                        task: None,
+                                    };
+                                    Some((notices.clone(), notice))
+                                }
+                                _ => None,
+                            };
                             (
                                 name,
                                 Box::pin(async move {
+                                    if let Some((notices, notice)) = notice {
+                                        let (told, title) = (agent.clone(), notice.title.clone());
+                                        notices.spawn(notice, move |error| {
+                                            told.notice_failed(&title, &error);
+                                        });
+                                    }
                                     agent.request_approval_as(approver, task_id, &ask).await
                                 }),
                             )

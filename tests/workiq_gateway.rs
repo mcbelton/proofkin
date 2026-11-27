@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use axum::{Json, Router};
 use proofkin::agent::Answer;
 use proofkin::evidence::sha256_hex;
 use proofkin::mcp::McpServer;
-use proofkin::profile::{WorkIqAccount, WorkIqChanges, WorkIqConnection};
+use proofkin::profile::{WorkIqAccount, WorkIqChanges, WorkIqConnection, WorkIqNotices};
 use proofkin::protocol::Origin;
 use proofkin::shares::{DATA_SHARE, ShareStore};
 use proofkin::workiq::Endpoints;
@@ -57,6 +58,18 @@ fn use_file_secret_store() {
 #[derive(Default)]
 struct Fake {
     calls: Mutex<Vec<(String, Value)>>,
+    /// How long Work IQ takes to send a sign-off's notice (a mail, or a Teams message).
+    notice_delay: Mutex<Duration>,
+    /// How many notices it has sent.
+    notices_sent: AtomicUsize,
+}
+
+/// Whether a change tool's `arguments` send a sign-off's notice.
+fn is_notice(arguments: &Value) -> bool {
+    arguments["actionUrl"] == "/me/sendMail"
+        || arguments["parentUrl"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("/chats/"))
 }
 
 /// A file as Work IQ (CLI 1.0.1) returns one: its label object, no relevanceScore.
@@ -173,7 +186,13 @@ async fn mcp(
         "tools/call" => {
             let name = message["params"]["name"].as_str().unwrap().to_owned();
             let arguments = message["params"]["arguments"].clone();
+            let notice = is_notice(&arguments);
             fake.calls.lock().unwrap().push((name.clone(), arguments));
+            if notice {
+                let delay = *fake.notice_delay.lock().unwrap();
+                tokio::time::sleep(delay).await;
+                fake.notices_sent.fetch_add(1, Ordering::SeqCst);
+            }
             answer(&name)
         }
         other => panic!("unexpected method {other}"),
@@ -1284,6 +1303,152 @@ async fn a_change_not_signed_off_in_time_is_withdrawn_and_a_late_answer_makes_no
         team.fake.calls.lock().unwrap().is_empty(),
         "nothing reached Work IQ"
     );
+    team.stop().await;
+}
+
+/// A change a worker's task holds for its owner's sign-off is also told in the Teams chat the
+/// owner chose for notices: one `create_entity` on `/chats/{id}/messages` that names the task
+/// and holds nothing of the change, sent in the background and audited with purpose
+/// `notice`. A slow notice doesn't make the wait longer: it runs from when the call was held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_change_is_told_in_the_owners_teams_chat_once_and_waits_no_longer() {
+    let mut team = Team::start(Some(Duration::from_millis(500))).await;
+    let profiles = team.dir.path().join("profiles");
+    let chat = "19:crew@thread.v2";
+    let mut owner = Profile::open_in(&profiles, "boss").unwrap();
+    owner.config.workiq_notices = Some(WorkIqNotices::Teams { chat: chat.into() });
+    owner.save().unwrap();
+    *team.fake.notice_delay.lock().unwrap() = Duration::from_secs(4);
+    let origin = Origin {
+        task: Some(12),
+        ..Origin::default()
+    };
+    let running = team.task(Some(origin), vec![("create_entity", booking())]);
+
+    let id = loop {
+        if let Event::ApprovalRequested { id, .. } = team.next_event().await {
+            break id;
+        }
+    };
+    loop {
+        if let Event::ApprovalClosed { id: closed } = team.next_event().await
+            && closed == id
+        {
+            break;
+        }
+    }
+    // The wait was over while Work IQ was still sending the notice.
+    assert_eq!(
+        team.fake.notices_sent.load(Ordering::SeqCst),
+        0,
+        "the sign-off waited for its notice"
+    );
+    let done = running.await.unwrap().unwrap();
+    let expired = "(error): Not signed off within 1 minute, so nothing was changed.";
+    assert!(done.output.contains(expired), "{}", done.output);
+
+    // One notice, in the chat: who waits for which sign-off, for which task, and how to
+    // answer it; nothing of the change or the task's prompt.
+    let mut calls = Vec::new();
+    for _ in 0..1500 {
+        calls = team.fake.calls.lock().unwrap().clone();
+        if !calls.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let text = "helper waits for your sign-off of \"Microsoft 365 change from helper\" (task \
+                #12). Answer it in Proofkin's web UI or with /approve in the agent's terminal. \
+                This message holds nothing of what you are asked to sign off.";
+    assert_eq!(
+        calls[0],
+        (
+            "create_entity".to_owned(),
+            json!({
+                "parentUrl": format!("/chats/{chat}/messages"),
+                "jsonBody": { "body": { "contentType": "text", "content": text } },
+            })
+        )
+    );
+    // Audited as a notice, for the worker, once Work IQ sent it.
+    let audit = profiles.join("helper").join("workiq-audit.jsonl");
+    let mut notices = Vec::new();
+    for _ in 0..1500 {
+        notices = read(&audit)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.purpose == "notice")
+            .collect();
+        if !notices.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(
+        (notices[0].tool.as_str(), notices[0].outcome.as_str()),
+        ("create_entity", "ok")
+    );
+    assert_eq!(team.fake.notices_sent.load(Ordering::SeqCst), 1);
+    team.stop().await;
+}
+
+/// A digital worker's held change is told where its owner's notices go, with its owner's
+/// Work IQ account: by mail to that account's own address, whatever the worker's own profile
+/// says. The sign-off still waits for the owner, and the change is made once they approve.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workers_notice_goes_with_its_owners_account_where_its_owner_chose() {
+    let team = Team::start(None).await;
+    let profiles = team.dir.path().join("profiles");
+    let mut owner = Profile::open_in(&profiles, "boss").unwrap();
+    owner.config.workiq_notices = Some(WorkIqNotices::Mail);
+    owner.save().unwrap();
+    // The worker's own setting doesn't count: it uses its owner's Work IQ.
+    let mut worker = Profile::open_in(&profiles, "helper").unwrap();
+    worker.config.workiq_notices = Some(WorkIqNotices::Teams {
+        chat: "19:helper@thread.v2".into(),
+    });
+    worker.save().unwrap();
+    let running = team.task(None, vec![("create_entity", booking())]);
+
+    let asked = team.asked().await;
+    let mut calls = Vec::new();
+    for _ in 0..1500 {
+        calls = team.fake.calls.lock().unwrap().clone();
+        if !calls.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let (tool, arguments) = &calls[0];
+    assert_eq!(tool, "do_action");
+    assert_eq!(arguments["actionUrl"], "/me/sendMail");
+    let message = &arguments["jsonBody"]["message"];
+    assert_eq!(
+        message["subject"],
+        "Proofkin: sign-off waiting: Microsoft 365 change from helper"
+    );
+    assert_eq!(
+        message["toRecipients"],
+        json!([{ "emailAddress": { "address": "alice@contoso.example" } }])
+    );
+    assert_eq!(arguments["jsonBody"]["saveToSentItems"], false);
+    assert!(
+        team.boss.approvals().iter().any(|a| a.id == asked.id),
+        "the sign-off still waits"
+    );
+
+    team.boss
+        .answer(asked.id, Answer::Approve, "")
+        .await
+        .unwrap();
+    let done = running.await.unwrap().unwrap();
+    assert!(done.ok && done.verified, "{}", done.output);
+    let calls = team.fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[1], ("create_entity".to_owned(), booking()));
     team.stop().await;
 }
 

@@ -312,7 +312,7 @@ fn check_status(tool: &str, value: &Value, ids: &RequestIds) -> Result<()> {
 }
 
 /// What a failed entity says about why: its error's code and message, redacted.
-fn failure(value: &Value) -> String {
+pub(crate) fn failure(value: &Value) -> String {
     let error = value
         .pointer("/data/error")
         .or_else(|| value.get("error"))
@@ -328,7 +328,7 @@ fn failure(value: &Value) -> String {
 }
 
 /// A number given as a JSON number or a string.
-fn number(value: Option<&Value>) -> Option<u64> {
+pub(crate) fn number(value: Option<&Value>) -> Option<u64> {
     match value? {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s.trim().parse().ok(),

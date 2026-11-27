@@ -11,6 +11,7 @@ use super::account::{HostedTokens, encode};
 use super::audit::{Audit, CallContext, Purpose};
 use super::client::{Class, Client, Fix, TokenSource, Who, WorkIqError, http_client};
 use super::login::id_token_claims;
+use super::notice::Setting;
 use super::{Endpoints, connect_at};
 use crate::profile::{Profile, WorkIqAccount, WorkIqChanges, WorkIqConnection};
 
@@ -106,6 +107,8 @@ pub struct Report {
     /// The profile's Microsoft 365 change settings, when it allows changes (`workiq changes
     /// on`).
     pub changes: Option<WorkIqChanges>,
+    /// Where its sign-off notices go (`workiq notices`).
+    pub notices: Setting,
 }
 
 impl Report {
@@ -137,6 +140,7 @@ impl Report {
             "checks": checks,
             "changes": self.changes.is_some(),
             "change_wait_minutes": self.changes.as_ref().map(WorkIqChanges::wait_minutes),
+            "notices": self.notices.to_json(),
         })
     }
 
@@ -169,6 +173,17 @@ impl Report {
             None => format!(
                 "Microsoft 365 changes: off (turn them on with: proofkin workiq changes on --profile {})\n",
                 self.profile
+            ),
+        });
+        text.push_str(&match &self.notices.to {
+            Some(_) => format!(
+                "Sign-off notices: {} (turn them off with: proofkin workiq notices off --profile {})\n",
+                self.notices.describe(),
+                self.notices.profile
+            ),
+            None => format!(
+                "Sign-off notices: off (turn them on with: proofkin workiq notices mail --profile {})\n",
+                self.notices.profile
             ),
         });
         text.push_str(if self.passed() {
@@ -277,6 +292,7 @@ impl<'a> Doctor<'a> {
             profile: self.profile.name.clone(),
             checks,
             changes: self.profile.config.workiq_changes.clone(),
+            notices: Setting::of(self.profile),
         }
     }
 

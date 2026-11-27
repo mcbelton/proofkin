@@ -627,7 +627,8 @@ usage by peer and provider, as providers reported it:
 
 Every call to [Work IQ](docs/work-iq.md) (Microsoft 365 work context), whether it is done,
 failed or refused, is one line in the profile's `workiq-audit.jsonl`: time, tool, purpose (a
-step of a run with the run id, a knowledge import, a gateway task, `doctor` or a command),
+step of a run with the run id, a knowledge import, a gateway task, `doctor`, a command, or a
+sign-off's `notice`, with its run and step when it has them),
 audience (`local` or the peer's name), the query's SHA-256 and length (never its text; for a
 change, its path's), outcome (`ok`, `refused`, or the error's class), the counts of results
 and withheld results and the sensitivity labels seen when known, the request and correlation
@@ -655,6 +656,48 @@ task's change waits for your sign-off, in awake time: 1 to 10 minutes, as `5m` o
 `proofkin workiq agents --profile alice` lists the declarative agents Work IQ offers (name
 and id), for `agent=` on [`@workiq` steps](#asking-microsoft-365-in-a-step-workiq).
 
+#### Sign-off notices in Teams or mail
+
+When a sign-off waits for you (a plan's `approve @me` step, or a change a digital worker's
+task for you holds), Proofkin can tell you in Microsoft 365 as well, so you don't have to
+watch the web UI. You still answer it in Proofkin: in the web UI, or with `/approve` in the
+agent's terminal. Notices are off by default; you opt in once per profile:
+
+```text
+> proofkin workiq notices mail --profile alice
+> proofkin workiq notices teams --list --profile alice
+> proofkin workiq notices teams --chat 19:abc123@thread.v2 --profile alice
+> proofkin workiq notices off --profile alice
+```
+
+- `mail` sends each notice to the signed-in account's own address (its UPN), with Work IQ's
+  `do_action` on `/me/sendMail`; it isn't kept in Sent Items.
+- `teams --chat <id>` posts it in a Teams chat you choose (`create_entity` on
+  `/chats/{id}/messages`). Before keeping the chat, Proofkin checks you are a member of it
+  (`fetch` on `/me/chats/{id}`). `teams --list` shows up to 20 of your recent chats (id, type
+  and topic) to pick from, and changes nothing. Teams' chat with yourself (`48:notes`) isn't
+  in the Microsoft Graph reference, so it isn't offered.
+- The setting is `workiq_notices` in `profile.json`: `{"to": "mail"}` or `{"to": "teams",
+  "chat": "<id>"}`. A digital worker that uses your Work IQ uses your setting and your
+  account, so its notices come to you (you set them on your own profile).
+
+A notice is plain text: `<agent> waits for your sign-off of "<title>" (run <run id>, step
+<step>). Answer it in Proofkin's web UI or with /approve in the agent's terminal. This message
+holds nothing of what you are asked to sign off.` A held change's notice names your task's
+number instead of a run and step, and a mail's subject is `Proofkin: sign-off waiting:
+<title>`. The title is cut to 200 characters, redacted and stripped of control characters. A
+notice never holds the change's content, recipients or body, nor any step's result.
+
+Each notice is a change Proofkin makes with your account, which you opted in to, so it needs
+no sign-off of its own. It goes through the audit with purpose `notice` and counts against
+the budgets. It is sent once, in the background, so the sign-off doesn't wait longer for it
+(a held change's wait runs from when the call was held). A notice whose call Work IQ fails or
+refuses is told in the activity and recorded in the audit. A notice that can't be sent at all
+(no usable Work IQ account, an account address that isn't an email address, a chat id that
+isn't one) makes no call, so it is told in the activity only. Either way, it isn't sent again
+and the sign-off still waits. `workiq doctor` and the web UI's Work IQ card say where
+notices go.
+
 #### Checking the Work IQ connection
 
 ```text
@@ -681,8 +724,13 @@ Enterprise applications, Users and groups), billing and the spending policy (a b
 in the Microsoft 365 admin center), the Work IQ MCP policy (an admin, Microsoft 365 admin
 center, Agents, Tools, Work IQ MCP), or signing in again (you). The command exits with 1 when
 a check fails. `--json` prints `{"profile", "ok", "checks": [{"name", "result", "detail",
-"fix": {"who", "action"} | null}]}`, with `result` one of `ok`, `failed` and `skipped`, for
-the web UI. `proofkin doctor` also shows one Work IQ line per profile (signed in or not, and
+"fix": {"who", "action"} | null}], "changes", "change_wait_minutes", "notices"}`, with
+`result` one of `ok`, `failed` and `skipped`, for the web UI. After the checks, the report
+says whether Microsoft 365 changes are on (and how long a task's change waits for its
+sign-off) and where [sign-off notices](#sign-off-notices-in-teams-or-mail) go (`notices` in
+the JSON: `{"to": "mail", "address"}`, `{"to": "teams", "chat"}`, or `null` when they are
+off).
+`proofkin doctor` also shows one Work IQ line per profile (signed in or not, and
 the connection) without calling Work IQ.
 
 ### Cancelling tasks
@@ -916,7 +964,9 @@ send after ok @workiq apply=draft
   nothing.
 - Your sign-off (`approve @me`) shows each change first: a mail's recipients, subject and
   first lines, any other change's verb, path and the start of its body, and the list's
-  SHA-256. Your signed answer covers exactly that text. Only your own sign-off counts.
+  SHA-256. Your signed answer covers exactly that text. Only your own sign-off counts. With
+  [sign-off notices](#sign-off-notices-in-teams-or-mail) on, you are also told by mail or in
+  Teams that it waits (never what it shows).
 - The apply step checks that your approval was for the list as it is now, then makes each
   change once, in order, and stops at the first that fails or whose outcome is unknown. Its
   result lists each change's outcome (*done*, *accepted* for a 202, *failed* with the fix, or
@@ -2264,7 +2314,10 @@ proofkin --name me --providers copilot --serve --ui
 - **Work IQ**: the [Work IQ](docs/work-iq.md) account this agent uses for Microsoft 365 work
   context and how it connects ("ada@contoso.com through the Work IQ CLI"), and today's calls
   against its [budgets](#work-iq-audit-file-and-budgets) ("Today: 3 of 200 Work IQ calls (at
-  most 25 per run)"). **Sign in…** signs in through the Work IQ CLI, as
+  most 25 per run)"). It also says where [sign-off notices](#sign-off-notices-in-teams-or-mail)
+  go ("Sign-off notices: by mail to ada@contoso.com"), or, while they are off, the command
+  that turns them on; a digital worker that uses its owner's account shows its owner's
+  setting. **Sign in…** signs in through the Work IQ CLI, as
   `auth login workiq --cli` does: an account the CLI has signed in (empty: its default
   account) and, when the CLI isn't found, where it is; if the sign-in fails, the dialog says
   why and keeps what you typed. Your organization's own app (the hosted connection) signs in
@@ -2557,6 +2610,7 @@ account, `proofkin auth logout workiq --profile me` removes it.
 | A peer that may receive some of it | `proofkin peers allow <peer> --profile me --m365 General,Public,unlabeled` | [Security model](#security-model) |
 | Changes in Microsoft 365 a plan makes once you sign them off | `proofkin workiq changes on`, then `@workiq apply=STEP` after an `approve @me` step | [Making Microsoft 365 changes in a plan](#making-microsoft-365-changes-in-a-plan-workiq-apply) |
 | Changes in Microsoft 365 your digital worker's task makes, each once you sign it off | `proofkin workiq changes on [--wait 5m]`, and `proofkin mcp add <folder> workiq --workiq --changes` | [Work IQ as a tool for tasks](#work-iq-as-a-tool-for-tasks-mcpworkiq) |
+| Being told by mail or in Teams when a sign-off waits for you | `proofkin workiq notices mail`, or `proofkin workiq notices teams --chat <id>` (`--list` shows your chats) | [Sign-off notices in Teams or mail](#sign-off-notices-in-teams-or-mail) |
 | What it cost and the limits | `proofkin workiq usage`, `proofkin workiq budget --per-day N --per-run N` | [Work IQ audit file and budgets](#work-iq-audit-file-and-budgets) |
 
 A first plan to try (`/plan first.plan` in the agent, or the web UI's plan editor), with one
@@ -2845,7 +2899,9 @@ nor does a peer's, whatever its grant.
 - Then it waits for your sign-off under **Waiting for your approval**: *Microsoft 365 change
   from* the worker, showing the change as a plan's sign-off shows one, its SHA-256 and the
   task it comes from (its number and the start of its prompt), for up to the wait (5 minutes
-  by default, 1 to 10, in awake time).
+  by default, 1 to 10, in awake time). With [sign-off notices](#sign-off-notices-in-teams-or-mail)
+  on, you are also told by mail or in Teams, in the background: the wait runs from when the
+  call was held either way.
 - Approved, it is made once, exactly as shown, and the model gets the outcome (*done*, with a
   created entity's id and link; *accepted* for a 202; *failed*; or *outcome unknown*).
   Rejected, or asked for changes, nothing is sent, and the model gets your note. Not answered

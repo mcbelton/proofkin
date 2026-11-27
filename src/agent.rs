@@ -216,6 +216,13 @@ pub enum Event {
     ApprovalClosed {
         id: u64,
     },
+    /// The notice in Microsoft 365 of a sign-off that waits (titled `title`) couldn't be
+    /// sent: why. It isn't sent again, and the sign-off still waits (docs/work-iq.md,
+    /// section 7).
+    NoticeFailed {
+        title: String,
+        error: String,
+    },
     /// What a peer publishes to this agent changed (see [`Agent::catalogs`]).
     Catalog {
         name: String,
@@ -393,6 +400,10 @@ impl crate::workiq::gateway::ChangeApprover for OwnerSignOff {
                     .unwrap_or_default(),
             ),
         }
+    }
+
+    fn notice_failed(&self, title: &str, error: &str) {
+        self.agent.notice_failed(title, error);
     }
 }
 
@@ -1417,6 +1428,15 @@ impl Agent {
             .values()
             .map(|a| a.info.clone())
             .collect()
+    }
+
+    /// Says in the activity ([`Event::NoticeFailed`]) that the notice of the sign-off titled
+    /// `title` couldn't be sent, and why.
+    pub fn notice_failed(&self, title: &str, error: &str) {
+        let _ = self.inner.events.send(Event::NoticeFailed {
+            title: title.to_owned(),
+            error: error.to_owned(),
+        });
     }
 
     /// The preview site of what came with open approval request `id`, if anything.
