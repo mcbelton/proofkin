@@ -248,7 +248,14 @@ local.
 - **`workiq=SOURCES`** on a step (`all`, or some of `email`, `meetings`, `files`, `teams`,
   `people`, `connectors`): when the step starts, its plan's agent runs `retrieve` with the
   step's task as the query, for the step's audience, and puts the result in front of the
-  prompt. `connectors` uses the `copilot` strategy, the rest `grounding`.
+  prompt. `all` and lists with `connectors` use the `copilot` strategy, the rest use
+  `grounding`. If `copilot` reports the generic tool error `An error occurred invoking
+  'retrieve'`, Proofkin repeats the search once with `grounding` without connectors. For
+  `all`, the fallback searches email, meetings, files, Teams messages and people. There is
+  no fallback for connectors alone, any other kind of error, or a search already using
+  `grounding`. Both calls count against the budgets and are audited. The step's progress
+  and sources say when it fell back; if both calls fail, the step shows the `grounding`
+  error and says that the `copilot` search failed first.
 
   ```text
   spec @worker:app workiq=meetings,files Write the retention spec the November design reviews agreed on
@@ -267,7 +274,8 @@ local.
 
 - **Knowledge import**: `proofkin kb import workiq <topic> --query "..." [--from
   meetings,files]` keeps cited work context as a topic (with its origin, labels, query and
-  date) for `context=`.
+  date) for `context=`. It uses the same fallback and reports it. The fallback doesn't apply
+  to the gateway, where the model chooses the strategy and sees Work IQ's error.
 - **Evidence**: the local run record keeps each call's sources, withheld counts and ids. The
   signed evidence, which can be shared, keeps only a hash of the context, the number of
   results and their labels.

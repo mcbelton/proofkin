@@ -2,11 +2,11 @@
 //! marked as Microsoft 365 content with the labels of the results kept, so `context=` can use
 //! it and the plan check keeps it from peers that may not have it.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::audit::{CallContext, Purpose};
 use super::content::{Audience, DEFAULT_CAP, retrieval_section};
-use super::context::WorkContext;
+use super::context::{WorkContext, retrieve_with_fallback};
 use crate::knowledge::{KnowledgeBase, with_mark};
 use crate::plan::{WORKIQ_QUERY_CHARS, parse_workiq_sources, workiq_request_for};
 use crate::profile::validate_name;
@@ -24,6 +24,8 @@ pub struct Imported {
     pub withheld: usize,
     /// The labels of the results kept (`unknown` for one without label information).
     pub labels: Vec<String>,
+    /// What to tell the owner when the import fell back to grounding.
+    pub fallback_note: Option<&'static str>,
 }
 
 /// Searches Work IQ for `query` over `sources` (as `workiq=` takes them; none: `all`) through
@@ -52,28 +54,36 @@ pub async fn import_knowledge(
     };
 
     let call = CallContext::local(Purpose::KnowledgeImport);
-    let result = work
-        .retrieve(&call, &query, strategy, &capabilities)
-        .await?;
-    let section = retrieval_section(&result, &Audience::Local, DEFAULT_CAP)?;
-    if section.kept == 0 {
-        let why = section
-            .withheld
-            .line()
-            .unwrap_or_else(|| "Work IQ found nothing for the query.".to_owned());
-        bail!("nothing was imported, and the topic '{topic}' was not written. {why}");
-    }
-
-    let retrieved = chrono::Local::now().format("%Y-%m-%d");
-    let text = format!(
-        "---\nquery: {query}\nretrieved: {retrieved}\n---\n{}",
-        section.text
-    );
-    kb.write(topic, &with_mark(&text, &section.labels), SOURCE)?;
-    Ok(Imported {
-        topic: topic.to_owned(),
-        kept: section.kept,
-        withheld: section.withheld.total(),
-        labels: section.labels,
+    let mut fallback_note = None;
+    let result = retrieve_with_fallback(work, &call, &query, strategy, &capabilities, |note| {
+        fallback_note = Some(note);
     })
+    .await?;
+    let saved = retrieval_section(&result, &Audience::Local, DEFAULT_CAP).and_then(|section| {
+        if section.kept == 0 {
+            let why = section
+                .withheld
+                .line()
+                .unwrap_or_else(|| "Work IQ found nothing for the query.".to_owned());
+            bail!("nothing was imported, and the topic '{topic}' was not written. {why}");
+        }
+
+        let retrieved = chrono::Local::now().format("%Y-%m-%d");
+        let text = format!(
+            "---\nquery: {query}\nretrieved: {retrieved}\n---\n{}",
+            section.text
+        );
+        kb.write(topic, &with_mark(&text, &section.labels), SOURCE)?;
+        Ok(Imported {
+            topic: topic.to_owned(),
+            kept: section.kept,
+            withheld: section.withheld.total(),
+            labels: section.labels,
+            fallback_note,
+        })
+    });
+    match fallback_note {
+        Some(note) => saved.context(note),
+        None => saved,
+    }
 }

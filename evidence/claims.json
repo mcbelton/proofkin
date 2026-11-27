@@ -1537,6 +1537,19 @@
       ]
     },
     {
+      "id": "WIQ-29",
+      "area": "work-iq",
+      "claim": "A workiq= step or kb import workiq whose copilot retrieve reports the generic tool error An error occurred invoking 'retrieve' (kind Tool and class Tool) searches once more with grounding for the same query and audience, omitting GraphConnectors. For all, grounding uses Email, Meetings, OneDriveAndSharePoint, TeamsMessages and People; a list keeps only its named sources other than connectors. Connectors alone, a search already using grounding, any other error text or class, and models' gateway calls do not use this fallback. Both calls go through the audited client and count against the budgets. The step's progress and its saved Work IQ sources (runs show and the web UI) say when the search fell back without connectors, as does the import. The grounding results follow the usual content policy. If grounding fails too, its error says that the copilot search failed first.",
+      "tests": [
+        "agents::a_workiq_all_step_uses_grounding_after_the_generic_copilot_error_and_records_both",
+        "agents::workiq_steps_do_not_fall_back_for_policy_specific_errors_connectors_only_or_grounding",
+        "agents::a_failed_grounding_fallback_names_both_errors_without_searching_again",
+        "agents::kb_import_reports_and_audits_the_grounding_fallback_for_all_and_mixed_sources",
+        "ui::a_run_answers_its_steps_microsoft_365_sources_but_never_what_they_said",
+        "workiq_e2e::the_work_iq_commands_run_through_the_program_with_a_hosted_account"
+      ]
+    },
+    {
       "id": "WIQ-19",
       "area": "work-iq",
       "claim": "Importing Microsoft's Work IQ plugin (the shape of microsoft/work-iq:plugins/workiq: .github/plugin/plugin.json, skills/, and a .mcp.json whose server is the hosted https://workiq.svc.cloud.microsoft/mcp with oauthClientId) keeps its skills and makes its MCP server a Work IQ template: its own connection and sign-in settings are dropped, the review notes that it is offered through this agent's own Work IQ sign-in and gateway with only its tools that read, and offering it in a folder gives the agent's workiq server (no URL, command or headers; it must be named workiq). The Work IQ CLI's server (npx @microsoft/workiq mcp, or workiq mcp) is recognized the same way; other servers are not.",

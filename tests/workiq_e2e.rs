@@ -184,6 +184,13 @@ fn work_file(id: &str, protection: &str, label: &str, text: &str) -> Value {
 /// [`chats_answer`]) or else the driveItem of a Markdown spec labelled General, and
 /// `fetch_blob` its bytes ([`SPEC_DOC`]).
 fn tool_answer(name: &str, arguments: &Value) -> Value {
+    if name == "retrieve" && arguments["strategy"] == "copilot" {
+        return json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": "An error occurred invoking 'retrieve'" }],
+        });
+    }
+
     let fetched = arguments["entityUrls"][0].as_str().unwrap_or_default();
     let (structured, text) = match name {
         "fetch" if fetched.starts_with("/me/chats") => (chats_answer(fetched), String::new()),
@@ -558,10 +565,19 @@ async fn the_work_iq_commands_run_through_the_program_with_a_hosted_account() {
         "launch",
         "--query",
         "launch budget",
+        "--from",
+        "all",
         "--profile",
         "boss",
     ];
     let out = env.ok(&import).await;
+    assert!(
+        out.contains(concat!(
+            "Work IQ's copilot search failed with its generic error, ",
+            "so it searched again with grounding, without connectors.",
+        )),
+        "{out}"
+    );
     assert!(
         out.contains("saved topic launch from Work IQ: 2 result(s) kept")
             && out.contains("1 withheld"),
@@ -681,20 +697,40 @@ async fn the_work_iq_commands_run_through_the_program_with_a_hosted_account() {
     );
 
     let usage = env.ok(&["workiq", "usage", "--profile", "boss"]).await;
-    assert!(usage.contains("calls today    5 of"), "{usage}");
-    let mut tools: Vec<String> = fake.calls().into_iter().map(|(name, _)| name).collect();
+    assert!(usage.contains("calls today    6 of"), "{usage}");
+    let calls = fake.calls();
+    let mut tools: Vec<&str> = calls.iter().map(|(name, _)| name.as_str()).collect();
     tools.sort();
     assert_eq!(
         tools,
-        ["ask", "list_agents", "retrieve", "retrieve", "retrieve"]
+        [
+            "ask",
+            "list_agents",
+            "retrieve",
+            "retrieve",
+            "retrieve",
+            "retrieve",
+        ]
     );
-    let queries: Vec<String> = fake
-        .calls()
+    assert!(calls.iter().any(|(_, args)| args["query"] == PROBE_QUERY));
+    let searches: Vec<_> = calls
         .iter()
-        .filter_map(|(_, arguments)| arguments["query"].as_str().map(str::to_owned))
+        .filter(|(tool, args)| tool == "retrieve" && args["query"] == "launch budget")
+        .map(|(_, args)| args)
         .collect();
-    assert!(queries.contains(&PROBE_QUERY.to_owned()), "{queries:?}");
-    assert!(queries.contains(&"launch budget".to_owned()), "{queries:?}");
+    assert_eq!(searches.len(), 2, "{calls:?}");
+    assert_eq!(searches[0]["strategy"], "copilot");
+    assert_eq!(searches[1]["strategy"], "grounding");
+    assert_eq!(
+        searches[1]["capabilities"],
+        json!([
+            { "name": "Email" },
+            { "name": "Meetings" },
+            { "name": "OneDriveAndSharePoint" },
+            { "name": "TeamsMessages" },
+            { "name": "People" },
+        ])
+    );
     let grants = fake.grants();
     assert!(grants[0].ends_with("device_code"), "{grants:?}");
     assert!(
@@ -710,7 +746,8 @@ async fn the_work_iq_commands_run_through_the_program_with_a_hosted_account() {
     assert!(!worked && out.contains("only for tests"), "{out}");
     let (worked, out) = away.run(&["workiq", "doctor", "--profile", "boss"]).await;
     assert!(!worked && out.contains("only for tests"), "{out}");
-    assert_eq!(fake.calls().len(), 5);
+    let before = fake.calls().len();
+    assert_eq!(before, 6);
 
     // A spec document on SharePoint, read through Work IQ: its requirement is the plan's claim,
     // and it is saved as a topic marked with its label. Both calls are audited as spec-import.
@@ -769,7 +806,10 @@ async fn the_work_iq_commands_run_through_the_program_with_a_hosted_account() {
     let (worked, out) = env.run(&both).await;
     assert!(!worked && out.contains("not both"), "{out}");
     let calls = fake.calls();
-    let names: Vec<&str> = calls[5..].iter().map(|(name, _)| name.as_str()).collect();
+    let names: Vec<&str> = calls[before..]
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
     assert_eq!(names, ["fetch", "fetch_blob"]);
 
     env.ok(&["auth", "logout", "workiq", "--profile", "boss"])

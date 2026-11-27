@@ -189,6 +189,7 @@ def main():
 
         print("== a digital worker for the owner, on its Copilot sign-in, started with it")
         cli("worker", "create", "helper", "--owner", "owner", "--providers", "copilot", "--start-with-owner")
+        # Keep all sources; a generic copilot search error falls back without connectors.
         plan = os.path.join(home, "workiq-live.plan")
         with open(plan, "w", encoding="utf-8") as f:
             f.write(f"find @helper workiq=all {QUERY} Answer in two sentences, without quoting anything.\n"

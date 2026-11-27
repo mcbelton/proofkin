@@ -4032,12 +4032,16 @@ async fn import_workiq(
     .map_err(|e| bad_request(format!("{e:#}")))?;
     // The knowledge list is part of the ops view.
     s.send(json!({ "type": "ops" }));
-    Ok(Json(json!({
+    let mut result = json!({
         "topic": done.topic,
         "kept": done.kept,
         "withheld": done.withheld,
         "labels": done.labels,
-    })))
+    });
+    if let Some(note) = done.fallback_note {
+        result["fallback_note"] = json!(note);
+    }
+    Ok(Json(result))
 }
 
 async fn kb_topic(
@@ -4155,13 +4159,17 @@ fn run_workiq_json(run: &RunRecord) -> Vec<Value> {
         .iter()
         .filter_map(|s| {
             let work = run.workiq.get(&s.step.id)?;
-            Some(json!({
+            let mut entry = json!({
                 "step": s.step.id,
                 "sources": work.sources,
                 "labels": work.labels,
                 "kept": work.kept,
                 "withheld": work.withheld,
-            }))
+            });
+            if let Some(note) = work.fallback_note() {
+                entry["fallback_note"] = json!(note);
+            }
+            Some(entry)
         })
         .collect()
 }
