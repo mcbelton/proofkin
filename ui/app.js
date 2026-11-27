@@ -2284,9 +2284,18 @@ function openPlanEditor() {
 // ---------- drafting a plan with a model ----------
 let planDrafting = false;
 const draftModelPicker = modelPicker("plan-draft-");
+let draftListState = null;
 
 function renderPlanDraftModels() {
-  draftModelPicker.render(state.me ? [state.me] : [], $("#plan-draft-provider").value, true);
+  const provider = $("#plan-draft-provider").value;
+  // A live update can arrive even before the options response.
+  const lists = draftListState?.me === state.me ? draftListState?.options : state.me?.model_lists;
+  const listing = lists?.listing?.includes(provider) ?? false;
+  draftModelPicker.render(state.me ? [state.me] : [], provider, true, listing);
+  const error = listing ? null : lists?.list_errors?.[provider];
+  const hint = $("#plan-draft-list-error");
+  const message = error ? `Couldn't list the models your account offers: ${error.match(/^.*/)[0]}` : "";
+  if (hint.textContent !== message) hint.textContent = message;
 }
 
 /// Opens the plan editor on Describe, where the profile's own model drafts the plan.
@@ -2305,6 +2314,7 @@ async function showPlanDescribe({ focus = true } = {}) {
   if (focus) $(hasPlan ? "#plan-draft-note" : "#plan-draft-goal").focus();
   const submit = $("#plan-draft-submit");
   submit.disabled = true;
+  const me = state.me;
   let options;
   try {
     options = await api("/api/plans/draft");
@@ -2315,6 +2325,7 @@ async function showPlanDescribe({ focus = true } = {}) {
   const select = $("#plan-draft-provider");
   const chosen = select.value;
   const providers = options.providers ?? [];
+  draftListState = { me, options };
   select.replaceChildren(...providers.map(({ provider }) => el("option", {
     value: provider, text: providerLabel(provider),
   })));

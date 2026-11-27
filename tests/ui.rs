@@ -1,6 +1,7 @@
 //! Web UI server: access token, Host check, security headers and the task API.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,6 +16,7 @@ use proofkin::{
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 
 struct Echo;
 
@@ -3522,12 +3524,53 @@ fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[derive(Default)]
 struct Planner {
     prompts: std::sync::Mutex<Vec<String>>,
+    listing: Option<DraftListing>,
+}
+
+const DRAFT_LIST_ERROR: &str = "the account's model list is unavailable";
+
+struct DraftListing {
+    calls: AtomicUsize,
+    release: Semaphore,
+    fail_first: bool,
+}
+
+impl Planner {
+    fn with_listing(fail_first: bool) -> Arc<Self> {
+        Arc::new(Self {
+            listing: Some(DraftListing {
+                calls: AtomicUsize::new(0),
+                release: Semaphore::new(0),
+                fail_first,
+            }),
+            ..Self::default()
+        })
+    }
 }
 
 #[async_trait]
 impl Executor for Planner {
     fn providers(&self) -> Vec<Provider> {
         vec![Provider::Copilot]
+    }
+
+    async fn list_models(&self, provider: Provider) -> anyhow::Result<Vec<Offered>> {
+        assert_eq!(provider, Provider::Copilot);
+        if let Some(listing) = &self.listing {
+            let call = listing.calls.fetch_add(1, Ordering::Relaxed);
+            listing.release.acquire().await.unwrap().forget();
+            if listing.fail_first && call == 0 {
+                anyhow::bail!(DRAFT_LIST_ERROR);
+            }
+        }
+        Ok(["claude-opus-5.5", "planner-1"]
+            .into_iter()
+            .map(|id| Offered {
+                id: id.into(),
+                name: id.into(),
+                ..Default::default()
+            })
+            .collect())
     }
 
     async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<Ran> {
@@ -3547,7 +3590,10 @@ impl Executor for Planner {
     }
 }
 
-async fn plan_draft_ui(home: &std::path::Path) -> (Profile, Agent, Arc<Planner>, u16, String) {
+async fn plan_draft_ui(
+    home: &std::path::Path,
+    planner: Arc<Planner>,
+) -> (Profile, Agent, u16, String) {
     let dir = home.join("owner");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -3565,6 +3611,7 @@ async fn plan_draft_ui(home: &std::path::Path) -> (Profile, Agent, Arc<Planner>,
     let mut config = AgentConfig::new("owner", SecretKey::generate());
     config.network = Network::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.models = profile.models();
     let (agent, events) = Agent::bind(config).await.unwrap();
     let info = UiInfo {
         profile: profile.clone(),
@@ -3576,19 +3623,107 @@ async fn plan_draft_ui(home: &std::path::Path) -> (Profile, Agent, Arc<Planner>,
         accounts: Vec::new(),
         workers: None,
     };
-    let planner = Arc::new(Planner::default());
     let server = ui::start(
         agent.clone(),
         events,
         info,
-        Some(planner.clone()),
+        Some(planner),
         "127.0.0.1:0".parse().unwrap(),
     )
     .await
     .unwrap();
     let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
     let (port, token) = rest.split_once("/#t=").unwrap();
-    (profile, agent, planner, port.parse().unwrap(), token.into())
+    (profile, agent, port.parse().unwrap(), token.into())
+}
+
+async fn plan_ui_get(port: u16, token: &str, path: &str) -> Value {
+    let host = format!("127.0.0.1:{port}");
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        request(port, "GET", path, &host, Some(token), None),
+    )
+    .await
+    .expect("the request answers without waiting for a model list");
+    assert_eq!(response.status, 200, "{}", response.body);
+    response.json()
+}
+
+async fn wait_for_draft_me(port: u16, token: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let me = plan_ui_get(port, token, "/api/state").await["me"].clone();
+            if ready(&me) {
+                return me;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the model listing reached the UI state")
+}
+
+#[tokio::test]
+async fn describe_lists_models_in_the_background_once_on_a_delegating_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let planner = Planner::with_listing(false);
+    let listing = planner.listing.as_ref().unwrap();
+    let (_, agent, port, token) = plan_draft_ui(home.path(), planner.clone()).await;
+    let options = || plan_ui_get(port, &token, "/api/plans/draft");
+
+    let first = options().await;
+    assert_eq!(first["listing"], serde_json::json!(["copilot"]));
+    let me = plan_ui_get(port, &token, "/api/state").await["me"].clone();
+    assert_eq!(me["providers"], serde_json::json!([]));
+    assert_eq!(me["offers"], serde_json::json!({}));
+    assert_eq!(options().await["listing"], first["listing"]);
+
+    listing.release.add_permits(1);
+    let me = wait_for_draft_me(port, &token, |me| me["offers"]["copilot"].is_array()).await;
+    let ids: Vec<_> = me["offers"]["copilot"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["claude-opus-5.5", "planner-1"]);
+    assert!(options().await.get("listing").is_none());
+    assert_eq!(listing.calls.load(Ordering::Relaxed), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn describe_reports_failed_model_listings_and_retries_when_reopened() {
+    let home = tempfile::tempdir().unwrap();
+    let planner = Planner::with_listing(true);
+    let listing = planner.listing.as_ref().unwrap();
+    let (_, agent, port, token) = plan_draft_ui(home.path(), planner.clone()).await;
+    let options = || plan_ui_get(port, &token, "/api/plans/draft");
+
+    assert_eq!(options().await["listing"], serde_json::json!(["copilot"]));
+    listing.release.add_permits(1);
+    let me = wait_for_draft_me(port, &token, |me| {
+        me["model_lists"]["list_errors"]["copilot"].is_string()
+    })
+    .await;
+    assert_eq!(
+        me["model_lists"]["list_errors"]["copilot"],
+        DRAFT_LIST_ERROR
+    );
+    assert!(me["model_lists"].get("listing").is_none());
+    assert!(me["offers"]["copilot"].is_null());
+
+    let retry = options().await;
+    assert_eq!(retry["list_errors"]["copilot"], DRAFT_LIST_ERROR);
+    assert_eq!(retry["listing"], serde_json::json!(["copilot"]));
+    listing.release.add_permits(1);
+    let me = wait_for_draft_me(port, &token, |me| me["offers"]["copilot"].is_array()).await;
+    assert!(me["model_lists"].get("list_errors").is_none());
+    let cached = options().await;
+    assert!(cached.get("listing").is_none());
+    assert!(cached.get("list_errors").is_none());
+    assert_eq!(listing.calls.load(Ordering::Relaxed), 2);
+    agent.shutdown().await;
 }
 
 /// `POST /api/plans/draft` has the chosen model write a plan: the model is told what
@@ -3599,7 +3734,8 @@ async fn plan_draft_ui(home: &std::path::Path) -> (Profile, Agent, Arc<Planner>,
 #[tokio::test]
 async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
     let home = tempfile::tempdir().unwrap();
-    let (profile, agent, planner, port, token) = plan_draft_ui(home.path()).await;
+    let planner = Arc::new(Planner::default());
+    let (profile, agent, port, token) = plan_draft_ui(home.path(), planner.clone()).await;
     let host = format!("127.0.0.1:{port}");
     let call = |method: &'static str, body: Value| {
         let (host, token) = (host.clone(), token.to_owned());
@@ -3801,7 +3937,8 @@ async fn the_owner_sets_and_clears_a_folder_task_limit_in_the_web_ui() {
 #[tokio::test]
 async fn plan_draft_refuses_disallowed_models_and_efforts_before_reading_an_issue() {
     let home = tempfile::tempdir().unwrap();
-    let (_, agent, planner, port, token) = plan_draft_ui(home.path()).await;
+    let planner = Arc::new(Planner::default());
+    let (_, agent, port, token) = plan_draft_ui(home.path(), planner.clone()).await;
     let host = format!("127.0.0.1:{port}");
     for (body, message) in [
         (

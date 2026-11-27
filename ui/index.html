@@ -514,7 +514,7 @@
           </label>
           <label class="field">
             <span>Model</span>
-            <select id="plan-draft-model" disabled></select>
+            <select id="plan-draft-model" aria-describedby="plan-draft-list-error" disabled></select>
           </label>
           <label class="field" id="plan-draft-model-name-field" hidden>
             <span>Model name</span>
@@ -522,8 +522,9 @@
           </label>
           <label class="field">
             <span>Reasoning</span>
-            <select id="plan-draft-effort" disabled></select>
+            <select id="plan-draft-effort" aria-describedby="plan-draft-list-error" disabled></select>
           </label>
+          <p class="muted small form-error" id="plan-draft-list-error" role="alert"></p>
           <p class="muted small">Your profile's own model, read-only in an empty folder with no tools.</p>
           <p class="muted small" id="plan-draft-status" role="status" aria-live="polite"></p>
           <p class="form-error" id="plan-draft-error" role="alert"></p>

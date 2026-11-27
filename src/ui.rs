@@ -530,6 +530,7 @@ impl Shared {
             .iter()
             .map(|(p, account)| json!({ "provider": p, "account": account }))
             .collect();
+        let (offers, model_lists) = self.agent.offers_with_list_status(models::LISTS_MODELS);
         json!({
             "name": self.agent.name(),
             "id": self.agent.id().to_string(),
@@ -546,7 +547,8 @@ impl Shared {
             // as now set (a digital worker's include its owner's), and the models its
             // accounts offer that they may.
             "models": self.agent.models(),
-            "offers": self.agent.offers(),
+            "offers": offers,
+            "model_lists": model_lists,
             "shares": if self.info.serving { self.shares_json() } else { json!([]) },
             "ticket": ticket,
         })
@@ -3158,12 +3160,23 @@ fn plan_check(s: &Shared, text: &str) -> Value {
     })
 }
 
+#[derive(Serialize)]
+struct PlanDraftOptions {
+    providers: Vec<Value>,
+    tracker: Option<String>,
+    max_goal: usize,
+    #[serde(flatten)]
+    model_lists: crate::agent::OfferListStatus,
+}
+
 /// What the Plan editor's Describe view offers: the providers the profile is signed in
-/// to, each with the model it drafts with by default, and the tracker's repository.
-async fn plan_draft_options(State(s): State<AppState>) -> Json<Value> {
-    let profile = s.profile_now();
+/// to, each with its default model, the tracker's repository and any lists still loading.
+async fn plan_draft_options(State(shared): State<AppState>) -> Json<PlanDraftOptions> {
+    let profile = shared.profile_now();
+    let signed_in = crate::plan_draft::signed_in(&profile);
+    let model_lists = models::list_in_background(&shared, &profile, &signed_in);
     let models = profile.models();
-    let providers: Vec<Value> = crate::plan_draft::signed_in(&profile)
+    let providers = signed_in
         .into_iter()
         .map(|p| {
             let model = crate::models::choice(&models, p).pick(None).ok().flatten();
@@ -3174,11 +3187,12 @@ async fn plan_draft_options(State(s): State<AppState>) -> Json<Value> {
         .ok()
         .flatten()
         .map(|c| c.repo);
-    Json(json!({
-        "providers": providers,
-        "tracker": tracker,
-        "max_goal": crate::plan_draft::MAX_GOAL,
-    }))
+    Json(PlanDraftOptions {
+        providers,
+        tracker,
+        max_goal: crate::plan_draft::MAX_GOAL,
+        model_lists,
+    })
 }
 
 async fn draft_plan_route(
