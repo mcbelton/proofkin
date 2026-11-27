@@ -81,6 +81,12 @@ pub fn list() -> Vec<(&'static str, &'static str)> {
     PLAYBOOKS.iter().map(|(n, d, _)| (*n, *d)).collect()
 }
 
+/// Each playbook's name, description and plan text, with `{{var}}` where a name of yours
+/// goes (a model that writes a plan gets them as examples, see [`crate::plan_draft`]).
+pub fn templates() -> Vec<(&'static str, &'static str, &'static str)> {
+    PLAYBOOKS.to_vec()
+}
+
 fn template(name: &str) -> Result<&'static str> {
     PLAYBOOKS
         .iter()

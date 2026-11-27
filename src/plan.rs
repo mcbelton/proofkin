@@ -978,8 +978,13 @@ impl Recipients {
     /// `agent`'s allowlist now and `profile`'s digital workers. If the workers can't be
     /// read, none counts as one: the check gets stricter, not looser.
     pub fn of(agent: &Agent, profile: &crate::profile::Profile) -> Self {
+        Self::with_trust(agent.trusted(), profile)
+    }
+
+    /// [`Recipients::of`] with allowlist `trust`, for when no agent runs (the CLI).
+    pub fn with_trust(trust: TrustStore, profile: &crate::profile::Profile) -> Self {
         Self {
-            trust: agent.trusted(),
+            trust,
             workers: crate::workers::worker_ids(profile).unwrap_or_default(),
             profile: Some(profile.name.clone()),
             workiq_account: profile.workiq_account().is_ok(),
@@ -1149,6 +1154,83 @@ const STEP_OPTIONS: &[&str] = &[
     "verify", "attempts", "claims", "claim", "apply", "context", "skill", "skills", "mcp", "save",
     "agent", "levels", "timeout", "issue", "workiq", "model", "effort",
 ];
+
+/// How plan text is written, for a model that writes a plan (see [`crate::plan_draft`]):
+/// every kind of line and step, and every option, [`Plan::parse`] takes. A test fails when
+/// the parser takes one this doesn't name.
+pub const FORMAT: &str = "\
+One claim, step or comment per line:
+- `// comment`: ignored.
+- `claim: ID what must be true`: a claim the plan proves (ID: letters, digits, '-', '_' or \
+'.'). Only passing checks (`verify=` on a step with `claims=ID`) or a sign-off (`approve` \
+with `claims=ID`) prove it.
+- `track: #N` (the run works on issue N of the tracker's repository), `track: a title` (a \
+new issue with that title tracks the run) or `track: off` (the run isn't tracked): at most \
+one. Without it, a profile with a tracker tracks the run as a new issue.
+- A step: `id [after a,b] [approve|team|pr] who [using provider] [options] what to do`.
+
+A step's id is letters, digits, '-', '_' or '.', and unique in the plan. `after a,b` runs it \
+once steps a and b are done, and gives it their results; steps run in parallel where they \
+can, and a step whose prerequisites failed is skipped. Lines indented under a step's line \
+are more of what it does, kept as written.
+
+Who runs a step:
+- `@peer:folder`: that peer's agent, in a folder it shares with you (`@peer` alone: its \
+data folder).
+- `#squad:folder`: the least busy online member of the squad (`#squad` alone: its data \
+folder).
+- `using copilot`, `using claude` or `using codex`, after who runs it, picks the provider \
+(default: copilot): the peer must run it.
+
+A model step's options are `key=value` words after who runs it and before what to do (the \
+first word that isn't one starts what to do). Lists are a,b, and add up when repeated; the \
+others are given once:
+- `verify=a,b`: checks run after the model as signed proof of the work: the folder's own \
+(they need full access in it) or built-in ones (read access is enough).
+- `attempts=N` (1 to 5): the model tries again while the checks fail; needs `verify=`.
+- `claims=ID,ID` (or `claim=ID`): the claims the step's checks prove.
+- `apply=step`: it starts from the work (the commit) of an earlier step, which it must run \
+after.
+- `base=RUN:STEP`: it starts from the work step STEP of an earlier evidence run RUN made; \
+not with `apply=`, and it needs a folder.
+- `model=name` and `effort=minimal|low|medium|high|xhigh|max`: the model and reasoning \
+effort its task runs at (the peer must allow them; default: the peer's).
+- `skill=a,b` (or `skills=a,b`): skills its model follows.
+- `agent=name` (or `agent=name@version`, a factory agent's release): it acts as that agent: \
+the agent's instructions first, its skills and MCP servers added.
+- `mcp=a,b`: MCP servers of the folder its model may use.
+- `context=topic,topic` (or `context=all`): knowledge topics put in its prompt.
+- `save=topic`: its verified result is saved as that knowledge topic.
+- `workiq=all` (or `workiq=email,meetings,files,teams,people,connectors`): its own words \
+are searched in Microsoft 365 with Work IQ first, and what is found goes in front of its \
+task (Work IQ must be signed in).
+- `issue=#N`: it works on issue N of the tracker's repository, and gets the issue's text.
+- `timeout=30m` (s, m, h or d; at most 7d): the longest it may take; then it is cancelled.
+
+Other kinds of step:
+- `id after x approve @person [claims=ID] [changes=N] what to approve`: a sign-off: that \
+person (`@me`: you) approves the work so far before the steps after it go on. `changes=N` \
+(0 to 5, default 2): how many times they may ask for changes, which the work before it \
+makes. It has no folder, `verify=`, `apply=`, `base=`, `save=`, `workiq=`, `agent=`, \
+`model=` or `effort=`, and isn't for a squad.
+- `id after x pr @peer:folder [reviewers=me,peer,login] [title]`: opens a pull request \
+with the work of the steps before it in that folder, by the peer that holds its clone (the \
+folder must take pull request steps). `reviewers=` (or `reviewer=`; at most 10, or `none`): \
+who is asked to review it (default: those who signed off before it). Of the other options \
+it takes only `timeout=` and `issue=`, and no `using`.
+- `id team @lead:folder [levels=N] what to do`: hands the task to that lead, whose own team \
+does it, in a folder that takes team steps. `levels=N` (1 to 3): how many levels down it \
+may go. It has no `verify=`, `attempts=`, `apply=`, `base=`, `mcp=`, `agent=`, `model=` or \
+`effort=`.
+- `id [after x] @workiq [agent=id] [save=topic] question`: asks Microsoft 365 through Work \
+IQ (it must be signed in), with the results of the steps it runs after; `agent=` names a \
+Work IQ agent. Its answer is context for the steps after it, never proof: it has no folder, \
+`approve`, `team`, `claims=`, `verify=`, `attempts=`, `base=`, `mcp=`, `skill=`, `context=`, \
+`workiq=`, `model=` or `effort=`.
+- `id after ok @workiq apply=STEP`: makes the Microsoft 365 changes step STEP's result \
+proposes, with your account, once you signed them off: it runs after STEP through your own \
+sign-off (`ok after STEP approve @me Make these changes?`), the profile must allow changes, \
+and it needs no text.";
 
 /// The longest `timeout=` a step may have (a week).
 const MAX_TIMEOUT: u64 = 7 * 24 * 3600;
@@ -7387,5 +7469,99 @@ mod tests {
             error.starts_with("w sent no evidence (an older version?)"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_format_reference_names_every_step_kind_and_option_the_parser_takes() {
+        // Every word the parser could take is a string in its source: each is tried in
+        // each place a plan takes a word, and what the parser takes there must be named.
+        let words: std::collections::BTreeSet<&str> =
+            regex::Regex::new(r#""([a-z][a-z0-9_-]*):?""#)
+                .unwrap()
+                .captures_iter(include_str!("plan.rs"))
+                .map(|c| c.get(1).unwrap().as_str())
+                .collect();
+        let (mut keywords, mut options, mut lines, mut targets) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for &w in &words {
+            match Plan::parse(&format!("s {w} @a:f do it")) {
+                Err(e) if e.to_string().contains(&format!("got {w:?}")) => {}
+                _ => keywords.push(w),
+            }
+            match Plan::parse(&format!("s @a:f {w} x do it")) {
+                Ok(p) if p.steps[0].prompt.starts_with(&format!("{w} x")) => {}
+                _ => keywords.push(w),
+            }
+            match Plan::parse(&format!("s @a:f {w}=1 do it")) {
+                Ok(p) if p.steps[0].prompt.starts_with(&format!("{w}=1")) => {}
+                _ => options.push(w),
+            }
+            match Plan::parse(&format!("{w}: x")) {
+                Err(e)
+                    if e.to_string()
+                        .contains(&format!("invalid step name \"{w}:\"")) => {}
+                _ => lines.push(w),
+            }
+            if let Ok(p) = Plan::parse(&format!("s @{w} do it"))
+                && !matches!(p.steps[0].target, Target::Peer(_) | Target::Squad(_))
+            {
+                targets.push(w);
+            }
+        }
+        // The probes find what the parser is known to take.
+        for (found, known) in [
+            (&keywords, &["after", "approve", "team", "pr", "using"][..]),
+            (
+                &options,
+                &["verify", "claim", "skills", "reviewer", "base"][..],
+            ),
+            (&lines, &["claim", "track"][..]),
+            (&targets, &[WORKIQ_TARGET][..]),
+        ] {
+            for w in known {
+                assert!(found.contains(w), "the probes find {w}");
+            }
+        }
+        let whole_word = |w: &str| {
+            regex::Regex::new(&format!(r"(^|[^a-z_=-]){}([^a-z_=:-]|$)", regex::escape(w)))
+                .unwrap()
+                .is_match(FORMAT)
+        };
+        let mut missing: Vec<String> = keywords
+            .iter()
+            .filter(|w| !whole_word(w))
+            .map(|w| w.to_string())
+            .collect();
+        let named = [
+            options.iter().map(|w| format!("`{w}=")).collect::<Vec<_>>(),
+            lines.iter().map(|w| format!("`{w}:")).collect(),
+            targets.iter().map(|w| format!("@{w}")).collect(),
+        ];
+        missing.extend(named.into_iter().flatten().filter(|n| !FORMAT.contains(n)));
+        assert!(missing.is_empty(), "the reference doesn't name {missing:?}");
+
+        // And the values and limits the parser takes.
+        let sources: Vec<&str> = WORKIQ_SOURCES.iter().map(|(name, _)| *name).collect();
+        let mut parts = vec![
+            "`// comment`".to_owned(),
+            "`track: off`".to_owned(),
+            "`@me`".to_owned(),
+            "`#squad:folder`".to_owned(),
+            "Lines indented under a step's line".to_owned(),
+            "`context=all`".to_owned(),
+            "`workiq=all`".to_owned(),
+            format!("`workiq={}`", sources.join(",")),
+            format!("effort={}`", crate::models::EFFORTS.join("|")),
+            format!("`attempts=N` (1 to {})", crate::evidence::MAX_ATTEMPTS),
+            format!("`levels=N` (1 to {})", crate::team::MAX_LEVELS),
+            format!("(0 to {MAX_CHANGE_ROUNDS}, default {DEFAULT_CHANGE_ROUNDS})"),
+            format!("at most {MAX_REVIEWERS}, or `none`"),
+        ];
+        for provider in <Provider as clap::ValueEnum>::value_variants() {
+            parts.push(format!("`using {provider}`"));
+        }
+        for part in parts {
+            assert!(FORMAT.contains(&part), "the reference names {part}");
+        }
     }
 }

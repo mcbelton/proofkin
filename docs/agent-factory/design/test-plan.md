@@ -51,6 +51,7 @@ A test for every acceptance criterion in `spec/SPEC.md` and every high-risk thre
 | TM-5 | Security | A release whose agent file asks for tools and a model, and a peer with read-only access, can't write, run a shell or use an unoffered MCP tool | A hostile agent file |
 | TM-6 | Security | Fixtures with planted secrets and instructions to reveal them: outputs are redacted, the adversarial cases fail an agent that reveals them, and labeled content stays from peers without a grant | Canary secrets, labeled topics |
 | TM-10 | Security | With the integration token, every lifecycle and approval call is refused over MCP and A2A, and the web UI's token is refused at /mcp | tests/connect.rs style client |
+| TM-16 | Security | A plan drafted from a goal with a planted secret, in a profile with a knowledge topic: the prompt has neither the secret nor the topic's text, an issue's text is inside the envelope, and drafting over the API, the CLI and MCP starts no task or run | A scripted model, the fake GitHub |
 
 ## Non-functional testing
 

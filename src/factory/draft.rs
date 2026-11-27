@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::factory::blueprint::{Catalog, Problem, SCHEMA, check_value, has_errors, name_problem};
+use crate::factory::blueprint::{Catalog, Problem, SCHEMA, check_value, name_problem};
 use crate::factory::store::{Draft, Provenance, now};
 use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
 
@@ -122,13 +122,80 @@ pub(crate) async fn ask(
     checked: &(dyn Fn(Value) -> (Value, Vec<Problem>) + Send + Sync),
     progress: &(dyn Fn(String) + Send + Sync),
 ) -> Result<Answered> {
+    let read = |output: &str| {
+        let answer = crate::team::written_plan(output);
+        let (written, problems) = match serde_json::from_str::<Value>(&answer) {
+            Ok(value) => {
+                let (value, problems) = checked(value);
+                (Some((value, problems.clone())), problems)
+            }
+            Err(e) => (
+                None,
+                vec![Problem::error(
+                    "invalid_json",
+                    "",
+                    format!("the answer isn't JSON: {e}"),
+                )],
+            ),
+        };
+        Reading {
+            written,
+            errors: problems.iter().filter(|p| p.error).count(),
+            again: again_prompt(&base, &answer, &problems),
+        }
+    };
+    let tried = ask_until(executor, provider, models, &base, what, &read, progress).await?;
+    let Some((blueprint, problems)) = tried.written else {
+        bail!("the model didn't write a blueprint in {TRIES} tries: its answers weren't JSON");
+    };
+    Ok(Answered {
+        blueprint,
+        problems,
+        model: tried.model,
+        effort: tried.effort,
+        tries: tried.tries,
+    })
+}
+
+/// An answer, as the one who asked read it: what it wrote (none: nothing could be read),
+/// how many errors that has, and the prompt that asks again with them fixed.
+pub(crate) struct Reading<T> {
+    pub written: Option<T>,
+    pub errors: usize,
+    pub again: String,
+}
+
+/// What the model wrote in the end: its last answer that could be read (none if none
+/// could), the model and effort it ran at, and the tries it took.
+pub(crate) struct Tried<T> {
+    pub written: Option<T>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub tries: u32,
+}
+
+/// Asks `executor`'s model of `provider` (at the profile's default model and effort, as
+/// `models` allows them) for `what` (a draft, a proposal, a plan) with prompt `base`, in
+/// an empty folder, read-only. `read` reads each answer; until one can be read and has no
+/// error, the model gets the prompt `read` gave for it, at most [`TRIES`] times in all.
+/// `progress` hears each try: the first, then how many problems the next one fixes.
+pub(crate) async fn ask_until<T: Send>(
+    executor: &dyn Executor,
+    provider: Provider,
+    models: &crate::models::Models,
+    base: &str,
+    what: &str,
+    read: &(dyn Fn(&str) -> Reading<T> + Send + Sync),
+    progress: &(dyn Fn(String) + Send + Sync),
+) -> Result<Tried<T>> {
     let choice = crate::models::choice(models, provider);
-    let mut ask = LlmTask::new(provider, base.clone());
+    let mut ask = LlmTask::new(provider, base.to_owned());
     ask.model = choice.pick(None)?;
     ask.effort = choice.pick_effort(None)?;
     let folder = EmptyFolder::new()?;
     let ctx = TaskContext::new(Access::ReadOnly, folder.path());
-    let (mut written, mut model, mut effort, mut tries) = (None, None, None, 0);
+    let (mut written, mut model, mut effort) = (None, None, None);
+    let (mut tries, mut errors) = (0, 0);
     while tries < TRIES {
         tries += 1;
         progress(if tries == 1 {
@@ -140,7 +207,8 @@ pub(crate) async fn ask(
                     .unwrap_or_default()
             )
         } else {
-            format!("try {tries} of {TRIES}: the model is writing it again, told what was wrong")
+            let s = if errors == 1 { "" } else { "s" };
+            format!("try {tries} of {TRIES}: fixing {errors} problem{s}")
         });
         let ran = executor
             .execute(&ask, &ctx)
@@ -148,33 +216,21 @@ pub(crate) async fn ask(
             .with_context(|| format!("the model couldn't write the {what}"))?;
         model = ran.model.clone().or_else(|| ask.model.clone());
         effort = ran.effort.clone().or_else(|| ask.effort.clone());
-        let answer = crate::team::written_plan(&ran.output);
-        let problems = match serde_json::from_str::<Value>(&answer) {
-            Ok(value) => {
-                let (value, problems) = checked(value);
-                let done = !has_errors(&problems);
-                written = Some((value, problems.clone()));
-                if done {
-                    break;
-                }
-                problems
-            }
-            Err(e) => vec![Problem::error(
-                "invalid_json",
-                "",
-                format!("the answer isn't JSON: {e}"),
-            )],
-        };
+        let reading = read(&ran.output);
+        errors = reading.errors;
+        let readable = reading.written.is_some();
+        if readable {
+            written = reading.written;
+        }
+        if readable && errors == 0 {
+            break;
+        }
         if tries < TRIES {
-            ask.prompt = again_prompt(&base, &answer, &problems);
+            ask.prompt = reading.again;
         }
     }
-    let Some((blueprint, problems)) = written else {
-        bail!("the model didn't write a blueprint in {TRIES} tries: its answers weren't JSON");
-    };
-    Ok(Answered {
-        blueprint,
-        problems,
+    Ok(Tried {
+        written,
         model,
         effort,
         tries,
@@ -374,7 +430,7 @@ impl Drop for EmptyFolder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -386,20 +442,20 @@ mod tests {
     use crate::llm::Ran;
 
     /// A model that answers from a script, and remembers what it was asked and where.
-    struct Scripted {
+    pub(crate) struct Scripted {
         answers: Mutex<VecDeque<String>>,
         asked: Mutex<Vec<(LlmTask, TaskContext)>>,
     }
 
     impl Scripted {
-        fn new(answers: &[String]) -> Self {
+        pub(crate) fn new(answers: &[String]) -> Self {
             Self {
                 answers: Mutex::new(answers.iter().cloned().collect()),
                 asked: Mutex::new(Vec::new()),
             }
         }
 
-        fn asked(&self) -> Vec<(LlmTask, TaskContext)> {
+        pub(crate) fn asked(&self) -> Vec<(LlmTask, TaskContext)> {
             self.asked.lock().unwrap().clone()
         }
     }

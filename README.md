@@ -829,6 +829,75 @@ So a plan's steps aren't cancelled when the agent stops: its peers keep working 
 minute, waiting for it to come back. Task ids go on after a restart (`next-task-id`), so
 a peer never takes a new task for one it is still running. A cancelled run doesn't go on.
 
+#### Drafting a plan with a model
+
+Your profile's own model can write a plan for you, from a goal in your words or from a
+GitHub issue, knowing the peers, folders, checks and skills you may use. You review the
+plan, then run it yourself.
+
+- **In the web UI:** in Plan mode, **Draft with a model…** (beside **Start from a
+  playbook…**) opens the plan editor on its **Describe** view:
+  - Say *What should the plan do?*, name an issue of the [tracker's](#tracked-work)
+    repository if you like (`#42`), and pick the model that writes it: each provider the
+    profile is signed in to, at its default model. Then press **Draft plan**.
+  - While the model writes, the view says so: *copilot's model (claude-opus-5.5) is
+    writing the plan*, then *try 2 of 3: fixing 2 problems*.
+  - The plan goes into the editor's Builder and Text views, checked as usual, with the
+    problems it still has. When the editor already holds a plan, it asks before replacing
+    it.
+  - With a plan in the editor, Describe also asks *What should change?* (for example, "add
+    a review by #qa before the sign-off"). The model gets the plan and your note, and
+    writes the whole plan again.
+  - **Run plan** stays your click, with the editor's check and tracking choice.
+- **From the command line:** `plan draft` prints the plan, or writes it to `--out`, then
+  its problems. It exits 1 while errors remain.
+
+  ```powershell
+  proofkin plan draft "Add CSV export to the reports page, with tests" --profile boss > csv.plan
+  proofkin plan draft --issue 42 --using claude --profile boss --out issue-42.plan
+  proofkin plan draft --from csv.plan --note "add a review by #qa before the sign-off" --profile boss --out csv.plan
+  ```
+
+- **For other agents:** the `draft_plan` MCP tool (`goal`, `issue`, `plan`, `note`) answers
+  the plan and its problems ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
+  `run_plan` still runs a plan, so an agent can draft one, show it to its user, then run
+  it.
+- **The API:** `POST /api/plans/draft` with `{goal, issue?, provider?, plan?, note?}`
+  answers `{plan, problems, provider, model, effort, tries}`. Its progress goes out as
+  events.
+
+**What the model gets:**
+- The goal, at most 4,000 characters, with secrets redacted. With an issue, the issue's
+  text as a step's `issue=` gets it, marked as external content, so instructions written
+  in it aren't taken as yours. To change a plan, the plan and your note.
+- A reference of the plan format: every step kind and option the parser takes. It is kept
+  next to the parser, and a test fails when the parser takes something it doesn't name.
+- What this agent may use, as the plan check sees it:
+  - connected peers and digital workers, with their roles and providers;
+  - the folders each shares with you, with its access and checks, and whether it takes
+    team or pull request steps;
+  - squads, skills and the factory agents plans may use (`agent=`);
+  - knowledge topic names (`context=`) and each folder's MCP server names (`mcp=`);
+  - whether Work IQ is signed in and changes are on;
+  - the tracker's repository;
+  - the playbooks, as examples.
+- Never file contents, knowledge text, tokens, Microsoft 365 content or past results. The
+  model works read-only in an empty folder with no tools, as a [factory](#the-agent-factory)
+  draft's does. Since it is the profile's own model, an agent that runs no tasks for
+  peers (no `--providers`) can still draft.
+
+**How it is written.** The model answers with the plan in one ```` ```plan ```` block; the
+text around it is dropped. The plan is checked as **Run plan** checks it. While it has
+errors, the model gets them and writes the whole plan again, at most 3 tries in all.
+Warnings are kept and shown. The plan starts with a comment naming the model and the
+goal's first line (redacted): `// Drafted by copilot (claude-opus-5.5): <goal>`.
+
+**A draft is data.** Drafting runs, grants, sends and changes nothing. Running it is a
+separate action, through the usual check and tracking choice (a tracked run posts its steps
+on GitHub, as the editor says). Each draft goes in the activity and the
+[audit log](#audit-log), with who asked, the provider and model, the tries and the goal's
+SHA-256 (never its text).
+
 #### Live status
 
 Every peer working for you says what it is doing, and the UI and CLI show it as it changes:
@@ -2365,7 +2434,7 @@ proofkin --name me --providers copilot --serve --ui
   [squads and plans](#squads-and-plans)).
   **Clear finished** lets the finished ones go (running ones stay).
 - **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
-  Ctrl+Enter runs it), or press **Open editor** for a full-size editor with two views of
+  Ctrl+Enter runs it), or press **Open editor** for a full-size editor with three views of
   the same plan:
   - **Builder** (forms, no syntax to learn): what must be true (claims), then a card per
     step, an agent task, a team task (handed to a peer's [team](#team-steps-handing-work-down-a-level);
@@ -2385,6 +2454,10 @@ proofkin --name me --providers copilot --serve --ui
     the step your cursor is on, in the place the plan syntax expects (skills you click
     add up, who runs it is replaced), or starts a new step on an empty line, then
     selects what to type next.
+  - **Describe**: say what the plan should do (or name an issue), and your profile's model
+    writes it into the other two views, checked; with a plan in the editor, say what
+    should change. **Draft with a model…**, beside **Start from a playbook…**, opens the
+    editor here. See [Drafting a plan with a model](#drafting-a-plan-with-a-model).
 
   The plan is checked as you go, and problems with a clear fix come with a button that
   makes it (in the builder, on the card they are about).
@@ -2503,7 +2576,10 @@ proofkin --name boss --ui --ui-port 7420
 
 **MCP tools:** `list_peers` (who can take work: providers, shared folders and their
 checks, squads), `delegate` (a task on a peer, in a folder it shares), `get_task` (waits for
-the result, up to `wait_seconds`), `cancel_task`, `check_plan`, `run_plan` (an evidence
+the result, up to `wait_seconds`), `cancel_task`, `check_plan`, `draft_plan` (the
+profile's model writes a plan from a goal, an issue, or a plan and a note, and answers it
+with its problems; it runs nothing: see [Drafting a plan with a
+model](#drafting-a-plan-with-a-model)), `run_plan` (an evidence
 plan), `get_run` (its evidence report) and `import_spec` ([Spec Kit and
 OpenSpec](#spec-kit-and-openspec)). For the [agent factory](#the-agent-factory):
 `factory_templates`, `factory_list`, `factory_draft`, `factory_check`, `factory_evaluate`
@@ -2704,6 +2780,12 @@ runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
   imported from a peer runs nothing until it passes an evaluation on your accounts (or you
   accept its publisher's report): its bundle is refused unless its publisher's key signed it
   and every file matches ([The agent factory](#the-agent-factory)).
+- A plan your model drafts is data: the model works read-only in an empty folder with no
+  tools, and sees names (peers, folders, checks, skills, topics), never file contents,
+  knowledge text, tokens or Microsoft 365 content. Secrets in the goal are redacted, and an
+  issue's text comes as external content. Drafting runs, grants and sends nothing: only your
+  **Run plan** (or `/plan`) starts it, through the plan check
+  ([Drafting a plan with a model](#drafting-a-plan-with-a-model)).
 
 ### Shared folders
 

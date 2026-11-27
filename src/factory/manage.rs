@@ -833,15 +833,17 @@ pub fn publish(
 }
 
 /// The profile's agent for a moment, to reach its peers over `network` (`what` it is for,
-/// should the profile's own agent run: two would share one identity).
-async fn peer_agent(
+/// and `place`, where its web UI does it, should the profile's own agent run: two would
+/// share one identity).
+pub(crate) async fn peer_agent(
     profile: &Profile,
     network: Network,
     what: &str,
+    place: &str,
 ) -> Result<(Agent, crate::profile::InstanceLock)> {
     let instance = profile.lock_instance().map_err(|_| {
         anyhow!(
-            "profile '{}' runs in a proofkin agent: {what} in its web UI (Agent factory › Catalog), or stop that agent first",
+            "profile '{}' runs in a proofkin agent: {what} in its web UI ({place}), or stop that agent first",
             profile.name
         )
     })?;
@@ -867,7 +869,13 @@ pub async fn catalog(profile: &Profile, wait: u64, network: Network) -> Result<(
         );
         return Ok(());
     }
-    let (agent, _instance) = peer_agent(profile, network, "list the catalog").await?;
+    let (agent, _instance) = peer_agent(
+        profile,
+        network,
+        "list the catalog",
+        "Agent factory › Catalog",
+    )
+    .await?;
     for peer in &trust.peers {
         let (agent, addr) = (agent.clone(), peer.addr());
         tokio::spawn(async move {
@@ -954,7 +962,13 @@ pub async fn import(
             profile.name
         )
     })?;
-    let (agent, _instance) = peer_agent(profile, network, &format!("import {target}")).await?;
+    let (agent, _instance) = peer_agent(
+        profile,
+        network,
+        &format!("import {target}"),
+        "Agent factory › Catalog",
+    )
+    .await?;
     let fetched = async {
         let _ = tokio::time::timeout(Duration::from_secs(wait), agent.connect(peer.addr())).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(wait);

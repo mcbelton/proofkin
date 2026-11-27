@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod models;
 pub mod ops;
 pub mod plan;
+pub mod plan_draft;
 pub mod playbooks;
 pub mod plugins;
 pub mod preview;

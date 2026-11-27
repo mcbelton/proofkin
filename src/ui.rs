@@ -1040,6 +1040,10 @@ pub async fn start_with_work(
         .route("/api/kb/import/workiq", post(import_workiq))
         .route("/api/kb/{topic}", get(kb_topic))
         .route("/api/plans/check", post(check_plan))
+        .route(
+            "/api/plans/draft",
+            get(plan_draft_options).post(draft_plan_route),
+        )
         .route("/api/github", get(github_state))
         .route("/api/github/login", post(github_sign_in))
         .route("/api/github/login/new", post(github_sign_in_new))
@@ -3149,6 +3153,84 @@ fn plan_check(s: &Shared, text: &str) -> Value {
         "steps": plan.steps.len(),
         "claims": plan.claims.len(),
     })
+}
+
+/// What the Plan editor's Describe view offers: the providers the profile is signed in
+/// to, each with the model it drafts with by default, and the tracker's repository.
+async fn plan_draft_options(State(s): State<AppState>) -> Json<Value> {
+    let profile = s.profile_now();
+    let models = profile.models();
+    let providers: Vec<Value> = crate::plan_draft::signed_in(&profile)
+        .into_iter()
+        .map(|p| {
+            let model = crate::models::choice(&models, p).pick(None).ok().flatten();
+            json!({ "provider": p, "model": model })
+        })
+        .collect();
+    let tracker = crate::tracker::TrackerConfig::load(&profile.tracker_path())
+        .ok()
+        .flatten()
+        .map(|c| c.repo);
+    Json(json!({
+        "providers": providers,
+        "tracker": tracker,
+        "max_goal": crate::plan_draft::MAX_GOAL,
+    }))
+}
+
+async fn draft_plan_route(
+    State(s): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let ask = serde_json::from_value(body).map_err(|e| bad_request(format!("{e}")))?;
+    let by = factory::owner(&s);
+    draft_plan(&s, ask, &by).await.map(Json)
+}
+
+/// The plan `ask` asks for, which `by` asked for: drafted by the profile's own model (see
+/// [`crate::plan_draft`]), checked as Run plan checks it, and recorded in the activity and
+/// the audit. Its progress goes out as `plan-draft` events. It runs nothing.
+async fn draft_plan(s: &Shared, ask: crate::plan_draft::Ask, by: &str) -> Result<Value, ApiError> {
+    use crate::plan_draft;
+    let started = SystemTime::now();
+    ask.validate().map_err(|e| bad_request(format!("{e:#}")))?;
+    let profile = s.profile_now();
+    let provider = plan_draft::provider_for(&profile, ask.provider).map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+    })?;
+    let issue = match ask.issue {
+        Some(n) => Some(
+            plan_draft::issue_text(&profile, n)
+                .await
+                .map_err(|e| bad_request(format!("{e:#}")))?,
+        ),
+        None => None,
+    };
+    s.agent.settle_peers().await;
+    let squads = s.squads.lock().unwrap().clone();
+    let recipients = crate::plan::Recipients::of(&s.agent, &profile);
+    let available = plan_draft::Available::of(&profile, s.agent.peers(), squads, recipients);
+    let (executor, own) = factory::executor_for(s, provider).await?;
+    let progress = |line: String| s.send(json!({ "type": "plan-draft", "progress": line }));
+    let drafted = plan_draft::write(
+        executor.as_ref(),
+        provider,
+        &profile.models(),
+        &ask.request(issue),
+        &available,
+        &progress,
+    )
+    .await;
+    if let Some(own) = own {
+        own.stop().await;
+    }
+    let drafted = drafted.map_err(|e| internal(format!("{e:#}")))?;
+    plan_draft::record(&profile, &drafted, by, &s.agent.id().to_string(), started);
+    s.system("info", plan_draft::activity(&drafted, by));
+    Ok(json!(drafted))
 }
 
 /// GitHub: the profile's account, the GitHub CLI accounts it could use, and the

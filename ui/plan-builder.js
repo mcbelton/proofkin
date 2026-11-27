@@ -839,10 +839,16 @@ const planBuilder = (() => {
   function setView(view, { focus = true } = {}) {
     const body = $("#plan-editor-body");
     body.dataset.view = view;
-    localStorage.setItem(VIEW_KEY, view);
+    // Describe writes a plan: the editor opens again on the view plans are edited in.
+    if (view !== "describe") localStorage.setItem(VIEW_KEY, view);
     for (const b of document.querySelectorAll("#plan-view [data-view]")) {
       b.setAttribute("aria-checked", String(b.dataset.view === view));
       b.tabIndex = b.dataset.view === view ? 0 : -1;
+    }
+    if (view === "describe") {
+      $("#plan-editor-tip").textContent = "Say what the plan should do · your profile's model writes it · you review and run it";
+      showPlanDescribe({ focus });
+      return;
     }
     $("#plan-editor-tip").textContent = view === "builder"
       ? "Fill in the cards · the plan is checked as you go · Ctrl+Enter runs it"

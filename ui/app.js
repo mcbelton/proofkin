@@ -2150,6 +2150,117 @@ function openPlanEditor() {
   editorTrack.sync();
 }
 
+// ---------- drafting a plan with a model ----------
+let planDrafting = false;
+
+/// Opens the plan editor on Describe, where the profile's own model drafts the plan.
+function openPlanDraft() {
+  openPlanEditor();
+  planBuilder.setView("describe");
+}
+
+/// Fills in the Describe view: the providers the profile is signed in to, each at its
+/// default model; the tracker's repository, for the issue; and "What should change?"
+/// when the editor holds a plan.
+async function showPlanDescribe({ focus = true } = {}) {
+  const hasPlan = Boolean($("#plan-editor-text").value.trim());
+  $("#plan-draft-note-field").hidden = !hasPlan;
+  $("#plan-draft-error").textContent = "";
+  if (focus) $(hasPlan ? "#plan-draft-note" : "#plan-draft-goal").focus();
+  let options;
+  try {
+    options = await api("/api/plans/draft");
+  } catch (err) {
+    $("#plan-draft-error").textContent = err.message;
+    return;
+  }
+  const select = $("#plan-draft-provider");
+  const chosen = select.value;
+  const providers = options.providers ?? [];
+  select.replaceChildren(...providers.map((p) => el("option", {
+    value: p.provider, text: `${p.provider}'s model (${p.model ?? "its default"})`,
+  })));
+  if (providers.some((p) => p.provider === chosen)) select.value = chosen;
+  select.disabled = !providers.length;
+  $("#plan-draft-submit").disabled = planDrafting || !providers.length;
+  if (!providers.length) {
+    $("#plan-draft-error").textContent = "Your profile isn't signed in to a provider whose model could write the plan: sign it in to Copilot, Claude or Codex first (proofkin auth login).";
+  }
+  const issue = $("#plan-draft-issue");
+  issue.disabled = !options.tracker;
+  $("#plan-draft-issue-hint").textContent = options.tracker
+    ? `#N of ${options.tracker}: the model gets the issue's text, as content it doesn't take orders from.`
+    : "Link a tracker repository (GitHub card) to name one of its issues.";
+}
+
+/// What the model says it is doing while it drafts (see `POST /api/plans/draft`).
+function onPlanDraftProgress(line) {
+  if (planDrafting && line) $("#plan-draft-status").textContent = `${line}…`;
+}
+
+/// Has the profile's model draft the plan the Describe view asks for, and puts it in the
+/// editor, checked. It never runs it: Run plan stays the owner's click.
+async function submitPlanDraft(e) {
+  e.preventDefault();
+  if (planDrafting) return;
+  const error = $("#plan-draft-error");
+  error.textContent = "";
+  const editor = $("#plan-editor-text");
+  const plan = editor.value.trim();
+  const note = $("#plan-draft-note-field").hidden ? "" : $("#plan-draft-note").value.trim();
+  const goal = $("#plan-draft-goal").value.trim();
+  const issueInput = $("#plan-draft-issue");
+  const issue = issueInput.disabled ? "" : issueInput.value.trim().replace(/^#/, "");
+  if (issue && !/^[1-9]\d*$/.test(issue)) {
+    issueInput.setAttribute("aria-invalid", "true");
+    error.textContent = "Name the issue by its number, e.g. #42.";
+    issueInput.focus();
+    return;
+  }
+  if (!goal && !issue && !note) {
+    error.textContent = plan
+      ? "Say what should change in the plan, or what a new plan should do."
+      : "Say what the plan should do, or name an issue.";
+    $(plan ? "#plan-draft-note" : "#plan-draft-goal").focus();
+    return;
+  }
+  // A note has the plan in the editor changed; without one, the draft replaces it.
+  if (plan && !note && !(await confirmDialog({
+    title: "Replace the plan in the editor?",
+    body: "The model writes a new plan from what you said, in place of the one in the editor. To keep it and have it changed, say what should change instead.",
+    confirm: "Replace it",
+  }))) return;
+  const body = { goal, provider: $("#plan-draft-provider").value || undefined };
+  if (issue) body.issue = Number(issue);
+  if (note) Object.assign(body, { plan, note });
+  const button = $("#plan-draft-submit");
+  planDrafting = true;
+  button.disabled = true;
+  button.textContent = "Drafting…";
+  $("#plan-draft-status").textContent = "Your profile's model is writing the plan…";
+  try {
+    const drafted = await api("/api/plans/draft", { method: "POST", body: JSON.stringify(body) });
+    // The model wrote this plan: it no longer comes from a playbook.
+    state.playbook = null;
+    editor.value = drafted.plan;
+    editor.dispatchEvent(new Event("input", { bubbles: true }));
+    $("#plan-draft-note").value = "";
+    const errors = drafted.problems.filter((p) => p.error).length;
+    const tries = `${drafted.tries} ${drafted.tries === 1 ? "try" : "tries"}`;
+    toast(errors
+      ? `The plan still has ${nOf(errors, "error")} after ${tries}: fix them before you run it`
+      : `Drafted in ${tries}: review the plan, then run it`, errors ? "error" : "");
+    planBuilder.setView(planBuilder.view());
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    planDrafting = false;
+    button.disabled = false;
+    button.textContent = "Draft plan";
+    $("#plan-draft-status").textContent = "";
+  }
+}
+
 /// Makes a palette change in the plan editor (see ui/plan-text.js) and selects what
 /// to type next.
 function applyPlanEdit(change) {
@@ -3539,13 +3650,18 @@ async function loadAudit() {
   }
   for (const e of res.entries) {
     const access = e.access ? ACCESS_SHORT[e.access] ?? e.access : "no access";
+    // A plan the profile's model drafted (Plan › Draft with a model…) is no peer's task.
+    const draft = e.origin === "a plan draft";
+    const origin = draft
+      ? `A plan draft ${e.peer} asked for, in ${e.attempts ?? 1} ${e.attempts === 1 ? "try" : "tries"}`
+      : `Part of ${e.origin} on ${e.peer}`;
     list.append(el("li", { class: "audit-item" },
       el("div", { class: "task-top" },
-        el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${e.team ? "Team step" : providerLabel(e.provider)}${e.model ? ` · ${e.model}` : ""}` }),
+        el("span", { class: "task-title", text: `${e.peer} · ${draft ? "Plan draft" : `#${e.task_id}`} · ${e.team ? "Team step" : providerLabel(e.provider)}${e.model ? ` · ${e.model}` : ""}` }),
         el("span", { class: `status ${OUTCOME_CLASS[e.outcome] ?? ""}`, text: OUTCOME_TEXT[e.outcome] ?? e.outcome })),
       el("div", { class: "task-meta", text: `${stamp(e.ts_ms)} · ${access} · ${duration(e.duration_ms)} · ${e.prompt_chars} chars, sha256 ${e.prompt_sha256.slice(0, 10)}` }),
       e.usage ? el("div", { class: "task-meta", title: "As its provider reported it", text: `Used ${usageText(e.usage)}` }) : null,
-      e.origin ? el("div", { class: "task-meta", text: `Part of ${e.origin} on ${e.peer}` }) : null,
+      e.origin ? el("div", { class: "task-meta", text: origin }) : null,
       e.error ? el("div", { class: e.outcome === "cancelled" ? "audit-note" : "audit-error", text: e.error }) : null));
   }
 }
@@ -4026,6 +4142,7 @@ function connectEvents() {
     else if (msg.type === "ops") loadOps().catch((err) => toast(err.message, "error"));
     else if (msg.type === "workers") loadWorkers().catch((err) => toast(err.message, "error"));
     else if (msg.type === "factory") onFactoryEvent(msg);
+    else if (msg.type === "plan-draft") onPlanDraftProgress(msg.progress);
     else if (msg.type === "catalog" && typeof onFactoryCatalogEvent === "function") onFactoryCatalogEvent();
     else if (msg.type === "approvals") {
       const before = new Set((state.approvals ?? []).map((a) => a.id));
@@ -4191,6 +4308,10 @@ function init() {
   $("#confirm-cancel").addEventListener("click", () => $("#confirm-dialog").close(""));
   $("#tools-open").addEventListener("click", () => openTools());
   $("#plan-expand").addEventListener("click", openPlanEditor);
+  $("#plan-draft-open").addEventListener("click", openPlanDraft);
+  $("#plan-describe").addEventListener("submit", submitPlanDraft);
+  $("#plan-draft-cancel").addEventListener("click", () => planBuilder.setView(planBuilder.view()));
+  $("#plan-draft-issue").addEventListener("input", (e) => e.target.removeAttribute("aria-invalid"));
   $("#plan-editor-close").addEventListener("click", () => $("#plan-editor").close());
   $("#plan-editor-text").addEventListener("input", onPlanEditorInput);
   $("#plan-editor-text").addEventListener("keydown", (e) => {
