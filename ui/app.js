@@ -2199,6 +2199,11 @@ function openPlanEditor() {
 
 // ---------- drafting a plan with a model ----------
 let planDrafting = false;
+const draftModelPicker = modelPicker("plan-draft-");
+
+function renderPlanDraftModels() {
+  draftModelPicker.render(state.me ? [state.me] : [], $("#plan-draft-provider").value, true);
+}
 
 /// Opens the plan editor on Describe, where the profile's own model drafts the plan.
 function openPlanDraft() {
@@ -2206,14 +2211,16 @@ function openPlanDraft() {
   planBuilder.setView("describe");
 }
 
-/// Fills in the Describe view: the providers the profile is signed in to, each at its
-/// default model; the tracker's repository, for the issue; and "What should change?"
+/// Fills in the Describe view: the providers the profile is signed in to; the tracker's
+/// repository, for the issue; and "What should change?"
 /// when the editor holds a plan.
 async function showPlanDescribe({ focus = true } = {}) {
   const hasPlan = Boolean($("#plan-editor-text").value.trim());
   $("#plan-draft-note-field").hidden = !hasPlan;
   $("#plan-draft-error").textContent = "";
   if (focus) $(hasPlan ? "#plan-draft-note" : "#plan-draft-goal").focus();
+  const submit = $("#plan-draft-submit");
+  submit.disabled = true;
   let options;
   try {
     options = await api("/api/plans/draft");
@@ -2224,12 +2231,13 @@ async function showPlanDescribe({ focus = true } = {}) {
   const select = $("#plan-draft-provider");
   const chosen = select.value;
   const providers = options.providers ?? [];
-  select.replaceChildren(...providers.map((p) => el("option", {
-    value: p.provider, text: `${p.provider}'s model (${p.model ?? "its default"})`,
+  select.replaceChildren(...providers.map(({ provider }) => el("option", {
+    value: provider, text: providerLabel(provider),
   })));
   if (providers.some((p) => p.provider === chosen)) select.value = chosen;
   select.disabled = !providers.length;
-  $("#plan-draft-submit").disabled = planDrafting || !providers.length;
+  renderPlanDraftModels();
+  submit.disabled = planDrafting || !providers.length;
   if (!providers.length) {
     $("#plan-draft-error").textContent = "Your profile isn't signed in to a provider whose model could write the plan: sign it in to Copilot, Claude or Codex first (proofkin auth login).";
   }
@@ -2249,7 +2257,8 @@ function onPlanDraftProgress(line) {
 /// editor, checked. It never runs it: Run plan stays the owner's click.
 async function submitPlanDraft(e) {
   e.preventDefault();
-  if (planDrafting) return;
+  const button = $("#plan-draft-submit");
+  if (planDrafting || button.disabled) return;
   const error = $("#plan-draft-error");
   error.textContent = "";
   const editor = $("#plan-editor-text");
@@ -2277,10 +2286,15 @@ async function submitPlanDraft(e) {
     body: "The model writes a new plan from what you said, in place of the one in the editor. To keep it and have it changed, say what should change instead.",
     confirm: "Replace it",
   }))) return;
-  const body = { goal, provider: $("#plan-draft-provider").value || undefined };
+  const { model, effort } = draftModelPicker.selected();
+  const body = {
+    goal,
+    provider: $("#plan-draft-provider").value,
+    model: model ?? undefined,
+    effort: effort ?? undefined,
+  };
   if (issue) body.issue = Number(issue);
   if (note) Object.assign(body, { plan, note });
-  const button = $("#plan-draft-submit");
   planDrafting = true;
   button.disabled = true;
   button.textContent = "Drafting…";
@@ -2302,7 +2316,7 @@ async function submitPlanDraft(e) {
     error.textContent = err.message;
   } finally {
     planDrafting = false;
-    button.disabled = false;
+    button.disabled = $("#plan-draft-provider").disabled;
     button.textContent = "Draft plan";
     $("#plan-draft-status").textContent = "";
   }
@@ -3761,11 +3775,7 @@ function targetSquad() {
   return target.startsWith("#") ? (state.squads ?? []).find((s) => `#${s.name}` === target) : null;
 }
 
-// The Model list's choice that takes a model by name (EFFORTS and the model helpers are
-// in ui/models.js).
-const OTHER_MODEL = "*other*";
-/** What the task form's Model and Reasoning lists offer, as last drawn (see modelMenu). */
-let taskModels = null;
+const taskModelPicker = modelPicker("");
 
 /** The agents a task to `target` may go to, as they say what they offer: this agent, a
  * peer, the connected peers that serve the provider (Any peer), or a squad's online
@@ -3778,53 +3788,12 @@ function targetAgents(target, provider) {
   return state.peers.filter((p) => p.id === target);
 }
 
-/** The model and reasoning effort a task runs at: its agent's defaults (selected, named
- * when it says them), or a model it lets you pick (those it allows, else all its account
- * offers; one by name when it allows any and lists none). With Any peer or a squad,
- * what their peers allow together (the task goes to one that allows your pick). */
 function renderModelOptions() {
   const provider = $("#provider").value;
   const target = $("#target").value;
-  const agents = target ? targetAgents(target, provider) : [];
-  const menu = modelMenu(agents, provider);
-  taskModels = { menu, theirs: agents.length > 1 ? "Each peer's default" : "Its default" };
-  const deflt = menu.defaultModel?.toLowerCase();
-  const sel = $("#model");
-  const prev = sel.value;
-  sel.replaceChildren(
-    el("option", { value: "", text: menu.defaultModel ? `${menu.defaultModel} (default)` : taskModels.theirs }),
-    ...modelOptionNodes(menu.models.filter((m) => m.id.toLowerCase() !== deflt)),
-    ...(menu.other ? [el("option", { value: OTHER_MODEL, text: "Another model…" })] : []));
-  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  taskModelPicker.render(target ? targetAgents(target, provider) : [], target ? provider : "", target === "local");
   $("#model-field").hidden = !target;
-  $("#model-name-field").hidden = !target || sel.value !== OTHER_MODEL;
   $("#effort-field").hidden = !target;
-  renderEffortOptions();
-}
-
-/** The Reasoning list for the model picked: the levels its agent allows that the model
- * supports, with the default selected as the model takes it. */
-function renderEffortOptions() {
-  if (!taskModels) return;
-  const chosen = $("#model").value;
-  const pick = effortChoices(taskModels.menu, chosen === OTHER_MODEL ? $("#model-name").value.trim() : chosen);
-  const effort = $("#effort");
-  const prev = effort.value;
-  effort.replaceChildren(
-    el("option", { value: "", text: pick.fixed ? "None for this model" : pick.fitted ? `${pick.fitted} (default)` : taskModels.theirs }),
-    ...pick.levels.filter((e) => e !== pick.fitted).map((e) => el("option", { value: e, text: e })));
-  if ([...effort.options].some((o) => o.value === prev)) effort.value = prev;
-  effort.disabled = pick.fixed;
-}
-
-function selectedModel() {
-  if ($("#model-field").hidden) return null;
-  const chosen = $("#model").value;
-  return chosen === OTHER_MODEL ? $("#model-name").value.trim() || null : chosen || null;
-}
-
-function selectedEffort() {
-  return $("#effort-field").hidden || $("#effort").disabled ? null : $("#effort").value || null;
 }
 
 /** Folder picker for a peer target: the folders that peer shares with this agent; for
@@ -3961,8 +3930,7 @@ async function submitComposer(e) {
           mcp: selectedMcp(),
           checks,
           attempts: checks.length ? Number($("#attempts").value) : null,
-          model: selectedModel(),
-          effort: selectedEffort(),
+          ...taskModelPicker.selected(),
           prompt: text,
         }),
       });
@@ -4157,6 +4125,7 @@ async function loadState() {
     approvals: s.approvals, builtinChecks: s.builtin_checks ?? [],
   });
   renderMe();
+  renderPlanDraftModels();
   renderPeers();
   renderFeed();
   renderTasks();
@@ -4205,6 +4174,7 @@ function connectEvents() {
       state.me = msg.me;
       renderMe();
       renderTaskOptions();
+      renderPlanDraftModels();
     }
     else if (msg.type === "peers") {
       state.peers = msg.peers;
@@ -4361,6 +4331,7 @@ function init() {
   $("#plan-draft-open").addEventListener("click", openPlanDraft);
   $("#plan-describe").addEventListener("submit", submitPlanDraft);
   $("#plan-draft-cancel").addEventListener("click", () => planBuilder.setView(planBuilder.view()));
+  $("#plan-draft-provider").addEventListener("change", renderPlanDraftModels);
   $("#plan-draft-issue").addEventListener("input", (e) => e.target.removeAttribute("aria-invalid"));
   $("#plan-editor-close").addEventListener("click", () => $("#plan-editor").close());
   $("#plan-editor-text").addEventListener("input", onPlanEditorInput);
@@ -4400,12 +4371,6 @@ function init() {
   initBranchReview();
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); renderModelOptions(); updateComposer(); });
-  $("#model").addEventListener("change", () => {
-    const other = $("#model").value === OTHER_MODEL;
-    $("#model-name-field").hidden = !other;
-    renderEffortOptions();
-    if (other) $("#model-name").focus();
-  });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
   $("#copy-ticket").addEventListener("click", copyTicket);

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use proofkin::audit::{AuditLog, Outcome};
 use proofkin::mcp::McpServer;
 use proofkin::plan::{Plan, RunContext, SquadStore, StepState, run_plan, run_plan_with};
-use proofkin::protocol::Phase;
+use proofkin::protocol::{Phase, Progress};
 use proofkin::pulls::{Asked, Opened, PullRequestAsk, PullRequests, Review};
 use proofkin::runs::{RunRecord, Verdict};
 use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks, parse_task_limit};
@@ -2461,16 +2461,20 @@ impl PullRequests for FakePulls {
 }
 
 impl FakePulls {
-    /// Once pull request `number` is opened, sets its state to `state`.
-    async fn when_opened(&self, number: u64, state: &str) {
-        timeout(Duration::from_secs(30), async {
-            while !self.states.lock().unwrap().contains_key(&number) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the pull request was opened");
-        self.states.lock().unwrap().insert(number, state.into());
+    /// Merges or closes a pull request only once the caller sees that it is waiting.
+    fn finish_when_waiting(&self, number: u64, state: &str, progress: &Progress) {
+        if progress.phase == Phase::PullRequest
+            && progress
+                .text
+                .starts_with(&format!("pull request #{number} is open"))
+        {
+            *self
+                .states
+                .lock()
+                .unwrap()
+                .get_mut(&number)
+                .expect("the pull request was opened") = state.into();
+        }
     }
 }
 
@@ -2551,11 +2555,7 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     })
     .await
     .expect("boss learns the folder takes pull request steps");
-    let merge = {
-        let pulls = pulls.clone();
-        tokio::spawn(async move { pulls.when_opened(1, "MERGED").await })
-    };
-    let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut said = Vec::new();
     let recipients = proofkin::plan::Recipients {
         github: Some("boss-gh".into()),
         ..Default::default()
@@ -2570,10 +2570,9 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     ))
     .unwrap();
     let states = {
-        let said = said.clone();
-        timeout(
+        let run = timeout(
             Duration::from_secs(60),
-            run_plan_with(&boss, &squads, &named, &ctx, move |id, state| {
+            run_plan_with(&boss, &squads, &named, &ctx, |id, state| {
                 if let (
                     "ship",
                     StepState::Running {
@@ -2581,14 +2580,14 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
                     },
                 ) = (id, state)
                 {
-                    said.lock().unwrap().push(p.text.clone());
+                    said.push(p.text.clone());
+                    pulls.finish_when_waiting(1, "MERGED", p);
                 }
             }),
         )
-        .await
-        .unwrap()
+        .await;
+        run.unwrap_or_else(|_| panic!("the plan did not finish; ship progress: {said:?}"))
     };
-    merge.await.unwrap();
     let StepState::Done {
         evidence: Some(checked),
         ..
@@ -2660,7 +2659,6 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         }
         other => panic!("{other:?}"),
     }
-    let said = said.lock().unwrap().clone();
     assert!(
         said.iter().any(|t| t.contains(
             "pull request #1 is open, with a review asked of boss-gh, carol-gh: waiting for it to be merged"
@@ -2670,21 +2668,25 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
 
     // A pull request closed without being merged fails the step. Naming no one, it asks
     // those who signed off: you.
-    let close = {
-        let pulls = pulls.clone();
-        tokio::spawn(async move { pulls.when_opened(2, "CLOSED").await })
-    };
     let ctx = RunContext {
         recipients,
         ..Default::default()
     };
     let states = timeout(
         Duration::from_secs(60),
-        run_plan_with(&boss, &squads, &plan, &ctx, |_, _| {}),
+        run_plan_with(&boss, &squads, &plan, &ctx, |id, state| {
+            if id == "ship"
+                && let StepState::Running {
+                    peer: _,
+                    progress: Some(p),
+                } = state
+            {
+                pulls.finish_when_waiting(2, "CLOSED", p);
+            }
+        }),
     )
     .await
     .unwrap();
-    close.await.unwrap();
     assert!(
         matches!(&states["ship"], StepState::Failed { error, .. } if error.contains("#2 was closed without being merged: https://github.com/acme/app/pull/2")),
         "{:?}",
@@ -2878,21 +2880,16 @@ async fn a_folder_owner_approves_each_pull_request_and_a_run_card_asks_for_one()
         step: None,
     };
     let yes = answer(true, "fine");
-    let merge = {
-        let pulls = pulls.clone();
-        tokio::spawn(async move { pulls.when_opened(1, "MERGED").await })
-    };
     let done = timeout(
         Duration::from_secs(60),
         boss.send_task(worker.id(), task.clone(), Some(origin.clone()))
             .unwrap()
-            .finish(|_| {}),
+            .finish(|p| pulls.finish_when_waiting(1, "MERGED", &p)),
     )
     .await
     .unwrap()
     .unwrap();
     yes.await.unwrap();
-    merge.await.unwrap();
     assert!(
         done.ok && done.output.contains("; worker approved opening it."),
         "{}",

@@ -993,6 +993,12 @@ examples:
         /// in to).
         #[arg(long, value_enum)]
         using: Option<Provider>,
+        /// The model that writes it (default: the profile's default for the provider).
+        #[arg(long, value_name = "NAME")]
+        model: Option<String>,
+        /// Its reasoning effort (default: the profile's default for the provider).
+        #[arg(long, value_name = "LEVEL")]
+        effort: Option<String>,
         /// A plan file to change, as --note says.
         #[arg(long, value_name = "FILE", requires = "note")]
         from: Option<PathBuf>,
@@ -3392,6 +3398,8 @@ async fn run_plan_command(command: PlanCommand) -> Result<()> {
             goal,
             issue,
             using,
+            model,
+            effort,
             from,
             note,
             out,
@@ -3412,6 +3420,8 @@ async fn run_plan_command(command: PlanCommand) -> Result<()> {
                 goal,
                 issue,
                 provider: using,
+                model,
+                effort,
                 plan,
                 note,
             };
