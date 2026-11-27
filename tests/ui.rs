@@ -3262,6 +3262,16 @@ async fn the_page_follows_the_ux_guidelines() {
     }
     // Playbooks need explaining, so they're picked from cards, not a native dropdown.
     assert!(!page.contains(r#"<select id="playbook""#));
+    for prefix in ["plan", "plan-editor"] {
+        for (setting, label) in [("model", "Model"), ("effort", "Reasoning")] {
+            let id = format!("{prefix}-{setting}");
+            assert!(
+                page.contains(&format!(r#"<label for="{id}">{label}"#)),
+                "{id}"
+            );
+            assert!(page.contains(&format!(r#"<select id="{id}""#)), "{id}");
+        }
+    }
     let confirm = regex::Regex::new(r"\bconfirm\(").unwrap();
     let html =
         regex::Regex::new(r"\.(inner|outer)HTML\b|insertAdjacentHTML|document\.write").unwrap();
@@ -3531,27 +3541,27 @@ impl Executor for Planner {
         };
         Ok(Ran::new(
             format!("Here is the plan.\n\n```plan\n{plan}\n```\n\nReview it first."),
-            Some("planner-1".into()),
-        ))
+            task.model.clone(),
+        )
+        .with_effort(task.effort.clone()))
     }
 }
 
-/// `POST /api/plans/draft` has the profile's own model write a plan: the model is told what
-/// the check found wrong and writes it again, the answer is the plan with its problems, its
-/// provider, model and tries, and it is recorded in the activity and the audit (with the
-/// goal's hash, not its text). Drafting starts no task and no run; a request without a
-/// goal, or for a provider the profile isn't signed in to, is refused with what to do.
-#[tokio::test]
-async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
-    let home = tempfile::tempdir().unwrap();
-    let dir = home.path().join("owner");
+async fn plan_draft_ui(home: &std::path::Path) -> (Profile, Agent, Arc<Planner>, u16, String) {
+    let dir = home.join("owner");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("profile.json"),
-        r#"{"copilot": {"source": "token", "host": "github.com"}}"#,
+        r#"{
+            "copilot": {"source": "token", "host": "github.com"},
+            "models": {"copilot": {
+                "allowed": ["claude-opus-5.5", "planner-1"],
+                "effort": "medium", "efforts": ["low", "medium"]
+            }}
+        }"#,
     )
     .unwrap();
-    let profile = Profile::open_in(home.path(), "owner").unwrap();
+    let profile = Profile::open_in(home, "owner").unwrap();
     let mut config = AgentConfig::new("owner", SecretKey::generate());
     config.network = Network::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
@@ -3561,7 +3571,7 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
         network: Network::Local,
         serving: false,
         access: Access::ReadOnly,
-        workspace: home.path().to_path_buf(),
+        workspace: home.to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
         workers: None,
@@ -3578,7 +3588,18 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
     .unwrap();
     let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
     let (port, token) = rest.split_once("/#t=").unwrap();
-    let port: u16 = port.parse().unwrap();
+    (profile, agent, planner, port.parse().unwrap(), token.into())
+}
+
+/// `POST /api/plans/draft` has the chosen model write a plan: the model is told what
+/// the check found wrong and writes it again. The answer has the plan with its problems,
+/// provider, model, effort and tries, and the draft is recorded in the activity and audit
+/// (with the goal's hash, not its text). Drafting starts no task and no run; a request
+/// without a goal, or for a provider the profile isn't signed in to, is refused.
+#[tokio::test]
+async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
+    let home = tempfile::tempdir().unwrap();
+    let (profile, agent, planner, port, token) = plan_draft_ui(home.path()).await;
     let host = format!("127.0.0.1:{port}");
     let call = |method: &'static str, body: Value| {
         let (host, token) = (host.clone(), token.to_owned());
@@ -3602,7 +3623,11 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
     assert_eq!(options.json()["max_goal"], 4000);
 
     let goal = "Fix the login bug, then let me sign it off";
-    let drafted = call("POST", serde_json::json!({ "goal": goal })).await;
+    let drafted = call(
+        "POST",
+        serde_json::json!({ "goal": goal, "model": "planner-1", "effort": "low" }),
+    )
+    .await;
     assert_eq!(drafted.status, 200, "{}", drafted.body);
     let drafted = drafted.json();
     assert_eq!(
@@ -3619,6 +3644,7 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
     );
     assert_eq!(drafted["provider"], "copilot");
     assert_eq!(drafted["model"], "planner-1");
+    assert_eq!(drafted["effort"], "low");
     assert_eq!(drafted["tries"], 2);
     assert!(drafted.get("goal_sha256").is_none(), "{drafted}");
     {
@@ -3632,7 +3658,7 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
         );
     }
 
-    let state = request(port, "GET", "/api/state", &host, Some(token), None)
+    let state = request(port, "GET", "/api/state", &host, Some(&token), None)
         .await
         .json();
     assert_eq!(
@@ -3644,9 +3670,10 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
         state["feed"].as_array().unwrap().iter().any(|f| f["text"]
             .as_str()
             .unwrap_or_default()
-            .starts_with(
-                "Drafted a plan with copilot's model (planner-1) in 2 tries for owner: 0 errors"
-            )),
+            .starts_with(concat!(
+                "Drafted a plan with copilot's model (planner-1) at low reasoning ",
+                "in 2 tries for owner: 0 errors"
+            ))),
         "{}",
         state["feed"]
     );
@@ -3664,7 +3691,7 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
         .find(|e| e.origin.as_deref() == Some("a plan draft"))
         .expect("the draft is in the audit");
     assert_eq!(entry.peer, "owner");
-    assert_eq!(entry.model.as_deref(), Some("planner-1"));
+    assert_eq!(entry.model.as_deref(), Some("planner-1 (low reasoning)"));
     assert_eq!(entry.attempts, Some(2));
     assert_eq!(
         entry.prompt_sha256,
@@ -3696,6 +3723,118 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
         unsigned.body
     );
     assert_eq!(planner.prompts.lock().unwrap().len(), 2);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_owner_sets_and_clears_a_folder_task_limit_in_the_web_ui() {
+    let home = tempfile::tempdir().unwrap();
+    let (agent, port, token) = solo_ui(home.path()).await;
+    let profile = Profile::open_in(home.path(), "solo").unwrap();
+    let (_, shares) = profile
+        .update_shares(|shares| {
+            shares.add("app", home.path(), Access::Full)?;
+            Ok(())
+        })
+        .unwrap();
+    agent.set_shares(shares);
+    let host = format!("127.0.0.1:{port}");
+    let put = |body: &'static str| {
+        request(
+            port,
+            "PUT",
+            "/api/shares/app/tasks",
+            &host,
+            Some(&token),
+            Some(body),
+        )
+    };
+    let shown = || async {
+        request(port, "GET", "/api/state", &host, Some(&token), None)
+            .await
+            .json()["me"]["shares"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|share| share["name"] == "app")
+            .unwrap()["task_limit"]
+            .clone()
+    };
+    assert!(shown().await.is_null(), "no limit by default");
+
+    let set = put(r#"{"tasks":"1"}"#).await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(
+        set.json(),
+        serde_json::json!({ "name": "app", "task_limit": 1 })
+    );
+    assert_eq!(shown().await, 1);
+    let saved = || {
+        profile
+            .shares()
+            .unwrap()
+            .get("app")
+            .unwrap()
+            .task_limit
+            .map(|n| n.get())
+    };
+    assert_eq!(saved(), Some(1));
+    let invalid = put(r#"{"tasks":"0"}"#).await;
+    assert_eq!(invalid.status, 400, "{}", invalid.body);
+    assert!(
+        invalid.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("1 or more")
+    );
+    assert_eq!(saved(), Some(1));
+    assert_eq!(shown().await, 1);
+
+    let cleared = put(r#"{"tasks":"any"}"#).await;
+    assert_eq!(cleared.status, 200, "{}", cleared.body);
+    assert!(cleared.json()["task_limit"].is_null());
+    assert!(shown().await.is_null());
+    assert_eq!(saved(), None);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn plan_draft_refuses_disallowed_models_and_efforts_before_reading_an_issue() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, agent, planner, port, token) = plan_draft_ui(home.path()).await;
+    let host = format!("127.0.0.1:{port}");
+    for (body, message) in [
+        (
+            serde_json::json!({ "issue": 42, "model": "gpt-5.5" }),
+            "gpt-5.5 isn't a model allowed here: claude-opus-5.5, planner-1",
+        ),
+        (
+            serde_json::json!({ "issue": 42, "effort": "turbo" }),
+            r#""turbo" isn't a reasoning effort: use one of"#,
+        ),
+        (
+            serde_json::json!({ "issue": 42, "effort": "high" }),
+            "high isn't a reasoning effort allowed here: low, medium",
+        ),
+    ] {
+        // There is no tracker: a later check would report that instead of the choice.
+        let response = request(
+            port,
+            "POST",
+            "/api/plans/draft",
+            &host,
+            Some(&token),
+            Some(&body.to_string()),
+        )
+        .await;
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert!(
+            response.json()["error"].as_str().unwrap().contains(message),
+            "{}",
+            response.body
+        );
+    }
+    assert!(planner.prompts.lock().unwrap().is_empty());
     agent.shutdown().await;
 }
 

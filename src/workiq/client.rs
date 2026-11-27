@@ -5,6 +5,7 @@
 //! [`HttpTransport`] here for the hosted endpoint, and [`super::stdio::StdioTransport`] for
 //! Microsoft's CLI.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::audit::{Audit, CallContext};
+use super::document::number;
 
 /// Work IQ's hosted MCP endpoint.
 pub const DEFAULT_URL: &str = "https://workiq.svc.cloud.microsoft/mcp";
@@ -275,8 +277,8 @@ impl WorkIqError {
         Self::new(WorkIqErrorKind::Http(status.as_u16()), class, message, ids)
     }
 
-    /// An entity a tool gave with a failed `statusCode` (`fetch` and `fetch_blob` give one per
-    /// entity), classified as an HTTP answer with that status would be.
+    /// A failed status inside a tool's answer (`fetch` gives one per entity), classified as
+    /// an HTTP answer with that status would be.
     pub(crate) fn entity(tool: &str, status: u16, detail: &str, ids: RequestIds) -> Self {
         let detail: String = one_line(detail).chars().take(ERROR_BODY_CHARS).collect();
         let class = class_of_status(status, &detail, &Payload::default(), None);
@@ -714,6 +716,26 @@ pub struct ToolResult {
     pub structured_content: Option<Value>,
     pub is_error: bool,
     pub ids: RequestIds,
+}
+
+impl ToolResult {
+    /// Work IQ's structured answer (or JSON in its text), and its status when given.
+    pub(crate) fn answer_with_status(&self) -> (Cow<'_, Value>, Option<u16>) {
+        let answer = match &self.structured_content {
+            Some(answer) => Cow::Borrowed(answer),
+            None => self
+                .content
+                .iter()
+                .filter_map(|item| item.get("text")?.as_str())
+                .find_map(|text| serde_json::from_str(text).ok())
+                .map_or(Cow::Borrowed(&Value::Null), Cow::Owned),
+        };
+        let status = ["status", "statusCode", "httpStatusCode"]
+            .iter()
+            .find_map(|key| number(answer.get(*key)))
+            .map(|status| u16::try_from(status).unwrap_or(u16::MAX));
+        (answer, status)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2278,8 +2300,9 @@ mod tests {
         assert!(ids.request_id.is_some() && ids.correlation_id.is_some());
     }
 
-    use crate::profile::WorkIqBudget;
+    use crate::profile::{WorkIqBudget, WorkIqNotices};
     use crate::workiq::audit::{self, Audit, CallContext, Clock, Purpose};
+    use crate::workiq::notice::{Notifier, SignOff};
     use chrono::{DateTime, Local, TimeZone};
     use sha2::{Digest, Sha256};
 
@@ -2398,6 +2421,60 @@ mod tests {
         assert_eq!(entries[1].results, None);
         assert_eq!(entries[2].audience, "bob");
         assert!(entries[2].request_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn answered_statuses_set_audit_outcomes_and_still_count_against_budgets() {
+        let (fake, url) = start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (client, audit) = audited(&url, dir.path(), WorkIqBudget::default());
+        let client = Arc::new(client);
+        fake.canned.lock().unwrap().extend([
+            Canned::result(json!({ "structuredContent": { "statusCode": 403 } })),
+            Canned::result(json!({ "structuredContent": { "statusCode": 201 } })),
+            Canned::result(json!({
+                "content": [{ "type": "text", "text": r#"{"httpStatusCode":"503"}"# }],
+            })),
+        ]);
+
+        let notices = Notifier::new(client.clone(), WorkIqNotices::Mail, "alice@example.com");
+        let error = notices
+            .send(&SignOff {
+                agent: "alice".into(),
+                title: "Sign off the draft".into(),
+                run: Some("run-1".into()),
+                step: Some("review".into()),
+                ..SignOff::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WorkIqError>().unwrap().class,
+            Class::DeniedByPolicy
+        );
+        let context = step("run-1");
+        client
+            .call_tool_in(
+                &context,
+                "create_entity",
+                json!({ "parentUrl": "/me/events", "jsonBody": { "subject": "Sync" } }),
+            )
+            .await
+            .unwrap();
+        client
+            .call_tool_in(&context, "get_schema", json!({}))
+            .await
+            .unwrap();
+
+        let entries = audit::read(audit.path()).unwrap();
+        let outcomes: Vec<&str> = entries.iter().map(|e| e.outcome.as_str()).collect();
+        assert_eq!(outcomes, ["denied-by-policy", "ok", "transient"]);
+        assert_eq!(entries[0].purpose, "notice");
+        assert!(entries.iter().all(|e| e.request_id.is_some()));
+        assert_eq!(fake.count("tools/call"), 3);
+        let usage = audit.usage(Some("run-1"));
+        assert_eq!(usage.today, 3);
+        assert_eq!(usage.run, Some(3));
     }
 
     #[tokio::test]

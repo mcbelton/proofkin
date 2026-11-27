@@ -318,6 +318,12 @@ function renderMe() {
               : "Preview prototype/index.html of this folder in a sandboxed tab",
             onclick: (e) => openPreview({ share: s.name }, e.currentTarget),
           }, s.preview === "review pack" ? "Preview review pack" : "Preview prototype") : null,
+          s.name === "data" ? null : el("div", { class: "share-team" },
+            el("button", {
+              type: "button", class: "btn small", "aria-label": `Editing task limit for ${s.name}`,
+              onclick: () => openShareTasks(s),
+            }, "Task limit…"),
+            el("span", { class: "muted small", text: `Editing tasks at once: ${s.task_limit ?? "any"}` })),
           s.name === "data" || !["workspace-write", "full"].includes(s.max_access) ? null : el("div", { class: "share-team" },
             el("button", {
               type: "button", class: "btn small", "aria-label": `Team plan for ${s.name}`,
@@ -423,6 +429,7 @@ function renderPeers() {
     if (state.trusted.some((t) => t.id === b.dataset.peer)) b.remove();
   }
   renderTaskOptions();
+  syncEditorModels();
 }
 
 function feedNode(item) {
@@ -883,6 +890,47 @@ function renderSquads() {
 /** The steps of a team plan: its lines that are neither blank, comments nor claims, nor the continuation of a step's text. */
 function teamStepCount(plan) {
   return planText.lineKinds(plan).filter(({ kind }) => kind === "step").length;
+}
+
+let taskLimitFolder = null;
+
+function focusShareTasks(name) {
+  [...$("#facts").querySelectorAll("button[aria-label]")]
+    .find((b) => b.getAttribute("aria-label") === `Editing task limit for ${name}`)?.focus();
+}
+
+function openShareTasks(share) {
+  if ($("#share-tasks-save").disabled) return;
+  taskLimitFolder = share.name;
+  $("#share-tasks-h").textContent = `Editing task limit for ${share.name}`;
+  $("#share-tasks").value = share.task_limit ?? "any";
+  $("#share-tasks-error").textContent = "";
+  $("#share-tasks-dialog").showModal();
+  $("#share-tasks").select();
+}
+
+async function submitShareTasks(e) {
+  e.preventDefault();
+  const save = $("#share-tasks-save");
+  if (save.disabled) return;
+  const name = taskLimitFolder;
+  $("#share-tasks-error").textContent = "";
+  save.disabled = true;
+  save.textContent = "Saving…";
+  try {
+    const body = JSON.stringify({ tasks: $("#share-tasks").value });
+    const { task_limit } = await api(`/api/shares/${encodeURIComponent(name)}/tasks`, { method: "PUT", body });
+    const share = state.me.shares.find((s) => s.name === name);
+    if (share) share.task_limit = task_limit;
+    $("#share-tasks-dialog").close();
+    renderMe();
+    focusShareTasks(name);
+  } catch (err) {
+    $("#share-tasks-error").textContent = err.message;
+  } finally {
+    save.disabled = false;
+    save.textContent = "Save task limit";
+  }
 }
 
 let teamFolder = null;
@@ -1727,6 +1775,7 @@ function playbookText(p) {
 
 /// Explains the playbook the plan came from (or what a plan is) above the plan box.
 function renderPlanExplain() {
+  syncPlanModels();
   const box = $("#plan-explain");
   if (state.mode !== "plan") {
     box.hidden = true;
@@ -2139,6 +2188,86 @@ function trackChoice(box, input, changed, shown) {
 let planTrack = { sync() {}, ready: () => true };
 let editorTrack = { sync() {}, ready: () => true };
 
+function stepAgents(target, provider) {
+  if (!target) return [];
+  const [who] = target.slice(1).split(":");
+  if (target.startsWith("#")) {
+    const squad = state.squads?.find((s) => s.name === who);
+    return squad ? squadServing(squad, provider) : [];
+  }
+  return state.peers.filter((p) => p.name === who && p.capabilities.includes(provider));
+}
+
+function planModelChoice(prefix, input, changed, shown) {
+  const box = $(`#${prefix}models`);
+  const model = $(`#${prefix}model`);
+  const effort = $(`#${prefix}effort`);
+  const name = $(`#${prefix}model-name`);
+  const mixed = $(`#${prefix}models-mixed`);
+  let naming = false;
+  let lastText = input.value;
+  const sync = () => {
+    if (input.value !== lastText) naming = false;
+    lastText = input.value;
+    const steps = shown() ? planText.modelSteps(input.value) : [];
+    box.hidden = !steps.length;
+    if (box.hidden) {
+      naming = false;
+      return;
+    }
+    const byProvider = new Map();
+    for (const step of steps) {
+      const provider = step.using ?? "copilot";
+      if (!byProvider.has(provider)) byProvider.set(provider, new Set());
+      for (const peer of stepAgents(step.target, provider)) byProvider.get(provider).add(peer);
+    }
+    const providers = [...byProvider.keys()];
+    const different = providers.length > 1;
+    const current = planText.modelsOf(input.value);
+    const pick = planModelOptions(byProvider, current);
+    model.replaceChildren(...modelOptionNodes(pick.models));
+    model.disabled = different;
+    naming = naming && !different && pick.models.some((o) => o.value === OTHER_MODEL);
+    model.value = naming ? OTHER_MODEL : pick.model;
+    name.closest("label").hidden = !naming;
+    effort.replaceChildren(...modelOptionNodes(pick.efforts));
+    effort.value = pick.effort;
+    effort.disabled = pick.fixed;
+    mixed.hidden = !different;
+    if (different) {
+      const list = `${providers.slice(0, -1).join(", ")} and ${providers.at(-1)}`;
+      mixed.textContent = `Its steps use ${list}: pick each step's model in the editor`
+        + (current.model !== null ? ". Remove the model: line in Text." : "");
+    }
+  };
+  const write = (value) => {
+    naming = false;
+    input.value = planText.setModels(input.value, value);
+    changed();
+  };
+  model.addEventListener("change", () => {
+    if (model.value === OTHER_MODEL) {
+      naming = true;
+      name.value = planText.modelsOf(input.value).model ?? "";
+      sync();
+      name.focus();
+    } else write({ model: model.value || null });
+  });
+  const nameModel = () => { if (naming) write({ model: name.value.trim() || null }); };
+  name.addEventListener("change", nameModel);
+  name.addEventListener("keydown", (event) => {
+    const { key, isComposing } = event;
+    if (key !== "Enter" || isComposing) return;
+    event.preventDefault();
+    nameModel();
+    model.focus();
+  });
+  effort.addEventListener("change", () => write({ effort: effort.value || null }));
+  return sync;
+}
+let syncPlanModels = () => {};
+let syncEditorModels = () => {};
+
 // ---------- plan editor ----------
 /// Opens the plan in a large editor: as forms (the builder) or as text with what can go
 /// into it beside it, whichever was used last.
@@ -2149,10 +2278,16 @@ function openPlanEditor() {
   $("#plan-editor").showModal();
   planBuilder.setView(planBuilder.view());
   editorTrack.sync();
+  syncEditorModels();
 }
 
 // ---------- drafting a plan with a model ----------
 let planDrafting = false;
+const draftModelPicker = modelPicker("plan-draft-");
+
+function renderPlanDraftModels() {
+  draftModelPicker.render(state.me ? [state.me] : [], $("#plan-draft-provider").value, true);
+}
 
 /// Opens the plan editor on Describe, where the profile's own model drafts the plan.
 function openPlanDraft() {
@@ -2160,14 +2295,16 @@ function openPlanDraft() {
   planBuilder.setView("describe");
 }
 
-/// Fills in the Describe view: the providers the profile is signed in to, each at its
-/// default model; the tracker's repository, for the issue; and "What should change?"
+/// Fills in the Describe view: the providers the profile is signed in to; the tracker's
+/// repository, for the issue; and "What should change?"
 /// when the editor holds a plan.
 async function showPlanDescribe({ focus = true } = {}) {
   const hasPlan = Boolean($("#plan-editor-text").value.trim());
   $("#plan-draft-note-field").hidden = !hasPlan;
   $("#plan-draft-error").textContent = "";
   if (focus) $(hasPlan ? "#plan-draft-note" : "#plan-draft-goal").focus();
+  const submit = $("#plan-draft-submit");
+  submit.disabled = true;
   let options;
   try {
     options = await api("/api/plans/draft");
@@ -2178,12 +2315,13 @@ async function showPlanDescribe({ focus = true } = {}) {
   const select = $("#plan-draft-provider");
   const chosen = select.value;
   const providers = options.providers ?? [];
-  select.replaceChildren(...providers.map((p) => el("option", {
-    value: p.provider, text: `${p.provider}'s model (${p.model ?? "its default"})`,
+  select.replaceChildren(...providers.map(({ provider }) => el("option", {
+    value: provider, text: providerLabel(provider),
   })));
   if (providers.some((p) => p.provider === chosen)) select.value = chosen;
   select.disabled = !providers.length;
-  $("#plan-draft-submit").disabled = planDrafting || !providers.length;
+  renderPlanDraftModels();
+  submit.disabled = planDrafting || !providers.length;
   if (!providers.length) {
     $("#plan-draft-error").textContent = "Your profile isn't signed in to a provider whose model could write the plan: sign it in to Copilot, Claude or Codex first (proofkin auth login).";
   }
@@ -2203,7 +2341,8 @@ function onPlanDraftProgress(line) {
 /// editor, checked. It never runs it: Run plan stays the owner's click.
 async function submitPlanDraft(e) {
   e.preventDefault();
-  if (planDrafting) return;
+  const button = $("#plan-draft-submit");
+  if (planDrafting || button.disabled) return;
   const error = $("#plan-draft-error");
   error.textContent = "";
   const editor = $("#plan-editor-text");
@@ -2231,10 +2370,15 @@ async function submitPlanDraft(e) {
     body: "The model writes a new plan from what you said, in place of the one in the editor. To keep it and have it changed, say what should change instead.",
     confirm: "Replace it",
   }))) return;
-  const body = { goal, provider: $("#plan-draft-provider").value || undefined };
+  const { model, effort } = draftModelPicker.selected();
+  const body = {
+    goal,
+    provider: $("#plan-draft-provider").value,
+    model: model ?? undefined,
+    effort: effort ?? undefined,
+  };
   if (issue) body.issue = Number(issue);
   if (note) Object.assign(body, { plan, note });
-  const button = $("#plan-draft-submit");
   planDrafting = true;
   button.disabled = true;
   button.textContent = "Drafting…";
@@ -2256,7 +2400,7 @@ async function submitPlanDraft(e) {
     error.textContent = err.message;
   } finally {
     planDrafting = false;
-    button.disabled = false;
+    button.disabled = $("#plan-draft-provider").disabled;
     button.textContent = "Draft plan";
     $("#plan-draft-status").textContent = "";
   }
@@ -2341,6 +2485,7 @@ function renderPalette() {
 
 let editorTimer = null;
 function onPlanEditorInput() {
+  syncEditorModels();
   clearTimeout(editorTimer);
   editorTimer = setTimeout(() => {
     renderPalette();
@@ -3716,11 +3861,7 @@ function targetSquad() {
   return target.startsWith("#") ? (state.squads ?? []).find((s) => `#${s.name}` === target) : null;
 }
 
-// The Model list's choice that takes a model by name (EFFORTS and the model helpers are
-// in ui/models.js).
-const OTHER_MODEL = "*other*";
-/** What the task form's Model and Reasoning lists offer, as last drawn (see modelMenu). */
-let taskModels = null;
+const taskModelPicker = modelPicker("");
 
 /** The agents a task to `target` may go to, as they say what they offer: this agent, a
  * peer, the connected peers that serve the provider (Any peer), or a squad's online
@@ -3733,53 +3874,12 @@ function targetAgents(target, provider) {
   return state.peers.filter((p) => p.id === target);
 }
 
-/** The model and reasoning effort a task runs at: its agent's defaults (selected, named
- * when it says them), or a model it lets you pick (those it allows, else all its account
- * offers; one by name when it allows any and lists none). With Any peer or a squad,
- * what their peers allow together (the task goes to one that allows your pick). */
 function renderModelOptions() {
   const provider = $("#provider").value;
   const target = $("#target").value;
-  const agents = target ? targetAgents(target, provider) : [];
-  const menu = modelMenu(agents, provider);
-  taskModels = { menu, theirs: agents.length > 1 ? "Each peer's default" : "Its default" };
-  const deflt = menu.defaultModel?.toLowerCase();
-  const sel = $("#model");
-  const prev = sel.value;
-  sel.replaceChildren(
-    el("option", { value: "", text: menu.defaultModel ? `${menu.defaultModel} (default)` : taskModels.theirs }),
-    ...modelOptionNodes(menu.models.filter((m) => m.id.toLowerCase() !== deflt)),
-    ...(menu.other ? [el("option", { value: OTHER_MODEL, text: "Another model…" })] : []));
-  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  taskModelPicker.render(target ? targetAgents(target, provider) : [], target ? provider : "", target === "local");
   $("#model-field").hidden = !target;
-  $("#model-name-field").hidden = !target || sel.value !== OTHER_MODEL;
   $("#effort-field").hidden = !target;
-  renderEffortOptions();
-}
-
-/** The Reasoning list for the model picked: the levels its agent allows that the model
- * supports, with the default selected as the model takes it. */
-function renderEffortOptions() {
-  if (!taskModels) return;
-  const chosen = $("#model").value;
-  const pick = effortChoices(taskModels.menu, chosen === OTHER_MODEL ? $("#model-name").value.trim() : chosen);
-  const effort = $("#effort");
-  const prev = effort.value;
-  effort.replaceChildren(
-    el("option", { value: "", text: pick.fixed ? "None for this model" : pick.fitted ? `${pick.fitted} (default)` : taskModels.theirs }),
-    ...pick.levels.filter((e) => e !== pick.fitted).map((e) => el("option", { value: e, text: e })));
-  if ([...effort.options].some((o) => o.value === prev)) effort.value = prev;
-  effort.disabled = pick.fixed;
-}
-
-function selectedModel() {
-  if ($("#model-field").hidden) return null;
-  const chosen = $("#model").value;
-  return chosen === OTHER_MODEL ? $("#model-name").value.trim() || null : chosen || null;
-}
-
-function selectedEffort() {
-  return $("#effort-field").hidden || $("#effort").disabled ? null : $("#effort").value || null;
 }
 
 /** Folder picker for a peer target: the folders that peer shares with this agent; for
@@ -3916,8 +4016,7 @@ async function submitComposer(e) {
           mcp: selectedMcp(),
           checks,
           attempts: checks.length ? Number($("#attempts").value) : null,
-          model: selectedModel(),
-          effort: selectedEffort(),
+          ...taskModelPicker.selected(),
           prompt: text,
         }),
       });
@@ -4112,6 +4211,7 @@ async function loadState() {
     approvals: s.approvals, builtinChecks: s.builtin_checks ?? [],
   });
   renderMe();
+  renderPlanDraftModels();
   renderPeers();
   renderFeed();
   renderTasks();
@@ -4160,6 +4260,7 @@ function connectEvents() {
       state.me = msg.me;
       renderMe();
       renderTaskOptions();
+      renderPlanDraftModels();
     }
     else if (msg.type === "peers") {
       state.peers = msg.peers;
@@ -4224,15 +4325,21 @@ function init() {
     // An emptied plan no longer comes from a playbook.
     if (!$("#composer-input").value.trim()) state.playbook = null;
     if (!state.playbook) renderPlanExplain();
+    else syncPlanModels();
   });
-  planTrack = trackChoice($("#plan-track"), $("#composer-input"),
-    () => $("#composer-input").dispatchEvent(new Event("input", { bubbles: true })),
-    () => state.mode === "plan");
-  editorTrack = trackChoice($("#plan-editor-track"), $("#plan-editor-text"), () => {
-    const editor = $("#plan-editor-text");
+  const composer = $("#composer-input");
+  const composerChanged = () => composer.dispatchEvent(new Event("input", { bubbles: true }));
+  const inPlanMode = () => state.mode === "plan";
+  const editor = $("#plan-editor-text");
+  const editorChanged = () => {
     if (planBuilder.active()) planBuilder.load(editor.value);
     editor.dispatchEvent(new Event("input", { bubbles: true }));
-  }, () => $("#plan-editor").open);
+  };
+  const editingPlan = () => $("#plan-editor").open;
+  planTrack = trackChoice($("#plan-track"), composer, composerChanged, inPlanMode);
+  editorTrack = trackChoice($("#plan-editor-track"), editor, editorChanged, editingPlan);
+  syncPlanModels = planModelChoice("plan-", composer, composerChanged, inPlanMode);
+  syncEditorModels = planModelChoice("plan-editor-", editor, editorChanged, editingPlan);
   loadPlaybooks().catch((err) => toast(err.message, "error"));
   loadSkills().catch((err) => toast(err.message, "error"));
   loadGithub().catch((err) => toast(err.message, "error"));
@@ -4286,6 +4393,9 @@ function init() {
     (back ?? $("#add-squad-btn")).focus();
   });
   $("#squad-form").addEventListener("submit", submitSquad);
+  $("#share-tasks-cancel").addEventListener("click", () => $("#share-tasks-dialog").close());
+  $("#share-tasks-dialog").addEventListener("close", () => focusShareTasks(taskLimitFolder));
+  $("#share-tasks-form").addEventListener("submit", submitShareTasks);
   $("#team-cancel").addEventListener("click", () => $("#team-dialog").close());
   $("#team-form").addEventListener("submit", submitTeamPlan);
   $("#team-remove").addEventListener("click", removeTeamPlan);
@@ -4313,6 +4423,7 @@ function init() {
   $("#plan-draft-open").addEventListener("click", openPlanDraft);
   $("#plan-describe").addEventListener("submit", submitPlanDraft);
   $("#plan-draft-cancel").addEventListener("click", () => planBuilder.setView(planBuilder.view()));
+  $("#plan-draft-provider").addEventListener("change", renderPlanDraftModels);
   $("#plan-draft-issue").addEventListener("input", (e) => e.target.removeAttribute("aria-invalid"));
   $("#plan-editor-close").addEventListener("click", () => $("#plan-editor").close());
   $("#plan-editor-text").addEventListener("input", onPlanEditorInput);
@@ -4344,6 +4455,7 @@ function init() {
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
+    "#share-tasks-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog",
     "#branch-dialog", "#pull-dialog", "#workiq-dialog", "#workiq-budget-dialog", "#kb-import-dialog",
     "#factory-new-dialog", "#factory-agent-dialog", "#factory-catalog-dialog"]) guardDialog($(id));
@@ -4351,12 +4463,6 @@ function init() {
   initBranchReview();
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); renderModelOptions(); updateComposer(); });
-  $("#model").addEventListener("change", () => {
-    const other = $("#model").value === OTHER_MODEL;
-    $("#model-name-field").hidden = !other;
-    renderEffortOptions();
-    if (other) $("#model-name").focus();
-  });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
   $("#copy-ticket").addEventListener("click", copyTicket);

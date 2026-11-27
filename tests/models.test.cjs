@@ -53,6 +53,51 @@ assert.deepStrictEqual(menu.models.map((m) => m.id), ["claude-opus-5.5", "gpt-5.
 assert.deepStrictEqual([menu.defaultModel, menu.defaultEffort], [null, null]);
 assert.strictEqual(menu.efforts.length, 6);
 
+// Run task on this agent and Describe: defaults first, then vendor groups, then a name.
+const { modelPickerOptions, OTHER_MODEL } = vm.runInThisContext("({ modelPickerOptions, OTHER_MODEL })");
+const sonnet = { id: "claude-sonnet-5.5", vendor: "Anthropic", efforts: ["low", "medium", "high"] };
+const local = { ...worker, offers: { copilot: [gpt, opus, sonnet, mini] } };
+const pick = (agent, provider = "copilot", model = "", effort = "", name = "") =>
+  modelPickerOptions([agent], provider, { model, effort, name }, true);
+const defaults = pick(local);
+assert.deepStrictEqual(defaults.models.map((o) => o.options ? [o.label, ...o.options.map((m) => m.value)] : [o.value, o.text]), [
+  ["", "claude-opus-5.5 (default)"],
+  ["OpenAI", "gpt-5.5", "gpt-5-mini"],
+  ["Anthropic", "claude-sonnet-5.5"],
+  [OTHER_MODEL, "Another model…"],
+]);
+assert.deepStrictEqual(defaults.efforts.map((o) => o.text), ["max (default)", "low", "medium", "high"]);
+assert.deepStrictEqual([defaults.model, defaults.effort], ["", ""]);
+const other = pick(local, "claude", OTHER_MODEL, "low", "claude-sonnet-5.5");
+assert.deepStrictEqual(other.models, [{ value: "", text: "Its default" }, { value: OTHER_MODEL, text: "Another model…" }]);
+assert.deepStrictEqual([other.model, other.effort], [OTHER_MODEL, "low"]);
+
+const chosen = pick(local, "copilot", "claude-sonnet-5.5", "low");
+assert.deepStrictEqual([chosen.model, chosen.effort], ["claude-sonnet-5.5", "low"]);
+assert.deepStrictEqual(chosen.efforts.map((o) => o.text), ["high (default)", "low", "medium"]);
+const fixed = pick(local, "copilot", "gpt-5-mini", "low");
+assert.strictEqual(fixed.fixed, true);
+assert.strictEqual(fixed.effort, "");
+assert.deepStrictEqual(fixed.efforts, [{ value: "", text: "None for this model" }]);
+// A model typed by name also changes Reasoning, even when it happens to be listed.
+assert.strictEqual(pick(local, "copilot", OTHER_MODEL, "low", " GPT-5-MINI ").fixed, true);
+
+// Refreshed settings keep what is still allowed, but drop the rest, including a free name.
+const limited = {
+  ...local,
+  models: { copilot: {
+    default: "claude-opus-5.5", allowed: ["claude-opus-5.5", "claude-sonnet-5.5"],
+    effort: "medium", efforts: ["low", "medium"],
+  } },
+};
+const kept = pick(limited, "copilot", chosen.model, chosen.effort);
+assert.deepStrictEqual([kept.model, kept.effort], ["claude-sonnet-5.5", "low"]);
+assert.deepStrictEqual(kept.models.map((o) => o.value), ["", "claude-sonnet-5.5"]);
+assert.deepStrictEqual(kept.efforts.map((o) => o.text), ["medium (default)", "low"]);
+const gone = pick(limited, "copilot", "gpt-5.5", "high");
+assert.deepStrictEqual([gone.model, gone.effort], ["", ""]);
+assert.strictEqual(pick(limited, "copilot", OTHER_MODEL).model, "");
+
 // A level fitted to a model as the worker fits it (src/models.rs fit_effort).
 assert.strictEqual(fitEffort("max", ["low", "medium", "high"]), "high");
 assert.strictEqual(fitEffort("minimal", ["low", "high"]), "low");
@@ -95,5 +140,32 @@ assert.deepStrictEqual(squadMember({ capabilities: ["codex"], shares: [], owner:
 // A lead with no providers of its own takes team steps: its team plan runs them.
 assert.deepStrictEqual(squadMember({ capabilities: [], shares: [{ name: "demo", team: true }] }, label),
   { takes: true, text: "team steps only · folders demo (team plan)" });
+
+const { planModelOptions } = vm.runInThisContext("({ planModelOptions })");
+const also = {
+  models: { copilot: { default: "CLAUDE-OPUS-5.5", allowed: [opus.id, gpt.id, "o9"], efforts: ["low", "high"] } },
+  offers: { copilot: [opus, gpt] },
+};
+const planPick = (agents, model = null, effort = null) =>
+  planModelOptions(new Map([["copilot", agents]]), { model, effort });
+const common = planPick([worker, also], gpt.id, "HIGH");
+assert.deepStrictEqual(common.models.map((o) => o.options ? [o.label, ...o.options.map((m) => m.value)] : [o.value, o.text]), [
+  ["", "claude-opus-5.5 (each peer's default)"],
+  ["Anthropic", opus.id],
+  ["OpenAI", gpt.id],
+]);
+assert.deepStrictEqual([common.model, common.effort], [gpt.id, "high"]);
+assert.deepStrictEqual(common.efforts.map((o) => o.value), ["", "low", "high"]);
+assert.strictEqual(planPick([worker, picky]).models[0].text, "Each step's peer default");
+assert.strictEqual(planPick([worker, {}]).models.at(-1).value, OTHER_MODEL, "one peer lists nothing");
+assert.strictEqual(planPick([worker], mini.id).fixed, true, "reasoning follows the model");
+const typed = planPick([worker, also], mini.id, "max");
+assert.deepStrictEqual([typed.model, typed.effort], [mini.id, "max"], "keep explicit lines even if not offered together");
+const mixed = planModelOptions(new Map([
+  ["copilot", [also]],
+  ["claude", [{ models: { claude: { efforts: ["low"] } } }]],
+]), { model: null, effort: null });
+assert.deepStrictEqual(mixed.models, [{ value: "", text: "Each step's peer default" }]);
+assert.deepStrictEqual(mixed.efforts.map((o) => o.value), ["", "low"], "reasoning spans providers");
 
 console.log("ok: model lists");

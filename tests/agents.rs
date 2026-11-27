@@ -10,15 +10,17 @@ use async_trait::async_trait;
 use proofkin::audit::{AuditLog, Outcome};
 use proofkin::mcp::McpServer;
 use proofkin::plan::{Plan, RunContext, SquadStore, StepState, run_plan, run_plan_with};
-use proofkin::protocol::Phase;
+use proofkin::protocol::{Phase, Progress};
 use proofkin::pulls::{Asked, Opened, PullRequestAsk, PullRequests, Review};
 use proofkin::runs::{RunRecord, Verdict};
-use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
+use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks, parse_task_limit};
 use proofkin::{
-    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, Ran,
-    SecretKey, TaskContext, TrustStore, TrustedPeer, Usage,
+    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Profile, Provider,
+    Ran, SecretKey, TaskContext, TrustStore, TrustedPeer, Usage,
 };
+use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 /// A node's built-in data folder (the fake executor never touches it).
@@ -1069,6 +1071,29 @@ async fn tasks_work_at_the_owners_reasoning_effort_unless_they_ask_for_another()
     );
 }
 
+#[tokio::test]
+async fn plan_defaults_reach_the_worker_and_its_signed_result() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let plan = Plan::parse(
+        "model: fake-big\neffort: high\na @worker Hello\nb @worker model=fake-other effort=low Hi",
+    )
+    .unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert_eq!(states["a"].model(), Some("fake-big (high reasoning)"));
+    assert_eq!(states["b"].model(), Some("fake-other (low reasoning)"));
+    let StepState::Done { output, .. } = &states["a"] else {
+        panic!("the inherited choice should run: {:?}", states["a"]);
+    };
+    assert!(output.contains("**Model** `fake-big` (copilot), high reasoning"));
+}
+
 /// A worker lets tasks ask only for some reasoning efforts (it refuses others, and one
 /// that asks for none works at the least of them), and tells peers the models its
 /// account offers and can use, with the efforts each supports.
@@ -1422,6 +1447,54 @@ async fn wait_stopped(stopped: &AtomicUsize, count: usize) {
 }
 
 #[tokio::test]
+async fn a_requester_gone_past_the_task_grace_stops_its_tasks_with_a_reason() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    worker.grace = Duration::from_secs(3);
+    // Keep waiting on the requester's end so we can see the worker's result on return.
+    boss.grace = Duration::from_secs(60);
+    mutual(&mut worker, &mut boss);
+    let stopped = worker.stopped.clone();
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let pending = boss
+        .send_task(worker.id(), LlmTask::new(Provider::Copilot, "hang"), None)
+        .unwrap();
+    let task_id = pending.task_id();
+    let received = Event::TaskReceived {
+        from: "boss".into(),
+        task_id,
+        provider: Provider::Copilot,
+        origin: None,
+        team: false,
+    };
+    next_matching(&mut worker_events, |e| e == &received).await;
+
+    let lost = std::time::Instant::now();
+    assert!(boss.disconnect(worker.id()));
+    let completed = Event::TaskCompleted {
+        from: "boss".into(),
+        task_id,
+        outcome: Outcome::Cancelled,
+        stop: Some("stopped: boss was gone for 3 s".into()),
+    };
+    next_matching(&mut worker_events, |e| e == &completed).await;
+    assert!(lost.elapsed() >= Duration::from_secs(3));
+    wait_stopped(&stopped, 1).await;
+
+    boss.connect(worker.addr()).await.unwrap();
+    let result = timeout(Duration::from_secs(10), pending.finish(|_| {}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!result.ok && !result.refused, "{result:?}");
+    assert_eq!(result.output, "task stopped: boss was gone for 3 s");
+}
+
+#[tokio::test]
 async fn cancelling_a_delegated_task_stops_it_on_the_worker() {
     let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
     let mut boss = Node::new("boss");
@@ -1436,13 +1509,13 @@ async fn cancelling_a_delegated_task_stops_it_on_the_worker() {
     wait_for_peers(&boss, 1).await;
 
     // Fill both task slots with hanging tasks, then cancel them from the requester.
+    let request = LlmTask::new(Provider::Copilot, "hang");
     let mut hanging = Vec::new();
+    let mut task_ids = Vec::new();
     for _ in 0..2 {
-        let (boss, id) = (boss.clone(), worker.id());
-        hanging.push(tokio::spawn(async move {
-            boss.delegate(id, LlmTask::new(Provider::Copilot, "hang"))
-                .await
-        }));
+        let delegation = boss.send_task(worker.id(), request.clone(), None).unwrap();
+        task_ids.push(delegation.task_id());
+        hanging.push(tokio::spawn(delegation.finish(|_| {})));
         next_matching(&mut worker_events, |e| {
             matches!(e, Event::TaskReceived { .. })
         })
@@ -1458,9 +1531,28 @@ async fn cancelling_a_delegated_task_stops_it_on_the_worker() {
         })
         .await;
         assert!(
-            matches!(completed, Event::TaskCompleted { outcome: Outcome::Cancelled, ref from, .. } if from == "boss"),
+            matches!(
+                completed,
+                Event::TaskCompleted {
+                    outcome: Outcome::Cancelled,
+                    ref from,
+                    stop: Some(ref stop),
+                    task_id: _,
+                } if from == "boss" && stop == "cancelled by boss"
+            ),
             "{completed:?}"
         );
+    }
+
+    // Dropping the waits sent TaskCancel. The worker keeps that result for replays.
+    for task_id in task_ids {
+        let delegation = boss.rejoin_task(worker.id(), task_id, request.clone(), None);
+        let result = timeout(Duration::from_secs(10), delegation.finish(|_| {}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!result.ok && !result.refused, "{result:?}");
+        assert_eq!(result.output, "task cancelled by boss");
     }
 
     // The slots are free again: a new task runs right away.
@@ -1896,6 +1988,99 @@ async fn plan_steps_after_a_failure_are_skipped() {
     assert!(matches!(&states["independent"], StepState::Done { .. }));
     assert!(
         matches!(&states["away"], StepState::Failed { peer: None, error, .. } if error.contains("not connected"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_served_task_runs_once_through_replacement_and_repeated_disconnects() {
+    #[derive(Default)]
+    struct GatedRun {
+        starts: AtomicUsize,
+        finish: Notify,
+    }
+
+    #[async_trait]
+    impl Executor for GatedRun {
+        fn providers(&self) -> Vec<Provider> {
+            vec![Provider::Copilot]
+        }
+
+        async fn execute(&self, _task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<Ran> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.finish.notified().await;
+            Ok(Ran::new("finished the original run", None))
+        }
+    }
+
+    let run = Arc::new(GatedRun::default());
+    let mut worker = Node::new("worker");
+    worker.executor = Some(run.clone());
+    let mut boss = Node::new("boss");
+    worker.grace = Duration::from_secs(15);
+    boss.grace = worker.grace;
+    mutual(&mut worker, &mut boss);
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, mut boss_events) = boss.start().await;
+    let (low, high) = if boss.id() < worker.id() {
+        (&boss, &worker)
+    } else {
+        (&worker, &boss)
+    };
+    high.connect(low.addr()).await.unwrap();
+    // Wait until the initial handshake's replay pass is done before sending the task.
+    wait_until(|| {
+        boss.peers()
+            .iter()
+            .any(|peer| peer.id == worker.id() && peer.load.is_some())
+    })
+    .await;
+
+    let delegation = boss
+        .send_task(worker.id(), LlmTask::new(Provider::Copilot, "wait"), None)
+        .unwrap();
+    let task_id = delegation.task_id();
+    let reports = Arc::new(AtomicUsize::new(0));
+    let running = reports.clone();
+    let task = tokio::spawn(delegation.finish(move |p| {
+        if p.phase == Phase::Running && p.attempt == Some(1) {
+            running.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    wait_until(|| run.starts.load(Ordering::SeqCst) == 1 && reports.load(Ordering::SeqCst) == 1)
+        .await;
+    // The second connection replaces the first while its reader is still live.
+    // Each replay of the model's progress proves the request reached the worker again.
+    low.reconnect(high.id()).await.unwrap();
+    wait_until(|| reports.load(Ordering::SeqCst) == 2).await;
+
+    let lost_boss = Event::PeerDisconnected {
+        name: "boss".into(),
+        id: boss.id(),
+    };
+    let lost_worker = Event::PeerDisconnected {
+        name: "worker".into(),
+        id: worker.id(),
+    };
+    for copies in [3, 4, 5] {
+        assert!(boss.disconnect(worker.id()));
+        next_matching(&mut worker_events, |e| e == &lost_boss).await;
+        next_matching(&mut boss_events, |e| e == &lost_worker).await;
+        boss.connect(worker.addr()).await.unwrap();
+        wait_until(|| reports.load(Ordering::SeqCst) == copies).await;
+    }
+
+    run.finish.notify_one();
+    let delivered = timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(delivered.ok && delivered.verified, "{delivered:?}");
+    assert_eq!(delivered.output, "finished the original run");
+    assert_eq!(
+        run.starts.load(Ordering::SeqCst),
+        1,
+        "task #{task_id} ran twice"
     );
 }
 
@@ -2467,16 +2652,20 @@ impl PullRequests for FakePulls {
 }
 
 impl FakePulls {
-    /// Once pull request `number` is opened, sets its state to `state`.
-    async fn when_opened(&self, number: u64, state: &str) {
-        timeout(Duration::from_secs(30), async {
-            while !self.states.lock().unwrap().contains_key(&number) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the pull request was opened");
-        self.states.lock().unwrap().insert(number, state.into());
+    /// Merges or closes a pull request only once the caller sees that it is waiting.
+    fn finish_when_waiting(&self, number: u64, state: &str, progress: &Progress) {
+        if progress.phase == Phase::PullRequest
+            && progress
+                .text
+                .starts_with(&format!("pull request #{number} is open"))
+        {
+            *self
+                .states
+                .lock()
+                .unwrap()
+                .get_mut(&number)
+                .expect("the pull request was opened") = state.into();
+        }
     }
 }
 
@@ -2557,11 +2746,7 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     })
     .await
     .expect("boss learns the folder takes pull request steps");
-    let merge = {
-        let pulls = pulls.clone();
-        tokio::spawn(async move { pulls.when_opened(1, "MERGED").await })
-    };
-    let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut said = Vec::new();
     let recipients = proofkin::plan::Recipients {
         github: Some("boss-gh".into()),
         ..Default::default()
@@ -2576,10 +2761,9 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
     ))
     .unwrap();
     let states = {
-        let said = said.clone();
-        timeout(
+        let run = timeout(
             Duration::from_secs(60),
-            run_plan_with(&boss, &squads, &named, &ctx, move |id, state| {
+            run_plan_with(&boss, &squads, &named, &ctx, |id, state| {
                 if let (
                     "ship",
                     StepState::Running {
@@ -2587,14 +2771,14 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
                     },
                 ) = (id, state)
                 {
-                    said.lock().unwrap().push(p.text.clone());
+                    said.push(p.text.clone());
+                    pulls.finish_when_waiting(1, "MERGED", p);
                 }
             }),
         )
-        .await
-        .unwrap()
+        .await;
+        run.unwrap_or_else(|_| panic!("the plan did not finish; ship progress: {said:?}"))
     };
-    merge.await.unwrap();
     let StepState::Done {
         evidence: Some(checked),
         ..
@@ -2666,7 +2850,6 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
         }
         other => panic!("{other:?}"),
     }
-    let said = said.lock().unwrap().clone();
     assert!(
         said.iter().any(|t| t.contains(
             "pull request #1 is open, with a review asked of boss-gh, carol-gh: waiting for it to be merged"
@@ -2676,21 +2859,25 @@ async fn a_pull_request_step_opens_the_work_before_it_and_waits_until_it_is_merg
 
     // A pull request closed without being merged fails the step. Naming no one, it asks
     // those who signed off: you.
-    let close = {
-        let pulls = pulls.clone();
-        tokio::spawn(async move { pulls.when_opened(2, "CLOSED").await })
-    };
     let ctx = RunContext {
         recipients,
         ..Default::default()
     };
     let states = timeout(
         Duration::from_secs(60),
-        run_plan_with(&boss, &squads, &plan, &ctx, |_, _| {}),
+        run_plan_with(&boss, &squads, &plan, &ctx, |id, state| {
+            if id == "ship"
+                && let StepState::Running {
+                    peer: _,
+                    progress: Some(p),
+                } = state
+            {
+                pulls.finish_when_waiting(2, "CLOSED", p);
+            }
+        }),
     )
     .await
     .unwrap();
-    close.await.unwrap();
     assert!(
         matches!(&states["ship"], StepState::Failed { error, .. } if error.contains("#2 was closed without being merged: https://github.com/acme/app/pull/2")),
         "{:?}",
@@ -2884,21 +3071,16 @@ async fn a_folder_owner_approves_each_pull_request_and_a_run_card_asks_for_one()
         step: None,
     };
     let yes = answer(true, "fine");
-    let merge = {
-        let pulls = pulls.clone();
-        tokio::spawn(async move { pulls.when_opened(1, "MERGED").await })
-    };
     let done = timeout(
         Duration::from_secs(60),
         boss.send_task(worker.id(), task.clone(), Some(origin.clone()))
             .unwrap()
-            .finish(|_| {}),
+            .finish(|p| pulls.finish_when_waiting(1, "MERGED", &p)),
     )
     .await
     .unwrap()
     .unwrap();
     yes.await.unwrap();
-    merge.await.unwrap();
     assert!(
         done.ok && done.output.contains("; worker approved opening it."),
         "{}",
@@ -5328,6 +5510,210 @@ async fn delegated_tasks_report_their_place_in_the_queue_and_the_worker_its_load
             .is_some_and(|l| l.running == 0 && l.queued == 0)
     })
     .await;
+}
+
+struct EditStarted {
+    workspace: std::path::PathBuf,
+    finish: oneshot::Sender<()>,
+}
+
+struct HeldEdits(mpsc::UnboundedSender<EditStarted>);
+
+#[async_trait]
+impl Executor for HeldEdits {
+    fn providers(&self) -> Vec<Provider> {
+        vec![Provider::Copilot]
+    }
+
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<Ran> {
+        if task.prompt == "hold edit" {
+            let (finish, held) = oneshot::channel();
+            assert!(
+                self.0
+                    .send(EditStarted {
+                        workspace: ctx.workspace.clone(),
+                        finish
+                    })
+                    .is_ok()
+            );
+            held.await?;
+        }
+        Ok(Ran::new(ctx.access.to_string(), None))
+    }
+}
+
+#[tokio::test]
+async fn a_folder_limit_queues_edits_but_leaves_the_other_slot_free() {
+    let app = git_repo();
+    let other = tempfile::tempdir().unwrap();
+    let (started, mut edits) = mpsc::unbounded_channel();
+    let mut worker = Node::new("worker");
+    worker.executor = Some(Arc::new(HeldEdits(started)));
+    worker
+        .shares
+        .add_with("app", app.path(), Access::Full, Default::default(), true)
+        .unwrap();
+    worker
+        .shares
+        .set_task_limit("app", parse_task_limit("1").unwrap())
+        .unwrap();
+    worker
+        .shares
+        .add("other", other.path(), Access::Full)
+        .unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker.grant("boss", Access::Full, &["app", "other"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let deadline = Duration::from_secs(30);
+    let send = |share, text| {
+        boss.send_task(
+            worker.id(),
+            LlmTask::new(Provider::Copilot, text).in_share(share),
+            None,
+        )
+        .unwrap()
+    };
+    let first = send("app", "hold edit");
+    let edit = timeout(deadline, edits.recv()).await.unwrap().unwrap();
+    assert!(edit.workspace.join(".git").is_file(), "edits in a worktree");
+    let second = send("app", "edit next");
+    let (progress, mut live) = mpsc::unbounded_channel();
+    let second = tokio::spawn(async move {
+        second
+            .finish(|p| {
+                let _ = progress.send(p);
+            })
+            .await
+    });
+    let queued = timeout(deadline, live.recv()).await.unwrap().unwrap();
+    assert_eq!(queued.phase, Phase::Queued);
+    assert_eq!(
+        queued.text,
+        "waiting for folder app: another task works there (next in line)"
+    );
+
+    let profile = Profile::open_in(other.path(), "boss").unwrap();
+    let problems = proofkin::plan::preflight(
+        &Plan::parse("edit @worker:app update it").unwrap(),
+        &boss.peers(),
+        &SquadStore::default(),
+        &profile.knowledge(),
+        &profile.skills(),
+        &Default::default(),
+    );
+    assert!(
+        problems.is_empty(),
+        "the busy folder still checks out: {problems:?}"
+    );
+
+    let abandoned = send("app", "cancel while queued");
+    let load = |queued| {
+        boss.peers()[0]
+            .load
+            .is_some_and(|l| l.running == 1 && l.queued == queued)
+    };
+    wait_until(|| load(2)).await;
+    drop(abandoned);
+    wait_until(|| load(1)).await;
+
+    let parallel = timeout(deadline, send("other", "edit elsewhere").finish(|_| {}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parallel.ok && parallel.output.starts_with("full"));
+
+    // The limit counts effective edit access, not all tasks sent to the folder.
+    let mut grant = worker.trusted().get_by_name("boss").unwrap().clone();
+    grant.access = Access::ReadOnly;
+    worker.allow(grant);
+    let reader = timeout(deadline, send("app", "read now").finish(|_| {}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reader.ok && reader.output.starts_with("read-only"));
+    assert!(!second.is_finished(), "the next edit still waits");
+
+    edit.finish.send(()).unwrap();
+    assert!(
+        timeout(deadline, first.finish(|_| {}))
+            .await
+            .unwrap()
+            .unwrap()
+            .ok
+    );
+    let second = timeout(deadline, second).await.unwrap().unwrap().unwrap();
+    assert!(second.ok && second.output.starts_with("full"));
+}
+
+#[tokio::test]
+async fn edits_overlap_by_default_and_the_queue_uses_the_current_folder_limit() {
+    let app = git_repo();
+    let (started, mut edits) = mpsc::unbounded_channel();
+    let mut worker = Node::new("worker");
+    worker.executor = Some(Arc::new(HeldEdits(started)));
+    worker
+        .shares
+        .add_with("app", app.path(), Access::Full, Default::default(), true)
+        .unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker.grant("boss", Access::Full, &["app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let deadline = Duration::from_secs(30);
+    let send = || {
+        let task = LlmTask::new(Provider::Copilot, "hold edit").in_share("app");
+        boss.send_task(worker.id(), task, None).unwrap()
+    };
+    let first = send();
+    let first_edit = timeout(deadline, edits.recv()).await.unwrap().unwrap();
+    let second = send();
+    let second_edit = timeout(deadline, edits.recv()).await.unwrap().unwrap();
+    assert_ne!(first_edit.workspace, second_edit.workspace);
+
+    let set = |limit| {
+        let mut shares = worker.shares();
+        shares
+            .set_task_limit("app", parse_task_limit(limit).unwrap())
+            .unwrap();
+        worker.set_shares(shares);
+    };
+    set("1");
+    let third = send();
+    first_edit.finish.send(()).unwrap();
+    assert!(
+        timeout(deadline, first.finish(|_| {}))
+            .await
+            .unwrap()
+            .unwrap()
+            .ok
+    );
+    wait_until(|| {
+        boss.peers()[0]
+            .load
+            .is_some_and(|l| l.running == 1 && l.queued == 1)
+    })
+    .await;
+    set("2");
+    let third_edit = timeout(deadline, edits.recv()).await.unwrap().unwrap();
+    for (task, edit) in [(second, second_edit), (third, third_edit)] {
+        edit.finish.send(()).unwrap();
+        assert!(
+            timeout(deadline, task.finish(|_| {}))
+                .await
+                .unwrap()
+                .unwrap()
+                .ok
+        );
+    }
 }
 
 /// While checks fail and attempts are left, each attempt and check is reported.

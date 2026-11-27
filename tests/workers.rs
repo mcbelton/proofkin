@@ -1,10 +1,13 @@
 //! Digital workers from their owner's web UI, end to end: a worker created there
 //! runs as a real proofkin agent that the owner's agent starts, connects to its
-//! owner, and is stopped, started and deleted from there. Its own test binary
-//! because it sets this process's environment (profiles home, secrets in files),
-//! which the workers it starts inherit.
+//! owner, and is stopped, started and deleted from there; and deleting a running
+//! worker, with a stand-in for its program. Its own test binary because its tests
+//! set this process's environment (profiles home, secrets in files) once, which the
+//! workers they start inherit.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use proofkin::trust::{DEFAULT_TASKS_PER_HOUR, TrustedPeer};
@@ -68,14 +71,26 @@ fn is_online(w: &Value) -> bool {
     w["online"] == true && w["process"]["state"] == "running"
 }
 
+/// The profiles home of this binary's tests: the environment is set once, before any
+/// of them reads it.
+fn shared_home() -> &'static Path {
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: every test here calls this first, so nothing reads the environment
+        // while it is set.
+        unsafe {
+            std::env::set_var("PROOFKIN_HOME", home.path());
+            std::env::set_var("PROOFKIN_SECRET_STORE", "file");
+        }
+        home
+    })
+    .path()
+}
+
 #[tokio::test]
 async fn owners_create_start_stop_and_delete_digital_workers_from_the_web_ui() {
-    let home = tempfile::tempdir().unwrap();
-    // SAFETY: this binary has a single test, so nothing reads the environment concurrently.
-    unsafe {
-        std::env::set_var("PROOFKIN_HOME", home.path());
-        std::env::set_var("PROOFKIN_SECRET_STORE", "file");
-    }
+    let home = shared_home();
     let boss = Profile::open("boss").unwrap();
     boss.save().unwrap();
     let app = tempfile::tempdir().unwrap();
@@ -102,7 +117,7 @@ async fn owners_create_start_stop_and_delete_digital_workers_from_the_web_ui() {
         network: Network::Local,
         serving: false,
         access: Access::ReadOnly,
-        workspace: home.path().to_path_buf(),
+        workspace: home.to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
         workers: Some(supervisor.clone()),
@@ -424,5 +439,131 @@ async fn owners_create_start_stop_and_delete_digital_workers_from_the_web_ui() {
     }
     let (_, listed) = ui.call("GET", "/api/workers", Value::Null).await;
     assert_eq!(listed["workers"], json!([]));
+    agent.shutdown().await;
+}
+
+/// A stand-in, in `dir`, for the program a worker runs: it takes no instance lock, and
+/// ends when its input closes (a stop closes it).
+fn stand_in(dir: &Path) -> PathBuf {
+    let (name, script) = if cfg!(windows) {
+        ("worker.cmd", "@findstr \"^\" >nul\r\n")
+    } else {
+        ("worker", "#!/bin/sh\ncat >/dev/null\n")
+    };
+    let exe = dir.join(name);
+    std::fs::write(&exe, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    exe
+}
+
+/// `owner`'s agent and web UI, whose supervisor runs its workers as [`stand_in`]s
+/// kept in `bin`.
+async fn owner_with_stand_ins(owner: &str, bin: &Path) -> (Agent, Arc<Supervisor>, Ui) {
+    let home = shared_home();
+    let me = Profile::open(owner).unwrap();
+    me.save().unwrap();
+    let mut config = AgentConfig::new(owner, me.identity().unwrap());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let launch = Launch {
+        exe: stand_in(bin),
+        network: Network::Local,
+        ip: Some([127, 0, 0, 1].into()),
+        bridge: None,
+    };
+    let supervisor = Supervisor::new(me.clone(), agent.clone(), launch);
+    let info = UiInfo {
+        profile: me,
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: Some(supervisor.clone()),
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let ui = Ui {
+        port: port.parse().unwrap(),
+        token: token.to_owned(),
+    };
+    (agent, supervisor, ui)
+}
+
+/// Creates worker `name` from the web UI and starts it.
+async fn create_and_start(ui: &Ui, name: &str) -> Profile {
+    let (status, created) = ui
+        .call("POST", "/api/workers", json!({ "name": name }))
+        .await;
+    assert_eq!(status, 200, "{created}");
+    let (status, started) = ui
+        .call("POST", &format!("/api/workers/{name}/start"), Value::Null)
+        .await;
+    assert_eq!(status, 200, "{started}");
+    Profile::open(name).unwrap()
+}
+
+/// Deleting a worker its owner's agent runs takes one request: the stop waits until the
+/// worker's instance lock is free, which the system can release a moment after its
+/// process ends (here it is held 500 ms longer).
+#[tokio::test]
+async fn a_running_worker_is_deleted_in_one_request_though_its_lock_outlasts_its_process() {
+    let bin = tempfile::tempdir().unwrap();
+    let (agent, supervisor, ui) = owner_with_stand_ins("chief", bin.path()).await;
+    let slow = create_and_start(&ui, "slow").await;
+    let lock = slow.lock_instance().unwrap();
+    let mut changes = supervisor.subscribe();
+    let let_go = tokio::spawn(async move {
+        // Its process started before this subscribed: the next change is its end.
+        while changes.recv().await.unwrap() != "slow" {}
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(lock);
+    });
+    let (status, deleted) = ui.call("DELETE", "/api/workers/slow", Value::Null).await;
+    assert_eq!(status, 200, "{deleted}");
+    assert_eq!(deleted["deleted"], "slow");
+    assert!(!slow.dir.exists());
+    let_go.await.unwrap();
+    agent.shutdown().await;
+}
+
+/// A worker whose instance lock is still held once it is stopped (its process didn't
+/// end) isn't deleted, and the refusal says so; once it lets go, it is.
+#[tokio::test]
+async fn a_worker_whose_lock_stays_held_is_not_deleted_and_the_refusal_says_why() {
+    let bin = tempfile::tempdir().unwrap();
+    let (agent, _, ui) = owner_with_stand_ins("lead", bin.path()).await;
+    let stuck = create_and_start(&ui, "stuck").await;
+    let lock = stuck.lock_instance().unwrap();
+    let (status, kept) = ui.call("DELETE", "/api/workers/stuck", Value::Null).await;
+    assert_eq!(status, 409, "{kept}");
+    assert!(
+        kept["error"]
+            .as_str()
+            .unwrap()
+            .contains("'stuck' was stopped, but its process didn't end"),
+        "{kept}"
+    );
+    assert!(stuck.dir.join("profile.json").is_file());
+    assert!(agent.trusted().get_by_name("stuck").is_some());
+    drop(lock);
+    let (status, deleted) = ui.call("DELETE", "/api/workers/stuck", Value::Null).await;
+    assert_eq!(status, 200, "{deleted}");
+    assert!(!stuck.dir.exists());
     agent.shutdown().await;
 }

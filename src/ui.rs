@@ -965,12 +965,14 @@ pub async fn start_with_work(
                     from,
                     task_id,
                     outcome,
+                    stop,
                 } => {
                     let (level, verb) = match outcome {
                         Outcome::Done => ("task", "finished"),
                         Outcome::Cancelled => ("warn", "was cancelled"),
                         _ => ("warn", "failed"),
                     };
+                    let verb = stop.as_deref().unwrap_or(verb);
                     pump.system(level, format!("Task #{task_id} from {from} {verb}"));
                     pump.end_team_run(&from, task_id, verb);
                     pump.send(json!({ "type": "audit" }));
@@ -1100,6 +1102,7 @@ pub async fn start_with_work(
             "/api/shares/{name}/team",
             put(tools::set_team).delete(tools::remove_team),
         )
+        .route("/api/shares/{name}/tasks", put(tools::set_task_limit))
         .route(
             "/api/shares/{name}/pull-requests",
             put(tools::set_pull_requests),
@@ -3201,6 +3204,9 @@ async fn draft_plan(s: &Shared, ask: crate::plan_draft::Ask, by: &str) -> Result
             Json(json!({ "error": format!("{e:#}") })),
         )
     })?;
+    let model = ask
+        .pick_model(&profile, provider)
+        .map_err(|error| bad_request(format!("{error:#}")))?;
     let issue = match ask.issue {
         Some(n) => Some(
             plan_draft::issue_text(&profile, n)
@@ -3217,8 +3223,7 @@ async fn draft_plan(s: &Shared, ask: crate::plan_draft::Ask, by: &str) -> Result
     let progress = |line: String| s.send(json!({ "type": "plan-draft", "progress": line }));
     let drafted = plan_draft::write(
         executor.as_ref(),
-        provider,
-        &profile.models(),
+        model,
         &ask.request(issue),
         &available,
         &progress,

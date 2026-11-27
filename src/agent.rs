@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::audit::{AuditEntry, AuditLog, Outcome};
 use crate::evidence::{
@@ -197,6 +197,8 @@ pub enum Event {
         from: String,
         task_id: u64,
         outcome: Outcome,
+        /// Why a cancelled task stopped (e.g. "cancelled by boss").
+        stop: Option<String>,
     },
     /// A peer's task was not run (not allowed to delegate, over its hourly limit,
     /// or a provider this agent doesn't serve).
@@ -481,6 +483,21 @@ const HOLD_ALERTS_FOR: Duration = Duration::from_secs(24 * 3600);
 
 /// A served task, the result sent for it, and when.
 type RecentResult = (LlmTask, Message, Instant);
+type TaskKey = (EndpointId, u64);
+
+enum TaskStop {
+    Requested,
+    RequesterGone,
+}
+
+/// Shared by all connections: deciding whether to start a task or replay its result
+/// must be atomic, since old and new readers may handle the same request at once.
+#[derive(Default)]
+struct ServedTasks {
+    /// Keep a stopping task here (without its sender) until its result is ready.
+    running: HashMap<TaskKey, Option<oneshot::Sender<TaskStop>>>,
+    recent: HashMap<TaskKey, RecentResult>,
+}
 
 /// What serving a peer's task produced.
 struct Served {
@@ -495,26 +512,19 @@ struct Served {
     usage: Option<Usage>,
 }
 
-/// A served task's place: waiting for a slot, or holding one (see
-/// [`Inner::take_slot`]). Leaving it tells the queue and peers.
+/// A served task's place in the queue or in a slot, until it finishes or is cancelled.
 struct Place<'a> {
     inner: &'a Inner,
-    key: (EndpointId, u64),
-    holding: bool,
+    id: TaskId,
 }
 
 impl Drop for Place<'_> {
     fn drop(&mut self) {
-        {
-            let mut slots = self.inner.slots.lock().unwrap();
-            if self.holding {
-                slots.holding.remove(&self.key);
-            } else {
-                slots.queue.retain(|k| *k != self.key);
+        self.inner.update_slots(|slots| {
+            if slots.holding.remove(&self.id).is_none() {
+                slots.queue.retain(|task| task.id != self.id);
             }
-        }
-        self.inner.report_queue();
-        self.inner.broadcast_load();
+        });
     }
 }
 
@@ -588,13 +598,92 @@ fn reply_result(
     }
 }
 
-/// A peer's task this agent serves: whether it got a slot, for load reports.
+type TaskId = (EndpointId, u64);
+
+struct WaitingTask {
+    id: TaskId,
+    /// Only editing tasks count against a folder's limit.
+    folder: Option<String>,
+    ready: oneshot::Sender<()>,
+}
+
 #[derive(Default)]
 struct Slots {
-    /// Tasks waiting for a slot, in order.
-    queue: VecDeque<(EndpointId, u64)>,
-    /// Tasks holding a slot.
-    holding: HashSet<(EndpointId, u64)>,
+    queue: VecDeque<WaitingTask>,
+    holding: HashMap<TaskId, Option<String>>,
+}
+
+impl Slots {
+    fn blocked_folder<'a>(&self, task: &'a WaitingTask, shares: &ShareStore) -> Option<&'a str> {
+        let folder = task.folder.as_deref()?;
+        let limit = shares.get(folder)?.task_limit?;
+        let editing = self
+            .holding
+            .values()
+            .filter(|f| f.as_deref() == Some(folder))
+            .count();
+        (editing >= limit.get() as usize).then_some(folder)
+    }
+
+    fn fill(&mut self, shares: &ShareStore) {
+        while self.holding.len() < MAX_CONCURRENT_TASKS {
+            // Take the oldest runnable task without reserving a slot for a blocked folder.
+            let Some(index) = self
+                .queue
+                .iter()
+                .position(|task| self.blocked_folder(task, shares).is_none())
+            else {
+                break;
+            };
+            let task = self.queue.remove(index).expect("index in the queue");
+            if task.ready.send(()).is_ok() {
+                self.holding.insert(task.id, task.folder);
+            }
+        }
+    }
+
+    fn queue_reports(&self, shares: &ShareStore, agent: &str) -> Vec<(TaskId, String)> {
+        let mut agent_ahead = 0;
+        let mut folder_ahead = HashMap::new();
+        self.queue
+            .iter()
+            .map(|task| {
+                let (waiting, ahead) = match self.blocked_folder(task, shares) {
+                    Some(folder) => (
+                        format!("waiting for folder {folder}: another task works there"),
+                        folder_ahead.entry(folder).or_insert(0),
+                    ),
+                    None => (
+                        format!("waiting for a free slot on {agent}"),
+                        &mut agent_ahead,
+                    ),
+                };
+                let place = match *ahead {
+                    0 => "next in line".to_owned(),
+                    1 => "1 task ahead".to_owned(),
+                    n => format!("{n} tasks ahead"),
+                };
+                *ahead += 1;
+                (task.id, format!("{waiting} ({place})"))
+            })
+            .collect()
+    }
+
+    fn load_for(&self, peer: &EndpointId) -> Message {
+        let yours = self
+            .queue
+            .iter()
+            .map(|task| &task.id)
+            .chain(self.holding.keys())
+            .filter(|(p, _)| p == peer)
+            .count();
+        Message::Load {
+            running: self.holding.len() as u32,
+            queued: self.queue.len() as u32,
+            slots: MAX_CONCURRENT_TASKS as u32,
+            yours: yours as u32,
+        }
+    }
 }
 
 struct Inner {
@@ -619,15 +708,9 @@ struct Inner {
     models: Mutex<crate::models::Models>,
     /// The models its accounts offer, as last listed (see [`Agent::set_offers`]).
     offers: Mutex<crate::models::Offers>,
-    task_slots: Semaphore,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
-    /// Cancel senders of tasks peers asked us to run, by (peer, task id); dropping
-    /// one cancels its task.
-    serving: Mutex<HashMap<(EndpointId, u64), oneshot::Sender<()>>>,
-    /// Results of recently served tasks, with the task, by (peer, task id): a re-sent
-    /// request for a task already done gets its result again instead of a re-run.
-    recent: Mutex<HashMap<(EndpointId, u64), RecentResult>>,
+    served: Mutex<ServedTasks>,
     /// Peers reported via `PeerConnected` and not yet via `PeerDisconnected`.
     announced: Mutex<HashSet<EndpointId>>,
     /// Alerts for allowlisted peers that weren't connected, with when they were
@@ -654,8 +737,10 @@ struct Inner {
     task_checks: Option<PathBuf>,
     workiq_gateway: Option<Arc<crate::workiq::gateway::Gateway>>,
     task_grace: Duration,
-    /// When peers that dropped were last seen, until they come back or are given up.
-    left: Mutex<HashMap<EndpointId, Instant>>,
+    /// The connection whose loss started each peer's grace. Updated with `peers` locked
+    /// first. Grace timers hold this lock through their effects so a reconnect cannot
+    /// slip in between checking the lost connection and acting on it.
+    left: Mutex<HashMap<EndpointId, u64>>,
     memory: Option<Arc<crate::factory::memory::WorkerMemory>>,
     owner_id: Option<EndpointId>,
     deployed: Option<Arc<crate::factory::deploy::Deployed>>,
@@ -716,11 +801,9 @@ impl Agent {
             role: config.role,
             models: Mutex::new(config.models),
             offers: Mutex::new(crate::models::Offers::new()),
-            task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
-            serving: Mutex::new(HashMap::new()),
-            recent: Mutex::new(HashMap::new()),
+            served: Mutex::default(),
             announced: Mutex::new(HashSet::new()),
             held: Mutex::new(HashMap::new()),
             next_task_id: AtomicU64::new(first_task_id(config.task_ids.as_deref())),
@@ -902,7 +985,9 @@ impl Agent {
     /// Replaces the shared folders (e.g. a newly linked repository); connected peers
     /// learn what they may now use right away. Persisting them is up to the caller.
     pub fn set_shares(&self, shares: ShareStore) {
-        *self.inner.shares.lock().unwrap() = shares;
+        self.inner.update_slots(|_| {
+            *self.inner.shares.lock().unwrap() = shares;
+        });
         let ids: Vec<EndpointId> = self.inner.peers.lock().unwrap().keys().copied().collect();
         for id in ids {
             let shares = self.inner.shares_for(&id);
@@ -1933,6 +2018,16 @@ impl Inner {
                 Registration::Replaced
             }
         };
+        let mut left = self.left.lock().unwrap();
+        left.remove(&id);
+        // A peer back within the disconnect grace was never reported gone, so it
+        // isn't reported as joining again either.
+        if self.announced.lock().unwrap().insert(id) {
+            let _ = self.events.send(Event::PeerConnected {
+                name: handle.name.clone(),
+                id,
+            });
+        }
         peers.insert(id, handle);
         outcome
     }
@@ -1940,10 +2035,49 @@ impl Inner {
     fn unregister(&self, id: EndpointId, conn_id: u64) -> bool {
         let mut peers = self.peers.lock().unwrap();
         if peers.get(&id).is_some_and(|p| p.conn_id == conn_id) {
+            let mut left = self.left.lock().unwrap();
             peers.remove(&id);
+            left.insert(id, conn_id);
             return true;
         }
         false
+    }
+
+    fn report_disconnected(&self, id: EndpointId, conn_id: u64, name: &str) -> bool {
+        let left = self.left.lock().unwrap();
+        if left.get(&id) != Some(&conn_id) {
+            return false;
+        }
+        if self.announced.lock().unwrap().remove(&id) {
+            let _ = self.events.send(Event::PeerDisconnected {
+                name: name.to_owned(),
+                id,
+            });
+        }
+        self.report_reconnecting(&id, name);
+        true
+    }
+
+    /// Gives up on this outage only, not a peer that came back (even if it left again).
+    fn expire_disconnect(&self, id: EndpointId, conn_id: u64) {
+        let mut left = self.left.lock().unwrap();
+        if left.get(&id) != Some(&conn_id) {
+            return;
+        }
+        left.remove(&id);
+        self.fail_pending(&id);
+        self.cancel_served(&id);
+        let gone_requests: Vec<u64> = self
+            .approvals
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.requester == id)
+            .map(|a| a.task_id)
+            .collect();
+        for task_id in gone_requests {
+            self.withdraw_approval(&id, task_id);
+        }
     }
 
     /// Sends `id` the alerts raised while it wasn't connected, saying how long ago.
@@ -2047,9 +2181,57 @@ impl Inner {
         }
     }
 
-    /// Stops the tasks `peer` asked this agent to run (it left for good).
+    /// Reserves a task for one reader, or answers the re-sent request with its latest
+    /// progress or result. No reader can replace a running task's cancellation sender.
+    fn begin_serving(
+        &self,
+        key: TaskKey,
+        task: &LlmTask,
+        tx: &mpsc::UnboundedSender<Message>,
+    ) -> Option<oneshot::Receiver<TaskStop>> {
+        let mut served = self.served.lock().unwrap();
+        if served.running.contains_key(&key) {
+            let last = self.last_progress.lock().unwrap().get(&key).cloned();
+            if let Some(progress) = last {
+                let _ = tx.send(Message::TaskProgress {
+                    task_id: key.1,
+                    progress,
+                });
+            }
+            return None;
+        }
+        if let Some((original, msg, at)) = served.recent.get(&key)
+            && original == task
+            && at.elapsed() < RECENT_RESULTS
+        {
+            let _ = tx.send(msg.clone());
+            return None;
+        }
+        let (cancel, stop) = oneshot::channel();
+        served.running.insert(key, Some(cancel));
+        Some(stop)
+    }
+
+    fn finish_serving(&self, key: TaskKey, task: LlmTask, result: Message) {
+        let mut served = self.served.lock().unwrap();
+        served
+            .recent
+            .retain(|_, (_, _, at)| at.elapsed() < RECENT_RESULTS);
+        served.recent.insert(key, (task, result, Instant::now()));
+        served.running.remove(&key);
+    }
+
+    /// Stops the tasks `peer` asked this agent to run (its task grace expired).
     fn cancel_served(&self, peer: &EndpointId) {
-        self.serving.lock().unwrap().retain(|(p, _), _| p != peer);
+        let mut served = self.served.lock().unwrap();
+        for ((p, _), cancel) in &mut served.running {
+            if p == peer
+                && let Some(cancel) = cancel.take()
+            {
+                let _ = cancel.send(TaskStop::RequesterGone);
+            }
+        }
+        served.recent.retain(|(p, _), _| p != peer);
     }
 
     /// Tells peers this agent is stopping: the tasks it gave them are cancelled (but
@@ -2073,7 +2255,14 @@ impl Inner {
                 said |= handle.tx.send(Message::TaskCancel { task_id }).is_ok();
             }
         }
-        let served: Vec<(EndpointId, u64)> = self.serving.lock().unwrap().keys().copied().collect();
+        let served: Vec<TaskKey> = self
+            .served
+            .lock()
+            .unwrap()
+            .running
+            .keys()
+            .copied()
+            .collect();
         for (peer, task_id) in served {
             if let Some(handle) = peers.get(&peer) {
                 said |= handle
@@ -2103,40 +2292,6 @@ impl Inner {
             .insert((*peer, task_id), progress.clone());
         if let Some(handle) = self.peers.lock().unwrap().get(peer) {
             let _ = handle.tx.send(Message::TaskProgress { task_id, progress });
-        }
-    }
-
-    /// How busy this agent is with peers' tasks, as `peer` is told.
-    fn load_for(&self, peer: &EndpointId) -> Message {
-        let slots = self.slots.lock().unwrap();
-        let yours = slots
-            .queue
-            .iter()
-            .chain(slots.holding.iter())
-            .filter(|(p, _)| p == peer)
-            .count();
-        Message::Load {
-            running: slots.holding.len() as u32,
-            queued: slots.queue.len() as u32,
-            slots: MAX_CONCURRENT_TASKS as u32,
-            yours: yours as u32,
-        }
-    }
-
-    /// Tells every connected peer how busy this agent is now (it serves tasks).
-    fn broadcast_load(&self) {
-        if self.executor.is_none() {
-            return;
-        }
-        let peers: Vec<(EndpointId, mpsc::UnboundedSender<Message>)> = self
-            .peers
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(id, h)| (*id, h.tx.clone()))
-            .collect();
-        for (id, tx) in peers {
-            let _ = tx.send(self.load_for(&id));
         }
     }
 
@@ -2480,9 +2635,8 @@ impl Inner {
         Ok((ctx, share))
     }
 
-    /// Runs a peer's task until it finishes or `cancel` fires (the peer sent
-    /// `TaskCancel` or disconnected), then audits it and reports the outcome. Also
-    /// says whether the task never ran (refused, so another worker may take it).
+    /// Runs a peer's task until it finishes or `cancel` fires, then audits it and
+    /// reports the outcome. Also says whether it was refused before running.
     async fn serve_task(
         self: &Arc<Self>,
         id: &EndpointId,
@@ -2490,25 +2644,33 @@ impl Inner {
         task_id: u64,
         task: LlmTask,
         origin: Option<Origin>,
-        cancel: oneshot::Receiver<()>,
+        cancel: oneshot::Receiver<TaskStop>,
     ) -> (Result<Served>, bool) {
         let clock = std::time::SystemTime::now();
         let mut granted = None;
-        let mut cancelled = false;
-        let result = self
-            .run_peer_task(
-                id,
-                from,
-                task_id,
-                &task,
-                origin.as_ref(),
-                cancel,
-                &mut granted,
-                &mut cancelled,
-            )
-            .await;
+        let mut stop = None;
+        // Dropping the work stops the provider run, team run, or pull request wait,
+        // as well as any check and worktree it owns.
+        let result = tokio::select! {
+            result = self.run_peer_task(id, from, task_id, &task, origin.as_ref(), &mut granted) => {
+                result
+            }
+            cause = cancel => {
+                let reason = match cause {
+                    Ok(TaskStop::Requested) => format!("cancelled by {from}"),
+                    Ok(TaskStop::RequesterGone) => {
+                        format!("stopped: {from} was gone for {} s", self.task_grace.as_secs())
+                    }
+                    Err(_) => "stopped: the worker lost its handle on the task".to_owned(),
+                };
+                let reason = crate::redact::redact(&reason).0;
+                let error = anyhow!("task {reason}");
+                stop = Some(reason);
+                Err(error)
+            }
+        };
         self.last_progress.lock().unwrap().remove(&(*id, task_id));
-        let refused = granted.is_none();
+        let refused = granted.is_none() && stop.is_none();
         let audited = match &result {
             Ok(served) if served.ok => Ok(String::new()),
             Ok(served) if served.evidence.team.is_some() => {
@@ -2531,7 +2693,7 @@ impl Inner {
             Err(e) => Err(anyhow!("{e:#}")),
         };
         let mut entry = AuditEntry::new(from, id, task_id, &task, granted, &audited, clock);
-        if cancelled {
+        if stop.is_some() {
             entry.outcome = Outcome::Cancelled;
         }
         entry.origin = origin.as_ref().and_then(Origin::describe);
@@ -2567,6 +2729,7 @@ impl Inner {
                 from: from.to_owned(),
                 task_id,
                 outcome,
+                stop,
             },
         };
         let _ = self.events.send(event);
@@ -2574,7 +2737,6 @@ impl Inner {
     }
 
     /// Checks and runs a peer's task; sets `granted` once it is admitted.
-    #[allow(clippy::too_many_arguments)]
     async fn run_peer_task(
         self: &Arc<Self>,
         id: &EndpointId,
@@ -2582,9 +2744,7 @@ impl Inner {
         task_id: u64,
         task: &LlmTask,
         origin: Option<&Origin>,
-        cancel: oneshot::Receiver<()>,
         granted: &mut Option<Access>,
-        cancelled: &mut bool,
     ) -> Result<Served> {
         if let Some(request) = &task.team {
             // A deployed agent whose release doesn't delegate hands work to nobody.
@@ -2601,16 +2761,12 @@ impl Inner {
                 .context(format!("{} refused the team step", self.name)));
             }
             return self
-                .lead_team(
-                    id, from, task_id, task, request, origin, cancel, granted, cancelled,
-                )
+                .lead_team(id, from, task_id, task, request, origin, granted)
                 .await;
         }
         if let Some(ask) = &task.pull_request {
             return self
-                .open_pull_request(
-                    id, from, task_id, task, ask, origin, cancel, granted, cancelled,
-                )
+                .open_pull_request(id, from, task_id, task, ask, origin, granted)
                 .await;
         }
         let executor = self
@@ -2630,7 +2786,10 @@ impl Inner {
             team: false,
         });
         let work = async {
-            let _slot = self.take_slot(id, task_id).await?;
+            let editing = ctx.access >= Access::WorkspaceWrite;
+            let _slot = self
+                .take_slot(id, task_id, editing.then_some(share.name.as_str()))
+                .await;
             self.attempt_task(
                 executor.as_ref(),
                 id,
@@ -2649,27 +2808,16 @@ impl Inner {
             .as_ref()
             .and_then(|d| d.current().ok())
             .and_then(|p| p.budgets.timeout_secs.map(|s| (p.label(), s)));
-        let work = async {
-            match limit {
-                Some((label, secs)) => tokio::time::timeout(Duration::from_secs(secs), work)
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(anyhow!(
-                            "stopped after {} minutes: {label}'s budget allows no longer a task",
-                            secs.div_ceil(60)
-                        ))
-                    }),
-                None => work.await,
-            }
-        };
-        // Dropping `work` stops the provider run (each backend aborts on drop) and
-        // any check, and removes the task's worktree.
-        tokio::select! {
-            result = work => result,
-            _ = cancel => {
-                *cancelled = true;
-                Err(anyhow!("task cancelled by {from}"))
-            }
+        match limit {
+            Some((label, secs)) => tokio::time::timeout(Duration::from_secs(secs), work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow!(
+                        "stopped after {} minutes: {label}'s budget allows no longer a task",
+                        secs.div_ceil(60)
+                    ))
+                }),
+            None => work.await,
         }
     }
 
@@ -2714,9 +2862,7 @@ impl Inner {
         task: &LlmTask,
         ask: &crate::pulls::PullRequestAsk,
         origin: Option<&Origin>,
-        cancel: oneshot::Receiver<()>,
         granted: &mut Option<Access>,
-        cancelled: &mut bool,
     ) -> Result<Served> {
         let pulls = self
             .pulls
@@ -2973,13 +3119,7 @@ impl Inner {
                 usage: None,
             })
         };
-        tokio::select! {
-            result = work => result,
-            _ = cancel => {
-                *cancelled = true;
-                Err(anyhow!("task cancelled by {from}"))
-            }
-        }
+        work.await
     }
 
     /// Runs team step `task` from `from`: its folder's team plan, or one this agent's
@@ -2996,9 +3136,7 @@ impl Inner {
         task: &LlmTask,
         request: &crate::team::TeamRequest,
         origin: Option<&Origin>,
-        cancel: oneshot::Receiver<()>,
         granted: &mut Option<Access>,
-        cancelled: &mut bool,
     ) -> Result<Served> {
         let runner = self
             .team
@@ -3102,13 +3240,7 @@ impl Inner {
             }
             anyhow::Ok(outcome)
         };
-        let outcome = tokio::select! {
-            outcome = work => outcome?,
-            _ = cancel => {
-                *cancelled = true;
-                bail!("task cancelled by {from}");
-            }
-        };
+        let outcome = work.await?;
         // What its team's results hold goes back only to a requester who may have it.
         if !outcome.labels.is_empty() && !self.may_have(id, &outcome.labels) {
             let recipients = runner.recipients(&agent);
@@ -3225,7 +3357,7 @@ impl Inner {
                 };
                 self.send_progress(id, task_id, Progress::new(Phase::Running, text));
                 let ran = {
-                    let _slot = self.take_slot(id, task_id).await?;
+                    let _slot = self.take_slot(id, task_id, None).await;
                     executor.execute(&ask, &ctx).await.with_context(|| {
                         format!("{}'s model couldn't write the team plan", self.name)
                     })?
@@ -3299,60 +3431,43 @@ impl Inner {
         Ok((format!("// {by}\n{plan}"), notes))
     }
 
-    /// Waits for a task slot for `peer`'s task `task_id`, telling it its place in the
-    /// queue meanwhile. The slot is free again when the returned pair is dropped.
-    async fn take_slot(
-        &self,
-        peer: &EndpointId,
-        task_id: u64,
-    ) -> Result<(tokio::sync::SemaphorePermit<'_>, Place<'_>)> {
-        let key = (*peer, task_id);
-        if let Ok(permit) = self.task_slots.try_acquire() {
-            self.slots.lock().unwrap().holding.insert(key);
-            self.broadcast_load();
-            return Ok((
-                permit,
-                Place {
-                    inner: self,
-                    key,
-                    holding: true,
-                },
-            ));
-        }
-        self.slots.lock().unwrap().queue.push_back(key);
-        let mut place = Place {
-            inner: self,
-            key,
-            holding: false,
-        };
-        self.report_queue();
-        self.broadcast_load();
-        let permit = self.task_slots.acquire().await?;
-        {
-            let mut slots = self.slots.lock().unwrap();
-            slots.queue.retain(|k| *k != key);
-            slots.holding.insert(key);
-        }
-        place.holding = true;
-        self.report_queue();
-        self.broadcast_load();
-        Ok((permit, place))
+    /// Waits for an agent slot and, for editing work, room in its folder.
+    async fn take_slot(&self, peer: &EndpointId, task_id: u64, folder: Option<&str>) -> Place<'_> {
+        let id = (*peer, task_id);
+        let place = Place { inner: self, id };
+        let (ready, wait) = oneshot::channel();
+        self.update_slots(|slots| {
+            slots.queue.push_back(WaitingTask {
+                id,
+                folder: folder.map(str::to_owned),
+                ready,
+            });
+        });
+        wait.await
+            .expect("a queued task stays until scheduled or cancelled");
+        place
     }
 
-    /// Tells each queued task's requester its place in the queue.
-    fn report_queue(&self) {
-        let queue: Vec<(EndpointId, u64)> =
-            self.slots.lock().unwrap().queue.iter().copied().collect();
-        for (ahead, (peer, task_id)) in queue.into_iter().enumerate() {
-            let place = match ahead {
-                0 => "next in line".to_owned(),
-                1 => "1 task ahead".to_owned(),
-                n => format!("{n} tasks ahead"),
+    fn update_slots(&self, change: impl FnOnce(&mut Slots)) {
+        let mut slots = self.slots.lock().unwrap();
+        change(&mut slots);
+        if !slots.queue.is_empty() {
+            let reports = {
+                let shares = self.shares.lock().unwrap();
+                slots.fill(&shares);
+                slots.queue_reports(&shares, &self.name)
             };
-            let text = format!("waiting for a free slot on {} ({place})", self.name);
-            self.send_progress(&peer, task_id, Progress::new(Phase::Queued, text));
+            for ((peer, task_id), text) in reports {
+                self.send_progress(&peer, task_id, Progress::new(Phase::Queued, text));
+            }
+        }
+        if self.executor.is_some() {
+            for (peer, handle) in self.peers.lock().unwrap().iter() {
+                let _ = handle.tx.send(slots.load_for(peer));
+            }
         }
     }
+
     /// Brings folder `share`'s clone up to its repository's latest commit before task
     /// `task_id` from `id` starts in it, if it is a linked repository's clone, telling the
     /// requester. Returns a note for the task's result when the task starts from the
@@ -4015,24 +4130,14 @@ async fn run_connection(
         close: close.clone(),
     };
     let known = inner.known_addrs();
-    match inner.register(peer_id, handle, outbound) {
-        Registration::Rejected => return Ok(()),
-        Registration::Replaced => {}
-        Registration::New => {
-            // A peer that reconnects within the disconnect grace period was never
-            // reported as gone, so it isn't reported as joining again either.
-            if inner.announced.lock().unwrap().insert(peer_id) {
-                let _ = inner.events.send(Event::PeerConnected {
-                    name: name.clone(),
-                    id: peer_id,
-                });
-            }
-        }
+    if matches!(
+        inner.register(peer_id, handle, outbound),
+        Registration::Rejected
+    ) {
+        return Ok(());
     }
     drop(handshake);
     drop(dialed);
-    // Back before its tasks gave up on it.
-    inner.left.lock().unwrap().remove(&peer_id);
     inner.received_catalog(peer_id, &name, catalog);
     inner.send_held(peer_id, &tx);
     // A shutdown that raced with this handshake missed our close handle.
@@ -4049,20 +4154,20 @@ async fn run_connection(
     });
     let _ = tx.send(Message::Peers { addrs: known });
     if inner.executor.is_some() {
-        let _ = tx.send(inner.load_for(&peer_id));
+        let _ = tx.send(inner.slots.lock().unwrap().load_for(&peer_id));
     }
     // Requests still waiting for this peer may have been queued on a connection that
     // was replaced: send them again (the peer ignores ones it already has).
-    let resend: Vec<Message> = inner
+    // Queue the replay before a concurrent CancelOnDrop can remove and cancel it.
+    for msg in inner
         .pending
         .lock()
         .unwrap()
         .values()
         .filter(|p| p.peer == peer_id)
-        .filter_map(|p| p.request.clone())
-        .collect();
-    for msg in resend {
-        let _ = tx.send(msg);
+        .filter_map(|p| p.request.as_ref())
+    {
+        let _ = tx.send(msg.clone());
     }
 
     let result = async {
@@ -4092,34 +4197,11 @@ async fn run_connection(
                 } => {
                     let task = *task;
                     let key = (peer_id, task_id);
-                    // A re-sent request: it's running (its requester hears where it is
-                    // again), or its result is sent again.
-                    if inner.serving.lock().unwrap().contains_key(&key) {
-                        let last = inner.last_progress.lock().unwrap().get(&key).cloned();
-                        if let Some(progress) = last {
-                            let _ = tx.send(Message::TaskProgress { task_id, progress });
-                        }
+                    let Some(cancel_rx) = inner.begin_serving(key, &task, &tx) else {
                         continue;
-                    }
-                    let done = inner
-                        .recent
-                        .lock()
-                        .unwrap()
-                        .get(&key)
-                        .filter(|(t, _, at)| t == &task && at.elapsed() < RECENT_RESULTS)
-                        .map(|(_, msg, _)| msg.clone());
-                    if let Some(msg) = done {
-                        let _ = tx.send(msg);
-                        continue;
-                    }
+                    };
                     let (inner, from) = (inner.clone(), name.clone());
                     let original = task.clone();
-                    let (cancel_tx, cancel_rx) = oneshot::channel();
-                    inner
-                        .serving
-                        .lock()
-                        .unwrap()
-                        .insert((peer_id, task_id), cancel_tx);
                     tokio::spawn(async move {
                         let (result, refused) = inner
                             .serve_task(&peer_id, &from, task_id, task, origin, cancel_rx)
@@ -4146,17 +4228,7 @@ async fn run_connection(
                                 usage: None,
                             },
                         };
-                        {
-                            // Remember the result before the task stops counting as
-                            // running, so a re-sent request never runs it twice.
-                            let mut recent = inner.recent.lock().unwrap();
-                            recent.retain(|_, (_, _, at)| at.elapsed() < RECENT_RESULTS);
-                            recent.insert(
-                                (peer_id, task_id),
-                                (original, msg.clone(), Instant::now()),
-                            );
-                        }
-                        inner.serving.lock().unwrap().remove(&(peer_id, task_id));
+                        inner.finish_serving(key, original, msg.clone());
                         inner.deliver(peer_id, msg).await;
                     });
                 }
@@ -4201,9 +4273,15 @@ async fn run_connection(
                 }
                 Message::TaskCancel { task_id } => {
                     inner.withdraw_approval(&peer_id, task_id);
-                    let cancel = inner.serving.lock().unwrap().remove(&(peer_id, task_id));
+                    let cancel = inner
+                        .served
+                        .lock()
+                        .unwrap()
+                        .running
+                        .get_mut(&(peer_id, task_id))
+                        .and_then(Option::take);
                     if let Some(cancel) = cancel {
-                        let _ = cancel.send(());
+                        let _ = cancel.send(TaskStop::Requested);
                     }
                 }
                 Message::TaskResult {
@@ -4363,44 +4441,81 @@ async fn run_connection(
             {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            let gone = !inner.peers.lock().unwrap().contains_key(&peer_id);
-            if !gone {
+            if !inner.report_disconnected(peer_id, conn_id, &name) {
                 return;
             }
-            let left = Instant::now();
-            inner.left.lock().unwrap().insert(peer_id, left);
-            if inner.announced.lock().unwrap().remove(&peer_id) {
-                let _ = inner.events.send(Event::PeerDisconnected {
-                    name: name.clone(),
-                    id: peer_id,
-                });
-            }
-            inner.report_reconnecting(&peer_id, &name);
             crate::awake::sleep(inner.task_grace.saturating_sub(DISCONNECT_GRACE)).await;
-            // Still gone since then (not back, nor gone again later).
-            if inner.left.lock().unwrap().get(&peer_id) != Some(&left) {
-                return;
-            }
-            inner.left.lock().unwrap().remove(&peer_id);
-            inner.fail_pending(&peer_id);
-            inner.cancel_served(&peer_id);
-            inner
-                .recent
-                .lock()
-                .unwrap()
-                .retain(|(p, _), _| p != &peer_id);
-            let gone_requests: Vec<(EndpointId, u64)> = inner
-                .approvals
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|a| a.requester == peer_id)
-                .map(|a| (a.requester, a.task_id))
-                .collect();
-            for (requester, task_id) in gone_requests {
-                inner.withdraw_approval(&requester, task_id);
-            }
+            inner.expire_disconnect(peer_id, conn_id);
         });
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_old_disconnect_cannot_report_or_expire_a_newer_disconnect() {
+        let mut config = AgentConfig::new("worker", SecretKey::generate());
+        config.network = Network::Local;
+        let (worker, _events) = Agent::bind(config).await.unwrap();
+        let inner = &worker.inner;
+        let boss = SecretKey::generate().public();
+        let register = |conn_id| {
+            inner.register(
+                boss,
+                PeerHandle {
+                    conn_id,
+                    name: "boss".into(),
+                    addr: EndpointAddr::new(boss),
+                    capabilities: Vec::new(),
+                    shares: Vec::new(),
+                    owner: None,
+                    role: None,
+                    agent: None,
+                    load: None,
+                    models: Default::default(),
+                    offers: Default::default(),
+                    tx: mpsc::unbounded_channel().0,
+                    close: Arc::new(Notify::new()),
+                },
+                worker.id() < boss,
+            )
+        };
+
+        assert!(matches!(register(1), Registration::New));
+        let key = (boss, 147);
+        let task = LlmTask::new(Provider::Copilot, "still working");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut stop = inner.begin_serving(key, &task, &tx).unwrap();
+
+        assert!(inner.unregister(boss, 1));
+        assert!(inner.report_disconnected(boss, 1, "boss"));
+        assert!(matches!(register(2), Registration::New));
+        assert!(matches!(register(3), Registration::Replaced));
+        assert!(inner.begin_serving(key, &task, &tx).is_none());
+        assert!(
+            !inner.unregister(boss, 2),
+            "late exit of the replaced reader"
+        );
+        assert!(inner.unregister(boss, 3));
+        assert!(matches!(register(4), Registration::New));
+        assert!(inner.unregister(boss, 4));
+
+        // Two earlier timers resume while the latest outage is still in its grace.
+        assert!(!inner.report_disconnected(boss, 3, "boss"));
+        inner.expire_disconnect(boss, 1);
+        assert!(matches!(
+            stop.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(inner.report_disconnected(boss, 4, "boss"));
+        inner.expire_disconnect(boss, 4);
+        assert!(matches!(stop.try_recv(), Ok(TaskStop::RequesterGone)));
+        assert!(
+            inner.begin_serving(key, &task, &tx).is_none(),
+            "still stopping"
+        );
+    }
 }

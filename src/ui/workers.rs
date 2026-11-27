@@ -207,7 +207,7 @@ pub(super) async fn edit(
 
 /// Stops a worker this agent runs, deletes it (ending a factory agent's deployment on it),
 /// and takes it off the allowlist and out of the squads. Refused while it runs outside
-/// this agent.
+/// this agent, or when its process didn't end once stopped.
 pub(super) async fn delete(
     State(s): State<AppState>,
     Path(name): Path<String>,
@@ -221,7 +221,11 @@ pub(super) async fn delete(
             "'{name}' is running outside this agent: stop it there (/quit or Ctrl+C), then delete it"
         )));
     }
-    sup.stop(&name).await;
+    if sup.stop(&name).await && worker.is_running() {
+        return Err(conflict(format!(
+            "'{name}' was stopped, but its process didn't end, so it isn't deleted: try again in a moment"
+        )));
+    }
     let ended = workers::delete(&me, &name).map_err(|e| conflict(format!("{e:#}")))?;
     if s.agent.remove_trusted(&name) {
         s.save_trust()?;

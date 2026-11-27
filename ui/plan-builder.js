@@ -71,17 +71,6 @@ const planBuilder = (() => {
 
   /// The folder a step runs in, as its peer (or a squad's online members) share it:
   /// checks, MCP servers, worktrees and access.
-  /// The peers a step may go to (its peer, or a squad's online members) that serve
-  /// `provider`, as they say what they offer (see modelMenu in ui/models.js).
-  function stepAgents(target, provider) {
-    if (!target) return [];
-    const [who] = target.slice(1).split(":");
-    const peers = target.startsWith("#")
-      ? state.peers.filter((p) => (state.squads ?? []).find((q) => q.name === who)?.members.some((m) => m.name === p.name))
-      : state.peers.filter((p) => p.name === who);
-    return peers.filter((p) => p.capabilities.includes(provider));
-  }
-
   function folderOf(target) {
     if (!target) return null;
     const [who, name = "data"] = target.slice(1).split(":");
@@ -499,12 +488,14 @@ const planBuilder = (() => {
       // lets you pick (those it allows, else all its account offers; one by name when it
       // allows any and lists none).
       const menu = modelMenu(stepAgents(s.target, provider.value), provider.value);
-      const deflt = menu.defaultModel?.toLowerCase();
+      const deflt = plan.model ? null : menu.defaultModel?.toLowerCase();
       const theirs = s.target?.startsWith("#") ? "Each member's default" : "Its default";
       const current = planText.valuesOf(s, "model")[0] ?? "";
+      const modelDefault = plan.model ? `${plan.model} (the plan's)`
+        : menu.defaultModel ? `${menu.defaultModel} (default)` : theirs;
       const model = el("select", {},
-        el("option", { value: "", text: menu.defaultModel ? `${menu.defaultModel} (default)` : theirs }),
-        ...modelOptionNodes(menu.models.filter((m) => m.id.toLowerCase() !== deflt)),
+        el("option", { value: "", text: modelDefault }),
+        ...modelOptionNodes(modelOptionData(menu.models.filter((m) => m.id.toLowerCase() !== deflt))),
         ...(menu.other ? [el("option", { value: OTHER_MODEL, text: "Another model…" })] : []));
       if (current && ![...model.options].some((o) => o.value === current)) {
         model.append(el("option", { value: current, text: current }));
@@ -527,18 +518,20 @@ const planBuilder = (() => {
       });
       name.addEventListener("change", () => { planText.setValues(s, "model", name.value.trim() || null); changed(true); });
       const modelField = field(`${k}-model`, "Model", model, menu.other
-        ? "Its peer's default, or another model by name"
+        ? "Use the default above, or pick another model by name"
         : `The models ${s.target} lets you pick; it refuses others`);
       modelField.append(name);
       items.push(modelField);
       set += Boolean(current);
       // How hard it reasons: its peer's default (selected, as the model takes it), or
       // another level its peer allows that the model supports.
-      const pick = effortChoices(menu, current);
+      const pick = effortChoices(menu, current || plan.model);
       const effortNow = planText.valuesOf(s, "effort")[0] ?? "";
-      const effort = el("select", { disabled: pick.fixed || undefined },
-        el("option", { value: "", text: pick.fixed ? "None for this model" : pick.fitted ? `${pick.fitted} (default)` : theirs }),
-        ...pick.levels.filter((e) => e !== pick.fitted).map((e) => el("option", { value: e, text: e })));
+      const effortDefault = plan.effort ? `${plan.effort} (the plan's)`
+        : pick.fixed ? "None for this model" : pick.fitted ? `${pick.fitted} (default)` : theirs;
+      const effort = el("select", { disabled: (pick.fixed && !effortNow) || undefined },
+        el("option", { value: "", text: effortDefault }),
+        ...pick.levels.filter((e) => plan.effort || e !== pick.fitted).map((e) => el("option", { value: e, text: e })));
       if (effortNow && ![...effort.options].some((o) => o.value === effortNow)) {
         effort.append(el("option", { value: effortNow, text: effortNow }));
       }
@@ -852,7 +845,7 @@ const planBuilder = (() => {
     }
     $("#plan-editor-tip").textContent = view === "builder"
       ? "Fill in the cards · the plan is checked as you go · Ctrl+Enter runs it"
-      : "Claims first, then one step per line · Ctrl+Enter runs the plan";
+      : "Plan settings, then claims and one step per line · Ctrl+Enter runs the plan";
     if (view === "builder") {
       load(editor().value);
       if (focus) {
@@ -883,7 +876,7 @@ const planBuilder = (() => {
     let last = null;
     return planText.lineKinds(text).map(({ kind }) => {
       if (kind === "text") return last;
-      if (kind === "empty" || kind === "comment" || kind === "track") return null;
+      if (kind !== "claim" && kind !== "step") return null;
       return (last = kind === "claim" ? { claim: plan.claims[claim++]?.id } : { step: plan.steps[step++]?.id });
     });
   }

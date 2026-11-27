@@ -285,23 +285,9 @@ fn failed_entity(status: u64, entity: &Value, result: &ToolResult) -> anyhow::Er
 /// Fails if Work IQ answered a notice's `tool` call with a failed status (a call it reported
 /// failed is already an error).
 fn check_sent(tool: &str, result: &ToolResult) -> Result<()> {
-    let answer = result
-        .structured_content
-        .clone()
-        .or_else(|| {
-            result
-                .content
-                .iter()
-                .filter_map(|c| c.get("text")?.as_str())
-                .find_map(|text| serde_json::from_str::<Value>(text).ok())
-        })
-        .unwrap_or(Value::Null);
-    let status = ["status", "statusCode", "httpStatusCode"]
-        .iter()
-        .find_map(|key| number(answer.get(*key)));
+    let (answer, status) = result.answer_with_status();
     match status {
-        Some(status) if status >= 400 => {
-            let status = u16::try_from(status).unwrap_or(u16::MAX);
+        Some(status @ 400..) => {
             Err(WorkIqError::entity(tool, status, &failure(&answer), result.ids.clone()).into())
         }
         _ => Ok(()),

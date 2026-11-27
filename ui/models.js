@@ -1,6 +1,6 @@
 // Proofkin web UI: models. Which models and reasoning efforts a task may ask an agent
 // for, from what it says (its settings, and the models its account offers it), for the
-// Run task form (app.js) and the plan builder's step cards (plan-builder.js); what a
+// Run task form and Describe view (app.js) and the plan builder's step cards; what a
 // squad member runs, for the squad dialog and card; and the Models dialog, where an
 // owner picks them for this agent and its digital workers.
 // The pure helpers at the top are tested in node (tests/models.test.cjs); the dialog
@@ -9,15 +9,18 @@
 
 // Reasoning efforts, least to most (src/models.rs EFFORTS).
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+// The Model list's choice that takes a model by name.
+const OTHER_MODEL = "*other*";
 
 const sameModel = (a, b) => a.toLowerCase() === b.toLowerCase();
 
 /** What `agents` (a peer, this agent, or the peers a task may go to) say about their
  * models for `provider`, merged: the models a task may pick (those each allows, else
  * all its account offers), the efforts it may ask for, and, for one agent, its defaults.
- * `other`: one of them allows any model and lists none (older versions, Claude, Codex),
- * so a model may also be named. */
-function modelMenu(agents, provider) {
+ * `other`: an agent allows any model and lists none (older versions, Claude, Codex),
+ * so a model may also be named. On this agent (`local`), an unrestricted provider
+ * also lets the owner name a model outside its offers. */
+function modelMenu(agents, provider, local = false) {
   const models = [];
   const efforts = new Set();
   let other = !agents.length;
@@ -25,7 +28,7 @@ function modelMenu(agents, provider) {
     const set = agent?.models?.[provider] ?? {};
     const offers = agent?.offers?.[provider] ?? [];
     const allowed = set.allowed ?? [];
-    if (!allowed.length && !offers.length) other = true;
+    if (!allowed.length && (local || !offers.length)) other = true;
     const list = allowed.length
       ? allowed.map((id) => offers.find((o) => sameModel(o.id, id)) ?? { id })
       : offers;
@@ -99,15 +102,135 @@ function modelsByVendor(models) {
 }
 
 /** Options for `models`, grouped by vendor when there is more than one. */
-function modelOptionNodes(models) {
-  const option = (m) => el("option", {
-    value: m.id, text: modelOptionText(m),
-    title: [m.name !== m.id ? m.name : null, m.vendor, m.multiplier ? `${m.multiplier}x the base rate` : null,
-      effortRange(m.efforts) ? `reasoning ${effortRange(m.efforts)}` : null].filter(Boolean).join(" · ") || null,
-  });
+function modelOptionData(models) {
+  const option = (m) => {
+    const range = effortRange(m.efforts);
+    return {
+      value: m.id, text: modelOptionText(m),
+      title: [m.name !== m.id ? m.name : null, m.vendor, m.multiplier ? `${m.multiplier}x the base rate` : null,
+        range ? `reasoning ${range}` : null].filter(Boolean).join(" · ") || null,
+    };
+  };
   const groups = modelsByVendor(models);
   if (groups.length < 2) return models.map(option);
-  return groups.map(([vendor, list]) => el("optgroup", { label: vendor }, ...list.map(option)));
+  return groups.map(([label, list]) => ({ label, options: list.map(option) }));
+}
+
+function modelOptionNodes(options) {
+  return options.map((o) => o.options
+    ? el("optgroup", { label: o.label }, ...modelOptionNodes(o.options))
+    : el("option", o));
+}
+
+const namedModel = (value, name) => value === OTHER_MODEL ? name.trim() : value;
+
+/** Choices and values for the Model and Reasoning lists, keeping a pick still offered. */
+function modelPickerOptions(agents, provider, previous, local = false) {
+  const menu = modelMenu(agents, provider, local);
+  const theirs = agents.length > 1 ? "Each peer's default" : "Its default";
+  const rest = menu.models.filter((m) => !menu.defaultModel || !sameModel(m.id, menu.defaultModel));
+  const models = [
+    { value: "", text: menu.defaultModel ? `${menu.defaultModel} (default)` : theirs },
+    ...modelOptionData(rest),
+    ...(menu.other ? [{ value: OTHER_MODEL, text: "Another model…" }] : []),
+  ];
+  const model = menu.other && previous.model === OTHER_MODEL
+    ? OTHER_MODEL : rest.find((m) => sameModel(m.id, previous.model))?.id ?? "";
+  const pick = effortChoices(menu, namedModel(model, previous.name));
+  const efforts = [
+    { value: "", text: pick.fixed ? "None for this model" : pick.fitted ? `${pick.fitted} (default)` : theirs },
+    ...pick.levels.filter((e) => e !== pick.fitted).map((e) => ({ value: e, text: e })),
+  ];
+  const effort = efforts.some((e) => e.value === previous.effort) ? previous.effort : "";
+  return { models, model, efforts, effort, fixed: pick.fixed };
+}
+
+// A plan-wide choice is offered only when all its peers can take it.
+function planModelMenu(agents, provider) {
+  const menu = modelMenu(agents, provider);
+  const each = agents.map((agent) => modelMenu([agent], provider));
+  const models = menu.models.flatMap((m) => {
+    const offers = each.map((peer) => peer.models.find((o) => sameModel(o.id, m.id)));
+    if (offers.some((o, i) => !o && !each[i].other)) return [];
+    const known = offers.map((o) => o?.efforts).filter(Boolean);
+    return [{ ...m, efforts: known.length ? EFFORTS.filter((e) => known.every((levels) => levels.includes(e))) : null }];
+  });
+  return {
+    ...menu, models,
+    defaultModel: sharedDefault(each, "defaultModel"),
+    defaultEffort: sharedDefault(each, "defaultEffort"),
+    efforts: EFFORTS.filter((e) => each.every((peer) => peer.efforts.includes(e))),
+  };
+}
+
+function sharedDefault(menus, key) {
+  const first = menus[0]?.[key];
+  return first && menus.every((m) => m[key] && sameModel(m[key], first)) ? first : null;
+}
+
+function planModelOptions(byProvider, current) {
+  const menus = Array.from(byProvider, ([provider, agents]) => planModelMenu([...agents], provider));
+  const menu = menus.length === 1 ? menus[0] : null;
+  const defaultLabel = (value) => value ? `${value} (each peer's default)` : "Each step's peer default";
+  const listed = current.model && menu?.models.find((m) => sameModel(m.id, current.model));
+  const model = listed?.id ?? current.model ?? "";
+  const models = [
+    { value: "", text: defaultLabel(menu?.defaultModel) },
+    ...modelOptionData(menu?.models ?? []),
+    ...(model && !listed ? [{ value: model, text: model }] : []),
+    ...(menu?.other ? [{ value: OTHER_MODEL, text: "Another model…" }] : []),
+  ];
+  const pick = menu ? effortChoices(menu, model) : {
+    levels: EFFORTS.filter((e) => menus.every((m) => m.efforts.includes(e))),
+    fitted: sharedDefault(menus, "defaultEffort"),
+    fixed: false,
+  };
+  // The text is authoritative, even if the peers no longer offer an explicit choice.
+  const effort = current.effort?.toLowerCase() ?? "";
+  const efforts = [
+    { value: "", text: pick.fixed ? "None for this model" : defaultLabel(pick.fitted) },
+    ...pick.levels.map((e) => ({ value: e, text: e })),
+    ...(effort && !pick.levels.includes(effort) ? [{ value: effort, text: current.effort }] : []),
+  ];
+  return { models, model, efforts, effort, fixed: pick.fixed && !effort };
+}
+
+/** The shared picker in Run task and Describe. */
+function modelPicker(prefix) {
+  const model = $(`#${prefix}model`);
+  const name = $(`#${prefix}model-name`);
+  const nameField = $(`#${prefix}model-name-field`);
+  const effort = $(`#${prefix}effort`);
+  let agents = [], provider = "", local = false;
+  function draw(redrawModel) {
+    const pick = modelPickerOptions(agents, provider, { model: model.value, name: name.value, effort: effort.value }, local);
+    if (redrawModel) {
+      model.replaceChildren(...modelOptionNodes(pick.models));
+      model.value = pick.model;
+      model.disabled = !provider;
+    }
+    nameField.hidden = !provider || pick.model !== OTHER_MODEL;
+    effort.replaceChildren(...modelOptionNodes(pick.efforts));
+    effort.value = pick.effort;
+    effort.disabled = !provider || pick.fixed;
+  }
+  model.addEventListener("change", () => {
+    draw(false);
+    if (!nameField.hidden) name.focus();
+  });
+  name.addEventListener("input", () => draw(false));
+  return {
+    render(nextAgents, nextProvider, localAgent = false) {
+      agents = nextAgents;
+      provider = nextProvider;
+      local = localAgent;
+      draw(true);
+    },
+    selected: () => ({
+      model: provider ? namedModel(model.value, name.value) || null : null,
+      effort: effort.disabled ? null : effort.value || null,
+    }),
+  };
 }
 
 // ---------- the Models dialog ----------

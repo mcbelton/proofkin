@@ -3,9 +3,11 @@
 //! where possible. Each step gets the results of the steps it depends on, and steps
 //! whose prerequisites failed are skipped.
 //!
-//! Plan text, one claim or step per line (`//` starts a comment):
+//! Plan text, one setting, claim or step per line (`//` starts a comment):
 //!
 //! ```text
+//! model: claude-sonnet-5.5
+//! effort: medium
 //! claim: C-1 The parser handles empty input
 //! api @alice:repo Summarize the public API of src/agent.rs
 //! fix after api @bob:app verify=test attempts=3 claims=C-1 Make the parser accept empty input
@@ -26,6 +28,8 @@
 //! others are given once. `approve @person` (or `@me`) asks a
 //! team member to sign off instead of running a model. See [`crate::runs`] for the
 //! verdicts.
+//! `model:` and `effort:` set defaults for the steps a model runs. Each step's
+//! `model=` or `effort=` wins, and `model:` needs all model steps to use one provider.
 //!
 //! With a tracker linked (see [`crate::tracker`]), each run is tracked as a GitHub
 //! issue and each step as a sub-issue: `track: #12` works on issue 12, `track: <title>`
@@ -322,6 +326,11 @@ pub fn parse_workiq_sources(value: &str) -> Result<Vec<String>> {
 pub const WORKIQ_QUERY_CHARS: usize = 1000;
 
 impl Step {
+    /// Whether this step sends a model task.
+    fn runs_model(&self) -> bool {
+        !self.approve && !self.pr && self.team.is_none() && !self.is_workiq()
+    }
+
     /// Whether this is a `@workiq` step.
     pub fn is_workiq(&self) -> bool {
         self.target == Target::Workiq
@@ -498,6 +507,12 @@ pub struct Plan {
     /// has a tracker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track: Option<Track>,
+    /// The model for model steps that don't set `model=`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The reasoning effort for model steps that don't set `effort=`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl Plan {
@@ -507,6 +522,8 @@ impl Plan {
         let mut steps = Vec::new();
         let mut claims = Vec::new();
         let mut track = None;
+        let mut model = None;
+        let mut effort = None;
         let mut errors = Vec::new();
         let lines: Vec<&str> = text.lines().collect();
         let mut n = 0;
@@ -518,13 +535,6 @@ impl Plan {
             if line.is_empty() || line.starts_with("//") {
                 continue;
             }
-            let is_step = !line.starts_with("claim:") && !line.starts_with("track:");
-            let mut continuation = String::new();
-            if is_step {
-                let (text, next) = continuation_after(&lines, at);
-                continuation = text;
-                n = next;
-            }
             let parsed = if let Some(rest) = line.strip_prefix("claim:") {
                 parse_claim(rest).map(|c| claims.push(c))
             } else if let Some(rest) = line.strip_prefix("track:") {
@@ -533,7 +543,24 @@ impl Plan {
                 } else {
                     parse_track(rest).map(|t| track = Some(t))
                 }
+            } else if let Some(rest) = line.strip_prefix("model:") {
+                if model.is_some() {
+                    Err(anyhow!("model: is given twice; a plan has one"))
+                } else {
+                    let name = rest.trim();
+                    crate::models::check_name(name).map(|()| model = Some(name.to_owned()))
+                }
+            } else if let Some(rest) = line.strip_prefix("effort:") {
+                if effort.is_some() {
+                    Err(anyhow!("effort: is given twice; a plan has one"))
+                } else {
+                    let level = rest.trim();
+                    crate::models::check_effort(level)
+                        .map(|()| effort = Some(level.to_ascii_lowercase()))
+                }
             } else {
+                let (continuation, next) = continuation_after(&lines, at);
+                n = next;
                 parse_step(line, &continuation).map(|s| steps.push(s))
             };
             if let Err(e) = parsed {
@@ -547,9 +574,22 @@ impl Plan {
             claims,
             steps,
             track,
+            model,
+            effort,
         };
         plan.validate()?;
         Ok(plan)
+    }
+
+    fn apply_model_defaults(&self, step: &mut Step) {
+        if step.runs_model() {
+            if step.model.is_none() {
+                step.model.clone_from(&self.model);
+            }
+            if step.effort.is_none() {
+                step.effort.clone_from(&self.effort);
+            }
+        }
     }
 
     /// Whether the plan names issues of a tracker (`track: #N` or `issue=`).
@@ -561,6 +601,20 @@ impl Plan {
     pub fn validate(&self) -> Result<()> {
         if self.steps.is_empty() {
             bail!("the plan has no steps");
+        }
+        if self.model.is_some() {
+            let mut providers = self
+                .steps
+                .iter()
+                .filter(|s| s.runs_model())
+                .map(|s| s.provider);
+            if let Some(first) = providers.next()
+                && providers.any(|p| p != first)
+            {
+                bail!(
+                    "model: needs all model steps to use the same provider; give each step its own model= instead"
+                );
+            }
         }
         let mut claim_ids = HashMap::new();
         for claim in &self.claims {
@@ -814,6 +868,7 @@ impl Plan {
     pub fn prepare(&self, kb: &KnowledgeBase, skills: &Skills) -> Result<Plan> {
         let mut plan = self.with_knowledge(kb)?;
         for step in &mut plan.steps {
+            self.apply_model_defaults(step);
             let workiq = step.is_workiq();
             let agent = match step.agent.as_ref().filter(|_| !workiq) {
                 Some(name) => Some(
@@ -826,8 +881,8 @@ impl Plan {
             if let Some(agent) = &agent {
                 step.skills = union(&agent.skills, &step.skills);
                 step.mcp = union(&agent.mcp, &step.mcp);
-                // The agent's model, unless the step names one.
-                if step.model.is_none() && !step.approve && step.team.is_none() {
+                // The agent's model, unless the step or plan names one.
+                if step.model.is_none() && step.runs_model() {
                     step.model = agent.model.clone();
                 }
                 // A factory agent's release, as its evidence and the run's record name it.
@@ -1153,8 +1208,13 @@ const STEP_OPTIONS: &[&str] = &[
 /// every kind of line and step, and every option, [`Plan::parse`] takes. A test fails when
 /// the parser takes one this doesn't name.
 pub const FORMAT: &str = "\
-One claim, step or comment per line:
+One setting, claim, step or comment per line:
 - `// comment`: ignored.
+- `model: name` and `effort: minimal|low|medium|high|xhigh|max`: before the claims and steps, \
+at most one of each. They set defaults for the steps a model runs, not `approve`, `pr`, \
+`team` or `@workiq` steps. A step's own `model=` or `effort=` wins. `model:` needs all model \
+steps to use the same provider; otherwise give each step its own `model=`. Model names use \
+letters, digits and -._:/@+.
 - `claim: ID what must be true`: a claim the plan proves (ID: letters, digits, '-', '_' or \
 '.'). Only passing checks (`verify=` on a step with `claims=ID`) or a sign-off (`approve` \
 with `claims=ID`) prove it.
@@ -1188,7 +1248,8 @@ after.
 - `base=RUN:STEP`: it starts from the work step STEP of an earlier evidence run RUN made; \
 not with `apply=`, and it needs a folder.
 - `model=name` and `effort=minimal|low|medium|high|xhigh|max`: the model and reasoning \
-effort its task runs at (the peer must allow them; default: the peer's).
+effort its task runs at (the peer must allow them). Without these, use the plan's \
+defaults if set, then the named agent's model if set, then the peer's defaults.
 - `skill=a,b` (or `skills=a,b`): skills its model follows.
 - `agent=name` (or `agent=name@version`, a factory agent's release): it acts as that agent: \
 the agent's instructions first, its skills and MCP servers added.
@@ -1771,9 +1832,10 @@ fn union(first: &[String], then: &[String]) -> Vec<String> {
 }
 
 /// The step as it runs as its agent: the agent's skills and MCP servers come first, and
-/// its model is the step's unless the step names one.
-fn with_agent(step: &Step, skills: &Skills) -> Result<Step> {
+/// its model is the step's unless the step or plan names one.
+fn with_agent(step: &Step, plan: &Plan, skills: &Skills) -> Result<Step> {
     let mut step = step.clone();
+    plan.apply_model_defaults(&mut step);
     if step.is_workiq() {
         return Ok(step);
     }
@@ -1781,7 +1843,7 @@ fn with_agent(step: &Step, skills: &Skills) -> Result<Step> {
         let agent = skills.agent(name)?;
         step.skills = union(&agent.skills, &step.skills);
         step.mcp = union(&agent.mcp, &step.mcp);
-        if step.model.is_none() && !step.approve && step.team.is_none() {
+        if step.model.is_none() && step.runs_model() {
             step.model = agent.model.clone();
         }
     }
@@ -2263,8 +2325,32 @@ pub fn preflight(
             fixes: Vec::new(),
         })
     };
+    if plan.model.is_some()
+        && !plan
+            .steps
+            .iter()
+            .any(|s| s.runs_model() && s.model.is_none())
+    {
+        report(
+            None,
+            false,
+            "model: has no model step without its own model=".into(),
+        );
+    }
+    if plan.effort.is_some()
+        && !plan
+            .steps
+            .iter()
+            .any(|s| s.runs_model() && s.effort.is_none())
+    {
+        report(
+            None,
+            false,
+            "effort: has no model step without its own effort=".into(),
+        );
+    }
     for own in &marked.steps {
-        let step = &match with_agent(own, skills) {
+        let step = &match with_agent(own, plan, skills) {
             Ok(step) => step,
             Err(e) => {
                 report(Some(own), true, format!("{e:#}"));
@@ -2441,8 +2527,14 @@ pub fn preflight(
         if step.approve {
             continue;
         }
-        let reasons: Vec<String> = candidates.iter().filter_map(|p| unable(step, p)).collect();
-        if reasons.len() == candidates.len() {
+        let (mut able, mut reasons) = (Vec::new(), Vec::new());
+        for &peer in &candidates {
+            match unable(step, peer) {
+                Some(why) => reasons.push(why),
+                None => able.push(peer),
+            }
+        }
+        if able.is_empty() {
             let reasons = reasons.join("; ");
             // Only the agent's MCP servers stand in the way: say so.
             let message = match &step.agent {
@@ -2453,10 +2545,14 @@ pub fn preflight(
             };
             report(Some(step), true, message);
         }
-        // A model or reasoning effort none of its peers allows: each would refuse the
-        // step (they say which they allow in their hello; peers that don't say allow any).
+        // A squad can run the step if any eligible member allows the settings together.
+        let model_peers = if able.is_empty() { &candidates } else { &able };
+        if !step.runs_model() || model_peers.iter().any(|p| admits_step(p, step)) {
+            continue;
+        }
+        let mut warned = false;
         if let Some(model) = &step.model {
-            let refusing: Vec<String> = candidates
+            let refusing: Vec<String> = model_peers
                 .iter()
                 .filter_map(|p| {
                     let choice = p.models.get(&step.provider)?;
@@ -2464,7 +2560,8 @@ pub fn preflight(
                         .then(|| format!("{} allows only {}", p.name, choice.allowed.join(", ")))
                 })
                 .collect();
-            if !refusing.is_empty() && refusing.len() == candidates.len() {
+            if refusing.len() == model_peers.len() {
+                warned = true;
                 report(
                     Some(step),
                     false,
@@ -2477,7 +2574,7 @@ pub fn preflight(
             }
         }
         if let Some(effort) = &step.effort {
-            let refusing: Vec<String> = candidates
+            let refusing: Vec<String> = model_peers
                 .iter()
                 .filter_map(|p| {
                     let choice = p.models.get(&step.provider)?;
@@ -2485,7 +2582,8 @@ pub fn preflight(
                         .then(|| format!("{} allows only {}", p.name, choice.efforts.join(", ")))
                 })
                 .collect();
-            if !refusing.is_empty() && refusing.len() == candidates.len() {
+            if refusing.len() == model_peers.len() {
+                warned = true;
                 report(
                     Some(step),
                     false,
@@ -2496,6 +2594,16 @@ pub fn preflight(
                     ),
                 );
             }
+        }
+        if !warned && let (Some(model), Some(effort)) = (&step.model, &step.effort) {
+            report(
+                Some(step),
+                false,
+                format!(
+                    "model={model} and effort={effort} would be refused for {}: no eligible squad member allows both",
+                    step.provider
+                ),
+            );
         }
     }
     // Each claim needs a step that can prove it: one with checks, or a sign-off.
@@ -2565,6 +2673,12 @@ pub fn preflight(
     problems
 }
 
+fn admits_step(peer: &PeerInfo, step: &Step) -> bool {
+    peer.models
+        .get(&step.provider)
+        .is_none_or(|choice| choice.admits(step.model.as_deref(), step.effort.as_deref()))
+}
+
 /// Picks the peer for `step`: the named peer, or the least busy online squad member
 /// that serves the provider (and the folder, if one is named). Ties go by name.
 pub fn choose_peer(
@@ -2599,11 +2713,7 @@ pub fn choose_peer(
             // Members that allow the step's model and reasoning effort come first (their
             // hello says which; one that doesn't say allows any): the others would turn
             // it down.
-            let allows = |p: &&PeerInfo| {
-                p.models.get(&step.provider).is_none_or(|choice| {
-                    choice.admits(step.model.as_deref(), step.effort.as_deref())
-                })
-            };
+            let allows = |p: &&PeerInfo| admits_step(p, step);
             let pool: Vec<&PeerInfo> = if able.iter().any(allows) {
                 able.into_iter().filter(allows).collect()
             } else {
@@ -3060,6 +3170,8 @@ fn plan_of(run: &crate::runs::RunRecord) -> Plan {
         claims: Vec::new(),
         steps: run.steps.iter().map(|s| s.step.clone()).collect(),
         track: None,
+        model: None,
+        effort: None,
     }
 }
 
@@ -3952,7 +4064,7 @@ fn apply_changes(
             let call = CallContext::local(purpose);
             for change in &list {
                 let outcome = match work.change(&call, &change.tool, change.arguments()).await {
-                    Ok(result) => Outcome::of(&result),
+                    Ok(result) => Outcome::of(&change.tool, &result),
                     Err(e) => Outcome::of_error(&e),
                 };
                 let made = outcome.made();
@@ -4067,6 +4179,24 @@ pub async fn run_plan_with(
     ctx: &RunContext,
     mut on_update: impl FnMut(&str, &StepState),
 ) -> BTreeMap<String, StepState> {
+    // A caller can run a parsed plan without prepare(); routing and dispatch both need
+    // its defaults. A prepared plan already has them and needs no copy.
+    let resolved = plan
+        .steps
+        .iter()
+        .any(|s| {
+            s.runs_model()
+                && ((plan.model.is_some() && s.model.is_none())
+                    || (plan.effort.is_some() && s.effort.is_none()))
+        })
+        .then(|| {
+            let mut resolved = plan.clone();
+            for step in &mut resolved.steps {
+                plan.apply_model_defaults(step);
+            }
+            resolved
+        });
+    let plan = resolved.as_ref().unwrap_or(plan);
     // A resumed run's finished steps stay as they ended.
     let mut states: BTreeMap<String, StepState> = plan
         .steps
@@ -5407,6 +5537,146 @@ mod tests {
                 "effort=max would be refused for copilot: x allows only low, medium"
             )]
         );
+    }
+
+    #[test]
+    fn plan_model_defaults_apply_only_to_model_steps_and_each_override_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        skills
+            .add_agent(
+                "arch",
+                "---\ndescription: Architect\nmodel: claude-opus-5.5\n---\nDesign it.",
+            )
+            .unwrap();
+        let plan = Plan::parse(
+            "track: off
+model: claude-sonnet-5.5
+effort: HIGH
+work @alice:app using claude Propose changes
+  model: an example in the task text
+squad #dev using claude agent=arch Design it
+model-only @alice using claude model=claude-haiku-4.5 Edit it
+effort-only @alice using claude effort=low Check it
+ok after work approve @me Approve the changes
+ship after work pr @alice:app
+lead team @lead:app Do the follow-up
+ask @workiq What changed?
+send after ok @workiq apply=work",
+        )
+        .unwrap();
+        assert_eq!(plan.model.as_deref(), Some("claude-sonnet-5.5"));
+        assert_eq!(plan.effort.as_deref(), Some("high"));
+        assert!(
+            plan.steps[0]
+                .prompt
+                .ends_with("model: an example in the task text")
+        );
+        let ready = plan.prepare(&kb, &skills).unwrap();
+        let choices: Vec<_> = ready
+            .steps
+            .iter()
+            .map(|s| (s.model.as_deref(), s.effort.as_deref()))
+            .collect();
+        assert_eq!(
+            choices,
+            [
+                (Some("claude-sonnet-5.5"), Some("high")),
+                (Some("claude-sonnet-5.5"), Some("high")),
+                (Some("claude-haiku-4.5"), Some("high")),
+                (Some("claude-sonnet-5.5"), Some("low")),
+                (None, None),
+                (None, None),
+                (None, None),
+                (None, None),
+                (None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_model_headers_reject_duplicates_bad_values_and_models_for_mixed_providers() {
+        let mixed = "a @x Do it\nb @y using claude Check it";
+        for (text, expected) in [
+            (
+                "model: a\nmodel: b\na @x Do it",
+                "line 2: model: is given twice",
+            ),
+            (
+                "effort: low\neffort: max\na @x Do it",
+                "line 2: effort: is given twice",
+            ),
+            ("model: two words\na @x Do it", "isn't a model name"),
+            ("effort: turbo\na @x Do it", "isn't a reasoning effort"),
+        ] {
+            let error = Plan::parse(text).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error = Plan::parse(&format!("model: a\n{mixed}")).unwrap_err();
+        assert!(error.to_string().contains("give each step its own model="));
+        assert!(Plan::parse(&format!("effort: low\n{mixed}")).is_ok());
+    }
+
+    #[test]
+    fn plan_check_warns_about_refused_and_unused_model_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let peer = PeerInfo {
+            name: "x".into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: vec![Provider::Copilot],
+            shares: vec![ShareInfo {
+                name: "data".into(),
+                access: Access::ReadOnly,
+                ..Default::default()
+            }],
+            owner: None,
+            role: None,
+            agent: None,
+            load: None,
+            models: BTreeMap::from([(
+                Provider::Copilot,
+                crate::models::ModelChoice {
+                    allowed: vec!["gpt-5.5".into()],
+                    efforts: vec!["low".into()],
+                    ..Default::default()
+                },
+            )]),
+            offers: Default::default(),
+        };
+        let check = |text: &str| {
+            preflight(
+                &Plan::parse(text).unwrap(),
+                std::slice::from_ref(&peer),
+                &SquadStore::default(),
+                &kb,
+                &skills,
+                &Recipients::default(),
+            )
+        };
+        let problems = check(
+            "model: claude-sonnet-5.5\neffort: high\na @x Do it\nb @x model=gpt-5.5 effort=low Check it",
+        );
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .all(|p| !p.error && p.step.as_deref() == Some("a"))
+        );
+        assert!(problems[0].message.contains("model=claude-sonnet-5.5"));
+        assert!(problems[1].message.contains("effort=high"));
+        for body in [
+            "ok approve @me Approve it",
+            "a @x model=gpt-5.5 effort=low Do it",
+        ] {
+            let problems = check(&format!("model: ignored\neffort: high\n{body}"));
+            assert_eq!(problems.len(), 2, "{problems:?}");
+            assert!(problems.iter().all(|p| !p.error && p.step.is_none()));
+            assert!(problems[0].message.starts_with("model: has no model step"));
+            assert!(problems[1].message.starts_with("effort: has no model step"));
+        }
     }
 
     #[test]
@@ -7008,6 +7278,81 @@ mod tests {
         assert!(errors(&recipients).is_empty());
     }
 
+    #[tokio::test]
+    async fn an_apply_step_fails_on_an_answered_403_and_sends_no_later_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use serde_json::{Value, json};
+
+        use crate::workiq::ToolResult;
+
+        #[derive(Debug, Default)]
+        struct FakeWork(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl WorkContext for FakeWork {
+            async fn retrieve(
+                &self,
+                _: &CallContext,
+                _: &str,
+                _: &str,
+                _: &[&str],
+            ) -> Result<ToolResult> {
+                unreachable!("an apply step only makes changes")
+            }
+
+            async fn change(&self, _: &CallContext, _: &str, _: Value) -> Result<ToolResult> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(ToolResult {
+                    content: Vec::new(),
+                    structured_content: Some(json!({
+                        "statusCode": 403,
+                        "error": { "code": "ErrorAccessDenied" },
+                    })),
+                    is_error: false,
+                    ids: Default::default(),
+                })
+            }
+        }
+
+        let plan = Plan::parse(
+            "draft @workiq Draft the changes\n\
+             ok after draft approve @me Make them?\n\
+             apply after ok @workiq apply=draft",
+        )
+        .unwrap();
+        let list = ["first", "second"]
+            .into_iter()
+            .map(|id| Change {
+                tool: "delete_entity".into(),
+                path: format!("/me/events/{id}"),
+                body: None,
+                if_match: None,
+            })
+            .collect::<Vec<_>>();
+        let digest = changes::digest(&list);
+        let work = Arc::new(FakeWork::default());
+        let ctx = RunContext {
+            work_context: Some(work.clone()),
+            ..RunContext::default()
+        };
+        let delivered = apply_changes(&ctx, &plan.steps[2], "draft", list, digest)
+            .await
+            .unwrap();
+        assert!(!delivered.ok);
+        let text = &delivered.output;
+        assert!(
+            text.contains("1. Delete /me/events/first: failed:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("delete_entity tool answered 403: ErrorAccessDenied"),
+            "{text}"
+        );
+        assert!(text.contains("Not made, after change 1: 2."), "{text}");
+        assert_eq!(work.0.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn a_workiq_step_is_marked_and_save_keeps_the_mark_and_says_it_was_an_answer() {
         let dir = tempfile::tempdir().unwrap();
@@ -7535,7 +7880,7 @@ mod tests {
                 &options,
                 &["verify", "claim", "skills", "reviewer", "base"][..],
             ),
-            (&lines, &["claim", "track"][..]),
+            (&lines, &["claim", "track", "model", "effort"][..]),
             (&targets, &[WORKIQ_TARGET][..]),
         ] {
             for w in known {
@@ -7572,6 +7917,7 @@ mod tests {
             "`workiq=all`".to_owned(),
             format!("`workiq={}`", sources.join(",")),
             format!("effort={}`", crate::models::EFFORTS.join("|")),
+            format!("`effort: {}`", crate::models::EFFORTS.join("|")),
             format!("`attempts=N` (1 to {})", crate::evidence::MAX_ATTEMPTS),
             format!("`levels=N` (1 to {})", crate::team::MAX_LEVELS),
             format!("(0 to {MAX_CHANGE_ROUNDS}, default {DEFAULT_CHANGE_ROUNDS})"),

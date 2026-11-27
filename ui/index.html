@@ -236,12 +236,25 @@
           <label for="composer-input" class="visually-hidden" id="composer-label">Message</label>
           <textarea id="composer-input" rows="2" placeholder="Message all connected peers…"></textarea>
           <div id="plan-problems" class="plan-problems" role="status" aria-live="polite" hidden></div>
+          <div class="plan-track" id="plan-track" hidden></div>
+          <div class="plan-models small" id="plan-models" hidden>
+            <label for="plan-model">Model
+              <select id="plan-model" aria-describedby="plan-models-note plan-models-mixed"></select>
+            </label>
+            <label for="plan-model-name" hidden>Model name
+              <input id="plan-model-name" type="text" placeholder="e.g. claude-sonnet-5.5" autocomplete="off" spellcheck="false" maxlength="100">
+            </label>
+            <label for="plan-effort">Reasoning
+              <select id="plan-effort" aria-describedby="plan-models-note"></select>
+            </label>
+            <p class="muted small" id="plan-models-mixed" hidden></p>
+            <p class="muted small" id="plan-models-note">Steps with their own <code>model=</code> or <code>effort=</code> keep their choices.</p>
+          </div>
           <button type="submit" class="btn primary" id="send-btn">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12l16-8-6 16-2-7-8-1z"></path></svg><span>Send</span>
           </button>
         </div>
         <p class="hint" id="composer-hint">Enter to send · Shift+Enter for a new line</p>
-        <div class="plan-track" id="plan-track" hidden></div>
       </form>
     </main>
     </div>
@@ -496,20 +509,45 @@
             <span class="muted small" id="plan-draft-issue-hint">Link a tracker repository (GitHub card) to name one of its issues.</span>
           </label>
           <label class="field">
-            <span>Model that writes it</span>
-            <select id="plan-draft-provider"></select>
-            <span class="muted small">Your profile's own, at its default model, read-only in an empty folder with no tools.</span>
+            <span>Provider</span>
+            <select id="plan-draft-provider" disabled></select>
           </label>
+          <label class="field">
+            <span>Model</span>
+            <select id="plan-draft-model" disabled></select>
+          </label>
+          <label class="field" id="plan-draft-model-name-field" hidden>
+            <span>Model name</span>
+            <input id="plan-draft-model-name" type="text" class="mono" placeholder="e.g. claude-sonnet-5.5" spellcheck="false" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>Reasoning</span>
+            <select id="plan-draft-effort" disabled></select>
+          </label>
+          <p class="muted small">Your profile's own model, read-only in an empty folder with no tools.</p>
           <p class="muted small" id="plan-draft-status" role="status" aria-live="polite"></p>
           <p class="form-error" id="plan-draft-error" role="alert"></p>
           <div class="dialog-actions">
             <button type="button" class="btn" id="plan-draft-cancel">Cancel</button>
-            <button type="submit" class="btn primary" id="plan-draft-submit">Draft plan</button>
+            <button type="submit" class="btn primary" id="plan-draft-submit" disabled>Draft plan</button>
           </div>
         </form>
       </div>
       <div class="editor-foot">
         <div class="plan-track" id="plan-editor-track" hidden></div>
+        <div class="plan-models small" id="plan-editor-models" hidden>
+          <label for="plan-editor-model">Model
+            <select id="plan-editor-model" aria-describedby="plan-editor-models-note plan-editor-models-mixed"></select>
+          </label>
+          <label for="plan-editor-model-name" hidden>Model name
+            <input id="plan-editor-model-name" type="text" placeholder="e.g. claude-sonnet-5.5" autocomplete="off" spellcheck="false" maxlength="100">
+          </label>
+          <label for="plan-editor-effort">Reasoning
+            <select id="plan-editor-effort" aria-describedby="plan-editor-models-note"></select>
+          </label>
+          <p class="muted small" id="plan-editor-models-mixed" hidden></p>
+          <p class="muted small" id="plan-editor-models-note">Steps with their own <code>model=</code> or <code>effort=</code> keep their choices.</p>
+        </div>
         <button type="button" class="btn" id="plan-editor-schedule">Schedule…</button>
         <button type="button" class="btn primary" id="plan-editor-run">Run plan</button>
       </div>
@@ -640,6 +678,22 @@
         <button type="button" class="btn danger" id="team-remove">Remove team plan</button>
         <button type="button" class="btn" id="team-cancel">Cancel</button>
         <button type="submit" class="btn primary" id="team-save">Save team plan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="share-tasks-dialog" aria-labelledby="share-tasks-h">
+    <form method="dialog" id="share-tasks-form" novalidate>
+      <h2 id="share-tasks-h">Editing task limit</h2>
+      <label class="field">
+        <span>Editing tasks at once</span>
+        <input type="text" id="share-tasks" aria-describedby="share-tasks-hint">
+        <span class="muted small" id="share-tasks-hint">Enter a whole number of 1 or more, or 'any' for no folder limit. Use 1 if tasks share build output. Read-only tasks do not count.</span>
+      </label>
+      <p class="form-error" id="share-tasks-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="share-tasks-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="share-tasks-save">Save task limit</button>
       </div>
     </form>
   </dialog>

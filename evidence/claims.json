@@ -73,11 +73,23 @@
       "live": ["worker2 wrote p2p_live.txt in its workspace", "worker2 audited boss's task with its grant"]
     },
     {
+      "id": "SHR-3",
+      "area": "shared folders",
+      "claim": "A folder's owner can limit how many editing tasks this agent runs there at once (a positive number or any, the default) with share add --tasks, share tasks, or This agent > Shared folders. The limit is saved in shares.json and shown by share list and in the web UI. When the folder is full, an edit waits with the folder named in its live status and runs when there is room; its wait leaves the agent's other slot free for another folder or a read-only task. Read-only tasks do not count toward the folder limit. With no limit, two edits can run at once as before. The limit does not change the plan check.",
+      "tests": [
+        "agents::a_folder_limit_queues_edits_but_leaves_the_other_slot_free",
+        "agents::edits_overlap_by_default_and_the_queue_uses_the_current_folder_limit",
+        "factory::share_commands_save_list_and_clear_folder_task_limits",
+        "ui::the_owner_sets_and_clears_a_folder_task_limit_in_the_web_ui"
+      ]
+    },
+    {
       "id": "NET-6",
       "area": "network",
       "claim": "A task in flight survives its connection being replaced (e.g. both peers dialed each other at once): it keeps running and its result arrives over the connection that is kept. Requests sent while connections converge are re-sent on the kept connection and run exactly once.",
       "tests": [
         "agents::delegated_tasks_survive_a_connection_being_replaced",
+        "agents::a_served_task_runs_once_through_replacement_and_repeated_disconnects",
         "agents::requests_are_resent_on_a_new_connection_and_run_only_once",
         "agents::tasks_delegated_while_peers_dial_each_other_are_not_lost"
       ],
@@ -270,13 +282,15 @@
     {
       "id": "DW-3",
       "area": "digital workers",
-      "claim": "From its web UI (or the command line) an owner creates digital workers that run on its sign-ins (it can sign in to Copilot there with a GitHub CLI account, refused unless it works) in folders it picks, which a worker shares as its owner does. The owner's agent runs each as a background agent that dials it, starts the ones that start with it whenever it starts, and stops them cleanly when it stops. The owner starts, stops and deletes them there: deleting stops a worker, takes it off the owner's allowlist and out of its squads (a squad left empty goes) and deletes its profile, keeping its data folder; one running outside the owner's agent isn't deleted until it stops, one that stops on its own shows why, and a profile runs in one agent at a time.",
+      "claim": "From its web UI (or the command line) an owner creates digital workers that run on its sign-ins (it can sign in to Copilot there with a GitHub CLI account, refused unless it works) in folders it picks, which a worker shares as its owner does. The owner's agent runs each as a background agent that dials it, starts the ones that start with it whenever it starts, and stops them cleanly when it stops. The owner starts, stops and deletes them there: deleting stops a worker, takes it off the owner's allowlist and out of its squads (a squad left empty goes) and deletes its profile, keeping its data folder, in one request (a stop waits, up to 5 seconds, until the worker's process has let go of its profile); one whose process didn't end once stopped isn't deleted, saying so; one running outside the owner's agent isn't deleted until it stops, one that stops on its own shows why, and a profile runs in one agent at a time.",
       "tests": [
         "lib::workers::workers_are_refused_what_they_could_not_run_with",
         "lib::workers::a_profile_runs_in_one_agent_at_a_time",
         "lib::workers::leaving_squads_removes_those_left_empty",
         "lib::workers::the_last_lines_of_a_log_are_kept",
         "workers::owners_create_start_stop_and_delete_digital_workers_from_the_web_ui",
+        "workers::a_running_worker_is_deleted_in_one_request_though_its_lock_outlasts_its_process",
+        "workers::a_worker_whose_lock_stays_held_is_not_deleted_and_the_refusal_says_why",
         "ui::the_page_follows_the_ux_guidelines"
       ],
       "live": [
@@ -317,9 +331,10 @@
     {
       "id": "EDD-1",
       "area": "evidence",
-      "claim": "A task can ask the worker's runtime (not the model) to run the folder owner's checks after the model; the result carries their exit codes and output, failures are retried with the failure output, timed-out or cancelled checks are killed with everything they started, and only peers with full access may request them (peers see check names, never commands).",
+      "claim": "A task can ask the worker's runtime (not the model) to run the folder owner's checks after the model; the result carries their exit codes and output, failures are retried with the failure output, timed-out or cancelled checks are killed with everything they started, and only peers with full access may request them (peers see check names, never commands). Check commands run at below-normal priority (BELOW_NORMAL_PRIORITY_CLASS on Windows, niceness 10 on Unix unless already lower priority) so builds and tests do not starve the agent's connections.",
       "tests": [
         "lib::evidence::checks_report_exit_codes_and_output",
+        "lib::evidence::check_commands_run_at_below_normal_priority",
         "lib::evidence::checks_time_out",
         "lib::evidence::timed_out_checks_kill_only_their_own_processes",
         "agents::checks_run_by_the_worker_prove_results_and_failures_are_retried"
@@ -497,10 +512,11 @@
     {
       "id": "PLAN-4",
       "area": "plans",
-      "claim": "The profile's own model drafts a plan (the plan editor's Describe view, POST /api/plans/draft, plan draft and the draft_plan MCP tool) from a goal (at most 4,000 characters, secrets redacted), a GitHub issue of the tracker's repository (its text as external content), or a plan and a note saying what should change. Its prompt has the plan format reference, which names every step kind and option the parser takes, and what this agent may use as the plan check sees it (peers, their folders, checks and flags, squads, skills, agents, knowledge topic and MCP server names, Work IQ, the tracker, playbooks), never a knowledge topic's text. The plan is read from the answer's fenced block, checked as Run plan checks it and, while it has errors, written again with them, at most 3 tries; the last plan comes back with its problems, headed by a comment naming the model and the goal. Drafting runs, grants and sends nothing: it starts no task or run, and is recorded in the activity and the audit with who asked, the provider and model, the tries and the goal's SHA-256, not its text (TM-16).",
+      "claim": "The profile's own model drafts a plan (the plan editor's Describe view, POST /api/plans/draft, plan draft and the draft_plan MCP tool) from a goal (at most 4,000 characters, secrets redacted), a GitHub issue of the tracker's repository (its text as external content), or a plan and a note saying what should change. Describe shares the Model and Reasoning choices of Run task on this agent, from the profile's settings and account offers. The requested model and effort are checked against the profile before an issue is read or a model runs; omissions use its defaults. Every try uses those choices and the answer gives the model and effort that ran. Its prompt has the plan format reference, which names every step kind and option the parser takes, and what this agent may use as the plan check sees it (peers, their folders, checks and flags, squads, skills, agents, knowledge topic and MCP server names, Work IQ, the tracker, playbooks), never a knowledge topic's text. The plan is read from the answer's fenced block, checked as Run plan checks it and, while it has errors, written again with them, at most 3 tries; the last plan comes back with its problems, headed by a comment naming the model and the goal. Drafting runs, grants and sends nothing: it starts no task or run, and is recorded in the activity and the audit with who asked, the provider, model and reasoning, the tries and the goal's SHA-256, not its text (TM-16).",
       "tests": [
         "lib::plan_draft::the_prompt_has_the_format_and_what_the_agent_may_use_but_no_secret_or_knowledge_text",
         "lib::plan_draft::a_plan_with_errors_goes_back_with_them_until_one_passes",
+        "lib::plan_draft::every_try_uses_the_requested_model_and_effort_or_the_profiles_defaults",
         "lib::plan_draft::after_three_failing_tries_the_last_plan_comes_back_with_its_problems",
         "lib::plan_draft::the_plan_is_read_from_the_fenced_block_and_the_prose_around_it_dropped",
         "lib::plan_draft::changing_a_plan_gives_the_model_the_plan_and_the_note",
@@ -508,7 +524,10 @@
         "lib::tracker::a_plan_drafted_for_an_issue_gets_its_text_as_external_content",
         "lib::plan::the_format_reference_names_every_step_kind_and_option_the_parser_takes",
         "ui::the_owner_drafts_a_plan_with_the_profiles_model_through_the_api",
+        "ui::plan_draft_refuses_disallowed_models_and_efforts_before_reading_an_issue",
+        "ui::task_forms_offer_the_models_and_levels_the_worker_allows",
         "connect::other_agents_draft_plans_over_mcp_and_drafting_runs_nothing",
+        "plan_draft::plan_draft_passes_the_model_and_effort_flags_to_the_bridge_and_refuses_bad_values",
         "plan_draft::plan_draft_prints_the_plan_then_its_problems_and_fails_while_errors_remain"
       ]
     },
@@ -989,19 +1008,24 @@
     {
       "id": "NET-7",
       "area": "network",
-      "claim": "A dropped connection doesn't fail tasks at once: they say they are reconnecting, and carry on if the peer comes back within the task grace (60 s of awake time by default, NET-8), their results arriving over the new connection. An agent that stops on purpose tells its peers first: the tasks it runs for them fail at once, saying it stopped, and the tasks it gave them are cancelled.",
+      "claim": "A dropped connection doesn't fail tasks at once: they say they are reconnecting, and run once through repeated reconnects and replacements within the task grace (60 s of awake time by default, NET-8), their results arriving over the new connection. A requester that stays gone stops its tasks with 'stopped: boss was gone for 60 s' (using its name and grace); a TaskCancel says 'cancelled by boss', and the worker's activity reports the same reason. An agent that stops on purpose tells its peers first: the tasks it runs for them fail at once, saying it stopped, and the tasks it gave them are cancelled.",
       "tests": [
         "agents::tasks_survive_a_dropped_connection_when_the_peer_comes_back_in_time",
+        "agents::a_served_task_runs_once_through_replacement_and_repeated_disconnects",
+        "agents::a_requester_gone_past_the_task_grace_stops_its_tasks_with_a_reason",
+        "agents::cancelling_a_delegated_task_stops_it_on_the_worker",
         "agents::delegated_task_fails_at_once_when_the_worker_stops"
       ]
     },
     {
       "id": "NET-8",
       "area": "network",
-      "claim": "Waits count only the time the machine is awake (src/awake.rs; issue #243): they go in ticks of at most 10 s, and a tick that ends more than 15 s later than asked for (the machine was suspended) counts nothing, so a suspension costs a wait at most one tick. The task grace (NET-7), a Copilot model run's hour (EDD-12; the SDK's own wait is a week, so it never stops a run first) and a step's timeout= use them: time spent asleep doesn't use up a peer's grace, a model's run or a step's timeout, so the tasks running when a laptop goes to sleep go on after it wakes.",
+      "claim": "Waits count only the time the machine is awake (src/awake.rs; issue #243): they go in ticks of at most 10 s, and a tick that ends more than 15 s later than asked for (the machine was suspended) counts nothing, so a suspension costs a wait at most one tick. The task grace (NET-7), a Copilot model run's hour (EDD-12; the SDK's own wait is a week, so it never stops a run first) and a step's timeout= use them: time spent asleep doesn't use up a peer's grace, a model's run or a step's timeout, so the tasks running when a laptop goes to sleep go on after it wakes. Only the current outage's grace can stop a task; an earlier disconnect's timer cannot act after a reconnect, even if the peer is gone again.",
       "tests": [
         "lib::awake::time_the_machine_was_suspended_doesnt_count",
-        "lib::awake::a_timeout_counts_only_awake_time_and_lets_work_that_ends_in_time_finish"
+        "lib::awake::a_timeout_counts_only_awake_time_and_lets_work_that_ends_in_time_finish",
+        "lib::agent::an_old_disconnect_cannot_report_or_expire_a_newer_disconnect",
+        "agents::a_requester_gone_past_the_task_grace_stops_its_tasks_with_a_reason"
       ]
     },
     {
@@ -1290,9 +1314,10 @@
     {
       "id": "WIQ-10",
       "area": "work-iq",
-      "claim": "Every Work IQ call through Client::call_tool_in (done, failed or refused) appends one JSON line to <profile>/workiq-audit.jsonl (append only, behind a lock, a write error only warns): time, tool, purpose (step with the run id and step, knowledge import, gateway, doctor or command), audience (local or the peer's name), the query's SHA-256 and length and never its text, outcome (ok, refused, or the error class), the results and withheld counts and the labels seen when the result has them, the request, x-ms-request, client-request and correlation ids, and the duration. Budgets in profile.json (workiq_budget: calls_per_day, default 200; calls_per_run, default 25) are checked before a call is sent: a call over a budget fails with an over-budget error that names the budget and the proofkin workiq budget command that raises it, is not sent, and is audited as refused (refused calls don't count). Usage today and per run is counted from the log, the day being the local date from an injectable clock, so a new day resets the daily count. proofkin workiq usage --profile P prints today's use against the budgets and proofkin workiq budget --per-day N --per-run N --profile P changes them (a limit left out is kept; zero is refused).",
+      "claim": "Every Work IQ call through Client::call_tool_in (done, failed or refused) appends one JSON line to <profile>/workiq-audit.jsonl (append only, behind a lock, a write error only warns): time, tool, purpose (step with the run id and step, knowledge import, gateway, doctor or command), audience (local or the peer's name), the query's SHA-256 and length and never its text, outcome (ok, refused, or the error class), the results and withheld counts and the labels seen when the result has them, the request, x-ms-request, client-request and correlation ids, and the duration. A status of 400 or more inside any tool answer (including a notice send), given as a number or numeric text, is recorded with its error class instead of ok, even when Work IQ did not flag the call as an error. Answered failures still count against the budgets. Budgets in profile.json (workiq_budget: calls_per_day, default 200; calls_per_run, default 25) are checked before a call is sent: a call over a budget fails with an over-budget error that names the budget and the proofkin workiq budget command that raises it, is not sent, and is audited as refused (refused calls don't count). Usage today and per run is counted from the log, the day being the local date from an injectable clock, so a new day resets the daily count. proofkin workiq usage --profile P prints today's use against the budgets and proofkin workiq budget --per-day N --per-run N --profile P changes them (a limit left out is kept; zero is refused).",
       "tests": [
         "lib::workiq::client::every_call_is_one_audit_line_and_none_holds_the_query_text",
+        "lib::workiq::client::answered_statuses_set_audit_outcomes_and_still_count_against_budgets",
         "lib::workiq::client::the_daily_budget_refuses_the_next_call_before_it_is_sent",
         "lib::workiq::client::the_per_run_budget_refuses_the_next_call_of_that_run_only",
         "lib::workiq::client::a_new_day_resets_the_daily_count",
@@ -1440,16 +1465,20 @@
     {
       "id": "WIQ-18",
       "area": "work-iq",
-      "claim": "A plan makes Microsoft 365 changes only as its owner signed them off (docs/work-iq.md section 7). A step whose changes a later @workiq apply=STEP step makes is told to propose them in one fenced m365-changes block, one JSON object a line: tool is create_entity, update_entity, delete_entity or do_action; path a Microsoft Graph path that starts with / with no host, no .. and no control characters, at most 2 KB; body a JSON object, none for a delete; ifMatch only for an update or a delete; at most 20 changes and 256 KB. A block that breaks a rule fails the step, naming the line and the rule. The approve @me step between them shows each change first (a mail's recipients, subject and first 10 lines with HTML removed; another change's verb, path and the first 500 characters of its body) and the list's SHA-256 over its canonical JSON, so the approver's signed answer (its prompt_sha256) covers exactly that list. The apply step has no model: it makes the changes only after a verified approval signed by its own agent for a request that showed the list as it is now, calls each once, in order, with exactly the proposed arguments (parentUrl, entityUrl or actionUrl, jsonBody, and If-Match), and stops at the first that fails or whose outcome is unknown; its result lists each outcome (done, accepted for a 202, failed, outcome unknown) and the changes not made. A rejected sign-off makes none. The plan check refuses an apply step, naming the fix, without an approve @me between the two steps (a peer's sign-off doesn't count), when it doesn't run after the step, when another step applies the same step, with an option that would make it more than that, or when the profile doesn't allow changes (proofkin workiq changes on sets workiq_changes in profile.json; off by default; workiq doctor and the Work IQ card say which). Neither step's result goes on GitHub.",
+      "claim": "A plan makes Microsoft 365 changes only as its owner signed them off (docs/work-iq.md section 7). A step whose changes a later @workiq apply=STEP step makes is told to propose them in one fenced m365-changes block, one JSON object a line: tool is create_entity, update_entity, delete_entity or do_action; path a Microsoft Graph path that starts with / with no host, no .. and no control characters, at most 2 KB; body a JSON object, none for a delete; ifMatch only for an update or a delete; at most 20 changes and 256 KB. A block that breaks a rule fails the step, naming the line and the rule. The approve @me step between them shows each change first (a mail's recipients, subject and first 10 lines with HTML removed; another change's verb, path and the first 500 characters of its body) and the list's SHA-256 over its canonical JSON, so the approver's signed answer (its prompt_sha256) covers exactly that list. The apply step has no model: it makes the changes only after a verified approval signed by its own agent for a request that showed the list as it is now, calls each once, in order, with exactly the proposed arguments (parentUrl, entityUrl or actionUrl, jsonBody, and If-Match), and stops at the first that fails or whose outcome is unknown; its result lists each outcome (done, accepted for a 202, failed, outcome unknown) and the changes not made. A 4xx status in the answer is failed, with the classified error and fix. A status of 500 or more leaves the outcome unknown and says to check in Microsoft 365 before trying again. This applies even when Work IQ did not flag the call as an error. A rejected sign-off makes none. The plan check refuses an apply step, naming the fix, without an approve @me between the two steps (a peer's sign-off doesn't count), when it doesn't run after the step, when another step applies the same step, with an option that would make it more than that, or when the profile doesn't allow changes (proofkin workiq changes on sets workiq_changes in profile.json; off by default; workiq doctor and the Work IQ card say which). Neither step's result goes on GitHub.",
       "tests": [
         "lib::workiq::changes::a_block_of_changes_is_read_with_each_tools_arguments",
         "lib::workiq::changes::a_block_that_breaks_a_rule_names_the_line_and_the_rule",
         "lib::workiq::changes::the_digest_is_over_canonical_json_so_key_order_and_spaces_dont_matter",
         "lib::workiq::changes::a_sign_off_shows_a_mails_people_subject_and_first_lines_and_other_changes_bodies",
         "lib::workiq::changes::outcomes_say_done_accepted_failed_or_unknown_and_what_was_not_made",
+        "lib::workiq::changes::an_answered_403_fails_with_the_redacted_error_and_fix",
+        "lib::workiq::changes::a_404_given_as_text_in_a_json_text_reply_fails",
+        "lib::workiq::changes::an_answered_503_leaves_the_outcome_unknown_and_says_to_check_before_retrying",
         "lib::workiq::changes::the_instruction_shows_a_block_that_parses",
         "lib::plan::a_step_that_makes_changes_runs_after_your_own_sign_off_and_is_the_only_one",
         "lib::plan::the_plan_check_needs_changes_on_for_a_step_that_makes_them",
+        "lib::plan::an_apply_step_fails_on_an_answered_403_and_sends_no_later_changes",
         "lib::tracker::proposed_microsoft_365_changes_and_their_outcomes_stay_off_github",
         "agents::a_plan_makes_the_microsoft_365_changes_you_sign_off_once_and_in_order"
       ]
@@ -1457,11 +1486,12 @@
     {
       "id": "WIQ-27",
       "area": "work-iq",
-      "claim": "A digital worker's task for its owner with mcp=workiq (the gateway's Local audience; never a plan step's task, whose origin names a step, nor a peer's, whatever its grant) may change Microsoft 365 while the owner is there to answer (docs/work-iq.md sections 6 and 7), only when the profile whose Work IQ account it uses allows changes (proofkin workiq changes on [--wait 5m]: a sign-off waits 1 to 10 minutes, given as 5m or 5, 5 by default) and the folder's workiq server does too (proofkin mcp add <folder> workiq --workiq --changes; --changes is only for --workiq, --tool may also name the change tools, and mcp list shows changes). Its session then lists Work IQ's change tools create_entity, update_entity, delete_entity and do_action, though their annotations say they change things; otherwise they aren't listed, and a call is refused before any sign-off or Work IQ call. It lists them without Work IQ's optional sessionId and agentId in each one's inputSchema (its properties and required), so the model isn't asked for them; the read tools' schemas are listed as Work IQ gives them. A change call takes parentUrl, entityUrl or actionUrl, jsonBody and headers (If-Match); a sessionId (a string: Work IQ's telemetry ID) and an agentId that is null or absent are accepted and left out of the change, so they aren't signed off, shown in the sign-off or sent to Work IQ, and an agentId that isn't null is refused before any sign-off, saying that a change can't name a Work IQ agent. A change call is held to the rules of a plan's changes (one that breaks a rule gets a tool error naming it, and nobody is asked), then becomes a signed approval request from the worker to its owner's agent, titled Microsoft 365 change from <worker>, whose text shows the change as a plan's sign-off shows one, its SHA-256 and its task (the owner's task number when it has one, and the first 200 characters of its prompt); the call waits for the answer up to the wait, in awake time. Only a verified approval signed by the owner, for exactly that text, makes the change, once, with exactly the call's arguments but sessionId and agentId (a jsonBody given as a JSON string is sent as the object it encodes), and the model gets how it ended: done, with a created entity's id and link; accepted, for a 202; failed; or outcome unknown. A rejection or a request for changes sends nothing, and the model gets the owner's note; with no answer in time the request is withdrawn from the owner's agent, so a late answer finds none and makes nothing. The same call again is a sign-off of its own. With change tools the session's server gets a tool timeout of the wait plus 60 seconds, in milliseconds, in Copilot's config and in the bridge's JSON for Claude; without them it has none. Each change is audited as a gateway call with its path's SHA-256, and the task's signed result ends with a Microsoft 365 changes this task made section naming each change's verb, path and outcome, never its body. workiq doctor and the web UI's Work IQ card say whether changes are on and how long a sign-off waits.",
+      "claim": "A digital worker's task for its owner with mcp=workiq (the gateway's Local audience; never a plan step's task, whose origin names a step, nor a peer's, whatever its grant) may change Microsoft 365 while the owner is there to answer (docs/work-iq.md sections 6 and 7), only when the profile whose Work IQ account it uses allows changes (proofkin workiq changes on [--wait 5m]: a sign-off waits 1 to 10 minutes, given as 5m or 5, 5 by default) and the folder's workiq server does too (proofkin mcp add <folder> workiq --workiq --changes; --changes is only for --workiq, --tool may also name the change tools, and mcp list shows changes). Its session then lists Work IQ's change tools create_entity, update_entity, delete_entity and do_action, though their annotations say they change things; otherwise they aren't listed, and a call is refused before any sign-off or Work IQ call. It lists them without Work IQ's optional sessionId and agentId in each one's inputSchema (its properties and required), so the model isn't asked for them; the read tools' schemas are listed as Work IQ gives them. A change call takes parentUrl, entityUrl or actionUrl, jsonBody and headers (If-Match); a sessionId (a string: Work IQ's telemetry ID) and an agentId that is null or absent are accepted and left out of the change, so they aren't signed off, shown in the sign-off or sent to Work IQ, and an agentId that isn't null is refused before any sign-off, saying that a change can't name a Work IQ agent. A change call is held to the rules of a plan's changes (one that breaks a rule gets a tool error naming it, and nobody is asked), then becomes a signed approval request from the worker to its owner's agent, titled Microsoft 365 change from <worker>, whose text shows the change as a plan's sign-off shows one, its SHA-256 and its task (the owner's task number when it has one, and the first 200 characters of its prompt); the call waits for the answer up to the wait, in awake time. Only a verified approval signed by the owner, for exactly that text, makes the change, once, with exactly the call's arguments but sessionId and agentId (a jsonBody given as a JSON string is sent as the object it encodes), and the model gets how it ended: done, with a created entity's id and link; accepted, for a 202; failed; or outcome unknown. A 4xx answer is failed, and an answer with a status of 500 or more is of unknown outcome and says to check in Microsoft 365 before trying again. Both are tool errors for the model (isError: true) and the changes list records the same outcome, even when Work IQ did not flag the call as an error. A rejection or a request for changes sends nothing, and the model gets the owner's note; with no answer in time the request is withdrawn from the owner's agent, so a late answer finds none and makes nothing. The same call again is a sign-off of its own. With change tools the session's server gets a tool timeout of the wait plus 60 seconds, in milliseconds, in Copilot's config and in the bridge's JSON for Claude; without them it has none. Each change is audited as a gateway call with its path's SHA-256, and the task's signed result ends with a Microsoft 365 changes this task made section naming each change's verb, path and outcome, never its body. workiq doctor and the web UI's Work IQ card say whether changes are on and how long a sign-off waits.",
       "tests": [
         "workiq_gateway::change_tools_go_only_to_the_owners_task_with_changes_on_in_profile_and_server",
         "workiq_gateway::a_change_in_a_workers_task_for_its_owner_waits_for_their_sign_off_and_is_made_once",
         "workiq_gateway::a_declined_change_sends_nothing_and_the_model_gets_the_owners_note",
+        "lib::workiq::gateway::a_signed_off_change_answered_400_is_an_error_to_the_model_and_in_the_changes_list",
         "workiq_gateway::a_change_not_signed_off_in_time_is_withdrawn_and_a_late_answer_makes_nothing",
         "workiq_gateway::a_plan_steps_task_and_a_task_with_the_profiles_changes_off_get_no_change_tools",
         "workiq_gateway::a_session_lists_its_change_tools_without_work_iqs_session_id_and_agent_id",
@@ -1771,6 +1801,21 @@
       "claim": "The Health card's summary counts evidence runs as passed, failed and without claims (a run without claims proves nothing, so it neither passed nor failed), leaves out counts that are zero, and shows times as durations.",
       "tests": [
         "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
+      ]
+    },
+    {
+      "id": "MDL-11",
+      "area": "models",
+      "claim": "A plan can set model: and effort: once each for its model steps. A step's own model= or effort= wins; sign-off, pull request, team and @workiq steps don't inherit either. The parser refuses duplicate or invalid settings and a model: line with mixed providers. The check warns when a step would be refused or when no step uses a setting. In Plan mode and the editor, labeled Model and Reasoning choices read and write those lines beside Run plan. The model menu offers what the steps' peers allow in common and names their shared default; only reasoning is selectable with mixed providers. The Builder keeps the lines and names the inherited choices, and each dispatched task and signed result use the effective settings.",
+      "tests": [
+        "lib::plan::plan_model_defaults_apply_only_to_model_steps_and_each_override_wins",
+        "lib::plan::plan_model_headers_reject_duplicates_bad_values_and_models_for_mixed_providers",
+        "lib::plan::plan_check_warns_about_refused_and_unused_model_defaults",
+        "lib::plan::the_format_reference_names_every_step_kind_and_option_the_parser_takes",
+        "agents::plan_defaults_reach_the_worker_and_its_signed_result",
+        "ui::the_plan_editor_keeps_plans_valid",
+        "ui::task_forms_offer_the_models_and_levels_the_worker_allows",
+        "ui::the_page_follows_the_ux_guidelines"
       ]
     },
     {

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::Json;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -19,7 +20,7 @@ use super::{ApiError, AppState, Shared, bad_request, internal};
 use crate::llm::Access;
 use crate::mcp::{Fill, McpServer, McpTemplate};
 use crate::plugins::{Fetched, Inspection, Plugin, Source};
-use crate::shares::{DATA_SHARE, McpOffer, ShareStore};
+use crate::shares::{DATA_SHARE, McpOffer, ShareStore, parse_task_limit};
 
 /// How long a fetched plugin waits to be imported, and how many may wait.
 const STAGED_FOR: Duration = Duration::from_secs(30 * 60);
@@ -706,6 +707,32 @@ pub(super) async fn remove_team(
     }
     shares_changed(&s, shares, format!("'{name}' no longer takes team steps"));
     Ok(Json(json!({ "name": name })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct TasksBody {
+    tasks: String,
+}
+
+pub(super) async fn set_task_limit(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    body: Result<Json<TasksBody>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(body) =
+        body.map_err(|_| bad_request("send 'tasks' as a number in quotes or 'any'"))?;
+    let limit = parse_task_limit(&body.tasks).map_err(err400)?;
+    if s.agent.shares().get(&name).is_none() {
+        return Err(no_share(&name));
+    }
+    let (_, shares) = s
+        .info
+        .profile
+        .update_shares(|shares| shares.set_task_limit(&name, limit))
+        .map_err(err400)?;
+    s.agent.set_shares(shares);
+    s.broadcast_me();
+    Ok(Json(json!({ "name": name, "task_limit": limit })))
 }
 
 #[derive(Deserialize)]

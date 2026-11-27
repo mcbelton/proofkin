@@ -39,11 +39,13 @@ LOGS = os.path.join(OUT, "logs")
 def run(name, cmd, env=None):
     """Runs `cmd`, saving combined output to logs/<name>.log. Returns (ok, output)."""
     print(f"== {name}: {' '.join(cmd)}", flush=True)
-    proc = subprocess.run(cmd, cwd=REPO, env={**os.environ, **(env or {})},
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    out = proc.stdout.decode("utf-8", errors="replace")
-    with open(os.path.join(LOGS, f"{name}.log"), "w", encoding="utf-8") as f:
-        f.write(out)
+    log = os.path.join(LOGS, f"{name}.log")
+    # Keep partial output on timeout, and do not wait for EOF on inherited pipes.
+    with open(log, "wb") as log_file:
+        proc = subprocess.run(cmd, cwd=REPO, env={**os.environ, **(env or {})},
+                              stdout=log_file, stderr=subprocess.STDOUT)
+    with open(log, "r", encoding="utf-8", errors="replace") as log_file:
+        out = log_file.read()
     print(f"   {'ok' if proc.returncode == 0 else 'FAILED'} (log: target/evidence/logs/{name}.log)", flush=True)
     return proc.returncode == 0, out
 
@@ -154,7 +156,15 @@ def main():
     if not args.no_gates:
         gates.append(("fmt", *run("fmt", ["cargo", "fmt", "--check"])[:1]))
         gates.append(("clippy", *run("clippy", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"])[:1]))
-    tests_ok, test_out = run("test", ["cargo", "test", "--locked", "--no-fail-fast", "--color", "never"])
+    test_env = None
+    if os.name == "nt" and "CARGO_TARGET_DIR" not in os.environ:
+        # A running debug agent can hold proofkin.exe open on Windows. Separate
+        # test executables from it without moving Cargo's cached intermediates.
+        test_env = {
+            "CARGO_TARGET_DIR": os.path.join(OUT, "cargo-target"),
+            "CARGO_BUILD_BUILD_DIR": os.environ.get("CARGO_BUILD_BUILD_DIR", os.path.dirname(OUT)),
+        }
+    tests_ok, test_out = run("test", ["cargo", "test", "--locked", "--no-fail-fast", "--color", "never"], env=test_env)
     gates.append(("tests", tests_ok))
     tests = parse_tests(test_out)
     sections = failed_output(test_out)
@@ -303,6 +313,6 @@ def render_markdown(report):
 
 
 if __name__ == "__main__":
-    # Test output can contain Unicode even when redirected to a Windows pipe.
-    sys.stdout.reconfigure(encoding="utf-8")
+    # Report failures even on legacy console encodings; the logs stay UTF-8.
+    sys.stdout.reconfigure(errors="backslashreplace")
     sys.exit(main())

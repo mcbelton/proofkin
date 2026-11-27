@@ -605,6 +605,7 @@ fn place(
                 max_access: theirs.max_access.min(access),
                 checks: theirs.checks.clone(),
                 worktrees: theirs.worktrees,
+                task_limit: theirs.task_limit,
                 mcp,
                 team: None,
                 team_model: false,

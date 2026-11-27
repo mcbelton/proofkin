@@ -303,6 +303,29 @@ cases.push(
     planText.setTask(plan.steps[0], "One\n- two\n\n  - three");
     return text(plan);
   })(), "a @x One\n  - two\n\n    - three"],
+  ...(() => {
+    const base = "track: off\n\nclaim: C-1 Something works\n\na @x Do it\n  model: an example\n  effort: an example";
+    const set = planText.setModels(base, { model: "Claude-Sonnet-5.5", effort: "HIGH" });
+    return [
+      ["set both defaults after tracking and before the claims", set,
+        base.replace("track: off", "track: off\nmodel: Claude-Sonnet-5.5\neffort: HIGH")],
+      ["read both headers as written", JSON.stringify(planText.modelsOf(set)),
+        JSON.stringify({ model: "Claude-Sonnet-5.5", effort: "HIGH" })],
+      ["don't read defaults out of a step's own text", JSON.stringify(planText.modelsOf(base)),
+        JSON.stringify({ model: null, effort: null })],
+      ["both defaults round-trip through the Builder", text(planText.parsePlan(set)), set],
+      ["change a choice without rewriting the other one",
+        planText.setModels(set, { model: "gpt-5.5" }), set.replace("Claude-Sonnet-5.5", "gpt-5.5")],
+      ["clear the choices without rewriting the step text",
+        planText.setModels(set, { model: null, effort: null }), base],
+      ["unrelated Builder edits don't drop duplicate or blank headers",
+        text(planText.parsePlan("model: a\nmodel: b\neffort:\na @x Do it")),
+        "model: a\nmodel: b\neffort:\n\na @x Do it"],
+      ["only provider tasks drive the plan model pickers",
+        planText.modelSteps("a @x Do it\nb #dev using claude Check it\nok approve @me Yes\nship pr @x:app\nlead team @y:app Lead\nask @workiq Ask\nsend @workiq apply=a")
+          .map((s) => s.id).join(","), "a,b"],
+    ];
+  })(),
   // How a run is tracked: read from its track: line, and set by the choice beside Run plan.
   ["no track: line is a new issue", JSON.stringify(planText.trackOf("a @x Do it")), JSON.stringify({ kind: "new", title: "" })],
   ["track: #12 and 12 work on issue 12", JSON.stringify([planText.trackOf("track: #12\na @x Do it"), planText.trackOf("track: 12")]),

@@ -7,7 +7,7 @@ import { createInterface } from "node:readline";
 createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   if (message.cancel !== undefined) return;
-  const { id, prompt, access, cwd } = message;
+  const { id, prompt, access, cwd, model, effort } = message;
   let plan = prompt.includes("ghost") ? "fix @ghost:app Fix the bug" : "ok approve @me Ship it?";
   if (prompt.includes("add a second sign-off")) plan += "\nagain after ok approve @me Ship it, really?";
   const text = [
@@ -19,5 +19,5 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     "",
     "Review it before you run it.",
   ].join("\n");
-  process.stdout.write(JSON.stringify({ id, ok: true, text, model: "fake-planner" }) + "\n");
+  process.stdout.write(JSON.stringify({ id, ok: true, text, model: model ?? "fake-planner", effort }) + "\n");
 });

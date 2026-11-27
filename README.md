@@ -371,10 +371,12 @@ shows which): a model that supports fewer levels takes the nearest it supports b
 one asked for, and one that supports none runs at its own. Claude takes `low` to `max`
 (`minimal` is `low`); Codex takes them all.
 
-A task picks its model and effort with `model=` and `effort=` in a plan step (or its agent's
-`model:`), `/ask` and `/delegate --model <name> --effort <level>`, the **Model** and
-**Reasoning** fields of the web UI's Run task form and plan builder, or the `model` and
-`effort` arguments of the MCP and A2A `delegate`. The web UI lists exactly what the chosen
+A task picks its model and effort with `model=` and `effort=` in a plan step,
+`/ask` and `/delegate --model <name> --effort <level>`, the **Model** and **Reasoning**
+fields of the web UI's Run task form and plan builder, or the `model` and `effort`
+arguments of the MCP and A2A `delegate`. Each plan step uses its own settings first,
+then the plan's `model:` and `effort:` for any it doesn't set. Without those, it uses
+its named agent's model if set, then its peer's defaults. The web UI lists what the chosen
 peer lets you pick: the models it allows, or all its account offers when it allows any (by
 vendor, with their cost multiplier; a name typed by hand only for a peer that lists none,
 such as Claude, Codex or an older version), and the levels it allows that the chosen model
@@ -439,9 +441,11 @@ of its log), with **Start**/**Stop**, **Starts with this agent** and **Delete**.
 - **Deleting** a worker (`worker remove`, `profile delete`, or **Delete** in the web UI,
   which stops it first) deletes its key, allowlist, folder settings and audit log, and
   takes it off its owner's allowlist and out of its squads (a squad left empty goes). Its
-  data folder stays. A worker running outside its owner's agent isn't deleted until it
-  stops. A factory agent's deployment on it ends (the agent and its releases stay; see
-  [Agent factory](docs/agent-factory.md)).
+  data folder stays. Stopping a worker waits (up to 5 seconds) until its process has let
+  go of its profile, so the web UI deletes a running worker in one go; one whose process
+  didn't end isn't deleted, and the web UI says so. A worker running outside its owner's
+  agent isn't deleted until it stops. A factory agent's deployment on it ends (the agent
+  and its releases stay; see [Agent factory](docs/agent-factory.md)).
 - Work stays private unless shared: a peer reaches only the folders the worker or owner
   explicitly shares with that peer.
 - **Memory:** `proofkin worker memory tester --context glossary,architecture --lessons
@@ -477,6 +481,25 @@ Agents connect with [iroh](https://iroh.computer):
 - **Discovery:** connected agents share each other's addresses; an agent auto-dials every
   allowlisted peer at startup and every 30 seconds, so the mesh reforms after restarts.
 
+A dropped connection doesn't fail tasks at once. If a connection is replaced (for example
+both peers dialed each other at once) or comes back after a drop, running tasks carry on
+and their results arrive over the new connection. After 2 seconds the peer shows as
+disconnected and its tasks say they are reconnecting (a connection back to it still in
+its handshake is waited for first, up to 10 seconds). A plan checked or started meanwhile
+(`/plan`, the web UI, MCP, A2A or a team step) waits for a peer that is reconnecting, up to
+the same 10 seconds, instead of finding it not connected.
+
+The **task grace** is 60 seconds by default (`PROOFKIN_TASK_GRACE_SECS`). Every confirmed
+reconnect ends the outage; a later drop gets its own grace. Only awake time counts, so
+sleep doesn't use up a peer's grace. If the peer stays away, the tasks you gave it fail
+and the tasks it gave you stop. The worker's activity and the stopped task's result say
+**stopped: boss was gone for 60 s**, rather than **cancelled by boss**, which means the
+requester actually sent a cancellation. A stop for another reason says what happened.
+
+An agent that stops on purpose (Ctrl+C, or **Stop** on a digital worker) says so first:
+the tasks it runs for you fail at once ("worker stopped before it finished the task"),
+and it cancels the tasks it gave its peers.
+
 ### Connect two machines
 
 ```powershell
@@ -507,7 +530,7 @@ with `/ticket`.
 | --- | --- |
 | `proofkin peers id --profile P` | Show P's endpoint id and ticket |
 | `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N] [--m365 LABELS\|off [--m365-tools]] [--github LOGIN\|--no-github] [--agents NAMES\|--no-agents]` | Allowlist a peer (re-run to change its rights). `--m365 General,Public,unlabeled` lets it receive Microsoft 365 content with those labels, `--m365-tools` lets its tasks use your Work IQ (read only), `--m365 off` removes the grant; without `--m365` a grant is kept. `--github` sets its GitHub account, which [pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan) ask to review; without it an account set before is kept |
-| `proofkin share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--check NAME=COMMAND ...]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
+| `proofkin share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--tasks N] [--check NAME=COMMAND ...]`, `share list`, `share tasks <name> <N or any>`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees, task limits and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
 | `proofkin peers list --profile P` | List allowlisted peers and their rights |
 | `proofkin peers github <name-or-id> <login>\|--off --profile P` | Set (or forget) an allowlisted peer's GitHub account without changing its rights. A running agent uses it after it restarts; the web UI's **Change…** sets it at once |
 | `proofkin peers remove <name-or-id> --profile P` | Remove a peer |
@@ -632,7 +655,9 @@ sign-off's `notice`, with its run and step when it has them),
 audience (`local` or the peer's name), the query's SHA-256 and length (never its text; for a
 change, its path's), outcome (`ok`, `refused`, or the error's class), the counts of results
 and withheld results and the sensitivity labels seen when known, the request and correlation
-ids, and the duration. A write error only warns.
+ids, and the duration. An answer with a status of 400 or more is recorded with its error
+class, even when Work IQ doesn't flag the call as an error, and still counts toward the
+budgets. A write error only warns.
 
 Calls are limited to 200 a day (the local date) and 25 per run. A call over a budget is not
 sent: it fails saying which budget is used up and how to raise it, and is recorded as
@@ -737,22 +762,8 @@ the connection) without calling Work IQ.
 
 `/cancel <n>` (or **Cancel** in the web UI) stops a task you started. For a delegated task
 the peer is told to stop: it aborts the Copilot session (or the Claude/Codex run), frees the
-task slot and records the task as `cancelled` in its audit log. If you disconnect, the peer
-cancels your running tasks the same way, so nothing keeps spending its accounts for you.
-
-A dropped connection doesn't lose work. If a connection is replaced (for example both peers
-dialed each other at once) or drops and comes back, running tasks carry on and their
-results arrive over the new connection. After 2 seconds the peer shows as disconnected and
-its tasks say **reconnecting to** it (a connection back to it still in its handshake is
-waited for first, up to 10 seconds). A plan checked or started meanwhile (`/plan`, the web
-UI, MCP, A2A or a team step) waits for a peer that is reconnecting, up to the same 10
-seconds, instead of finding it not connected. Those tasks are failed (on your side) and
-cancelled (on the peer's) only if the peer stays away for the **task grace**: 60 seconds, or
-`PROOFKIN_TASK_GRACE_SECS`. Only time the machine is awake counts, so sleep doesn't use up a
-peer's grace: the tasks that were running when a laptop went to sleep go on after it wakes.
-An agent that stops on purpose (Ctrl+C, or **Stop** on a digital worker) says so first: the
-tasks it runs for you fail at once ("worker stopped before it finished the task"), and it
-cancels the tasks it gave its peers.
+task slot and records the task as `cancelled` in its audit log. A dropped connection
+isn't a cancellation; see [Internet P2P](#internet-p2p) for the task grace and stop messages.
 
 ### Squads and plans
 
@@ -838,8 +849,10 @@ plan, then run it yourself.
 - **In the web UI:** in Plan mode, **Draft with a model…** (beside **Start from a
   playbook…**) opens the plan editor on its **Describe** view:
   - Say *What should the plan do?*, name an issue of the [tracker's](#tracked-work)
-    repository if you like (`#42`), and pick the model that writes it: each provider the
-    profile is signed in to, at its default model. Then press **Draft plan**.
+    repository if you like (`#42`), and pick **Provider**, **Model** and **Reasoning** as
+    in **Run task** on **This agent**. Choose a provider your profile is signed in to,
+    then keep its defaults or pick an allowed model and reasoning level. Then press
+    **Draft plan**.
   - While the model writes, the view says so: *copilot's model (claude-opus-5.5) is
     writing the plan*, then *try 2 of 3: fixing 2 problems*.
   - The plan goes into the editor's Builder and Text views, checked as usual, with the
@@ -850,21 +863,25 @@ plan, then run it yourself.
     writes the whole plan again.
   - **Run plan** stays your click, with the editor's check and tracking choice.
 - **From the command line:** `plan draft` prints the plan, or writes it to `--out`, then
-  its problems. It exits 1 while errors remain.
+  its problems. It exits 1 while errors remain. Choose a provider with `--using`, or
+  override its defaults with `--model <name>` and `--effort <level>`.
 
   ```powershell
-  proofkin plan draft "Add CSV export to the reports page, with tests" --profile boss > csv.plan
+  proofkin plan draft "Add CSV export to the reports page, with tests" --using copilot --model claude-sonnet-5.5 --effort low --profile boss > csv.plan
   proofkin plan draft --issue 42 --using claude --profile boss --out issue-42.plan
   proofkin plan draft --from csv.plan --note "add a review by #qa before the sign-off" --profile boss --out csv.plan
   ```
 
-- **For other agents:** the `draft_plan` MCP tool (`goal`, `issue`, `plan`, `note`) answers
-  the plan and its problems ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
+- **For other agents:** the `draft_plan` MCP tool (`goal`, `issue`, `plan`, `note`, and
+  optional `provider`, `model`, `effort`) answers the plan and its problems
+  ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
   `run_plan` still runs a plan, so an agent can draft one, show it to its user, then run
   it.
-- **The API:** `POST /api/plans/draft` with `{goal, issue?, provider?, plan?, note?}`
-  answers `{plan, problems, provider, model, effort, tries}`. Its progress goes out as
-  events.
+- **The API:** `POST /api/plans/draft` with `{goal, issue?, provider?, model?, effort?, plan?, note?}`
+  answers `{plan, problems, provider, model, effort, tries}`. With no provider named, the
+  first signed-in provider writes it. Omit model or effort to use the profile's default.
+  Invalid or disallowed model and reasoning choices are refused with HTTP 400 before
+  looking up an issue or asking a model. Progress goes out as events.
 
 **What the model gets:**
 - The goal, at most 4,000 characters, with secrets redacted. With an issue, the issue's
@@ -895,8 +912,8 @@ goal's first line (redacted): `// Drafted by copilot (claude-opus-5.5): <goal>`.
 **A draft is data.** Drafting runs, grants, sends and changes nothing. Running it is a
 separate action, through the usual check and tracking choice (a tracked run posts its steps
 on GitHub, as the editor says). Each draft goes in the activity and the
-[audit log](#audit-log), with who asked, the provider and model, the tries and the goal's
-SHA-256 (never its text).
+[audit log](#audit-log), with who asked, the provider, model and reasoning effort, the tries
+and the goal's SHA-256 (never its text).
 
 #### Live status
 
@@ -1050,8 +1067,9 @@ send after ok @workiq apply=draft
 - The apply step checks that your approval was for the list as it is now, then makes each
   change once, in order, and stops at the first that fails or whose outcome is unknown. Its
   result lists each change's outcome (*done*, *accepted* for a 202, *failed* with the fix, or
-  *outcome unknown*: check in Microsoft 365) and the changes not made. A change is never sent
-  again, even if the agent restarts.
+  *outcome unknown*) and the changes not made. A 4xx status in Work IQ's answer means
+  *failed*. With a status of 500 or more, the outcome is unknown: check in Microsoft 365
+  before trying again. A change is never sent again, even if the agent restarts.
 - The plan check refuses an apply step, naming the fix, without your sign-off between the
   two steps, with changes off or without the Work IQ sign-in, or when another step applies
   the same step. Both steps' results stay in the run's record, never on GitHub.
@@ -1265,6 +1283,12 @@ proofkin share add app D:\src\app --access full --worktrees `
 proofkin peers allow <boss-ticket> --profile alice --delegate --access full --share data,app
 ```
 
+If the checks share build output across worktrees (for example through `CARGO_TARGET_DIR`),
+add `--tasks 1` when you share the folder, or set it with `proofkin share tasks app 1
+--profile alice`. This keeps editing tasks from overwriting or using each other's build
+output. The alternative is a build folder per task (no shared `CARGO_TARGET_DIR`): that
+also keeps the builds separate, but builds from scratch each time.
+
 **2. The boss writes a plan with claims.**
 
 ```text
@@ -1275,6 +1299,16 @@ review after fix #qa:app apply=fix verify=test claims=PARSE-1 Review the change 
 signoff after review approve @carol claims=PARSE-2 Approve the parser change for release
 ```
 
+| Plan option (before claims and steps) | What it does |
+| --- | --- |
+| `track: #N`, `track: title` or `track: off` | Chooses how the run is [tracked on GitHub](#tracked-work). |
+| `model: name` | Sets the model for steps that don't have `model=`, e.g. `model: claude-sonnet-5.5`. Use it only when all model steps use the same provider. |
+| `effort: level` | Sets reasoning for steps that don't have `effort=`: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. It can span providers. |
+
+Use each of these lines at most once. `model:` and `effort:` don't apply to sign-offs,
+pull requests, team steps or `@workiq` steps. The plan check warns about an unused
+choice or one a step's peer doesn't allow.
+
 | Step option | What it does |
 | --- | --- |
 | `verify=a,b` | After the model finishes, the **worker's runtime** (not the model) runs those checks in the task's folder. It records exit codes, durations and the end of their output. The step fails if any check fails. |
@@ -1283,9 +1317,9 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
 | `base=RUN:STEP` | Starts from the commit step STEP of an earlier evidence run RUN made, merged or not: its patch, from the run's signed record (which must check out), is applied in this step's worktree first. The plan check says when the run, its step or its patch isn't there. Not with `apply=`; needs edit access in a `--worktrees` folder. A run's card has **Build on it…**, which starts such a plan. |
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
-| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step names one). Not on sign-offs. |
-| `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (default: the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
-| `effort=level` | The reasoning effort its model works at: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (default: the peer's default; a model that supports fewer takes the nearest below, see [Models](#models)). The peer refuses an effort its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it. Not on sign-offs, team steps or `@workiq` steps. |
+| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own (and its `model:`, unless the step or plan names one). Not on sign-offs. |
+| `model=name` | The model the step runs on, e.g. `model=claude-sonnet-5.5` (otherwise the plan's model, the named agent's, or the peer's default). The peer refuses a model its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it (see [Models](#models)). Not on sign-offs, team steps or `@workiq` steps. |
+| `effort=level` | The reasoning effort its model works at: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (otherwise the plan's effort or the peer's default; a model that supports fewer takes the nearest below, see [Models](#models)). The peer refuses an effort its owner doesn't allow, so a squad step goes to another member; the plan check warns when the step's peer says it doesn't allow it. Not on sign-offs, team steps or `@workiq` steps. |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results, or asks for changes: the steps it waits for are done again with their note, then they are asked again. |
@@ -1301,12 +1335,12 @@ A step line is `name [after steps] [team|pr] @peer[:folder] or #squad [options] 
 go before the task text (the plan check warns about one typed after it, but not text in
 backticks, which is taken as an example). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
-`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout`, `issue` and `model` are given once.
+`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels`, `timeout`, `issue`, `model` and `effort` are given once.
 
 A step's task text can go on over the lines after it: lines indented more than the step line continue
 it, with their common indentation removed (deeper indentation is kept, so nested lists work), and a
 blank line between them is a paragraph break. A line that isn't indented more ends the step. Options
-still go only on the step line, and lines after a `claim:`, `track:` or `//` line are not continuations.
+still go only on the step line, and lines after a plan setting, claim or comment are not continuations.
 
 ```
 review @alice:app verify=test Check the change:
@@ -1334,8 +1368,8 @@ review @alice:app verify=test Check the change:
 - **Worktrees** (`share add --worktrees`, for a git repository): each editing task runs on
   its own branch `p2p/<peer>/<task>-<time>` in its own worktree under
   `~/.proofkin-worktrees/<profile>`, with git hooks disabled. The work is committed there and
-  returned as a patch whose hash is signed. Your checkout is never touched and parallel
-  tasks never collide. Review or merge the branch (`git log p2p/boss/...`) when you're
+  returned as a patch whose hash is signed. Your checkout is never touched and the tasks'
+  checkouts stay separate. Review or merge the branch (`git log p2p/boss/...`) when you're
   happy. Removed worktrees keep their branch. The commit's subject is the task's title (the
   first line of its own words, at most 100 characters), followed by who asked and who did it.
   A plan step that works on an issue (`issue=#N`) is committed with the issue's title as the
@@ -1426,8 +1460,10 @@ web UI lists runs under **Evidence runs** and opens each report with a fresh sig
 Checks run your folder's code (tests, builds) with **your** rights and without the OS
 sandbox, like a CI job on your machine. So only peers with `full` access to that folder may
 request them. Their environment has no inherited credential variables (`GH_TOKEN`,
-`ANTHROPIC_API_KEY`, ...). Each check may run for up to 30 minutes, and on a timeout or
-cancellation everything it started is killed.
+`ANTHROPIC_API_KEY`, ...). Check commands and the processes they start run at below-normal
+priority (Below Normal on Windows, niceness 10 or lower priority on Unix), so builds and
+tests leave CPU time for the agent's connections. Each check may run for up to 30 minutes,
+and on a timeout or cancellation everything it started is killed.
 
 ### The lifecycle: from a fresh project to operations
 
@@ -2322,7 +2358,7 @@ proofkin playbook show rehearse --set peer=alice --set folder=shop --set change=
 | `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
 Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|remove`,
-`proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
+`proofkin share add|list|tasks|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove|memory`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
 `proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin factory templates|new|list|show|edit|check|build|evaluate|report|init|delete`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
@@ -2473,6 +2509,12 @@ proofkin --name me --providers copilot --serve --ui
 
   The plan is checked as you go, and problems with a clear fix come with a button that
   makes it (in the builder, on the card they are about).
+  Beside **Run plan** in Plan mode and the editor, **Model** and **Reasoning** choose
+  defaults for the whole plan. The choices write `model:` and `effort:` into the plan
+  before its claims and steps; choosing a peer default removes the corresponding line.
+  The menu offers the models the steps' peers allow in common, counting online squad
+  members. If the steps use different providers, choose each step's model in the editor;
+  you can still pick reasoning for the plan. A step's own `model=` or `effort=` always wins.
   Steps show which steps they wait for, and skipped steps are flagged. **Schedule…** runs
   the plan on its own at set times ([scheduled plans](#scheduled-plans)). With a
   [tracker](#tracked-work) linked, **Track on GitHub** beside it chooses where the run is
@@ -2826,6 +2868,13 @@ A worker decides exactly what each peer can see:
 - Peers see shared folders **by name and access only**, never their paths, and only the ones
   granted to them (`/peers` lists them). Changing a connected peer's grant reaches it at once.
 - A task naming a folder that isn't shared with that peer is refused (and audited).
+- Set how many editing tasks this agent may run at once in a folder with `share add --tasks N`,
+  `share tasks <name> N`, or **This agent > Shared folders > Task limit?**. `N` is a whole
+  number from 1 up; new folders default to `any` (no folder limit beyond the agent's slots).
+  Set `any` to clear the limit. `share list` and the web UI show it. When a folder is full,
+  the task waits and its live status names the folder; the agent's other slot can still run
+  a task in another folder. Read-only tasks don't count toward the folder limit. The limit
+  queues tasks, so it doesn't change the plan check.
 - `proofkin share team <folder> <file>` gives a folder a **team plan**, so peers with edit
   access can hand it [team steps](#team-steps-handing-work-down-a-level) that your agent
   runs with your own team; `--model` has your agent's model write one for each team step
@@ -3007,6 +3056,8 @@ nor does a peer's, whatever its grant.
   call was held either way.
 - Approved, it is made once, exactly as shown, and the model gets the outcome (*done*, with a
   created entity's id and link; *accepted* for a 202; *failed*; or *outcome unknown*).
+  As in plans, a 4xx answer from Work IQ fails and a 5xx or higher answer leaves the outcome
+  unknown. Both are tool errors for the model.
   Rejected, or asked for changes, nothing is sent, and the model gets your note. Not answered
   in time, the request is withdrawn, and a late answer makes nothing. A change is never sent
   again: the same call again is a sign-off of its own.
