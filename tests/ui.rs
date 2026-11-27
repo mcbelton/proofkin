@@ -3506,6 +3506,199 @@ fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// The owner's model, as the Plan editor's Describe view has it draft a plan: it keeps each
+/// prompt, and answers with prose around a plan whose first one has a step on a peer that
+/// isn't connected.
+#[derive(Default)]
+struct Planner {
+    prompts: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Executor for Planner {
+    fn providers(&self) -> Vec<Provider> {
+        vec![Provider::Copilot]
+    }
+
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<Ran> {
+        assert_eq!(ctx.access, Access::ReadOnly, "a draft only reads");
+        let mut prompts = self.prompts.lock().unwrap();
+        prompts.push(task.prompt.clone());
+        let plan = if prompts.len() == 1 {
+            "fix @ghost:app Fix the bug"
+        } else {
+            "ok approve @me Ship the fix?"
+        };
+        Ok(Ran::new(
+            format!("Here is the plan.\n\n```plan\n{plan}\n```\n\nReview it first."),
+            Some("planner-1".into()),
+        ))
+    }
+}
+
+/// `POST /api/plans/draft` has the profile's own model write a plan: the model is told what
+/// the check found wrong and writes it again, the answer is the plan with its problems, its
+/// provider, model and tries, and it is recorded in the activity and the audit (with the
+/// goal's hash, not its text). Drafting starts no task and no run; a request without a
+/// goal, or for a provider the profile isn't signed in to, is refused with what to do.
+#[tokio::test]
+async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("owner");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("profile.json"),
+        r#"{"copilot": {"source": "token", "host": "github.com"}}"#,
+    )
+    .unwrap();
+    let profile = Profile::open_in(home.path(), "owner").unwrap();
+    let mut config = AgentConfig::new("owner", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: profile.clone(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let planner = Arc::new(Planner::default());
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        Some(planner.clone()),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let call = |method: &'static str, body: Value| {
+        let (host, token) = (host.clone(), token.to_owned());
+        async move {
+            let body = (!body.is_null()).then(|| body.to_string());
+            request(
+                port,
+                method,
+                "/api/plans/draft",
+                &host,
+                Some(&token),
+                body.as_deref(),
+            )
+            .await
+        }
+    };
+
+    let options = call("GET", Value::Null).await;
+    assert_eq!(options.status, 200, "{}", options.body);
+    assert_eq!(options.json()["providers"][0]["provider"], "copilot");
+    assert_eq!(options.json()["max_goal"], 4000);
+
+    let goal = "Fix the login bug, then let me sign it off";
+    let drafted = call("POST", serde_json::json!({ "goal": goal })).await;
+    assert_eq!(drafted.status, 200, "{}", drafted.body);
+    let drafted = drafted.json();
+    assert_eq!(
+        drafted["plan"],
+        format!("// Drafted by copilot (planner-1): {goal}\nok approve @me Ship the fix?\n")
+    );
+    assert!(
+        drafted["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["error"] == false),
+        "{drafted}"
+    );
+    assert_eq!(drafted["provider"], "copilot");
+    assert_eq!(drafted["model"], "planner-1");
+    assert_eq!(drafted["tries"], 2);
+    assert!(drafted.get("goal_sha256").is_none(), "{drafted}");
+    {
+        let prompts = planner.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains(goal), "{}", prompts[0]);
+        assert!(
+            prompts[1].contains("ghost is not connected"),
+            "{}",
+            prompts[1]
+        );
+    }
+
+    let state = request(port, "GET", "/api/state", &host, Some(token), None)
+        .await
+        .json();
+    assert_eq!(
+        state["tasks"],
+        serde_json::json!([]),
+        "drafting starts no task"
+    );
+    assert!(
+        state["feed"].as_array().unwrap().iter().any(|f| f["text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(
+                "Drafted a plan with copilot's model (planner-1) in 2 tries for owner: 0 errors"
+            )),
+        "{}",
+        state["feed"]
+    );
+    assert!(
+        !profile.runs_dir().exists()
+            || std::fs::read_dir(profile.runs_dir())
+                .unwrap()
+                .next()
+                .is_none(),
+        "drafting starts no run"
+    );
+    let audit = AuditLog::read(&profile.audit_path(), 10).unwrap();
+    let entry = audit
+        .iter()
+        .find(|e| e.origin.as_deref() == Some("a plan draft"))
+        .expect("the draft is in the audit");
+    assert_eq!(entry.peer, "owner");
+    assert_eq!(entry.model.as_deref(), Some("planner-1"));
+    assert_eq!(entry.attempts, Some(2));
+    assert_eq!(
+        entry.prompt_sha256,
+        proofkin::evidence::sha256_hex(goal.as_bytes())
+    );
+
+    let empty = call("POST", serde_json::json!({ "goal": "  " })).await;
+    assert_eq!(empty.status, 400);
+    assert!(
+        empty.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("say what the plan should do"),
+        "{}",
+        empty.body
+    );
+    let unsigned = call(
+        "POST",
+        serde_json::json!({ "goal": goal, "provider": "claude" }),
+    )
+    .await;
+    assert_eq!(unsigned.status, 409);
+    assert!(
+        unsigned.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("proofkin auth login claude --profile owner"),
+        "{}",
+        unsigned.body
+    );
+    assert_eq!(planner.prompts.lock().unwrap().len(), 2);
+    agent.shutdown().await;
+}
+
 /// An owner sets, replaces and removes a shared folder's team plan through the API;
 /// the running agent and `shares.json` follow, and bad plans change nothing.
 #[tokio::test]

@@ -161,11 +161,35 @@ pub fn plan_prompt(
          ## Your team\n\n\
          Your peers, the folders each shares with you and the access its tasks get there:\n"
     );
-    let mut team = String::new();
-    for peer in peers
-        .iter()
-        .filter(|p| p.id != requester && !request.chain.contains(&p.id.to_string()))
-    {
+    let mut team = peers_text(
+        peers
+            .iter()
+            .filter(|p| p.id != requester && !request.chain.contains(&p.id.to_string())),
+        false,
+    );
+    if team.is_empty() {
+        team = "- none: no peer you may hand this work to is connected\n".into();
+    }
+    text += &crate::boundary::wrap("your peers", &team);
+    text += "\n\nYour squads (a step for #squad runs on its least busy member):\n";
+    text += &squads_text(squads);
+    text += "\nYour skills (skill=name):\n";
+    text += &skills_text(skills);
+    text += "\nAnswer with the team plan alone, in one fenced block:\n\n\
+             ```plan\none claim or step per line\n```\n";
+    crate::boundary::guard(&text)
+}
+
+/// `peers` as a prompt that asks for a plan lists them: each with its role and the
+/// providers it runs, and each folder it shares with this agent, with the access its tasks
+/// get there, its checks and whether it takes team or pull request steps. `detailed` adds
+/// whose digital worker a peer is and each folder's MCP servers, by name.
+pub(crate) fn peers_text<'a>(
+    peers: impl IntoIterator<Item = &'a PeerInfo>,
+    detailed: bool,
+) -> String {
+    let mut text = String::new();
+    for peer in peers {
         let role = peer
             .role
             .as_deref()
@@ -173,39 +197,52 @@ pub fn plan_prompt(
             .filter(|r| !r.is_empty())
             .map(|r| format!(" ({})", clip(&r, 100)))
             .unwrap_or_default();
+        let worker = match &peer.owner {
+            Some(owner) if detailed => format!(", a digital worker of {owner}"),
+            _ => String::new(),
+        };
         let runs = if peer.capabilities.is_empty() {
             "no models".to_owned()
         } else {
             let providers: Vec<String> = peer.capabilities.iter().map(|p| p.to_string()).collect();
             providers.join(", ")
         };
-        team += &format!("- @{}{role}: runs {runs}\n", peer.name);
+        text += &format!("- @{}{role}{worker}: runs {runs}\n", peer.name);
         for share in &peer.shares {
-            team += &format!("  - folder {}: {} access", share.name, share.access);
+            text += &format!("  - folder {}: {} access", share.name, share.access);
             if !share.checks.is_empty() {
-                team += &format!("; checks {}", share.checks.join(", "));
+                text += &format!("; checks {}", share.checks.join(", "));
+            }
+            if detailed && !share.mcp.is_empty() {
+                text += &format!("; MCP servers {}", share.mcp.join(", "));
             }
             if share.team {
-                team += "; takes team steps";
+                text += "; takes team steps";
             }
             if share.pull_requests {
-                team += "; takes pull request steps";
+                text += "; takes pull request steps";
             }
-            team += "\n";
+            text += "\n";
         }
     }
-    if team.is_empty() {
-        team = "- none: no peer you may hand this work to is connected\n".into();
-    }
-    text += &crate::boundary::wrap("your peers", &team);
-    text += "\n\nYour squads (a step for #squad runs on its least busy member):\n";
+    text
+}
+
+/// `squads` as a prompt that asks for a plan lists them: each with its members.
+pub(crate) fn squads_text(squads: &SquadStore) -> String {
+    let mut text = String::new();
     for squad in &squads.squads {
         text += &format!("- #{}: {}\n", squad.name, squad.members.join(", "));
     }
     if squads.squads.is_empty() {
         text += "- none\n";
     }
-    text += "\nYour skills (skill=name):\n";
+    text
+}
+
+/// `skills` as a prompt that asks for a plan lists them: each with what it is for.
+pub(crate) fn skills_text(skills: &[SkillInfo]) -> String {
+    let mut text = String::new();
     for skill in skills {
         let about = clip(&one_line(&skill.description), 200);
         text += &format!("- {}: {about}\n", skill.name);
@@ -213,30 +250,40 @@ pub fn plan_prompt(
     if skills.is_empty() {
         text += "- none\n";
     }
-    text += "\nAnswer with the team plan alone, in one fenced block:\n\n\
-             ```plan\none claim or step per line\n```\n";
-    crate::boundary::guard(&text)
+    text
 }
 
 /// `prompt` (see [`plan_prompt`]) again, after the model answered it with `plan`, which
 /// doesn't check out: `problems` says why.
 pub fn plan_again_prompt(prompt: &str, plan: &str, problems: &str) -> String {
+    again_prompt("team plan", prompt, plan, problems)
+}
+
+/// `prompt` again, after the model answered it with `plan` (a `noun`: a team plan, a
+/// plan), which doesn't check out: `problems` says why.
+pub(crate) fn again_prompt(noun: &str, prompt: &str, plan: &str, problems: &str) -> String {
     crate::boundary::guard(&format!(
-        "{prompt}\n\n## Your last team plan doesn't check out\n\n{}\n\n\
+        "{prompt}\n\n## Your last {noun} doesn't check out\n\n{}\n\n\
          What is wrong with it: {problems}\n\n\
-         Write the whole team plan again, with that fixed, in one fenced block (```plan).",
-        crate::boundary::wrap("your last team plan", plan)
+         Write the whole {noun} again, with that fixed, in one fenced block (```plan).",
+        crate::boundary::wrap(&format!("your last {noun}"), plan)
     ))
 }
 
 /// `prompt` (see [`plan_prompt`]) again, after `by`, the lead's owner, read `plan`, the
 /// team plan the model wrote, and asked for changes to it: `note` says which.
 pub fn plan_changes_prompt(prompt: &str, plan: &str, by: &str, note: &str) -> String {
+    changes_prompt("team plan", prompt, plan, by, note)
+}
+
+/// `prompt` again, after `by` read `plan` (a `noun`: a team plan, a plan) before it ran,
+/// and asked for changes to it: `note` says which.
+pub(crate) fn changes_prompt(noun: &str, prompt: &str, plan: &str, by: &str, note: &str) -> String {
     crate::boundary::guard(&format!(
-        "{prompt}\n\n## {by} asked for changes to your team plan\n\n{}\n\n\
-         {by} read this team plan before it ran, and asked for changes:\n\n{}\n\n\
-         Write the whole team plan again, with those changes, in one fenced block (```plan).",
-        crate::boundary::wrap("your last team plan", plan),
+        "{prompt}\n\n## {by} asked for changes to your {noun}\n\n{}\n\n\
+         {by} read this {noun} before it ran, and asked for changes:\n\n{}\n\n\
+         Write the whole {noun} again, with those changes, in one fenced block (```plan).",
+        crate::boundary::wrap(&format!("your last {noun}"), plan),
         note.trim()
     ))
 }
@@ -743,11 +790,11 @@ pub fn sub_step(step: &Step, state: &StepState) -> SubStep {
     sub
 }
 
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }

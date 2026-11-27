@@ -91,7 +91,7 @@ pub(super) async fn create_draft(
 
 /// An executor that runs `provider`: the agent's, when it serves it, else one started for
 /// the purpose (`true`: stop it when done).
-async fn executor_for(
+pub(super) async fn executor_for(
     s: &Shared,
     provider: Provider,
 ) -> Result<(Arc<dyn Executor>, Option<Arc<SdkExecutor>>), ApiError> {

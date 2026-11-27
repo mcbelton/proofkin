@@ -116,6 +116,10 @@ enum Command {
     /// verify=spec:api,design:threats,...), or import a Spec Kit or OpenSpec spec as a plan.
     #[command(subcommand)]
     Spec(SpecCommand),
+    /// Plans: have the profile's model draft one from a goal or an issue, for you to
+    /// review and run.
+    #[command(subcommand)]
+    Plan(PlanCommand),
     /// The design package (architecture, ADRs, diagrams, data dictionary, data flows,
     /// threat model, test and operations plans) and the review pack (decks per
     /// audience, customer feedback document).
@@ -960,6 +964,58 @@ Open <out>/index.html in a browser. For PowerPoint, the decks are Marp Markdown:
 }
 
 #[derive(Subcommand)]
+enum PlanCommand {
+    /// Have the profile's own model draft a plan: from a goal in your words, an issue of
+    /// the tracker's repository, or a plan and a note that says what should change.
+    #[command(after_help = "\
+The model gets how plans are written and what this agent may use, as the plan check sees
+it: the peers connected within --wait (their roles, providers, folders, access, checks and
+MCP servers, by name), squads, skills, agents, knowledge topic names, whether Work IQ is
+signed in and the tracker's repository; with --issue, the issue's text, as external
+content. Never file contents, knowledge text, tokens or Microsoft 365 content: it works
+read-only in an empty folder with no tools, and secrets in the goal are redacted. The plan
+is checked as /plan and Run plan check it; while it has errors the model is told them and
+writes it again, at most 3 tries in all. Drafting runs nothing: the plan goes to stdout
+(or --out), then its problems (to stderr); it exits 1 when errors remain. Review it, then
+run it with /plan <file>, or paste it in the web UI's Plan mode. Each draft is recorded in
+the audit (proofkin audit), with the goal's SHA-256, not its text.
+examples:
+  proofkin plan draft \"Add CSV export to the reports page, with tests\" --profile boss > csv.plan
+  proofkin plan draft --issue 42 --using claude --profile boss --out issue-42.plan
+  proofkin plan draft --from csv.plan --note \"add a review by #qa before the sign-off\" --profile boss --out csv.plan")]
+    Draft {
+        /// What the plan should do, in your words (at most 4000 characters).
+        goal: Option<String>,
+        /// The issue of the tracker's repository the plan is for (N of #N).
+        #[arg(long, value_name = "N")]
+        issue: Option<u64>,
+        /// The provider whose model writes it (default: the first the profile is signed
+        /// in to).
+        #[arg(long, value_enum)]
+        using: Option<Provider>,
+        /// A plan file to change, as --note says.
+        #[arg(long, value_name = "FILE", requires = "note")]
+        from: Option<PathBuf>,
+        /// What should change in the plan --from gives.
+        #[arg(long, requires = "from")]
+        note: Option<String>,
+        /// Write the plan to this file instead of stdout.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Seconds to wait for the profile's peers to connect.
+        #[arg(long, default_value_t = 10)]
+        wait: u64,
+        /// How to reach peers: over the internet or direct IPs only.
+        #[arg(long, value_enum, default_value_t = Network::Internet)]
+        network: Network,
+        #[command(flatten)]
+        profile: ProfileArg,
+        #[command(flatten)]
+        bridge: BridgeArg,
+    },
+}
+
+#[derive(Subcommand)]
 enum PlaybookCommand {
     /// List the playbooks and what they need.
     List,
@@ -1721,6 +1777,7 @@ async fn main() -> Result<()> {
         Some(Command::Agent(command)) => run_agent_command(command),
         Some(Command::Factory(command)) => proofkin::factory::cli::run(command).await,
         Some(Command::Spec(command)) => run_spec(command).await,
+        Some(Command::Plan(command)) => run_plan_command(command).await,
         Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command).await,
         Some(Command::Models(command)) => run_models(command).await,
@@ -3304,6 +3361,76 @@ fn run_connect(profile: &str, new: bool, off: bool) -> Result<()> {
         "Turn it off: proofkin connect --off --profile {}",
         profile.name
     );
+    Ok(())
+}
+
+async fn run_plan_command(command: PlanCommand) -> Result<()> {
+    match command {
+        PlanCommand::Draft {
+            goal,
+            issue,
+            using,
+            from,
+            note,
+            out,
+            wait,
+            network,
+            profile,
+            bridge,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let plan = match &from {
+                Some(file) => Some(
+                    std::fs::read_to_string(file)
+                        .with_context(|| format!("reading {}", file.display()))?,
+                ),
+                None => None,
+            };
+            let ask = proofkin::plan_draft::Ask {
+                goal,
+                issue,
+                provider: using,
+                plan,
+                note,
+            };
+            let drafted = proofkin::plan_draft::draft_offline(
+                &profile,
+                &ask,
+                Duration::from_secs(wait),
+                network,
+                bridge.path(),
+                &|line: String| eprintln!("  {line}"),
+            )
+            .await?;
+            match &out {
+                Some(file) => {
+                    std::fs::write(file, &drafted.plan)
+                        .with_context(|| format!("writing {}", file.display()))?;
+                    eprintln!("Wrote the plan to {}.", file.display());
+                }
+                None => print!("{}", drafted.plan),
+            }
+            for problem in &drafted.problems {
+                let kind = if problem.error { "error" } else { "warning" };
+                match &problem.step {
+                    Some(step) => eprintln!("{kind}: step {step}: {}", problem.message),
+                    None => eprintln!("{kind}: {}", problem.message),
+                }
+            }
+            let errors = drafted.errors();
+            if errors > 0 {
+                eprintln!(
+                    "{errors} error{} left: fix the plan before you run it",
+                    if errors == 1 { "" } else { "s" }
+                );
+                std::process::exit(1);
+            }
+            eprintln!(
+                "Review it, then run it with /plan <file> in the agent of profile '{}', or paste it in the web UI's Plan mode.",
+                profile.name
+            );
+        }
+    }
     Ok(())
 }
 

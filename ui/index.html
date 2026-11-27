@@ -223,6 +223,8 @@
           <div class="task-opts" id="playbook-opts" hidden>
             <button type="button" class="btn small" id="playbook-pick" aria-haspopup="dialog"
                     title="Ready-made plans for the lifecycle: see what each does, then fill in who and where">Start from a playbook…</button>
+            <button type="button" class="btn small" id="plan-draft-open" aria-haspopup="dialog"
+                    title="Say what the plan should do, or name an issue: your profile's model writes the plan, for you to review and run">Draft with a model…</button>
             <button type="button" class="btn small" id="plan-expand"
                     title="Edit the plan in a large editor, with peers, folders, skills and checks to insert">Open editor</button>
             <button type="button" class="btn small" id="schedule-open"
@@ -458,6 +460,7 @@
         <div class="segmented" id="plan-view" role="radiogroup" aria-label="Edit the plan as">
           <button type="button" role="radio" data-view="builder" aria-checked="true">Builder</button>
           <button type="button" role="radio" data-view="text" aria-checked="false" tabindex="-1">Text</button>
+          <button type="button" role="radio" data-view="describe" aria-checked="false" tabindex="-1">Describe</button>
         </div>
         <span class="muted small" id="plan-editor-tip">Fill in the cards · the plan is checked as you go · Ctrl+Enter runs it</span>
         <button type="button" class="btn small" id="plan-editor-close">Done</button>
@@ -474,6 +477,36 @@
           <p class="muted small palette-hint">A click adds to the step your cursor is on, in its place; on an empty line it starts a new step.</p>
           <div id="plan-palette"></div>
         </aside>
+        <form class="plan-describe" id="plan-describe" novalidate aria-labelledby="plan-describe-h">
+          <h3 id="plan-describe-h">Draft the plan with a model</h3>
+          <p class="muted small">Your profile's own model writes the plan from what you say here, knowing the peers, folders, checks, squads and skills you may use. It reads no files and runs nothing: the plan goes into the editor, checked, for you to review and run.</p>
+          <label class="field" id="plan-draft-note-field" hidden>
+            <span>What should change?</span>
+            <textarea id="plan-draft-note" rows="3" maxlength="4000" placeholder="e.g. add a review by #qa before the sign-off…"></textarea>
+            <span class="muted small">The model gets the plan in the editor and this note, and writes the whole plan again.</span>
+          </label>
+          <label class="field">
+            <span>What should the plan do?</span>
+            <textarea id="plan-draft-goal" rows="5" maxlength="4000" placeholder="e.g. Add CSV export to the reports page, with tests, and let me sign it off…"></textarea>
+            <span class="muted small">In your words, at most 4,000 characters. Secrets in it are removed before the model sees it.</span>
+          </label>
+          <label class="field narrow">
+            <span>GitHub issue (optional)</span>
+            <input id="plan-draft-issue" type="text" inputmode="numeric" maxlength="12" spellcheck="false" autocomplete="off" placeholder="#42">
+            <span class="muted small" id="plan-draft-issue-hint">Link a tracker repository (GitHub card) to name one of its issues.</span>
+          </label>
+          <label class="field">
+            <span>Model that writes it</span>
+            <select id="plan-draft-provider"></select>
+            <span class="muted small">Your profile's own, at its default model, read-only in an empty folder with no tools.</span>
+          </label>
+          <p class="muted small" id="plan-draft-status" role="status" aria-live="polite"></p>
+          <p class="form-error" id="plan-draft-error" role="alert"></p>
+          <div class="dialog-actions">
+            <button type="button" class="btn" id="plan-draft-cancel">Cancel</button>
+            <button type="submit" class="btn primary" id="plan-draft-submit">Draft plan</button>
+          </div>
+        </form>
       </div>
       <div class="editor-foot">
         <div class="plan-track" id="plan-editor-track" hidden></div>

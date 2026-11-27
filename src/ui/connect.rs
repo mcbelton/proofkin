@@ -60,7 +60,9 @@ const INSTRUCTIONS: &str = "Proofkin hands work to the agents of your teammates 
 peer to peer, and proves it. list_peers: who can take work, with the folders they share \
 and their checks. delegate: run a task on a peer (its result is signed by that peer). \
 run_plan: run an evidence plan across peers (check it first with check_plan); its \
-claims are proven only by passing checks or sign-offs. get_task: wait for a result. \
+claims are proven only by passing checks or sign-offs. draft_plan: have the owner's model \
+write a plan from a goal or an issue (it runs nothing: show it, then run_plan). get_task: \
+wait for a result. \
 get_run: the evidence report. import_spec: turn a Spec Kit feature or OpenSpec change \
 into a plan. factory_*: design agents with the owner's agent factory: draft one \
 (factory_draft), check it (factory_check), and evaluate it (factory_evaluate: the estimate \
@@ -721,6 +723,15 @@ fn tools() -> Value {
             "Check a plan before running it: its syntax, and whether the peers, folders, checks, squads, skills and knowledge it uses are there. Lists each problem (and how to fix it).",
             json!({ "plan": text("The plan text") }),
             &["plan"], true),
+        tool("draft_plan", "Draft a plan",
+            "Have the owner's model write a plan, from a goal in plain words, an issue of the tracker's repository, or a plan and a note that says what should change. The model knows how plans are written and the peers, folders, checks, squads, skills and agents this agent may use (never files, knowledge text or tokens); it works read-only in an empty folder. The plan is checked as run_plan checks it, and written again while it has errors, at most 3 tries. Drafting runs nothing: returns the plan and its problems; show it to your user, then run it with run_plan.",
+            json!({
+                "goal": text("What the plan should do, in plain words (at most 4000 characters)"),
+                "issue": { "type": "integer", "minimum": 1, "description": "The issue of the tracker's repository the plan is for (N of #N); the model gets its text" },
+                "plan": text("A plan to change; give note too"),
+                "note": text("What should change in plan (at most 4000 characters)"),
+            }),
+            &[], true),
         tool("run_plan", "Run an evidence plan",
             "Run a plan across peers and squads in dependency order. A plan is claim lines (claim: ID what must be true), then one step per line: name [after a,b] @peer[:folder] or #squad [skill=s] [verify=check] [attempts=N] [apply=step] [claims=IDs] what to do; `approve @person` steps are sign-offs. Claims are proven only by passing checks or sign-offs; the run's evidence report is saved (get_run). With a progress token (_meta.progressToken) and Accept listing text/event-stream, it streams notifications/progress while the plan runs, then the result.",
             json!({ "plan": text("The plan text"), "wait_seconds": wait }),
@@ -1115,6 +1126,10 @@ async fn call_tool(s: &AppState, params: &Value) -> Result<Value, String> {
         },
         "cancel_task" => cancel_task(s, &args),
         "check_plan" => text_arg(&args, "plan").map(|plan| plan_check(s, &plan)),
+        "draft_plan" => match serde_json::from_value(args.clone()) {
+            Ok(ask) => super::draft_plan(s, ask, BY_AGENT).await.map_err(api_error),
+            Err(e) => Err(format!("{e}")),
+        },
         "get_run" => text_arg(&args, "run_id")
             .and_then(|id| run_details(s, &id).map_err(|e| format!("{e:#}"))),
         "import_spec" => import_spec(s, &args).await,

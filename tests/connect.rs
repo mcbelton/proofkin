@@ -400,6 +400,7 @@ async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
             "get_task",
             "cancel_task",
             "check_plan",
+            "draft_plan",
             "run_plan",
             "get_run",
             "import_spec",
@@ -1275,5 +1276,143 @@ async fn editor_agents_design_agents_over_mcp_and_the_lifecycle_stays_with_the_o
         !skills.contains("release") && !skills.contains("deploy"),
         "{skills}"
     );
+    agent.shutdown().await;
+}
+
+/// The profile's model, as an agent connected over MCP has it draft plans: prose around a
+/// plan with a step on a peer that isn't connected, and a sign-off after it when the
+/// prompt asks for one.
+struct Drafter;
+
+#[async_trait]
+impl Executor for Drafter {
+    fn providers(&self) -> Vec<Provider> {
+        vec![Provider::Copilot]
+    }
+
+    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<proofkin::Ran> {
+        let mut plan = "work @ghost:app Do the work".to_owned();
+        if task.prompt.contains("add a sign-off by me") {
+            plan += "\nok after work approve @me Sign it off";
+        }
+        Ok(proofkin::Ran::new(
+            format!("Sure, here it is:\n```plan\n{plan}\n```\nTell me if it needs more."),
+            Some("drafter-1".into()),
+        ))
+    }
+}
+
+/// Another agent drafts a plan over MCP with `draft_plan`, then has it changed: each answer
+/// is the plan and its problems (here, the peer it names isn't connected, after 3 tries),
+/// and drafting runs nothing; `run_plan` stays how a plan runs.
+#[tokio::test]
+async fn other_agents_draft_plans_over_mcp_and_drafting_runs_nothing() {
+    let home = shared_home();
+    let profiles = home.join("profiles");
+    std::fs::create_dir_all(profiles.join("planner")).unwrap();
+    std::fs::write(
+        profiles.join("planner").join("profile.json"),
+        r#"{"copilot": {"source": "token", "host": "github.com"}}"#,
+    )
+    .unwrap();
+    let mut config = AgentConfig::new("planner", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(&profiles, "planner").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        Some(Arc::new(Drafter)),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, ui_token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let ui_auth = format!("Bearer {ui_token}");
+    let on = request(
+        port,
+        "POST",
+        "/api/connect",
+        &[("Authorization", ui_auth.as_str())],
+        None,
+    )
+    .await
+    .json();
+    let auth = format!("Bearer {}", on["token"].as_str().unwrap());
+    let call = |arguments: Value| {
+        let auth = auth.clone();
+        let body = rpc(
+            "tools/call",
+            json!({ "name": "draft_plan", "arguments": arguments }),
+        );
+        async move {
+            let headers = [
+                ("Authorization", auth.as_str()),
+                ("Accept", "application/json, text/event-stream"),
+            ];
+            let reply = request(port, "POST", "/mcp", &headers, Some(&body))
+                .await
+                .json();
+            reply["result"].clone()
+        }
+    };
+
+    let first = call(json!({ "goal": "Do the work in app" })).await;
+    assert_ne!(first["isError"], true, "{first}");
+    let drafted = &first["structuredContent"];
+    let plan = drafted["plan"].as_str().unwrap();
+    assert_eq!(
+        plan,
+        "// Drafted by copilot (drafter-1): Do the work in app\nwork @ghost:app Do the work\n"
+    );
+    assert_eq!(drafted["tries"], 3);
+    assert_eq!(drafted["model"], "drafter-1");
+    assert!(
+        drafted["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["error"] == true
+                && p["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ghost is not connected")),
+        "{drafted}"
+    );
+
+    let changed = call(json!({ "plan": plan, "note": "add a sign-off by me" })).await;
+    let changed = &changed["structuredContent"];
+    assert_eq!(
+        changed["plan"],
+        "// Drafted by copilot (drafter-1): Do the work in app\nwork @ghost:app Do the work\n\
+         ok after work approve @me Sign it off\n",
+        "{changed}"
+    );
+    let refused = call(json!({ "note": "add a sign-off by me" })).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+
+    let state = request(
+        port,
+        "GET",
+        "/api/state",
+        &[("Authorization", ui_auth.as_str())],
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(state["tasks"], json!([]), "drafting starts no task");
     agent.shutdown().await;
 }
