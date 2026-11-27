@@ -886,7 +886,10 @@ plan, then run it yourself.
 **What the model gets:**
 - The goal, at most 4,000 characters, with secrets redacted. With an issue, the issue's
   text as a step's `issue=` gets it, marked as external content, so instructions written
-  in it aren't taken as yours. To change a plan, the plan and your note.
+  in it aren't taken as yours. It is told to name the issue one way, not both: `track: #N`
+  (the run works on it, and its steps get sub-issues of it) or `issue=#N` on the step that
+  does the work, as the plan check refuses a step whose `issue=` is the run's own
+  `track: #N`. To change a plan, the plan and your note.
 - A reference of the plan format: every step kind and option the parser takes. It is kept
   next to the parser, and a test fails when the parser takes something it doesn't name.
 - What this agent may use, as the plan check sees it:
@@ -1986,13 +1989,15 @@ signoff after ui approve @me claims=C-1 Try the export and approve it
 Here the run works on issue #12 (reopened if it is closed; `track: <title>` makes a new issue with that title,
 `track: off` leaves the run untracked; without a `track:` line the run gets a new issue
 named after its first claim). Step `api` works on #15, made a sub-issue of #12 if it isn't
-one; `ui` and `signoff` get new sub-issues. A later run with `track: #12` takes up its
-steps' open sub-issues again: it gives each its step's title and text (the earlier run's
-stay in the issue's history) and comments that it took the issue over. A run closes only
-an issue a run made (`track: <title>`, or no `track:` line): an issue you name with
-`track: #12`, such as an epic or a bucket of findings, may hold other work, so when the
-run passes it says so on the issue, puts it back where it was on the board and leaves it
-open.
+one; `ui` and `signoff` get new sub-issues. No step may also say `issue=#12`: the plan
+check refuses a step whose `issue=` is the run's own `track: #N`, so name an issue one way,
+with `track: #N` or with `issue=#N` on the step that does the work. A later run with
+`track: #12` takes up its steps' open sub-issues again: it gives each its step's title and
+text (the earlier run's stay in the issue's history) and comments that it took the issue
+over. A run closes only an issue a run made (`track: <title>`, or no `track:` line): an
+issue you name with `track: #12`, such as an epic or a bucket of findings, may hold other
+work, so when the run passes it says so on the issue, puts it back where it was on the
+board and leaves it open.
 In the web UI the **Tracker** card links and shows the
 tracker, and **Board items** lists what is open by status; **Plan it** starts a plan on an
 item, with a step per open sub-issue. **Add existing issues** (`tracker add`) puts the
