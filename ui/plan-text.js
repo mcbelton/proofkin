@@ -33,7 +33,7 @@ const planText = (() => {
     ["meetings", "your meetings"],
     ["files", "your files in OneDrive and SharePoint"],
     ["teams", "your Teams chats and channel messages"],
-    ["people", "people in your organization (their results are withheld for now)"],
+    ["people", "people in your organization (for your own agent and digital workers only)"],
     ["connectors", "what Microsoft Graph connectors bring in from other systems"],
   ];
   /// What a new step does until you say: selected, so typing replaces it (the plan

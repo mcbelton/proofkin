@@ -55,7 +55,8 @@ What the Work IQ CLI 1.0.1 returned in a Microsoft tenant (seven queries, 36 res
   content is untrusted. Proofkin treats all of it that way anyway.
 - No result had an empty or null `sensitivityLabel`: meetings, chats and people have none at
   all, so their sensitivity isn't known and they go to no peer (the `unlabeled` grant matched
-  nothing in this sample). People results have no `contentProtection`, so they are withheld.
+  nothing in this sample). People results have no `contentProtection` either: only the
+  owner's own agent and digital workers get them (section 3).
 - `ask` gives its answer twice: as the text `content` and as `structuredContent.answer`, with
   the `conversationId`. It has no citations, so an answer has no labels and stays local.
   Work IQ's [tool reference](https://learn.microsoft.com/microsoft-365/copilot/extensibility/work-iq/mcp/tool-reference)
@@ -84,8 +85,9 @@ and `do_action` are destructive. `ask` and `list_agents` have none. The CLI also
    agent and digital workers, unless the owner allows a peer to receive it, within the
    sensitivity labels they choose. Anything made from it (a step's output, a knowledge
    topic) carries that origin.
-4. **Fail closed.** Only results Work IQ marks `allowed` are used, labels the owner didn't
-   allow are withheld, and denials are reported with who can fix them, never retried.
+4. **Fail closed.** Only results Work IQ marks `allowed` are used (and People results, which
+   it leaves unmarked, only by the owner's own agent and digital workers), labels the owner
+   didn't allow are withheld, and denials are reported with who can fix them, never retried.
 5. **Read by default.** Changes (send mail, post in Teams, edit a file) need the tenant's
    policy, the owner's opt-in and a sign-off on the exact operation, and run once.
 6. **Visible cost.** Every call is audited (without its text) and counted against daily and
@@ -178,7 +180,20 @@ Every result goes through one function before it reaches a prompt (`src/workiq/c
 
 1. Read `structuredContent`, never the `content` array, except where Work IQ gives what was
    asked for only there: an `ask` answer without a structured one, and the `list_agents` list.
-2. Keep only `contentProtection: "allowed"`. Count the rest as withheld, by reason.
+2. Keep only `contentProtection: "allowed"`. Count the rest as withheld, by reason. One
+   exception ([#241](https://github.com/mcbelton/proofkin/issues/241)): Work IQ gives People
+   results (`entityType: People`) no `contentProtection` at all. They are directory entries
+   (name, title, link) the owner can already see, so a People result without
+   `contentProtection` is kept for the owner's own agent and digital workers (the `Local`
+   audience) as if Work IQ had said `allowed`. Its label is what it carries: none today, so
+   `unknown`, and nothing made from it goes to a peer. A peer never gets it, whatever its
+   label and the peer's grant (`unlabeled` included): it is withheld and counted as missing.
+   A People result whose `contentProtection` is `blocked` or any other value, and any other
+   result without one, are withheld as before. `workiq=` steps, `kb import workiq`, the
+   gateway's results for the owner's own tasks and the audit's withheld count all follow
+   this. The Work IQ team was asked whether a missing `contentProtection` on People means
+   `allowed` or "not evaluated"; if it means "not evaluated, withhold", the exception is
+   removed.
 3. Filter by the audience's labels. The owner's own agent and digital workers get every label;
    a peer gets only the labels the owner allowed for it (`unlabeled` is one of the choices).
    Labels are names each tenant defines, so the rule is an allowlist, not a ranking. A
@@ -567,8 +582,9 @@ one release and one live check for the batch. The items marked later come after 
   withhold most of them. We start strict and show withheld counts, and revisit with
   Microsoft's guidance rather than add an override. In the
   [#94](https://github.com/mcbelton/proofkin/issues/94) sample only People results
-  lacked it, so `workiq=people` finds nothing usable
-  ([#241](https://github.com/mcbelton/proofkin/issues/241)).
+  lacked it; the owner's own agent and digital workers get those, a peer never does
+  (section 3), until the Work IQ team says whether a missing value on People means `allowed`
+  or "not evaluated" ([#241](https://github.com/mcbelton/proofkin/issues/241)).
 - `@workiq` steps start with MCP `ask`. A2A (streaming, `contextId` conversations) may suit
   long answers better.
 - Whether peers should share their Work IQ tenant id, so the web UI can say "same
