@@ -164,6 +164,7 @@ fn finish(
                     f.checks.clone(),
                     f.worktrees,
                 )?;
+                shares.set_task_limit(&f.name, f.task_limit)?;
             }
             Ok(())
         })?;

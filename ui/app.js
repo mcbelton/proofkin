@@ -318,6 +318,12 @@ function renderMe() {
               : "Preview prototype/index.html of this folder in a sandboxed tab",
             onclick: (e) => openPreview({ share: s.name }, e.currentTarget),
           }, s.preview === "review pack" ? "Preview review pack" : "Preview prototype") : null,
+          s.name === "data" ? null : el("div", { class: "share-team" },
+            el("button", {
+              type: "button", class: "btn small", "aria-label": `Editing task limit for ${s.name}`,
+              onclick: () => openShareTasks(s),
+            }, "Task limit…"),
+            el("span", { class: "muted small", text: `Editing tasks at once: ${s.task_limit ?? "any"}` })),
           s.name === "data" || !["workspace-write", "full"].includes(s.max_access) ? null : el("div", { class: "share-team" },
             el("button", {
               type: "button", class: "btn small", "aria-label": `Team plan for ${s.name}`,
@@ -883,6 +889,47 @@ function renderSquads() {
 /** The steps of a team plan: its lines that are neither blank, comments nor claims, nor the continuation of a step's text. */
 function teamStepCount(plan) {
   return planText.lineKinds(plan).filter(({ kind }) => kind === "step").length;
+}
+
+let taskLimitFolder = null;
+
+function focusShareTasks(name) {
+  [...$("#facts").querySelectorAll("button[aria-label]")]
+    .find((b) => b.getAttribute("aria-label") === `Editing task limit for ${name}`)?.focus();
+}
+
+function openShareTasks(share) {
+  if ($("#share-tasks-save").disabled) return;
+  taskLimitFolder = share.name;
+  $("#share-tasks-h").textContent = `Editing task limit for ${share.name}`;
+  $("#share-tasks").value = share.task_limit ?? "any";
+  $("#share-tasks-error").textContent = "";
+  $("#share-tasks-dialog").showModal();
+  $("#share-tasks").select();
+}
+
+async function submitShareTasks(e) {
+  e.preventDefault();
+  const save = $("#share-tasks-save");
+  if (save.disabled) return;
+  const name = taskLimitFolder;
+  $("#share-tasks-error").textContent = "";
+  save.disabled = true;
+  save.textContent = "Saving…";
+  try {
+    const body = JSON.stringify({ tasks: $("#share-tasks").value });
+    const { task_limit } = await api(`/api/shares/${encodeURIComponent(name)}/tasks`, { method: "PUT", body });
+    const share = state.me.shares.find((s) => s.name === name);
+    if (share) share.task_limit = task_limit;
+    $("#share-tasks-dialog").close();
+    renderMe();
+    focusShareTasks(name);
+  } catch (err) {
+    $("#share-tasks-error").textContent = err.message;
+  } finally {
+    save.disabled = false;
+    save.textContent = "Save task limit";
+  }
 }
 
 let teamFolder = null;
@@ -4284,6 +4331,9 @@ function init() {
     (back ?? $("#add-squad-btn")).focus();
   });
   $("#squad-form").addEventListener("submit", submitSquad);
+  $("#share-tasks-cancel").addEventListener("click", () => $("#share-tasks-dialog").close());
+  $("#share-tasks-dialog").addEventListener("close", () => focusShareTasks(taskLimitFolder));
+  $("#share-tasks-form").addEventListener("submit", submitShareTasks);
   $("#team-cancel").addEventListener("click", () => $("#team-dialog").close());
   $("#team-form").addEventListener("submit", submitTeamPlan);
   $("#team-remove").addEventListener("click", removeTeamPlan);
@@ -4342,6 +4392,7 @@ function init() {
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
+    "#share-tasks-dialog",
     "#monitor-dialog", "#team-dialog", "#tracker-dialog", "#tracker-items-dialog", "#gh-flow-dialog", "#models-dialog",
     "#branch-dialog", "#pull-dialog", "#workiq-dialog", "#workiq-budget-dialog", "#kb-import-dialog",
     "#factory-new-dialog", "#factory-agent-dialog", "#factory-catalog-dialog"]) guardDialog($(id));

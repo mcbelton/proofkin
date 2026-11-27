@@ -1100,6 +1100,7 @@ pub async fn start_with_work(
             "/api/shares/{name}/team",
             put(tools::set_team).delete(tools::remove_team),
         )
+        .route("/api/shares/{name}/tasks", put(tools::set_task_limit))
         .route(
             "/api/shares/{name}/pull-requests",
             put(tools::set_pull_requests),

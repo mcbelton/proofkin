@@ -6,6 +6,7 @@
 //! `proofkin share add`, each with the most access any peer's task may get there.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +33,9 @@ pub struct Share {
     /// Run each editing task in its own git worktree and branch, and commit its work.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktrees: bool,
+    /// Editing tasks this agent may run at once in this folder (`None`: no folder limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_limit: Option<NonZeroU32>,
     /// Owner-defined MCP servers tasks here may use (see [`crate::mcp`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
@@ -119,6 +123,18 @@ pub fn parse_checks(defs: &[String]) -> Result<BTreeMap<String, String>> {
     Ok(checks)
 }
 
+/// Parses the editing task limit set by a folder's owner.
+pub fn parse_task_limit(value: &str) -> Result<Option<NonZeroU32>> {
+    let value = value.trim();
+    if value == "any" {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
+        .context("give a whole number of 1 or more, or 'any' for no folder limit")
+}
+
 /// The access a peer's task gets in a share.
 pub fn effective_access(peer_grant: Access, share_max: Access) -> Access {
     peer_grant.min(share_max)
@@ -140,6 +156,7 @@ impl ShareStore {
                 max_access: Access::ReadOnly,
                 checks: BTreeMap::new(),
                 worktrees: false,
+                task_limit: None,
                 mcp: BTreeMap::new(),
                 team: None,
                 team_model: false,
@@ -194,7 +211,7 @@ impl ShareStore {
     }
 
     /// Shares `path` (an existing folder) as `name`, replacing a share of that name
-    /// (its MCP servers are kept).
+    /// (its MCP servers and editing task limit are kept).
     pub fn add(&mut self, name: &str, path: &Path, max_access: Access) -> Result<&Share> {
         self.add_with(name, path, max_access, BTreeMap::new(), false)
     }
@@ -224,6 +241,7 @@ impl ShareStore {
                 path.display()
             );
         }
+        let task_limit = self.get(name).and_then(|s| s.task_limit);
         let mcp = self.get(name).map(|s| s.mcp.clone()).unwrap_or_default();
         let team = self.get(name).and_then(|s| s.team.clone());
         let team_model = self.get(name).is_some_and(|s| s.team_model);
@@ -238,6 +256,7 @@ impl ShareStore {
             max_access,
             checks,
             worktrees,
+            task_limit,
             mcp,
             team,
             team_model,
@@ -246,6 +265,20 @@ impl ShareStore {
             pull_request_approval,
         });
         Ok(self.shares.last().expect("just pushed"))
+    }
+
+    /// Limits concurrent editing tasks in `name`. `None` clears the folder's limit.
+    pub fn set_task_limit(&mut self, name: &str, limit: Option<NonZeroU32>) -> Result<()> {
+        if name == DATA_SHARE {
+            bail!("the built-in '{DATA_SHARE}' share only takes read-only tasks");
+        }
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|s| s.name == name)
+            .with_context(|| format!("no share named '{name}'"))?;
+        share.task_limit = limit;
+        Ok(())
     }
 
     /// Lets peers with edit access end their plans with pull request steps in share
