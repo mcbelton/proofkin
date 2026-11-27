@@ -327,6 +327,75 @@ pub struct ApprovalAsk {
     pub changes: bool,
 }
 
+/// Has a digital worker's owner sign off each Microsoft 365 change of their task (see
+/// [`crate::workiq::gateway::ChangeApprover`]): a signed approval request to the owner's
+/// agent, as an `approve @peer` step's is, that counts only as the owner's signed approval of
+/// exactly its text.
+struct OwnerSignOff {
+    agent: Agent,
+    owner: EndpointId,
+}
+
+#[async_trait::async_trait]
+impl crate::workiq::gateway::ChangeApprover for OwnerSignOff {
+    async fn approve(
+        &self,
+        title: &str,
+        text: &str,
+        wait: Duration,
+    ) -> crate::workiq::gateway::Approval {
+        use crate::workiq::gateway::Approval;
+        // An approver signs what it shows: a longer text would be cut, and its sign-off
+        // wouldn't be of this change.
+        if text.chars().count() > MAX_APPROVAL_TEXT {
+            return Approval::Failed(format!(
+                "the change is too long to show for a sign-off (over {MAX_APPROVAL_TEXT} \
+                 characters)"
+            ));
+        }
+        let ask = ApprovalAsk {
+            title: title.to_owned(),
+            text: text.to_owned(),
+            // They may also ask for it to be done otherwise: the model gets their note.
+            changes: true,
+            ..Default::default()
+        };
+        let id = self.agent.new_task_id();
+        let asked = self.agent.request_approval_as(Some(self.owner), id, &ask);
+        // Not answered in time: dropping the request withdraws it on the owner's agent.
+        let delivered = match crate::awake::timeout(wait, asked).await {
+            None => return Approval::TimedOut,
+            Some(Err(e)) => {
+                return Approval::Failed(format!("the sign-off couldn't be asked for: {e:#}"));
+            }
+            Some(Ok(delivered)) => delivered,
+        };
+        let Some(evidence) = &delivered.evidence else {
+            return Approval::Failed(format!(
+                "the sign-off couldn't be asked for: {}",
+                delivered.output
+            ));
+        };
+        let signed = delivered.verified
+            && evidence.kind == EvidenceKind::Approval
+            && evidence.signer_id == self.owner.to_string()
+            && evidence.prompt_sha256 == sha256_hex(text.as_bytes());
+        if !signed {
+            return Approval::Failed("the answer isn't the owner's sign-off of this change".into());
+        }
+        match evidence.approved {
+            Some(true) => Approval::Approved,
+            _ => Approval::Declined(
+                delivered
+                    .output
+                    .split_once(": ")
+                    .map(|(_, note)| note.trim().to_owned())
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+}
+
 struct IncomingApproval {
     info: ApprovalInfo,
     requester: EndpointId,
@@ -336,6 +405,8 @@ struct IncomingApproval {
 
 /// Most open approval requests one peer may have with this agent.
 const MAX_OPEN_APPROVALS: usize = 20;
+/// The most of a request's text an approver is shown and signs, in characters.
+const MAX_APPROVAL_TEXT: usize = 20_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
@@ -2116,7 +2187,7 @@ impl Inner {
                         id,
                         from: from.clone(),
                         title: title.chars().take(200).collect(),
-                        text: text.chars().take(20_000).collect(),
+                        text: text.chars().take(MAX_APPROVAL_TEXT).collect(),
                         preview: crate::preview::label(&preview),
                         changes,
                     },
@@ -2200,6 +2271,28 @@ impl Inner {
                  --m365 <labels> --m365-tools`",
                 self.name
             ),
+        }
+    }
+
+    /// Who signs off the Microsoft 365 changes of `owner`'s task `task`: `owner`, asked by this
+    /// digital worker (see [`OwnerSignOff`]).
+    fn owner_sign_off(
+        self: &Arc<Self>,
+        owner: &EndpointId,
+        origin: Option<&Origin>,
+        task: &LlmTask,
+    ) -> crate::workiq::gateway::ChangeSignOff {
+        let agent = Agent {
+            inner: self.clone(),
+        };
+        crate::workiq::gateway::ChangeSignOff {
+            approver: Arc::new(OwnerSignOff {
+                agent,
+                owner: *owner,
+            }),
+            worker: self.name.clone(),
+            task: origin.and_then(|o| o.task),
+            prompt: task.prompt.clone(),
         }
     }
 
@@ -2518,8 +2611,17 @@ impl Inner {
         });
         let work = async {
             let _slot = self.take_slot(id, task_id).await?;
-            self.attempt_task(executor.as_ref(), id, from, task_id, task, ctx, &share)
-                .await
+            self.attempt_task(
+                executor.as_ref(),
+                id,
+                from,
+                task_id,
+                task,
+                origin,
+                ctx,
+                &share,
+            )
+            .await
         };
         // A deployed agent's budget: no task runs longer than it allows.
         let limit = self
@@ -3292,12 +3394,13 @@ impl Inner {
     /// with the failures while attempts are left. Returns the signed evidence.
     #[allow(clippy::too_many_arguments)]
     async fn attempt_task(
-        &self,
+        self: &Arc<Self>,
         executor: &dyn Executor,
         id: &EndpointId,
         from: &str,
         task_id: u64,
         task: &LlmTask,
+        origin: Option<&Origin>,
         mut ctx: TaskContext,
         share: &Share,
     ) -> Result<Served> {
@@ -3357,7 +3460,9 @@ impl Inner {
         }
         // A Work IQ server becomes this task's own address on this machine, with a bearer
         // that stops working when the task ends: the model never gets the account's token.
-        // What it sees is for the task's requester (a grant revoked since counts).
+        // What it sees is for the task's requester (a grant revoked since counts). A task for
+        // the owner may change Microsoft 365, each change signed off by them, but not a plan
+        // step's: plans propose changes, and an apply step makes them.
         let mut workiq_sessions = Vec::new();
         for (name, def) in ctx.mcp.iter_mut().filter(|(_, def)| def.workiq) {
             let gateway = self
@@ -3365,8 +3470,11 @@ impl Inner {
                 .as_ref()
                 .context("this agent doesn't serve Work IQ")?;
             let context = self.workiq_audience(id, from)?;
+            let owners = matches!(context.audience, crate::workiq::content::Audience::Local);
+            let sign_off = (owners && origin.is_none_or(|o| o.step.is_none()))
+                .then(|| self.owner_sign_off(id, origin, task));
             let (server, session) = gateway
-                .open(def, context)
+                .open(def, context, sign_off)
                 .await
                 .with_context(|| format!("MCP server '{name}'"))?;
             *def = server;
@@ -3455,6 +3563,11 @@ impl Inner {
                                 commit.chars().take(12).collect::<String>()
                             );
                         }
+                    }
+                    // The Microsoft 365 changes it made are named, however the run ended.
+                    let made = changes_made(&workiq_sessions);
+                    if !made.is_empty() {
+                        why += &format!("\n\n{made}");
                     }
                     bail!("{why}");
                 }
@@ -3650,6 +3763,8 @@ impl Inner {
         for used in &plain {
             summary += &crate::evidence::context_line(&self.name, used);
         }
+        // Last, the Microsoft 365 changes its model made, each signed off by the owner.
+        summary += &changes_made(&workiq_sessions);
         if !summary.is_empty() {
             output = format!("{}\n\n---\n{summary}", output.trim_end());
         }
@@ -3673,6 +3788,13 @@ impl Inner {
             usage,
         })
     }
+}
+
+/// The section a task's result ends with for the Microsoft 365 changes its Work IQ sessions
+/// made (see [`crate::workiq::changes::made_section`]); empty when they made none.
+fn changes_made(sessions: &[crate::workiq::gateway::SessionGuard]) -> String {
+    let made: Vec<String> = sessions.iter().flat_map(|s| s.changes()).collect();
+    crate::workiq::changes::made_section(&made)
 }
 
 /// The subject of the commit of `task`'s work, and the line under it, if any: the title of

@@ -1,8 +1,11 @@
-//! Microsoft 365 changes in plans (docs/work-iq.md, section 7). A step's model never changes
+//! Microsoft 365 changes (docs/work-iq.md, section 7). A plan step's model never changes
 //! Microsoft 365 itself: it proposes changes in one fenced `m365-changes` block of its result
 //! ([`proposed`]), its owner signs off exactly that list (shown by [`preview`], with the
 //! list's [`digest`]), and a `@workiq apply=STEP` step makes them once, in order, reporting
-//! how each ended ([`report`]).
+//! how each ended ([`report`]). In a digital worker's task for its owner, the Work IQ gateway
+//! reads each change call ([`Change::from_arguments`]), holds it to the same rules
+//! ([`check`]) and has the owner sign off exactly that change ([`preview_one`]) before it
+//! makes it once (see [`crate::workiq::gateway`]).
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -62,6 +65,76 @@ impl Change {
         arguments
     }
 
+    /// The change a call of Work IQ's change tool `tool` with `arguments` makes: the inverse
+    /// of [`Change::arguments`]. Its path is `parentUrl`, `entityUrl` or `actionUrl`;
+    /// `jsonBody` is a JSON object or one encoded as a string; `headers` has only
+    /// `If-Match`. An error says what is wrong; [`check`] then holds it to the rules.
+    pub fn from_arguments(tool: &str, arguments: &Value) -> std::result::Result<Change, String> {
+        let url = match tool {
+            "create_entity" => "parentUrl",
+            "update_entity" | "delete_entity" => "entityUrl",
+            "do_action" => "actionUrl",
+            _ => {
+                return Err(format!(
+                    "tool is create_entity, update_entity, delete_entity or do_action, not {:?}",
+                    cut(tool, 40)
+                ));
+            }
+        };
+        let Some(given) = arguments.as_object() else {
+            return Err(format!("{tool}'s arguments are a JSON object"));
+        };
+        let unknown: Vec<&str> = given
+            .keys()
+            .map(String::as_str)
+            .filter(|key| ![url, "jsonBody", "headers"].contains(key))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "{tool} takes {url}, jsonBody and headers, not {}",
+                cut(&unknown.join(", "), 200)
+            ));
+        }
+        let Some(Value::String(path)) = given.get(url) else {
+            return Err(format!(
+                "{url} is the Microsoft Graph path, as a string (like /me/sendMail)"
+            ));
+        };
+        let body = match given.get("jsonBody") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(serde_json::from_str(text).map_err(|e| {
+                format!("jsonBody is a JSON object, or one encoded as a string ({e})")
+            })?),
+            Some(body) => Some(body.clone()),
+        };
+        let if_match = match given.get("headers") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(headers)) => {
+                let mut tag = None;
+                for (name, value) in headers {
+                    if !name.eq_ignore_ascii_case("If-Match") || tag.is_some() {
+                        return Err(format!(
+                            "headers has only one If-Match, not {:?}",
+                            cut(name, 40)
+                        ));
+                    }
+                    let Value::String(value) = value else {
+                        return Err("If-Match is the entity's ETag, as a string".into());
+                    };
+                    tag = Some(value.clone());
+                }
+                tag
+            }
+            Some(_) => return Err("headers is a JSON object with If-Match".into()),
+        };
+        Ok(Change {
+            tool: tool.to_owned(),
+            path: path.clone(),
+            body,
+            if_match,
+        })
+    }
+
     fn verb(&self) -> &'static str {
         match self.tool.as_str() {
             "create_entity" => "Create",
@@ -96,7 +169,7 @@ impl Change {
     }
 
     /// How a result names it: its verb and path.
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         format!("{} {}", self.verb(), cut(&self.path, 120))
     }
 }
@@ -180,8 +253,8 @@ pub fn proposed(output: &str) -> Result<Option<Vec<Change>>> {
     Ok(Some(changes))
 }
 
-/// Why `change` breaks a rule of the block, if it does.
-fn check(change: &Change) -> std::result::Result<(), String> {
+/// Why `change` breaks a rule of Microsoft 365 changes, if it does: the rule, in words.
+pub fn check(change: &Change) -> std::result::Result<(), String> {
     if !TOOLS.contains(&change.tool.as_str()) {
         return Err(format!(
             "tool is create_entity, update_entity, delete_entity or do_action, not {:?}",
@@ -290,22 +363,48 @@ pub fn preview(step: &str, by: &str, changes: &[Change]) -> String {
         digest(changes)
     );
     for (i, change) in changes.iter().enumerate() {
-        let details = match change.mail() {
-            Some(message) => {
-                text += &format!("\n**{}. Mail**\n\n", i + 1);
-                mail_lines(&change.path, message)
+        let (heading, details) = shown_as(change);
+        text += &format!("\n**{}. {heading}**\n\n{}", i + 1, fenced(&details));
+    }
+    crate::redact::redact(&text).0
+}
+
+/// What a sign-off shows of one change a digital worker's task makes: the change as a person
+/// reads it, as [`preview`] shows each. Redacted; the web UI shows it as text.
+pub fn preview_one(change: &Change) -> String {
+    let (heading, details) = shown_as(change);
+    crate::redact::redact(&format!("**{heading}**\n\n{}", fenced(&details))).0
+}
+
+/// How a sign-off shows `change`: its heading (Mail, or its verb) and its details.
+fn shown_as(change: &Change) -> (&'static str, String) {
+    match change.mail() {
+        Some(message) => ("Mail", mail_lines(&change.path, message)),
+        None => {
+            let mut lines = format!("{} {}", change.tool, change.path);
+            if let Some(body) = &change.body {
+                lines += &format!("\n{}", cut(&compact(body), BODY_CHARS));
             }
-            None => {
-                text += &format!("\n**{}. {}**\n\n", i + 1, change.verb());
-                let mut lines = format!("{} {}", change.tool, change.path);
-                if let Some(body) = &change.body {
-                    lines += &format!("\n{}", cut(&compact(body), BODY_CHARS));
-                }
-                lines
-            }
-        };
-        let fence = "`".repeat(longest_backticks(&details).max(2) + 1);
-        text += &format!("{fence}text\n{details}\n{fence}\n");
+            (change.verb(), lines)
+        }
+    }
+}
+
+/// `text` in a fenced block that its own backticks can't close.
+pub(crate) fn fenced(text: &str) -> String {
+    let fence = "`".repeat(longest_backticks(text).max(2) + 1);
+    format!("{fence}text\n{text}\n{fence}\n")
+}
+
+/// The section a task's result ends with when it made Microsoft 365 changes: each change's
+/// verb and path, and how it ended (never its body). Empty when it made none.
+pub fn made_section(made: &[String]) -> String {
+    if made.is_empty() {
+        return String::new();
+    }
+    let mut text = "**Microsoft 365 changes this task made:**\n".to_owned();
+    for line in made {
+        text += &format!("- {}\n", crate::runs::one_line(line));
     }
     crate::redact::redact(&text).0
 }
@@ -486,7 +585,9 @@ impl Outcome {
         }
     }
 
-    fn describe(&self) -> String {
+    /// How it ended, in words: done (with a created entity's id and link), accepted, failed
+    /// or outcome unknown.
+    pub fn describe(&self) -> String {
         match self {
             Outcome::Done { status, id, link } => {
                 let mut text = match status {
@@ -807,5 +908,111 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn a_change_call_reads_back_as_the_change_whose_arguments_it_has() {
+        let create: Change = serde_json::from_str(
+            r#"{"tool":"create_entity","path":"/me/events","body":{"subject":"Sync"}}"#,
+        )
+        .unwrap();
+        let delete: Change = serde_json::from_str(
+            r#"{"tool":"delete_entity","path":"/me/messages/AAMk2","ifMatch":"W/\"x\""}"#,
+        )
+        .unwrap();
+        let mut changes = proposed(&block(&[MAIL, UPDATE])).unwrap().unwrap();
+        changes.extend([create, delete]);
+        for change in changes {
+            let read = Change::from_arguments(&change.tool, &change.arguments()).unwrap();
+            assert_eq!(read, change);
+            assert_eq!(check(&read), Ok(()));
+        }
+
+        // As Work IQ's schemas also allow: the body encoded as a string, any case of If-Match.
+        let read = Change::from_arguments(
+            "update_entity",
+            &json!({ "entityUrl": "/me/events/AAMk1", "jsonBody": "{\"subject\":\"Moved\"}",
+                     "headers": { "if-match": "W/\"abc\"" } }),
+        )
+        .unwrap();
+        assert_eq!(read, serde_json::from_str::<Change>(UPDATE).unwrap());
+
+        let fails = |tool: &str, arguments: Value, says: &str| {
+            let err = Change::from_arguments(tool, &arguments).unwrap_err();
+            assert!(err.contains(says), "{arguments}: {err}");
+        };
+        fails("send_mail", json!({}), "tool is create_entity");
+        fails("do_action", json!([1]), "arguments are a JSON object");
+        fails(
+            "do_action",
+            json!({ "actionUrl": "/me/sendMail", "jsonBody": {}, "to": "x" }),
+            "do_action takes actionUrl, jsonBody and headers, not to",
+        );
+        fails(
+            "create_entity",
+            json!({ "entityUrl": "/me/events", "jsonBody": {} }),
+            "create_entity takes parentUrl",
+        );
+        fails("do_action", json!({ "actionUrl": 7 }), "actionUrl is the");
+        fails(
+            "create_entity",
+            json!({ "parentUrl": "/me/events", "jsonBody": "{not json" }),
+            "jsonBody is a JSON object",
+        );
+        fails(
+            "update_entity",
+            json!({ "entityUrl": "/me/events/1", "jsonBody": {}, "headers": { "Prefer": "x" } }),
+            "headers has only one If-Match",
+        );
+        fails(
+            "update_entity",
+            json!({ "entityUrl": "/me/events/1", "jsonBody": {}, "headers": ["If-Match"] }),
+            "headers is a JSON object",
+        );
+
+        // What reads well is still held to the rules.
+        let graph = "https://graph.microsoft.com/v1.0/me/sendMail";
+        let hosted =
+            Change::from_arguments("do_action", &json!({ "actionUrl": graph, "jsonBody": {} }))
+                .unwrap();
+        assert!(check(&hosted).unwrap_err().contains("with no host"));
+        let deleted = Change::from_arguments(
+            "delete_entity",
+            &json!({ "entityUrl": "/me/messages/1", "jsonBody": {} }),
+        )
+        .unwrap();
+        assert_eq!(check(&deleted), Err("delete_entity has no body".into()));
+    }
+
+    #[test]
+    fn a_sign_off_of_one_change_shows_it_as_a_plans_sign_off_shows_each() {
+        let mail: Change = serde_json::from_str(MAIL).unwrap();
+        let text = preview_one(&mail);
+        assert!(text.starts_with("**Mail**\n\n```text\n"), "{text}");
+        assert!(text.contains("To: Ana <ana@contoso.com>"), "{text}");
+        assert!(text.contains("Subject: Re: the outage"), "{text}");
+        let plan = preview("draft", "send", std::slice::from_ref(&mail));
+        assert!(
+            plan.contains(&text.replacen("**Mail**", "**1. Mail**", 1)),
+            "{plan}"
+        );
+        let update = preview_one(&serde_json::from_str(UPDATE).unwrap());
+        assert!(update.starts_with("**Update**\n\n```text\n"), "{update}");
+        assert!(update.contains("update_entity /me/events/AAMk1\n{\"subject\":\"Moved\"}\n```"));
+    }
+
+    #[test]
+    fn the_section_of_changes_a_task_made_names_each_and_how_it_ended() {
+        assert_eq!(made_section(&[]), "");
+        let text = made_section(&[
+            "Action /me/sendMail: accepted (202)".into(),
+            "Create /me/events: failed: denied\nby policy".into(),
+        ]);
+        assert_eq!(
+            text,
+            "**Microsoft 365 changes this task made:**\n\
+             - Action /me/sendMail: accepted (202)\n\
+             - Create /me/events: failed: denied by policy\n"
+        );
     }
 }

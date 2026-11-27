@@ -76,6 +76,15 @@ pub struct McpServer {
     /// command or URL of its own; each task gets an address of its own on this machine.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workiq: bool,
+    /// A Work IQ server whose gateway also offers Work IQ's change tools to a digital
+    /// worker's task for its owner, each change waiting for the owner's sign-off (with the
+    /// profile's `workiq changes on`; docs/work-iq.md, section 7).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changes: bool,
+    /// How long the task's MCP client waits for one tool call, in seconds; none: its own
+    /// default. Set on a task's Work IQ server whose change calls wait for a sign-off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// The plugin server template an [`McpServer`] was made from, with the values its
@@ -116,6 +125,8 @@ impl McpServer {
             secret_args: Vec::new(),
             secret_url: false,
             workiq: false,
+            changes: false,
+            timeout_secs: None,
         }
     }
 
@@ -159,6 +170,9 @@ impl McpServer {
         }
         if self.workiq {
             return self.validate_workiq(name);
+        }
+        if self.changes {
+            bail!("MCP server '{name}': --changes is only for Work IQ (--workiq)");
         }
         match (&self.command, &self.url) {
             (Some(c), None) if !c.trim().is_empty() => {
@@ -211,8 +225,9 @@ impl McpServer {
 
     /// [`McpServer::validate`] for a Work IQ server: it is called `workiq` (plans know a
     /// step that asks for it brings Microsoft 365 content), has nothing to start or reach,
-    /// and offers only the gateway's read tools.
+    /// and offers only the gateway's read tools, and with `changes` its change tools too.
     fn validate_workiq(&self, name: &str) -> Result<()> {
+        use crate::workiq::changes::TOOLS;
         use crate::workiq::gateway::{DEFAULT_TOOLS, SERVER};
         if name != SERVER {
             bail!("a Work IQ MCP server is called '{SERVER}', not '{name}'");
@@ -229,15 +244,19 @@ impl McpServer {
                  variables or headers"
             );
         }
-        if let Some(tool) = self
-            .tools
-            .iter()
-            .find(|t| !DEFAULT_TOOLS.contains(&t.as_str()))
-        {
+        let offered = |t: &str| DEFAULT_TOOLS.contains(&t) || (self.changes && TOOLS.contains(&t));
+        if let Some(tool) = self.tools.iter().find(|t| !offered(t)) {
+            if TOOLS.contains(&tool.as_str()) {
+                bail!(
+                    "MCP server '{name}': '{tool}' changes Microsoft 365: add the server with \
+                     --changes to offer it"
+                );
+            }
             bail!(
-                "MCP server '{name}': the Work IQ gateway offers only tools that read ({}), \
-                 not '{tool}'",
-                DEFAULT_TOOLS.join(", ")
+                "MCP server '{name}': the Work IQ gateway offers only tools that read ({}) \
+                 and, with --changes, the change tools ({}), not '{tool}'",
+                DEFAULT_TOOLS.join(", "),
+                TOOLS.join(", ")
             );
         }
         if self.description.chars().count() > MAX_DESCRIPTION
@@ -296,9 +315,15 @@ impl McpServer {
     /// How it starts or where it is, with secret values hidden (for listings).
     pub fn describe(&self) -> String {
         if self.workiq {
-            return "Work IQ through this agent's gateway (each task gets its own address on \
-                    this machine)"
-                .to_owned();
+            let changes = if self.changes {
+                "; changes: a digital worker's tasks for its owner, each change signed off"
+            } else {
+                ""
+            };
+            return format!(
+                "Work IQ through this agent's gateway (each task gets its own address on this \
+                 machine){changes}"
+            );
         }
         let mut text = match (&self.command, &self.url) {
             (Some(c), _) => std::iter::once(c.as_str())
@@ -332,7 +357,7 @@ impl McpServer {
     }
 
     /// The server as JSON for the providers' SDKs: `{type, command, args, env}` or
-    /// `{type, url, headers}`, plus `tools`.
+    /// `{type, url, headers}`, plus `tools`, and `timeout` (in milliseconds) when it has one.
     pub fn to_json(&self) -> serde_json::Value {
         use serde_json::json;
         let mut v = match (&self.command, &self.url) {
@@ -350,6 +375,9 @@ impl McpServer {
             _ => json!({}),
         };
         v["tools"] = json!(self.tools);
+        if let Some(secs) = self.timeout_secs {
+            v["timeout"] = json!(secs.saturating_mul(1000));
+        }
         v
     }
 }
@@ -694,6 +722,8 @@ impl McpTemplate {
             secret_args,
             secret_url,
             workiq: false,
+            changes: false,
+            timeout_secs: None,
         })
     }
 }
@@ -1014,6 +1044,35 @@ mod tests {
         }
         let saved = serde_json::to_string(&browser).unwrap();
         assert_eq!(serde_json::from_str::<McpServer>(&saved).unwrap(), browser);
+    }
+
+    #[test]
+    fn change_tools_need_changes_on_a_workiq_server_and_a_timeout_goes_in_its_json() {
+        let mut workiq = McpServer::workiq(vec!["ask".into(), "do_action".into()]);
+        let err = workiq.validate("workiq").unwrap_err().to_string();
+        assert!(
+            err.contains("'do_action' changes Microsoft 365: add the server with --changes"),
+            "{err}"
+        );
+        workiq.changes = true;
+        workiq.validate("workiq").unwrap();
+        assert!(
+            workiq.describe().contains("changes:"),
+            "{}",
+            workiq.describe()
+        );
+        workiq.tools = vec!["send_mail".into()];
+        let err = workiq.validate("workiq").unwrap_err().to_string();
+        assert!(err.contains("only tools that read"), "{err}");
+        let mut browser = McpServer::local("npx", vec![]);
+        browser.changes = true;
+        let err = browser.validate("browser").unwrap_err().to_string();
+        assert!(err.contains("--changes is only for Work IQ"), "{err}");
+
+        let mut session = McpServer::remote("http://127.0.0.1:1234/mcp", false);
+        assert!(session.to_json().get("timeout").is_none());
+        session.timeout_secs = Some(360);
+        assert_eq!(session.to_json()["timeout"], 360_000);
     }
 
     #[test]

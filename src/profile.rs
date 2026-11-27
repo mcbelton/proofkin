@@ -217,9 +217,53 @@ impl WorkIqBudget {
     }
 }
 
+/// How long a change in a digital worker's task waits for its owner's sign-off, in minutes of
+/// awake time, when the profile sets none.
+pub const DEFAULT_WORKIQ_CHANGE_WAIT_MINUTES: u32 = 5;
+/// The shortest wait for a change's sign-off, in minutes.
+pub const MIN_WORKIQ_CHANGE_WAIT_MINUTES: u32 = 1;
+/// The longest wait for a change's sign-off, in minutes.
+pub const MAX_WORKIQ_CHANGE_WAIT_MINUTES: u32 = 10;
+
 /// That a profile allows Microsoft 365 changes (see [`ProfileConfig::workiq_changes`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkIqChanges {}
+pub struct WorkIqChanges {
+    /// How long a change in a digital worker's task for its owner waits for the owner's
+    /// sign-off, in minutes (1 to 10; 5 when not set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_minutes: Option<u32>,
+}
+
+impl WorkIqChanges {
+    /// The wait for a change's sign-off in minutes, within 1 to 10.
+    pub fn wait_minutes(&self) -> u32 {
+        self.wait_minutes
+            .unwrap_or(DEFAULT_WORKIQ_CHANGE_WAIT_MINUTES)
+            .clamp(
+                MIN_WORKIQ_CHANGE_WAIT_MINUTES,
+                MAX_WORKIQ_CHANGE_WAIT_MINUTES,
+            )
+    }
+
+    /// The wait for a change's sign-off.
+    pub fn wait(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.wait_minutes()) * 60)
+    }
+
+    /// The wait `text` gives, in minutes: `5m` or `5`, from 1 to 10.
+    pub fn parse_wait(text: &str) -> std::result::Result<u32, String> {
+        let minutes = text.trim();
+        let minutes = minutes.strip_suffix('m').unwrap_or(minutes).trim();
+        let range = MIN_WORKIQ_CHANGE_WAIT_MINUTES..=MAX_WORKIQ_CHANGE_WAIT_MINUTES;
+        match minutes.parse::<u32>() {
+            Ok(minutes) if range.contains(&minutes) => Ok(minutes),
+            _ => Err(format!(
+                "the wait for a change's sign-off is {MIN_WORKIQ_CHANGE_WAIT_MINUTES} to \
+                 {MAX_WORKIQ_CHANGE_WAIT_MINUTES} minutes, like 5m, not {text:?}"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileConfig {
@@ -259,8 +303,9 @@ pub struct ProfileConfig {
     pub workiq_budget: Option<WorkIqBudget>,
     /// Set, this profile allows Microsoft 365 changes (docs/work-iq.md, section 7): a plan's
     /// `@workiq apply=STEP` step makes the changes step STEP proposed, once its owner signed
-    /// them off. Off by default (`proofkin workiq changes on|off`); the tenant's policy
-    /// still applies on top.
+    /// them off, and a digital worker's task for its owner, in a folder whose Work IQ server
+    /// allows changes, makes each change its owner signs off. Off by default
+    /// (`proofkin workiq changes on|off`); the tenant's policy still applies on top.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workiq_changes: Option<WorkIqChanges>,
     /// Per provider: the model tasks that name none run on, and the models tasks may ask
@@ -1296,5 +1341,31 @@ mod tests {
         alice.config.owner = Some("someone".into());
         alice.save().unwrap();
         assert!(helper.account_profile().is_err());
+    }
+
+    /// `workiq changes on --wait` takes 1 to 10 minutes, as `5m` or `5`; a profile that sets
+    /// none waits 5, and one whose file says more than 10 waits 10.
+    #[test]
+    fn a_changes_sign_off_waits_1_to_10_minutes_given_as_5m_or_5() {
+        assert_eq!(WorkIqChanges::parse_wait("5m"), Ok(5));
+        assert_eq!(WorkIqChanges::parse_wait(" 10 "), Ok(10));
+        assert_eq!(WorkIqChanges::parse_wait("1m"), Ok(1));
+        for bad in ["0", "11m", "5h", "m", "", "-1", "5 minutes"] {
+            let error = WorkIqChanges::parse_wait(bad).unwrap_err();
+            assert!(error.contains("1 to 10 minutes"), "{bad:?}: {error}");
+        }
+        let unset = WorkIqChanges::default();
+        assert_eq!(unset.wait(), std::time::Duration::from_secs(300));
+        let edited = WorkIqChanges {
+            wait_minutes: Some(60),
+        };
+        assert_eq!(edited.wait_minutes(), 10);
+        let config: ProfileConfig = serde_json::from_str(r#"{"workiq_changes":{}}"#).unwrap();
+        assert_eq!(config.workiq_changes, Some(WorkIqChanges::default()));
+        let set = serde_json::to_value(WorkIqChanges {
+            wait_minutes: Some(3),
+        })
+        .unwrap();
+        assert_eq!(set, serde_json::json!({ "wait_minutes": 3 }));
     }
 }

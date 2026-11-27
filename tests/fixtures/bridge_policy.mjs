@@ -100,12 +100,16 @@ assert.match(toolRefusal(ws, "full", "WebFetch", { url: "https://x" }), /not all
 const mcp = {
   browser: { type: "stdio", command: "npx", args: ["@playwright/mcp"], env: {}, tools: ["browser_snapshot"] },
   docs: { type: "http", url: "https://docs.example.com/mcp", headers: { Authorization: "x" }, tools: [] },
+  // A Work IQ session whose change calls wait for a sign-off: Claude waits as long.
+  workiq: { type: "http", url: "http://127.0.0.1:1/mcp/workiq/s", headers: {}, tools: ["create_entity"], timeout: 360000 },
 };
 const { servers, allowed } = claudeMcp(mcp);
-assert.deepEqual(allowed, ["mcp__browser__browser_snapshot", "mcp__docs"]);
+assert.deepEqual(allowed, ["mcp__browser__browser_snapshot", "mcp__docs", "mcp__workiq__create_entity"]);
 assert.equal(servers.browser.tools, undefined);
 assert.equal(servers.browser.alwaysLoad, true);
 assert.equal(servers.docs.url, "https://docs.example.com/mcp");
+assert.equal(servers.workiq.timeout, 360000);
+assert.equal(servers.docs.timeout, undefined);
 assert.equal(toolRefusal(ws, "read-only", "mcp__browser__browser_snapshot", {}, mcp), null);
 assert.equal(toolRefusal(ws, "read-only", "mcp__docs__search", {}, mcp), null);
 assert.match(toolRefusal(ws, "full", "mcp__browser__browser_evaluate", {}, mcp), /not one of the tools/);

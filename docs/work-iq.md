@@ -283,9 +283,19 @@ token:
   the token.
 - Only read tools by default (`retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
   `list_agents`, `call_function`), and never one whose annotations say it changes things,
-  whatever its name. `call_function`'s results carry no labels, so like `fetch` it goes only
+  whatever its name, except the change tools a session signs off (below). `call_function`'s
+  results carry no labels, so like `fetch` it goes only
   to the owner's own tasks. Every result goes through the content policy for the task's audience;
   every call is audited and metered; sizes are capped.
+- **Changes, in a digital worker's task for its owner.** A task a digital worker runs for its
+  owner (its session's audience is `Local`; the owner starts it from chat, Run task, the REPL,
+  MCP or A2A on their own agent) also gets Work IQ's change tools when both the profile whose
+  Work IQ account the worker uses (its owner's) has `workiq changes on` and the folder's
+  server was added with `--changes` (`proofkin mcp add <folder> workiq --workiq --changes`;
+  `--tool` still narrows the tools, and may name the change tools). Each change waits for the
+  owner's sign-off of exactly that change (section 7). Never a plan step's task, whose origin
+  names a step (plans propose changes and `@workiq apply=` makes them), and never a peer's
+  task, whatever its grant: `--m365-tools` stays read only.
 - The server is called `workiq`, so a plan knows a step with `mcp=workiq` reads Microsoft
   365 content whose labels it never learns: the step is marked `unknown`, and nothing made
   from it goes to a peer.
@@ -303,10 +313,11 @@ ok after draft approve @me Send these replies?
 send after ok @workiq apply=draft
 ```
 
-- **Allowed per profile.** `proofkin workiq changes on --profile NAME` sets `workiq_changes`
-  in `profile.json`; they are off by default (`workiq changes off`). The tenant's policy
-  still applies on top, and blocks changes by default. `proofkin workiq doctor` and the web
-  UI's Work IQ card say whether they are on.
+- **Allowed per profile.** `proofkin workiq changes on --profile NAME [--wait 5m]` sets
+  `workiq_changes` in `profile.json`; they are off by default (`workiq changes off`). The
+  tenant's policy still applies on top, and blocks changes by default. `proofkin workiq
+  doctor` and the web UI's Work IQ card say whether they are on, and how long a task's change
+  waits for its sign-off.
 - **Proposing.** A step that a later step applies is told how to write its changes: one
   fenced `m365-changes` block in its result, one JSON object a line, `{"tool", "path",
   "body", "ifMatch"}`. `tool` is `create_entity`, `update_entity`, `delete_entity` or
@@ -341,10 +352,46 @@ send after ok @workiq apply=draft
 - **Never on GitHub.** The proposing step's result and the apply step's stay in the run's
   record (section 4), even when the run is tracked.
 
-In interactive tasks (to come, #272), a task you start yourself with `mcp=workiq`, on a
-folder whose `workiq` server allows changes, gets the change tools, and each call waits for
-your sign-off of exactly that change, like a plan's. Later: sign-off requests in Teams or
-mail, if the owner opts in (#61).
+**In interactive tasks**, while you're there to answer, a digital worker's task for you may
+change Microsoft 365 (section 6: with `--changes` on the folder's `workiq` server and changes
+on in your profile; never a plan step's task or a peer's). Each change waits for your
+sign-off of exactly that change:
+
+- **The tools.** `create_entity`, `update_entity`, `delete_entity` and `do_action`, with the
+  arguments Work IQ's own schemas give them: `parentUrl`, `entityUrl` or `actionUrl`;
+  `jsonBody`, an object or a JSON-encoded string; `headers` with `If-Match`, for an update or
+  a delete. The session lists them, though their annotations say they change things: that's
+  what they are for. Any other tool whose annotations say it changes things stays refused.
+- **Checked.** Each call is held to the rules above. One that breaks a rule gets a tool error
+  that names the rule, and nobody is asked.
+- **Signed off.** The call becomes a signed approval request from the worker to your agent,
+  as an `approve @peer` step's is, under **Waiting for your approval**. It is titled
+  `Microsoft 365 change from <worker>`, and shows the change as a plan's sign-off shows one,
+  its SHA-256, and the task it comes from (your task number, when it has one, and the first
+  200 characters of its prompt). The model's call waits for your answer for up to `--wait` of
+  awake time (`workiq_changes.wait_minutes`: 1 to 10 minutes, as `5m` or `5`; 5 by default).
+- **Approved** (a verified approval signed by you, approving, whose `prompt_sha256` is the
+  SHA-256 of the request's text): the change is made once, with exactly the call's arguments,
+  through the session's audited client. The model gets its outcome: *done* (a created
+  entity's id and link), *accepted* (202), *failed*, or *outcome unknown*.
+- **Rejected, or asked for changes:** nothing is sent to Work IQ. The model gets *You didn't
+  approve this change, so nothing was changed*, then your note.
+- **No answer in time:** the request is withdrawn from your agent, so a late answer finds no
+  request and makes nothing. The model gets *Not signed off within N minutes, so nothing was
+  changed*.
+- **Made once.** A change tool call is never sent again: the same call again is a sign-off
+  of its own.
+- **The model's MCP client waits long enough.** With change tools, the session's server gets
+  a tool timeout of the wait plus 60 seconds: `timeout` (milliseconds) in Copilot's MCP
+  config, and in the server entry the bridge gives Claude Code, which also lifts its
+  60-second limit on each HTTP request. Codex tasks can't use MCP servers.
+- **The task's result names them.** The session logs each change it made: its verb, path and
+  outcome, never its body. When the task ends, the agent adds a **Microsoft 365 changes this
+  task made** section at the end of its result, before it signs it, so its evidence, the
+  activity and the task's card show them. Each change call is audited like any gateway call:
+  purpose `gateway`, with its path's SHA-256.
+
+Later: sign-off requests in Teams or mail, if the owner opts in (#61).
 
 ### 8. Plugins and enterprise skills
 
@@ -370,7 +417,8 @@ use.
 `proofkin workiq doctor` checks, in order: discovery, the sign-in, the token's audience,
 tenant and scopes, `tools/list`, and one small `retrieve`. Each failure names the fix and who
 can make it (service principal, consent, user assignment, billing, MCP policy). It also says
-whether Microsoft 365 changes are on (section 7). The web UI
+whether Microsoft 365 changes are on, and how long a task's change waits for its sign-off
+(section 7). The web UI
 gets a Work IQ card in Accounts (sign in with a device code shown in the page, status, doctor,
 use against budgets), Microsoft 365 grants on peers, `workiq=` and `@workiq` in the plan
 editor, an import in Knowledge, and the sources a step used in its run.
@@ -386,6 +434,7 @@ editor, an import in Knowledge, and the sources a step used in its run.
 | Runaway cost | Budgets per day and per run; every call counted |
 | Retry storms, repeated changes | Classified errors; denials and changes never retried; the server's delays honored |
 | A plan making Microsoft 365 changes you didn't mean | Off unless the profile allows them; a model only proposes; your own signed approval covers the request showing the list and its SHA-256, which the step with no model checks before it makes exactly that list, once and in order; a change is never sent again, even after a restart; neither the proposal nor the outcome goes on GitHub |
+| A task's model making Microsoft 365 changes you didn't mean | Off unless both the profile and the folder's `workiq` server allow them; only a digital worker's task for its owner, never a plan step's or a peer's; each call is checked, then waits for your own signed approval of a request showing exactly that change and its SHA-256, and is withdrawn when you don't answer in time; made once and never sent again; the task's signed result names each change |
 | Stale or wrong context taken as truth | Cited, dated and marked unverified; claims are proven only by checks |
 
 ## Admin setup (summary)

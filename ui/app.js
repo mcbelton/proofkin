@@ -3049,12 +3049,14 @@ function renderWorkiq() {
   if (focused !== null) focusWorkiq(focused);
 }
 
-/** Whether plans may make the Microsoft 365 changes you sign off (`workiq changes on|off`). */
+/** Whether Microsoft 365 changes are allowed (`workiq changes on|off`): plans make the ones you
+ *  sign off, and a digital worker's task for you each one you sign off, waiting this long. */
 function workiqChanges(w) {
   if (w.changes) {
-    return el("p", { class: "small", text: "Changes: on. A plan's @workiq apply= step makes the Microsoft 365 changes you signed off, once." });
+    const wait = nOf(w.change_wait_minutes ?? 5, "minute");
+    return el("p", { class: "small", text: `Changes: on. A plan's @workiq apply= step makes the Microsoft 365 changes you signed off, once. A digital worker's task for you, in a folder whose workiq server has --changes, asks you to sign off each change and waits up to ${wait} for you.` });
   }
-  return [el("p", { class: "muted small", text: "Changes: off. Plans make no Microsoft 365 changes; to let them make the ones you sign off, run:" }),
+  return [el("p", { class: "muted small", text: "Changes: off. Plans and digital workers' tasks make no Microsoft 365 changes; to let them make the ones you sign off, run:" }),
     workiqCommand(`proofkin workiq changes on --profile ${w.profile ?? w.holder}`)];
 }
 
