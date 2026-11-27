@@ -3932,7 +3932,7 @@ fn apply_changes(
             let call = CallContext::local(purpose);
             for change in &list {
                 let outcome = match work.change(&call, &change.tool, change.arguments()).await {
-                    Ok(result) => Outcome::of(&result),
+                    Ok(result) => Outcome::of(&change.tool, &result),
                     Err(e) => Outcome::of_error(&e),
                 };
                 let made = outcome.made();
@@ -6986,6 +6986,81 @@ mod tests {
         );
         recipients.workiq_changes = true;
         assert!(errors(&recipients).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_apply_step_fails_on_an_answered_403_and_sends_no_later_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use serde_json::{Value, json};
+
+        use crate::workiq::ToolResult;
+
+        #[derive(Debug, Default)]
+        struct FakeWork(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl WorkContext for FakeWork {
+            async fn retrieve(
+                &self,
+                _: &CallContext,
+                _: &str,
+                _: &str,
+                _: &[&str],
+            ) -> Result<ToolResult> {
+                unreachable!("an apply step only makes changes")
+            }
+
+            async fn change(&self, _: &CallContext, _: &str, _: Value) -> Result<ToolResult> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(ToolResult {
+                    content: Vec::new(),
+                    structured_content: Some(json!({
+                        "statusCode": 403,
+                        "error": { "code": "ErrorAccessDenied" },
+                    })),
+                    is_error: false,
+                    ids: Default::default(),
+                })
+            }
+        }
+
+        let plan = Plan::parse(
+            "draft @workiq Draft the changes\n\
+             ok after draft approve @me Make them?\n\
+             apply after ok @workiq apply=draft",
+        )
+        .unwrap();
+        let list = ["first", "second"]
+            .into_iter()
+            .map(|id| Change {
+                tool: "delete_entity".into(),
+                path: format!("/me/events/{id}"),
+                body: None,
+                if_match: None,
+            })
+            .collect::<Vec<_>>();
+        let digest = changes::digest(&list);
+        let work = Arc::new(FakeWork::default());
+        let ctx = RunContext {
+            work_context: Some(work.clone()),
+            ..RunContext::default()
+        };
+        let delivered = apply_changes(&ctx, &plan.steps[2], "draft", list, digest)
+            .await
+            .unwrap();
+        assert!(!delivered.ok);
+        let text = &delivered.output;
+        assert!(
+            text.contains("1. Delete /me/events/first: failed:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("delete_entity tool answered 403: ErrorAccessDenied"),
+            "{text}"
+        );
+        assert!(text.contains("Not made, after change 1: 2."), "{text}");
+        assert_eq!(work.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -357,7 +357,9 @@ send after ok @workiq apply=draft
   each change and its outcome: *done* (a created entity's id and web link, when Work IQ gives
   them), *accepted* (202: Microsoft 365 finishes it later), *failed* (the classified error and
   its fix; a policy denial names where an admin changes it) or *outcome unknown* (check in
-  Microsoft 365), then the changes not made. A change is never sent again: if the agent stops
+  Microsoft 365 before trying again), then the changes not made. A status of 400 to 499 in
+  Work IQ's answer means *failed*; a status of 500 or more means *outcome unknown*, even if
+  Work IQ didn't flag the call as an error. A change is never sent again: if the agent stops
   while the step runs, the run that goes on fails the step instead of making any again.
 - **The plan check** refuses an apply step, naming the fix, unless it runs after STEP through
   an `approve @me` step that runs after STEP, the profile allows changes and has the Work IQ
@@ -397,7 +399,8 @@ sign-off of exactly that change:
   SHA-256 of the request's text): the change is made once, with exactly the call's arguments
   but `sessionId` and `agentId`, through the session's audited client. The model gets its
   outcome: *done* (a created entity's id and link), *accepted* (202), *failed*, or *outcome
-  unknown*.
+  unknown*. As in plans, an answer with a 4xx status fails; with 5xx or higher, the outcome
+  is unknown. The model gets either as a tool error, with the change's outcome.
 - **Rejected, or asked for changes:** nothing is sent to Work IQ. The model gets *You didn't
   approve this change, so nothing was changed*, then your note.
 - **No answer in time:** the request is withdrawn from your agent, so a late answer finds no
@@ -471,13 +474,15 @@ skills and plugins with Work IQ's `discover` and add them through the usual plug
 
 Every call is a line in `<profile>/workiq-audit.jsonl`: time, tool, purpose (a run's step,
 knowledge import, a gateway task, doctor, a sign-off's notice), audience, the query's SHA-256
-and length (not its
-text; for a change, its path's), outcome class, results and withheld counts, labels, request
-and correlation ids, and duration. Budgets in `profile.json` (`workiq_budget.calls_per_day`, default 200;
+and length (not its text; for a change, its path's), outcome class, results and withheld
+counts, labels, request and correlation ids, and duration. If a tool's answer has a status
+of 400 or more, the audit records its error class (for example `denied-by-policy` for 403 or
+`transient` for 503), not `ok`. The call was sent, so it still counts against the budgets.
+
+Budgets in `profile.json` (`workiq_budget.calls_per_day`, default 200;
 `workiq_budget.calls_per_run`, default 25) stop calls with a clear error before they are
-sent, and the call is audited as refused; `proofkin workiq usage` and `proofkin workiq
-budget` show and change them. The web UI shows today's
-use.
+sent, and the call is audited as refused. `proofkin workiq usage` and `proofkin workiq
+budget` show and change them. The web UI shows today's use.
 
 ### 10. Diagnostics and the web UI
 
