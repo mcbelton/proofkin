@@ -54,7 +54,9 @@ use crate::workiq::changes::{self, Change, Outcome};
 use crate::workiq::content::{
     Audience, DEFAULT_CAP, Source, UNLABELED, answer_section, retrieval_section,
 };
-use crate::workiq::context::{ClientWork, WorkContext};
+use crate::workiq::context::{
+    ClientWork, GROUNDING_FALLBACK_NOTE, WorkContext, retrieve_with_fallback,
+};
 use crate::workiq::notice::{Notifier, SignOff};
 
 /// Longest prerequisite result passed on to a dependent step.
@@ -284,15 +286,7 @@ pub const MAX_CHANGE_ROUNDS: u32 = 5;
 /// The most reviewers a pull request step names.
 pub const MAX_REVIEWERS: usize = 10;
 
-/// The `workiq=` sources, and the Work IQ capability each one names.
-pub const WORKIQ_SOURCES: &[(&str, &str)] = &[
-    ("email", "Email"),
-    ("meetings", "Meetings"),
-    ("files", "OneDriveAndSharePoint"),
-    ("teams", "TeamsMessages"),
-    ("people", "People"),
-    ("connectors", "GraphConnectors"),
-];
+pub use crate::workiq::context::WORKIQ_SOURCES;
 
 /// The Work IQ strategy and capability names for `workiq=`-style `sources` (see
 /// [`Step::workiq_request`]); `None` for no sources.
@@ -3444,6 +3438,9 @@ pub struct WorkRecord {
     pub kept: usize,
     pub withheld: usize,
     pub request_ids: String,
+    /// The copilot search failed with Work IQ's generic error, so grounding was tried.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grounding_fallback: bool,
     /// For a `workiq=` step: the section of its task's prompt with what was found, and its
     /// SHA-256, which the step's signed evidence records (never the text itself; see
     /// [`crate::evidence::ContextUse`]). The text is Microsoft 365 content, so it is never
@@ -3454,6 +3451,12 @@ pub struct WorkRecord {
     pub sha256: String,
     #[serde(default, skip_serializing)]
     pub text: String,
+}
+
+impl WorkRecord {
+    pub(crate) fn fallback_note(&self) -> Option<&'static str> {
+        self.grounding_fallback.then_some(GROUNDING_FALLBACK_NOTE)
+    }
 }
 
 /// The [`WorkRecord`]s of a run, by step.
@@ -3719,6 +3722,7 @@ async fn search_work(
     ctx: &RunContext,
     step: &Step,
     peer: &PeerInfo,
+    on_update: &mut impl FnMut(&str, &StepState),
 ) -> Result<crate::workiq::content::Section> {
     let Some(work) = &ctx.work_context else {
         bail!("Work IQ isn't set up for this run");
@@ -3738,29 +3742,45 @@ async fn search_work(
         Audience::Peer { labels } => CallContext::peer(&peer.name, labels.clone(), purpose),
     };
     let query = step.workiq_query();
+    let mut record = WorkRecord::default();
     let result = within(
         step.timeout,
-        work.retrieve(&call, &query, strategy, &capabilities),
-    )
-    .await?;
-    let section = retrieval_section(&result, &audience, DEFAULT_CAP)?;
-    ctx.work_log.put(
-        &step.id,
-        WorkRecord {
-            sources: section.sources.clone(),
-            labels: section.labels.clone(),
-            kept: section.kept,
-            withheld: section.withheld.total(),
-            request_ids: result.ids.to_string(),
-            sha256: if section.text.is_empty() {
-                String::new()
-            } else {
-                crate::evidence::sha256_hex(section.text.as_bytes())
+        retrieve_with_fallback(
+            work.as_ref(),
+            &call,
+            &query,
+            strategy,
+            &capabilities,
+            |note| {
+                record.grounding_fallback = true;
+                on_update(
+                    &step.id,
+                    &StepState::Running {
+                        peer: peer.name.clone(),
+                        progress: Some(Progress::new(Phase::Running, note)),
+                    },
+                );
             },
-            text: section.text.clone(),
-        },
-    );
-    Ok(section)
+        ),
+    )
+    .await;
+    let section = result.and_then(|result| {
+        let section = retrieval_section(&result, &audience, DEFAULT_CAP)?;
+        record.sources = section.sources.clone();
+        record.labels = section.labels.clone();
+        record.kept = section.kept;
+        record.withheld = section.withheld.total();
+        record.request_ids = result.ids.to_string();
+        if !section.text.is_empty() {
+            record.sha256 = crate::evidence::sha256_hex(section.text.as_bytes());
+        }
+        record.text = section.text.clone();
+        Ok(section)
+    });
+    if section.is_ok() || record.grounding_fallback {
+        ctx.work_log.put(&step.id, record);
+    }
+    section
 }
 
 /// Asks Work IQ for `step`, a `@workiq` step, as the owner's own agent: `question` is the
@@ -4358,7 +4378,7 @@ pub async fn run_plan_with(
                     let (prompt, context) = if step.workiq.is_empty() {
                         (prompt, None)
                     } else {
-                        match search_work(agent, ctx, step, &peer).await {
+                        match search_work(agent, ctx, step, &peer, &mut on_update).await {
                             Ok(work) => {
                                 let full =
                                     step_prompt_with(step, &deps, &format!("{issue}{}", work.text));

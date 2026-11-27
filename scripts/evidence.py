@@ -303,4 +303,6 @@ def render_markdown(report):
 
 
 if __name__ == "__main__":
+    # Test output can contain Unicode even when redirected to a Windows pipe.
+    sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main())

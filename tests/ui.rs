@@ -4627,7 +4627,7 @@ async fn a_run_answers_its_steps_microsoft_365_sources_but_never_what_they_said(
     use proofkin::workiq::content::Source;
     let home = tempfile::tempdir().unwrap();
     let profile = Profile::open_in(home.path(), "owner").unwrap();
-    let text = "find @alice workiq=files,email Summarize the launch\n\
+    let text = "find @alice workiq=all Summarize the launch\n\
                 notes after find @alice Write the launch notes";
     let plan = proofkin::plan::Plan::parse(text).unwrap();
     let mut run = proofkin::runs::RunRecord::new(
@@ -4664,6 +4664,7 @@ async fn a_run_answers_its_steps_microsoft_365_sources_but_never_what_they_said(
             kept: 2,
             withheld: 1,
             request_ids: "req-1".into(),
+            grounding_fallback: true,
             sha256: proofkin::evidence::sha256_hex(context.as_bytes()),
             text: context.into(),
         },
@@ -4689,8 +4690,12 @@ async fn a_run_answers_its_steps_microsoft_365_sources_but_never_what_they_said(
             "labels": ["General"],
             "kept": 2,
             "withheld": 1,
+            "fallback_note": concat!(
+                "Work IQ's copilot search failed with its generic error, ",
+                "so it searched again with grounding, without connectors.",
+            ),
         }]),
-        "only the step that had some, without its text"
+        "only the step that had some, with its fallback but without its text"
     );
     for words in ["four million", "moves to May", "From Microsoft 365"] {
         assert!(!answer.body.contains(words), "{words}: {}", answer.body);
@@ -4709,6 +4714,10 @@ async fn a_run_answers_its_steps_microsoft_365_sources_but_never_what_they_said(
     assert!(
         app.contains("renderRunWorkiq(run.workiq ?? [])"),
         "the run dialog doesn't show them"
+    );
+    assert!(
+        app.contains("w.fallback_note"),
+        "the sources line omits the fallback"
     );
     agent.shutdown().await;
 }

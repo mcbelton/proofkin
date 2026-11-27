@@ -4,14 +4,31 @@
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use super::audit::{Audit, CallContext};
-use super::client::{Client, ToolResult};
+use super::client::{Class, Client, ToolResult, WorkIqError, WorkIqErrorKind};
 use super::connect;
 use super::content::read_agents;
 use crate::profile::Profile;
+
+const CONNECTORS: &str = "GraphConnectors";
+
+/// The `workiq=` sources, and the Work IQ capability each one names.
+pub const WORKIQ_SOURCES: &[(&str, &str)] = &[
+    ("email", "Email"),
+    ("meetings", "Meetings"),
+    ("files", "OneDriveAndSharePoint"),
+    ("teams", "TeamsMessages"),
+    ("people", "People"),
+    ("connectors", CONNECTORS),
+];
+
+pub(crate) const GROUNDING_FALLBACK_NOTE: &str = concat!(
+    "Work IQ's copilot search failed with its generic error, ",
+    "so it searched again with grounding, without connectors.",
+);
 
 /// The Work IQ calls a run makes for its steps.
 #[async_trait]
@@ -57,6 +74,45 @@ pub trait WorkContext: Send + Sync + fmt::Debug {
     ) -> Result<ToolResult> {
         anyhow::bail!("this Work IQ context makes no changes")
     }
+}
+
+/// Searches for a plan step or an import. Only Work IQ's generic copilot error allows a
+/// second search, with the same query and audience but without connectors.
+pub(crate) async fn retrieve_with_fallback(
+    work: &dyn WorkContext,
+    call: &CallContext,
+    query: &str,
+    strategy: &str,
+    capabilities: &[&str],
+    on_fallback: impl FnOnce(&'static str),
+) -> Result<ToolResult> {
+    let error = match work.retrieve(call, query, strategy, capabilities).await {
+        Ok(result) => return Ok(result),
+        Err(error) => error,
+    };
+    let generic = error.downcast_ref::<WorkIqError>().is_some_and(|failure| {
+        failure.kind == WorkIqErrorKind::Tool
+            && failure.class == Class::Tool
+            && failure.tool_text.as_deref() == Some("An error occurred invoking 'retrieve'")
+    });
+    if strategy != "copilot" || !generic {
+        return Err(error);
+    }
+    let mut grounding: Vec<_> = if capabilities.is_empty() {
+        WORKIQ_SOURCES.iter().map(|&(_, name)| name).collect()
+    } else {
+        capabilities.to_vec()
+    };
+    grounding.retain(|&name| name != CONNECTORS);
+    if grounding.is_empty() {
+        return Err(error);
+    }
+    on_fallback(GROUNDING_FALLBACK_NOTE);
+    work.retrieve(call, query, "grounding", &grounding)
+        .await
+        .with_context(|| {
+            format!("Work IQ's grounding search failed after its copilot search failed ({error:#})")
+        })
 }
 
 /// The declarative agents Work IQ offers `client`'s account, one per line (name, then the id

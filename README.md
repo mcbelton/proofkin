@@ -934,6 +934,10 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
 - The value is `all` or a comma list of `email`, `meetings`, `files`, `teams`, `people` and
   `connectors`. `all` searches everything (Work IQ's `copilot` strategy), a list with
   `connectors` uses `copilot` over those sources, any other list uses `grounding` over them.
+  If `copilot` gives the generic `An error occurred invoking 'retrieve'` tool error, Proofkin
+  searches once more with `grounding` over the same sources without connectors. With `all`,
+  that means `email`, `meetings`, `files`, `teams` and `people`. There is no fallback for
+  `connectors` alone, for any other kind of error, or when already using `grounding`.
   An unknown source is refused, and so is `workiq=` on an `approve` step.
 - In the web UI, the plan builder's **More options** for a step that goes to a peer or squad
   has a **Microsoft 365 (Work IQ)** group with a checkbox per source (`all` clears the others,
@@ -958,8 +962,10 @@ notes @helper workiq=meetings,email Summarize what was decided about the launch
   other result without that decision, are withheld
   ([#241](https://github.com/mcbelton/proofkin/issues/241); see
   [docs/work-iq.md](docs/work-iq.md#3-content-policy)).
-- Searches are audited and held to the profile's Work IQ budgets. A Work IQ error or a budget
-  refusal fails the step with its one-line message.
+- Searches are audited and held to the profile's Work IQ budgets, including both calls on a
+  fallback. The step's progress and sources, including in `proofkin runs show`, say when it
+  fell back. If the fallback fails, the step shows the `grounding` error and says `copilot`
+  failed first. Other Work IQ errors or a budget refusal fail the step with their message.
 - The run record keeps, for each step, the sources (title, type, label, link), how many
   results were kept and withheld, the request ids, and the SHA-256 of the section of the
   prompt with what was found. The section itself is Microsoft 365 content, so it is never in
@@ -2007,7 +2013,8 @@ proofkin kb import workiq invoice-retention --query "invoice retention decisions
 
 - `--from` takes the sources of a step's [`workiq=`](#microsoft-365-search-in-a-step-workiq)
   option (`all` by default, or a list of `email`, `meetings`, `files`, `teams`, `people`,
-  `connectors`) with the same rules.
+  `connectors`) with the same rules. The import says when it falls back to `grounding`
+  without connectors.
 - The topic is marked as Microsoft 365 content with the labels of the results kept (`unknown`
   for a result without label information), so a peer only gets it if its `--m365` grant
   includes those labels: a topic with people results goes to no peer. Its front matter also
@@ -2749,7 +2756,7 @@ against call budgets.
 | `the daily Work IQ budget ... is used up` | Wait for tomorrow, or raise it: `proofkin workiq budget --per-day N --profile P`. |
 | A step for a peer is refused for its Microsoft 365 content | The peer's grant doesn't cover those labels: `peers allow <peer> --m365 <labels>`, or send the step to your own worker. |
 | `kb import workiq` writes nothing | Every result was withheld because Work IQ didn't mark it `allowed`; try another query. |
-| `the retrieve tool reported an error: An error occurred invoking 'retrieve'` on a `workiq=all` step | Work IQ's `copilot` search (what `all` and `connectors` use) couldn't answer that query; its `grounding` search often can. Name the sources instead (`workiq=email,files,meetings,teams`), or ask it in other words. |
+| `the retrieve tool reported an error: An error occurred invoking 'retrieve'` | If a step or import used Work IQ's `copilot` search (`all` or a list with `connectors`), Proofkin tries `grounding` once without connectors, unless `connectors` was the only source. If it still fails, follow the `grounding` error. For connectors alone, try rewording the query; for a query that doesn't need connectors, name the other sources to search (`workiq=email,files`, or `--from email,files`). |
 
 ## Security model
 

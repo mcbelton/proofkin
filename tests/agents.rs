@@ -191,6 +191,7 @@ impl FakeExecutor {
                 .args(&server.args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()?;
             let call = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -201,6 +202,12 @@ impl FakeExecutor {
                 stdin.write_all(format!("{call}\n").as_bytes()).await?;
             }
             let out = child.wait_with_output().await?;
+            anyhow::ensure!(
+                out.status.success(),
+                "the task-checks process exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
             let line = String::from_utf8_lossy(&out.stdout);
             let reply: serde_json::Value =
                 serde_json::from_str(line.lines().next().unwrap_or("{}"))?;
@@ -4064,12 +4071,15 @@ async fn a_work_iq_error_fails_the_step_with_its_one_line_message() {
     );
 }
 
-/// A Work IQ MCP endpoint that answers `retrieve` with two files and keeps what it was asked.
+type RetrieveError = fn(&serde_json::Value) -> Option<serde_json::Value>;
+
+/// A Work IQ MCP endpoint that answers `retrieve` with two files by default and logs its calls.
 /// Microsoft Graph accepts a change (a sign-off's notice), unless `refuse` is set.
 #[derive(Default)]
 struct FakeMcp {
     calls: Mutex<Vec<serde_json::Value>>,
     refuse: AtomicBool,
+    retrieve_error: Option<RetrieveError>,
 }
 
 async fn fake_mcp(
@@ -4099,6 +4109,18 @@ async fn fake_mcp(
         ]}}),
         "tools/call" => {
             fake.calls.lock().unwrap().push(message["params"].clone());
+            if message["params"]["name"] == "retrieve"
+                && let Some(result) = fake
+                    .retrieve_error
+                    .and_then(|fail| fail(&message["params"]["arguments"]))
+            {
+                let reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                return (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "application/json".to_string())],
+                    reply.to_string(),
+                );
+            }
             let change = matches!(
                 message["params"]["name"].as_str(),
                 Some("do_action" | "create_entity")
@@ -4142,6 +4164,281 @@ async fn fake_mcp(
         [("content-type", "application/json".to_string())],
         reply.to_string(),
     )
+}
+
+const GENERIC_RETRIEVE_ERROR: &str = "An error occurred invoking 'retrieve'";
+const FALLBACK_NOTE: &str = concat!(
+    "Work IQ's copilot search failed with its generic error, ",
+    "so it searched again with grounding, without connectors.",
+);
+const GROUNDING_CAPABILITIES: &[&str] = &[
+    "Email",
+    "Meetings",
+    "OneDriveAndSharePoint",
+    "TeamsMessages",
+    "People",
+];
+
+fn retrieve_error(text: &str, code: Option<&str>) -> serde_json::Value {
+    use serde_json::json;
+    let mut result = json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true,
+    });
+    if let Some(code) = code {
+        result["structuredContent"] = json!({ "errorCode": code });
+    }
+    result
+}
+
+fn generic_copilot_error(arguments: &serde_json::Value) -> Option<serde_json::Value> {
+    (arguments["strategy"] == "copilot").then(|| retrieve_error(GENERIC_RETRIEVE_ERROR, None))
+}
+
+fn retrieval(query: &str, strategy: &str, capabilities: &[&str]) -> serde_json::Value {
+    use serde_json::json;
+    let mut arguments = json!({ "query": query, "strategy": strategy });
+    if !capabilities.is_empty() {
+        let named: Vec<_> = capabilities
+            .iter()
+            .map(|name| json!({ "name": name }))
+            .collect();
+        arguments["capabilities"] = json!(named);
+    }
+    json!({ "name": "retrieve", "arguments": arguments })
+}
+
+async fn failing_workiq(
+    audit_path: std::path::PathBuf,
+    fail: RetrieveError,
+) -> (
+    Arc<FakeMcp>,
+    Arc<proofkin::workiq::audit::Audit>,
+    Arc<proofkin::workiq::context::ClientWork>,
+) {
+    use proofkin::workiq::audit::Audit;
+    use proofkin::workiq::client::{Client, FixedToken};
+    use proofkin::workiq::context::ClientWork;
+
+    let (fake, url) = serve_mcp(FakeMcp {
+        retrieve_error: Some(fail),
+        ..FakeMcp::default()
+    })
+    .await;
+    let audit = Arc::new(Audit::new(audit_path, "boss", Default::default()));
+    let client = Client::new(&url, Arc::new(FixedToken("token".into())))
+        .unwrap()
+        .with_audit(audit.clone());
+    (fake, audit, Arc::new(ClientWork::new(client)))
+}
+
+#[tokio::test]
+async fn a_workiq_all_step_uses_grounding_after_the_generic_copilot_error_and_records_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, audit, work) =
+        failing_workiq(dir.path().join("audit.jsonl"), generic_copilot_error).await;
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let ctx = workiq_run(helper_id, work);
+    let query = "Find the launch dates";
+    let text = format!("find @partner workiq=all {query}");
+    let plan = Plan::parse(&text).unwrap();
+    let mut progress = Vec::new();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |id, state| {
+        if let StepState::Running {
+            progress: Some(update),
+            ..
+        } = state
+        {
+            progress.push((id.to_owned(), update.text.clone()));
+        }
+    })
+    .await;
+
+    let output = done_output(&states, "find");
+    assert!(output.contains("Launch is in May."), "{output}");
+    assert!(
+        !output.contains("Budget is four million."),
+        "the peer's grant still applies"
+    );
+    assert!(
+        progress.contains(&("find".into(), FALLBACK_NOTE.into())),
+        "{progress:?}"
+    );
+    assert_eq!(
+        *fake.calls.lock().unwrap(),
+        [
+            retrieval(query, "copilot", &[]),
+            retrieval(query, "grounding", GROUNDING_CAPABILITIES),
+        ]
+    );
+
+    let records = ctx.work_log.records();
+    assert!(records["find"].grounding_fallback);
+    assert_eq!((records["find"].kept, records["find"].withheld), (1, 1));
+    let mut run = RunRecord::new("boss", &boss.id().to_string(), &text, &plan, &states, 0);
+    run.workiq = records;
+    run.save(dir.path()).unwrap();
+    let shown = RunRecord::load(dir.path(), &run.id)
+        .unwrap()
+        .render_markdown();
+    assert!(
+        shown.contains(&format!("Microsoft 365 sources: {FALLBACK_NOTE}")),
+        "{shown}"
+    );
+
+    let rows = proofkin::workiq::audit::read(audit.path()).unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].outcome, "tool");
+    assert_eq!(rows[1].outcome, "ok");
+    for row in &rows {
+        assert_eq!(row.tool, "retrieve");
+        assert_eq!(row.purpose, "step");
+        assert_eq!(row.audience, "partner");
+        assert_eq!(row.run.as_deref(), Some("r1"));
+        assert_eq!(row.step.as_deref(), Some("find"));
+        assert_eq!(row.query_sha256, rows[0].query_sha256);
+    }
+    assert_eq!(audit.usage(Some("r1")).run, Some(2));
+    assert_eq!(audit.usage(None).today, 2);
+}
+
+#[tokio::test]
+async fn workiq_steps_do_not_fall_back_for_policy_specific_errors_connectors_only_or_grounding() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, _audit, work) = failing_workiq(dir.path().join("audit.jsonl"), |arguments| {
+        let reply = match arguments["query"].as_str().unwrap() {
+            "Policy case" => retrieve_error(GENERIC_RETRIEVE_ERROR, Some("DeniedByPolicy")),
+            "Specific case" => {
+                retrieve_error("An error occurred invoking 'retrieve': bad query", None)
+            }
+            _ => retrieve_error(GENERIC_RETRIEVE_ERROR, None),
+        };
+        Some(reply)
+    })
+    .await;
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let ctx = workiq_run(helper_id, work);
+    let plan = Plan::parse(concat!(
+        "policy @helper workiq=all Policy case\n",
+        "specific @helper workiq=all Specific case\n",
+        "connectors @helper workiq=connectors Find a connector item\n",
+        "grounding @helper workiq=files Search files",
+    ))
+    .unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    for step in ["policy", "specific", "connectors", "grounding"] {
+        assert!(
+            matches!(states[step], StepState::Failed { .. }),
+            "{states:?}"
+        );
+    }
+    assert!(ctx.work_log.records().is_empty());
+    assert_eq!(
+        *fake.calls.lock().unwrap(),
+        [
+            retrieval("Policy case", "copilot", &[]),
+            retrieval("Specific case", "copilot", &[]),
+            retrieval("Find a connector item", "copilot", &["GraphConnectors"]),
+            retrieval("Search files", "grounding", &["OneDriveAndSharePoint"]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_grounding_fallback_names_both_errors_without_searching_again() {
+    use proofkin::knowledge::KnowledgeBase;
+    use proofkin::workiq::client::WorkIqError;
+    use proofkin::workiq::import::import_knowledge;
+
+    const GROUNDING_ERROR: &str = "No search index for grounding";
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, _audit, work) = failing_workiq(dir.path().join("audit.jsonl"), |arguments| {
+        generic_copilot_error(arguments).or_else(|| Some(retrieve_error(GROUNDING_ERROR, None)))
+    })
+    .await;
+    let (boss, _agents, helper_id) = boss_with_helper_and_partner(&["General"]).await;
+    let ctx = workiq_run(helper_id, work.clone());
+    let query = "Find the launch dates";
+    let plan = Plan::parse(&format!("find @helper workiq=all {query}")).unwrap();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}).await;
+    let StepState::Failed { error, .. } = &states["find"] else {
+        panic!("{states:?}")
+    };
+    assert!(
+        error.contains("grounding search failed after its copilot search failed"),
+        "{error}"
+    );
+    assert!(error.contains(GENERIC_RETRIEVE_ERROR), "{error}");
+    assert!(error.contains(GROUNDING_ERROR), "{error}");
+    assert!(ctx.work_log.records()["find"].grounding_fallback);
+
+    let kb = KnowledgeBase::new(dir.path().join("knowledge"));
+    let failure = import_knowledge(work.as_ref(), &kb, "launch", query, Some("all"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure
+            .downcast_ref::<WorkIqError>()
+            .unwrap()
+            .tool_text
+            .as_deref(),
+        Some(GROUNDING_ERROR)
+    );
+    assert!(
+        failure
+            .to_string()
+            .contains("after its copilot search failed")
+    );
+    assert!(kb.list().is_empty());
+    assert_eq!(
+        *fake.calls.lock().unwrap(),
+        [
+            retrieval(query, "copilot", &[]),
+            retrieval(query, "grounding", GROUNDING_CAPABILITIES),
+            retrieval(query, "copilot", &[]),
+            retrieval(query, "grounding", GROUNDING_CAPABILITIES),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn kb_import_reports_and_audits_the_grounding_fallback_for_all_and_mixed_sources() {
+    use proofkin::knowledge::KnowledgeBase;
+    use proofkin::workiq::import::import_knowledge;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, audit, work) =
+        failing_workiq(dir.path().join("audit.jsonl"), generic_copilot_error).await;
+    let kb = KnowledgeBase::new(dir.path().join("knowledge"));
+    let query = "launch budget";
+    for (topic, from) in [("launch", "all"), ("launch-files", "files,connectors")] {
+        let done = import_knowledge(work.as_ref(), &kb, topic, query, Some(from), false)
+            .await
+            .unwrap();
+        assert_eq!(done.fallback_note, Some(FALLBACK_NOTE));
+        assert_eq!((done.kept, done.withheld), (2, 0));
+        assert!(kb.read(topic).unwrap().contains("Launch is in May."));
+    }
+    assert_eq!(
+        *fake.calls.lock().unwrap(),
+        [
+            retrieval(query, "copilot", &[]),
+            retrieval(query, "grounding", GROUNDING_CAPABILITIES),
+            retrieval(
+                query,
+                "copilot",
+                &["OneDriveAndSharePoint", "GraphConnectors"]
+            ),
+            retrieval(query, "grounding", &["OneDriveAndSharePoint"]),
+        ]
+    );
+    let rows = proofkin::workiq::audit::read(audit.path()).unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row.purpose == "knowledge-import" && row.audience == "local")
+    );
+    let outcomes: Vec<_> = rows.iter().map(|row| row.outcome.as_str()).collect();
+    assert_eq!(outcomes, ["tool", "ok", "tool", "ok"]);
 }
 
 #[tokio::test]
@@ -4718,7 +5015,11 @@ async fn a_workiq_step_asks_through_the_audited_client_with_agent_id() {
 
 /// A fake Work IQ endpoint on localhost: what it was called with, and its URL.
 async fn serve_fake_mcp() -> (Arc<FakeMcp>, String) {
-    let fake = Arc::new(FakeMcp::default());
+    serve_mcp(FakeMcp::default()).await
+}
+
+async fn serve_mcp(fake: FakeMcp) -> (Arc<FakeMcp>, String) {
+    let fake = Arc::new(fake);
     let app = axum::Router::new()
         .route("/mcp", axum::routing::post(fake_mcp))
         .with_state(fake.clone());

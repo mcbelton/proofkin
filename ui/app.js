@@ -1606,7 +1606,8 @@ function renderRunWorkiq(steps) {
     el("p", { class: "muted small", text: "Where each step's work context came from. What it said isn't shown here." }),
   ] : []), ...steps.map((w) => el("div", { class: "run-workiq-step" },
     el("p", { class: "small" }, el("strong", { text: `Step ${w.step}` }),
-      ` · Microsoft 365: ${workiqCounts(w.kept, w.labels, w.withheld)}`),
+      ` · Microsoft 365: ${workiqCounts(w.kept, w.labels, w.withheld)}`,
+      w.fallback_note ? `. ${w.fallback_note}` : ""),
     w.sources?.length ? el("ul", { class: "run-workiq-sources", "aria-label": `Step ${w.step}'s sources` },
       ...w.sources.map((s) => {
         const title = s.title || "Untitled";
@@ -2609,12 +2610,13 @@ async function submitKbImport(e) {
     imported = true;
     kbImported = true;
     const counts = workiqCounts(res.kept, res.labels, res.withheld);
+    const fallback = res.fallback_note ? ` ${res.fallback_note}` : "";
     if (dialog.open) {
-      result.replaceChildren(el("strong", { text: `Imported ${res.topic}` }), `: ${counts}. Plan steps use it with `,
+      result.replaceChildren(el("strong", { text: `Imported ${res.topic}` }), `: ${counts}.${fallback} Plan steps use it with `,
         el("span", { class: "mono", text: `context=${res.topic}` }), ".");
       $("#kb-import-cancel").textContent = "Close";
     } else {
-      toast(`Imported ${res.topic} from Microsoft 365: ${counts}`);
+      toast(`Imported ${res.topic} from Microsoft 365: ${counts}${fallback ? `.${fallback}` : ""}`);
     }
     await loadOps().catch((err) => toast(err.message, "error"));
   } catch (err) {

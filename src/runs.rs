@@ -660,6 +660,13 @@ impl RunRecord {
             md += &format!("- Started from the commit of step {from} of evidence run {run}\n");
         }
         md += &format!("- Task: {}\n", step.prompt);
+        if let Some(note) = self
+            .workiq
+            .get(&step.id)
+            .and_then(crate::plan::WorkRecord::fallback_note)
+        {
+            md += &format!("- Microsoft 365 sources: {note}\n");
+        }
         if let Some(model) = s.state.model() {
             md += &format!("- Model: `{}`\n", crate::llm::clean_model(model));
         }

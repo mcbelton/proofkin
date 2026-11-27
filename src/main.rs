@@ -2502,6 +2502,9 @@ async fn run_kb(command: KbCommand) -> Result<()> {
                 replace,
             )
             .await?;
+            if let Some(note) = done.fallback_note {
+                println!("{note}");
+            }
             println!(
                 "profile '{}': saved topic {} from Work IQ: {} result(s) kept ({}), {} withheld",
                 profile.name,
