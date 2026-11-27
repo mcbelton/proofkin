@@ -333,8 +333,14 @@ pub fn prompt(request: &Request, available: &Available) -> String {
     if let Some((n, issue)) = &request.issue {
         text += &format!(
             "## The issue it is for\n\nThe plan works on issue #{n} of the tracker's \
-             repository: its steps that work on it say `issue=#{n}`, and `track: #{n}` makes \
-             the run work on it. Its text, as GitHub has it:\n\n{}\n\n",
+             repository. Name it one way, not both:\n\
+             - `track: #{n}`: the run works on #{n}, and its steps get sub-issues of #{n}; or\n\
+             - `issue=#{n}` on the step that does the work, which then gets the issue's text. \
+             `track:` may then name the issue #{n} belongs under, or a title, or be left out \
+             (a new run issue).\n\n\
+             The plan check refuses a step whose `issue=` is the run's own `track: #N`, so a \
+             plan that gives both `track: #{n}` and `issue=#{n}` doesn't check out.\n\n\
+             The issue's text, as GitHub has it:\n\n{}\n\n",
             wrap(&format!("issue:{n}"), issue)
         );
     }
@@ -747,6 +753,32 @@ mod tests {
             !prompt.contains("KNOWLEDGE-TEXT-NEVER-SENT"),
             "topic names only"
         );
+    }
+
+    #[test]
+    fn the_prompt_for_an_issue_says_not_to_give_both_track_and_issue() {
+        let f = fixture();
+        let request = Request {
+            issue: Some((12, "acme/app#12 Ship the tracker".into())),
+            ..Request::default()
+        };
+        let prompt = prompt(&request, &f.available);
+        // One way or the other: the run works on the issue, or the step that does the work.
+        for said in [
+            "Name it one way, not both:\n",
+            "\n- `track: #12`: the run works on #12, and its steps get sub-issues of #12; or\n",
+            "\n- `issue=#12` on the step that does the work, which then gets the issue's text. \
+             `track:` may then name the issue #12 belongs under, or a title, or be left out",
+        ] {
+            assert!(prompt.contains(said), "{said:?} in {prompt}");
+        }
+        // The one line that names both is the one that says the plan check refuses them.
+        let both: Vec<&str> = prompt
+            .lines()
+            .filter(|l| l.contains("`track: #12`") && l.contains("`issue=#12`"))
+            .collect();
+        let refused = "The plan check refuses a step whose `issue=` is the run's own `track: #N`";
+        assert!(both.len() == 1 && both[0].starts_with(refused), "{both:?}");
     }
 
     #[tokio::test]

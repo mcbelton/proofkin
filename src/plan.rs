@@ -1166,7 +1166,9 @@ One claim, step or comment per line:
 with `claims=ID`) prove it.
 - `track: #N` (the run works on issue N of the tracker's repository), `track: a title` (a \
 new issue with that title tracks the run) or `track: off` (the run isn't tracked): at most \
-one. Without it, a profile with a tracker tracks the run as a new issue.
+one. Without it, a profile with a tracker tracks the run as a new issue. A step's `issue=` \
+can't be the run's own `track: #N` (its steps get sub-issues of N): name an issue one way, \
+not both.
 - A step: `id [after a,b] [approve|team|pr] who [using provider] [options] what to do`.
 
 A step's id is letters, digits, '-', '_' or '.', and unique in the plan. `after a,b` runs it \
@@ -1204,7 +1206,9 @@ the agent's instructions first, its skills and MCP servers added.
 - `workiq=all` (or `workiq=email,meetings,files,teams,people,connectors`): its own words \
 are searched in Microsoft 365 with Work IQ first, and what is found goes in front of its \
 task (Work IQ must be signed in).
-- `issue=#N`: it works on issue N of the tracker's repository, and gets the issue's text.
+- `issue=#N`: it works on issue N of the tracker's repository, and gets the issue's text. A \
+step's `issue=` can't be the run's own `track: #N` (its steps get sub-issues of N): name an \
+issue one way, not both.
 - `timeout=30m` (s, m, h or d; at most 7d): the longest it may take; then it is cancelled.
 
 Other kinds of step:
@@ -7637,6 +7641,23 @@ mod tests {
         }
         for part in parts {
             assert!(FORMAT.contains(&part), "the reference names {part}");
+        }
+    }
+
+    #[test]
+    fn the_format_reference_says_a_steps_issue_cant_be_the_runs_own_track() {
+        // Where it explains each of track: and issue=, so a model that drafts a plan doesn't
+        // give both for one issue (the plan check refuses that).
+        for entry in ["- `track: #N`", "- `issue=#N`"] {
+            let line = FORMAT
+                .lines()
+                .find(|l| l.starts_with(entry))
+                .unwrap_or_else(|| panic!("the reference explains {entry}"));
+            assert!(
+                line.contains("A step's `issue=` can't be the run's own `track: #N`")
+                    && line.contains("name an issue one way, not both"),
+                "{line}"
+            );
         }
     }
 }
