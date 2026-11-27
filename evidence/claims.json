@@ -73,6 +73,17 @@
       "live": ["worker2 wrote p2p_live.txt in its workspace", "worker2 audited boss's task with its grant"]
     },
     {
+      "id": "SHR-3",
+      "area": "shared folders",
+      "claim": "A folder's owner can limit how many editing tasks this agent runs there at once (a positive number or any, the default) with share add --tasks, share tasks, or This agent > Shared folders. The limit is saved in shares.json and shown by share list and in the web UI. When the folder is full, an edit waits with the folder named in its live status and runs when there is room; its wait leaves the agent's other slot free for another folder or a read-only task. Read-only tasks do not count toward the folder limit. With no limit, two edits can run at once as before. The limit does not change the plan check.",
+      "tests": [
+        "agents::a_folder_limit_queues_edits_but_leaves_the_other_slot_free",
+        "agents::edits_overlap_by_default_and_the_queue_uses_the_current_folder_limit",
+        "factory::share_commands_save_list_and_clear_folder_task_limits",
+        "ui::the_owner_sets_and_clears_a_folder_task_limit_in_the_web_ui"
+      ]
+    },
+    {
       "id": "NET-6",
       "area": "network",
       "claim": "A task in flight survives its connection being replaced (e.g. both peers dialed each other at once): it keeps running and its result arrives over the connection that is kept. Requests sent while connections converge are re-sent on the kept connection and run exactly once.",

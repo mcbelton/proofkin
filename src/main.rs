@@ -1212,11 +1212,24 @@ rights, so only peers with full access may request them.")]
         /// (the folder must be a git repository).
         #[arg(long)]
         worktrees: bool,
+        /// Editing tasks allowed at once (1 or more, or `any`; default for new folders: any).
+        #[arg(long, value_name = "N|any")]
+        tasks: Option<String>,
         #[command(flatten)]
         profile: ProfileArg,
     },
     /// List the folders a profile shares.
     List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Set how many editing tasks can run at once in a shared folder.
+    Tasks {
+        /// The shared folder.
+        name: String,
+        /// A whole number of 1 or more, or `any` for no folder limit.
+        #[arg(value_name = "N|any")]
+        tasks: String,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -2279,9 +2292,18 @@ fn remove_worker(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `; checks: test, lint; worktrees` for a share listing.
+fn share_tasks_text(limit: Option<std::num::NonZeroU32>) -> String {
+    let tasks = limit.map_or_else(|| "any".to_owned(), |n| n.to_string());
+    format!("editing tasks at once: {tasks}")
+}
+
+/// Details after the path of a share listing.
 fn share_extras(share: &proofkin::shares::Share) -> String {
     let mut extras = String::new();
+    if share.name != proofkin::shares::DATA_SHARE {
+        extras += "; ";
+        extras += &share_tasks_text(share.task_limit);
+    }
     if !share.checks.is_empty() {
         extras += &format!(
             "; checks: {}",
@@ -4075,6 +4097,7 @@ fn run_squad(command: SquadCommand) -> Result<()> {
 }
 
 fn run_share(command: ShareCommand) -> Result<()> {
+    use proofkin::shares::{parse_checks, parse_task_limit};
     match command {
         ShareCommand::Add {
             name,
@@ -4082,20 +4105,25 @@ fn run_share(command: ShareCommand) -> Result<()> {
             access,
             checks,
             worktrees,
+            tasks,
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
-            let mut shares = profile.shares()?;
-            let checks = proofkin::shares::parse_checks(&checks)?;
-            let share = shares
-                .add_with(&name, &path, access, checks, worktrees)?
-                .clone();
-            shares.save(&profile.shares_path())?;
+            let checks = parse_checks(&checks)?;
+            let tasks = tasks.as_deref().map(parse_task_limit).transpose()?;
+            let (_, shares) = profile.update_shares(|shares| {
+                shares.add_with(&name, &path, access, checks, worktrees)?;
+                if let Some(limit) = tasks {
+                    shares.set_task_limit(&name, limit)?;
+                }
+                Ok(())
+            })?;
+            let share = shares.get(&name).expect("just added the share");
             println!(
                 "profile '{}': sharing {} as '{name}' (at most {access}){}. Grant it to a peer with: proofkin peers allow <peer> --profile {} --delegate --share data,{name}",
                 profile.name,
                 share.path.display(),
-                share_extras(&share),
+                share_extras(share),
                 profile.name
             );
         }
@@ -4110,6 +4138,20 @@ fn run_share(command: ShareCommand) -> Result<()> {
                     share_extras(&share)
                 );
             }
+        }
+        ShareCommand::Tasks {
+            name,
+            tasks,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let limit = parse_task_limit(&tasks)?;
+            profile.update_shares(|shares| shares.set_task_limit(&name, limit))?;
+            println!(
+                "profile '{}': '{name}' {}",
+                profile.name,
+                share_tasks_text(limit)
+            );
         }
         ShareCommand::Team {
             name,
@@ -4208,11 +4250,12 @@ fn run_share(command: ShareCommand) -> Result<()> {
         }
         ShareCommand::Remove { name, profile } => {
             let profile = Profile::open(&profile.name)?;
-            let mut shares = profile.shares()?;
-            if !shares.remove(&name)? {
-                bail!("profile '{}' shares no folder named '{name}'", profile.name);
-            }
-            shares.save(&profile.shares_path())?;
+            profile.update_shares(|shares| {
+                if !shares.remove(&name)? {
+                    bail!("profile '{}' shares no folder named '{name}'", profile.name);
+                }
+                Ok(())
+            })?;
             println!("profile '{}': stopped sharing '{name}'", profile.name);
         }
     }

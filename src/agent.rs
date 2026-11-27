@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::audit::{AuditEntry, AuditLog, Outcome};
 use crate::evidence::{
@@ -495,26 +495,19 @@ struct Served {
     usage: Option<Usage>,
 }
 
-/// A served task's place: waiting for a slot, or holding one (see
-/// [`Inner::take_slot`]). Leaving it tells the queue and peers.
+/// A served task's place in the queue or in a slot, until it finishes or is cancelled.
 struct Place<'a> {
     inner: &'a Inner,
-    key: (EndpointId, u64),
-    holding: bool,
+    id: TaskId,
 }
 
 impl Drop for Place<'_> {
     fn drop(&mut self) {
-        {
-            let mut slots = self.inner.slots.lock().unwrap();
-            if self.holding {
-                slots.holding.remove(&self.key);
-            } else {
-                slots.queue.retain(|k| *k != self.key);
+        self.inner.update_slots(|slots| {
+            if slots.holding.remove(&self.id).is_none() {
+                slots.queue.retain(|task| task.id != self.id);
             }
-        }
-        self.inner.report_queue();
-        self.inner.broadcast_load();
+        });
     }
 }
 
@@ -588,13 +581,92 @@ fn reply_result(
     }
 }
 
-/// A peer's task this agent serves: whether it got a slot, for load reports.
+type TaskId = (EndpointId, u64);
+
+struct WaitingTask {
+    id: TaskId,
+    /// Only editing tasks count against a folder's limit.
+    folder: Option<String>,
+    ready: oneshot::Sender<()>,
+}
+
 #[derive(Default)]
 struct Slots {
-    /// Tasks waiting for a slot, in order.
-    queue: VecDeque<(EndpointId, u64)>,
-    /// Tasks holding a slot.
-    holding: HashSet<(EndpointId, u64)>,
+    queue: VecDeque<WaitingTask>,
+    holding: HashMap<TaskId, Option<String>>,
+}
+
+impl Slots {
+    fn blocked_folder<'a>(&self, task: &'a WaitingTask, shares: &ShareStore) -> Option<&'a str> {
+        let folder = task.folder.as_deref()?;
+        let limit = shares.get(folder)?.task_limit?;
+        let editing = self
+            .holding
+            .values()
+            .filter(|f| f.as_deref() == Some(folder))
+            .count();
+        (editing >= limit.get() as usize).then_some(folder)
+    }
+
+    fn fill(&mut self, shares: &ShareStore) {
+        while self.holding.len() < MAX_CONCURRENT_TASKS {
+            // Take the oldest runnable task without reserving a slot for a blocked folder.
+            let Some(index) = self
+                .queue
+                .iter()
+                .position(|task| self.blocked_folder(task, shares).is_none())
+            else {
+                break;
+            };
+            let task = self.queue.remove(index).expect("index in the queue");
+            if task.ready.send(()).is_ok() {
+                self.holding.insert(task.id, task.folder);
+            }
+        }
+    }
+
+    fn queue_reports(&self, shares: &ShareStore, agent: &str) -> Vec<(TaskId, String)> {
+        let mut agent_ahead = 0;
+        let mut folder_ahead = HashMap::new();
+        self.queue
+            .iter()
+            .map(|task| {
+                let (waiting, ahead) = match self.blocked_folder(task, shares) {
+                    Some(folder) => (
+                        format!("waiting for folder {folder}: another task works there"),
+                        folder_ahead.entry(folder).or_insert(0),
+                    ),
+                    None => (
+                        format!("waiting for a free slot on {agent}"),
+                        &mut agent_ahead,
+                    ),
+                };
+                let place = match *ahead {
+                    0 => "next in line".to_owned(),
+                    1 => "1 task ahead".to_owned(),
+                    n => format!("{n} tasks ahead"),
+                };
+                *ahead += 1;
+                (task.id, format!("{waiting} ({place})"))
+            })
+            .collect()
+    }
+
+    fn load_for(&self, peer: &EndpointId) -> Message {
+        let yours = self
+            .queue
+            .iter()
+            .map(|task| &task.id)
+            .chain(self.holding.keys())
+            .filter(|(p, _)| p == peer)
+            .count();
+        Message::Load {
+            running: self.holding.len() as u32,
+            queued: self.queue.len() as u32,
+            slots: MAX_CONCURRENT_TASKS as u32,
+            yours: yours as u32,
+        }
+    }
 }
 
 struct Inner {
@@ -619,7 +691,6 @@ struct Inner {
     models: Mutex<crate::models::Models>,
     /// The models its accounts offer, as last listed (see [`Agent::set_offers`]).
     offers: Mutex<crate::models::Offers>,
-    task_slots: Semaphore,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
     /// Cancel senders of tasks peers asked us to run, by (peer, task id); dropping
@@ -716,7 +787,6 @@ impl Agent {
             role: config.role,
             models: Mutex::new(config.models),
             offers: Mutex::new(crate::models::Offers::new()),
-            task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             serving: Mutex::new(HashMap::new()),
@@ -902,7 +972,9 @@ impl Agent {
     /// Replaces the shared folders (e.g. a newly linked repository); connected peers
     /// learn what they may now use right away. Persisting them is up to the caller.
     pub fn set_shares(&self, shares: ShareStore) {
-        *self.inner.shares.lock().unwrap() = shares;
+        self.inner.update_slots(|_| {
+            *self.inner.shares.lock().unwrap() = shares;
+        });
         let ids: Vec<EndpointId> = self.inner.peers.lock().unwrap().keys().copied().collect();
         for id in ids {
             let shares = self.inner.shares_for(&id);
@@ -2106,40 +2178,6 @@ impl Inner {
         }
     }
 
-    /// How busy this agent is with peers' tasks, as `peer` is told.
-    fn load_for(&self, peer: &EndpointId) -> Message {
-        let slots = self.slots.lock().unwrap();
-        let yours = slots
-            .queue
-            .iter()
-            .chain(slots.holding.iter())
-            .filter(|(p, _)| p == peer)
-            .count();
-        Message::Load {
-            running: slots.holding.len() as u32,
-            queued: slots.queue.len() as u32,
-            slots: MAX_CONCURRENT_TASKS as u32,
-            yours: yours as u32,
-        }
-    }
-
-    /// Tells every connected peer how busy this agent is now (it serves tasks).
-    fn broadcast_load(&self) {
-        if self.executor.is_none() {
-            return;
-        }
-        let peers: Vec<(EndpointId, mpsc::UnboundedSender<Message>)> = self
-            .peers
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(id, h)| (*id, h.tx.clone()))
-            .collect();
-        for (id, tx) in peers {
-            let _ = tx.send(self.load_for(&id));
-        }
-    }
-
     /// Tells the tasks waiting for `peer` that it dropped and they wait for it.
     fn report_reconnecting(&self, peer: &EndpointId, name: &str) {
         let text = format!(
@@ -2630,7 +2668,10 @@ impl Inner {
             team: false,
         });
         let work = async {
-            let _slot = self.take_slot(id, task_id).await?;
+            let editing = ctx.access >= Access::WorkspaceWrite;
+            let _slot = self
+                .take_slot(id, task_id, editing.then_some(share.name.as_str()))
+                .await;
             self.attempt_task(
                 executor.as_ref(),
                 id,
@@ -3225,7 +3266,7 @@ impl Inner {
                 };
                 self.send_progress(id, task_id, Progress::new(Phase::Running, text));
                 let ran = {
-                    let _slot = self.take_slot(id, task_id).await?;
+                    let _slot = self.take_slot(id, task_id, None).await;
                     executor.execute(&ask, &ctx).await.with_context(|| {
                         format!("{}'s model couldn't write the team plan", self.name)
                     })?
@@ -3299,60 +3340,43 @@ impl Inner {
         Ok((format!("// {by}\n{plan}"), notes))
     }
 
-    /// Waits for a task slot for `peer`'s task `task_id`, telling it its place in the
-    /// queue meanwhile. The slot is free again when the returned pair is dropped.
-    async fn take_slot(
-        &self,
-        peer: &EndpointId,
-        task_id: u64,
-    ) -> Result<(tokio::sync::SemaphorePermit<'_>, Place<'_>)> {
-        let key = (*peer, task_id);
-        if let Ok(permit) = self.task_slots.try_acquire() {
-            self.slots.lock().unwrap().holding.insert(key);
-            self.broadcast_load();
-            return Ok((
-                permit,
-                Place {
-                    inner: self,
-                    key,
-                    holding: true,
-                },
-            ));
-        }
-        self.slots.lock().unwrap().queue.push_back(key);
-        let mut place = Place {
-            inner: self,
-            key,
-            holding: false,
-        };
-        self.report_queue();
-        self.broadcast_load();
-        let permit = self.task_slots.acquire().await?;
-        {
-            let mut slots = self.slots.lock().unwrap();
-            slots.queue.retain(|k| *k != key);
-            slots.holding.insert(key);
-        }
-        place.holding = true;
-        self.report_queue();
-        self.broadcast_load();
-        Ok((permit, place))
+    /// Waits for an agent slot and, for editing work, room in its folder.
+    async fn take_slot(&self, peer: &EndpointId, task_id: u64, folder: Option<&str>) -> Place<'_> {
+        let id = (*peer, task_id);
+        let place = Place { inner: self, id };
+        let (ready, wait) = oneshot::channel();
+        self.update_slots(|slots| {
+            slots.queue.push_back(WaitingTask {
+                id,
+                folder: folder.map(str::to_owned),
+                ready,
+            });
+        });
+        wait.await
+            .expect("a queued task stays until scheduled or cancelled");
+        place
     }
 
-    /// Tells each queued task's requester its place in the queue.
-    fn report_queue(&self) {
-        let queue: Vec<(EndpointId, u64)> =
-            self.slots.lock().unwrap().queue.iter().copied().collect();
-        for (ahead, (peer, task_id)) in queue.into_iter().enumerate() {
-            let place = match ahead {
-                0 => "next in line".to_owned(),
-                1 => "1 task ahead".to_owned(),
-                n => format!("{n} tasks ahead"),
+    fn update_slots(&self, change: impl FnOnce(&mut Slots)) {
+        let mut slots = self.slots.lock().unwrap();
+        change(&mut slots);
+        if !slots.queue.is_empty() {
+            let reports = {
+                let shares = self.shares.lock().unwrap();
+                slots.fill(&shares);
+                slots.queue_reports(&shares, &self.name)
             };
-            let text = format!("waiting for a free slot on {} ({place})", self.name);
-            self.send_progress(&peer, task_id, Progress::new(Phase::Queued, text));
+            for ((peer, task_id), text) in reports {
+                self.send_progress(&peer, task_id, Progress::new(Phase::Queued, text));
+            }
+        }
+        if self.executor.is_some() {
+            for (peer, handle) in self.peers.lock().unwrap().iter() {
+                let _ = handle.tx.send(slots.load_for(peer));
+            }
         }
     }
+
     /// Brings folder `share`'s clone up to its repository's latest commit before task
     /// `task_id` from `id` starts in it, if it is a linked repository's clone, telling the
     /// requester. Returns a note for the task's result when the task starts from the
@@ -4049,7 +4073,7 @@ async fn run_connection(
     });
     let _ = tx.send(Message::Peers { addrs: known });
     if inner.executor.is_some() {
-        let _ = tx.send(inner.load_for(&peer_id));
+        let _ = tx.send(inner.slots.lock().unwrap().load_for(&peer_id));
     }
     // Requests still waiting for this peer may have been queued on a connection that
     // was replaced: send them again (the peer ignores ones it already has).

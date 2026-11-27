@@ -509,7 +509,7 @@ with `/ticket`.
 | --- | --- |
 | `proofkin peers id --profile P` | Show P's endpoint id and ticket |
 | `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N] [--m365 LABELS\|off [--m365-tools]] [--github LOGIN\|--no-github] [--agents NAMES\|--no-agents]` | Allowlist a peer (re-run to change its rights). `--m365 General,Public,unlabeled` lets it receive Microsoft 365 content with those labels, `--m365-tools` lets its tasks use your Work IQ (read only), `--m365 off` removes the grant; without `--m365` a grant is kept. `--github` sets its GitHub account, which [pull request steps](#pull-request-steps-opening-the-pull-request-from-the-plan) ask to review; without it an account set before is kept |
-| `proofkin share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--check NAME=COMMAND ...]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
+| `proofkin share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--tasks N] [--check NAME=COMMAND ...]`, `share list`, `share tasks <name> <N or any>`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees, task limits and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
 | `proofkin peers list --profile P` | List allowlisted peers and their rights |
 | `proofkin peers github <name-or-id> <login>\|--off --profile P` | Set (or forget) an allowlisted peer's GitHub account without changing its rights. A running agent uses it after it restarts; the web UI's **Change…** sets it at once |
 | `proofkin peers remove <name-or-id> --profile P` | Remove a peer |
@@ -1270,6 +1270,12 @@ proofkin share add app D:\src\app --access full --worktrees `
 proofkin peers allow <boss-ticket> --profile alice --delegate --access full --share data,app
 ```
 
+If the checks share build output across worktrees (for example through `CARGO_TARGET_DIR`),
+add `--tasks 1` when you share the folder, or set it with `proofkin share tasks app 1
+--profile alice`. This keeps editing tasks from overwriting or using each other's build
+output. The alternative is a build folder per task (no shared `CARGO_TARGET_DIR`): that
+also keeps the builds separate, but builds from scratch each time.
+
 **2. The boss writes a plan with claims.**
 
 ```text
@@ -1339,8 +1345,8 @@ review @alice:app verify=test Check the change:
 - **Worktrees** (`share add --worktrees`, for a git repository): each editing task runs on
   its own branch `p2p/<peer>/<task>-<time>` in its own worktree under
   `~/.proofkin-worktrees/<profile>`, with git hooks disabled. The work is committed there and
-  returned as a patch whose hash is signed. Your checkout is never touched and parallel
-  tasks never collide. Review or merge the branch (`git log p2p/boss/...`) when you're
+  returned as a patch whose hash is signed. Your checkout is never touched and the tasks'
+  checkouts stay separate. Review or merge the branch (`git log p2p/boss/...`) when you're
   happy. Removed worktrees keep their branch. The commit's subject is the task's title (the
   first line of its own words, at most 100 characters), followed by who asked and who did it.
   A plan step that works on an issue (`issue=#N`) is committed with the issue's title as the
@@ -2326,7 +2332,7 @@ proofkin playbook show rehearse --set peer=alice --set folder=shop --set change=
 | `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
 Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|remove`,
-`proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
+`proofkin share add|list|tasks|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove|memory`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
 `proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin factory templates|new|list|show|edit|check|build|evaluate|report|init|delete`, `proofkin github login|grant|status|logout`, `proofkin models list|default|allow|effort`,
@@ -2830,6 +2836,13 @@ A worker decides exactly what each peer can see:
 - Peers see shared folders **by name and access only**, never their paths, and only the ones
   granted to them (`/peers` lists them). Changing a connected peer's grant reaches it at once.
 - A task naming a folder that isn't shared with that peer is refused (and audited).
+- Set how many editing tasks this agent may run at once in a folder with `share add --tasks N`,
+  `share tasks <name> N`, or **This agent > Shared folders > Task limit?**. `N` is a whole
+  number from 1 up; new folders default to `any` (no folder limit beyond the agent's slots).
+  Set `any` to clear the limit. `share list` and the web UI show it. When a folder is full,
+  the task waits and its live status names the folder; the agent's other slot can still run
+  a task in another folder. Read-only tasks don't count toward the folder limit. The limit
+  queues tasks, so it doesn't change the plan check.
 - `proofkin share team <folder> <file>` gives a folder a **team plan**, so peers with edit
   access can hand it [team steps](#team-steps-handing-work-down-a-level) that your agent
   runs with your own team; `--model` has your agent's model write one for each team step

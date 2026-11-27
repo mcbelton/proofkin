@@ -656,6 +656,22 @@
     </form>
   </dialog>
 
+  <dialog id="share-tasks-dialog" aria-labelledby="share-tasks-h">
+    <form method="dialog" id="share-tasks-form" novalidate>
+      <h2 id="share-tasks-h">Editing task limit</h2>
+      <label class="field">
+        <span>Editing tasks at once</span>
+        <input type="text" id="share-tasks" aria-describedby="share-tasks-hint">
+        <span class="muted small" id="share-tasks-hint">Enter a whole number of 1 or more, or 'any' for no folder limit. Use 1 if tasks share build output. Read-only tasks do not count.</span>
+      </label>
+      <p class="form-error" id="share-tasks-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="share-tasks-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="share-tasks-save">Save task limit</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="models-dialog" aria-labelledby="models-h">
     <form method="dialog" id="models-form" novalidate>
       <h2 id="models-h">Models</h2>

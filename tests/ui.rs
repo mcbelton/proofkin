@@ -3717,6 +3717,78 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
 }
 
 #[tokio::test]
+async fn the_owner_sets_and_clears_a_folder_task_limit_in_the_web_ui() {
+    let home = tempfile::tempdir().unwrap();
+    let (agent, port, token) = solo_ui(home.path()).await;
+    let profile = Profile::open_in(home.path(), "solo").unwrap();
+    let (_, shares) = profile
+        .update_shares(|shares| {
+            shares.add("app", home.path(), Access::Full)?;
+            Ok(())
+        })
+        .unwrap();
+    agent.set_shares(shares);
+    let host = format!("127.0.0.1:{port}");
+    let put = |body: &'static str| {
+        request(
+            port,
+            "PUT",
+            "/api/shares/app/tasks",
+            &host,
+            Some(&token),
+            Some(body),
+        )
+    };
+    let shown = || async {
+        request(port, "GET", "/api/state", &host, Some(&token), None)
+            .await
+            .json()["me"]["shares"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|share| share["name"] == "app")
+            .unwrap()["task_limit"]
+            .clone()
+    };
+    assert!(shown().await.is_null(), "no limit by default");
+
+    let set = put(r#"{"tasks":"1"}"#).await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(
+        set.json(),
+        serde_json::json!({ "name": "app", "task_limit": 1 })
+    );
+    assert_eq!(shown().await, 1);
+    let saved = || {
+        profile
+            .shares()
+            .unwrap()
+            .get("app")
+            .unwrap()
+            .task_limit
+            .map(|n| n.get())
+    };
+    assert_eq!(saved(), Some(1));
+    let invalid = put(r#"{"tasks":"0"}"#).await;
+    assert_eq!(invalid.status, 400, "{}", invalid.body);
+    assert!(
+        invalid.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("1 or more")
+    );
+    assert_eq!(saved(), Some(1));
+    assert_eq!(shown().await, 1);
+
+    let cleared = put(r#"{"tasks":"any"}"#).await;
+    assert_eq!(cleared.status, 200, "{}", cleared.body);
+    assert!(cleared.json()["task_limit"].is_null());
+    assert!(shown().await.is_null());
+    assert_eq!(saved(), None);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn plan_draft_refuses_disallowed_models_and_efforts_before_reading_an_issue() {
     let home = tempfile::tempdir().unwrap();
     let (_, agent, planner, port, token) = plan_draft_ui(home.path()).await;

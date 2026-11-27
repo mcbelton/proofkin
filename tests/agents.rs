@@ -13,12 +13,13 @@ use proofkin::plan::{Plan, RunContext, SquadStore, StepState, run_plan, run_plan
 use proofkin::protocol::{Phase, Progress};
 use proofkin::pulls::{Asked, Opened, PullRequestAsk, PullRequests, Review};
 use proofkin::runs::{RunRecord, Verdict};
-use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
+use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks, parse_task_limit};
 use proofkin::{
-    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, Ran,
-    SecretKey, TaskContext, TrustStore, TrustedPeer, Usage,
+    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Profile, Provider,
+    Ran, SecretKey, TaskContext, TrustStore, TrustedPeer, Usage,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 /// A node's built-in data folder (the fake executor never touches it).
@@ -5024,6 +5025,210 @@ async fn delegated_tasks_report_their_place_in_the_queue_and_the_worker_its_load
             .is_some_and(|l| l.running == 0 && l.queued == 0)
     })
     .await;
+}
+
+struct EditStarted {
+    workspace: std::path::PathBuf,
+    finish: oneshot::Sender<()>,
+}
+
+struct HeldEdits(mpsc::UnboundedSender<EditStarted>);
+
+#[async_trait]
+impl Executor for HeldEdits {
+    fn providers(&self) -> Vec<Provider> {
+        vec![Provider::Copilot]
+    }
+
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<Ran> {
+        if task.prompt == "hold edit" {
+            let (finish, held) = oneshot::channel();
+            assert!(
+                self.0
+                    .send(EditStarted {
+                        workspace: ctx.workspace.clone(),
+                        finish
+                    })
+                    .is_ok()
+            );
+            held.await?;
+        }
+        Ok(Ran::new(ctx.access.to_string(), None))
+    }
+}
+
+#[tokio::test]
+async fn a_folder_limit_queues_edits_but_leaves_the_other_slot_free() {
+    let app = git_repo();
+    let other = tempfile::tempdir().unwrap();
+    let (started, mut edits) = mpsc::unbounded_channel();
+    let mut worker = Node::new("worker");
+    worker.executor = Some(Arc::new(HeldEdits(started)));
+    worker
+        .shares
+        .add_with("app", app.path(), Access::Full, Default::default(), true)
+        .unwrap();
+    worker
+        .shares
+        .set_task_limit("app", parse_task_limit("1").unwrap())
+        .unwrap();
+    worker
+        .shares
+        .add("other", other.path(), Access::Full)
+        .unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker.grant("boss", Access::Full, &["app", "other"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let deadline = Duration::from_secs(30);
+    let send = |share, text| {
+        boss.send_task(
+            worker.id(),
+            LlmTask::new(Provider::Copilot, text).in_share(share),
+            None,
+        )
+        .unwrap()
+    };
+    let first = send("app", "hold edit");
+    let edit = timeout(deadline, edits.recv()).await.unwrap().unwrap();
+    assert!(edit.workspace.join(".git").is_file(), "edits in a worktree");
+    let second = send("app", "edit next");
+    let (progress, mut live) = mpsc::unbounded_channel();
+    let second = tokio::spawn(async move {
+        second
+            .finish(|p| {
+                let _ = progress.send(p);
+            })
+            .await
+    });
+    let queued = timeout(deadline, live.recv()).await.unwrap().unwrap();
+    assert_eq!(queued.phase, Phase::Queued);
+    assert_eq!(
+        queued.text,
+        "waiting for folder app: another task works there (next in line)"
+    );
+
+    let profile = Profile::open_in(other.path(), "boss").unwrap();
+    let problems = proofkin::plan::preflight(
+        &Plan::parse("edit @worker:app update it").unwrap(),
+        &boss.peers(),
+        &SquadStore::default(),
+        &profile.knowledge(),
+        &profile.skills(),
+        &Default::default(),
+    );
+    assert!(
+        problems.is_empty(),
+        "the busy folder still checks out: {problems:?}"
+    );
+
+    let abandoned = send("app", "cancel while queued");
+    let load = |queued| {
+        boss.peers()[0]
+            .load
+            .is_some_and(|l| l.running == 1 && l.queued == queued)
+    };
+    wait_until(|| load(2)).await;
+    drop(abandoned);
+    wait_until(|| load(1)).await;
+
+    let parallel = timeout(deadline, send("other", "edit elsewhere").finish(|_| {}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parallel.ok && parallel.output.starts_with("full"));
+
+    // The limit counts effective edit access, not all tasks sent to the folder.
+    let mut grant = worker.trusted().get_by_name("boss").unwrap().clone();
+    grant.access = Access::ReadOnly;
+    worker.allow(grant);
+    let reader = timeout(deadline, send("app", "read now").finish(|_| {}))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reader.ok && reader.output.starts_with("read-only"));
+    assert!(!second.is_finished(), "the next edit still waits");
+
+    edit.finish.send(()).unwrap();
+    assert!(
+        timeout(deadline, first.finish(|_| {}))
+            .await
+            .unwrap()
+            .unwrap()
+            .ok
+    );
+    let second = timeout(deadline, second).await.unwrap().unwrap().unwrap();
+    assert!(second.ok && second.output.starts_with("full"));
+}
+
+#[tokio::test]
+async fn edits_overlap_by_default_and_the_queue_uses_the_current_folder_limit() {
+    let app = git_repo();
+    let (started, mut edits) = mpsc::unbounded_channel();
+    let mut worker = Node::new("worker");
+    worker.executor = Some(Arc::new(HeldEdits(started)));
+    worker
+        .shares
+        .add_with("app", app.path(), Access::Full, Default::default(), true)
+        .unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    worker.grant("boss", Access::Full, &["app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let deadline = Duration::from_secs(30);
+    let send = || {
+        let task = LlmTask::new(Provider::Copilot, "hold edit").in_share("app");
+        boss.send_task(worker.id(), task, None).unwrap()
+    };
+    let first = send();
+    let first_edit = timeout(deadline, edits.recv()).await.unwrap().unwrap();
+    let second = send();
+    let second_edit = timeout(deadline, edits.recv()).await.unwrap().unwrap();
+    assert_ne!(first_edit.workspace, second_edit.workspace);
+
+    let set = |limit| {
+        let mut shares = worker.shares();
+        shares
+            .set_task_limit("app", parse_task_limit(limit).unwrap())
+            .unwrap();
+        worker.set_shares(shares);
+    };
+    set("1");
+    let third = send();
+    first_edit.finish.send(()).unwrap();
+    assert!(
+        timeout(deadline, first.finish(|_| {}))
+            .await
+            .unwrap()
+            .unwrap()
+            .ok
+    );
+    wait_until(|| {
+        boss.peers()[0]
+            .load
+            .is_some_and(|l| l.running == 1 && l.queued == 1)
+    })
+    .await;
+    set("2");
+    let third_edit = timeout(deadline, edits.recv()).await.unwrap().unwrap();
+    for (task, edit) in [(second, second_edit), (third, third_edit)] {
+        edit.finish.send(()).unwrap();
+        assert!(
+            timeout(deadline, task.finish(|_| {}))
+                .await
+                .unwrap()
+                .unwrap()
+                .ok
+        );
+    }
 }
 
 /// While checks fail and attempts are left, each attempt and check is reported.

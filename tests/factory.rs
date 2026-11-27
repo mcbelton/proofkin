@@ -528,6 +528,54 @@ fn a_draft_is_built_into_the_same_files_each_time_and_kept_by_their_hash() {
 }
 
 #[test]
+fn share_commands_save_list_and_clear_folder_task_limits() {
+    let home = Home::new();
+    let path = home.path().to_str().unwrap();
+    home.proofkin_ok(&[
+        "share",
+        "add",
+        "app",
+        path,
+        "--profile",
+        "alice",
+        "--tasks",
+        "1",
+    ]);
+    let list = || home.proofkin_ok(&["share", "list", "--profile", "alice"]);
+    assert!(list().contains("editing tasks at once: 1"));
+    let profile = proofkin::Profile::open_in(&home.path().join("profiles"), "alice").unwrap();
+    let saved = || {
+        let json: Value =
+            serde_json::from_slice(&std::fs::read(profile.shares_path()).unwrap()).unwrap();
+        json["shares"][0]["task_limit"].clone()
+    };
+    assert_eq!(saved(), 1);
+
+    // Sharing it again to change another setting doesn't silently remove its protection.
+    home.proofkin_ok(&[
+        "share",
+        "add",
+        "app",
+        path,
+        "--profile",
+        "alice",
+        "--access",
+        "workspace-write",
+    ]);
+    let invalid = home.proofkin(&["share", "tasks", "app", "0", "--profile", "alice"]);
+    assert!(!invalid.ok);
+    assert!(invalid.out.contains("1 or more"));
+    assert_eq!(saved(), 1);
+
+    home.proofkin_ok(&["share", "tasks", "app", "5", "--profile", "alice"]);
+    assert_eq!(saved(), 5);
+    assert!(list().contains("editing tasks at once: 5"));
+    home.proofkin_ok(&["share", "tasks", "app", "any", "--profile", "alice"]);
+    assert!(saved().is_null());
+    assert!(list().contains("editing tasks at once: any"));
+}
+
+#[test]
 fn check_resolves_what_an_agent_asks_for_in_each_folder_and_grants_nothing() {
     let home = Home::new();
     // Signed in to Claude: its tasks may use MCP servers (Codex's can't).
