@@ -1432,6 +1432,27 @@
       ]
     },
     {
+      "id": "WIQ-27",
+      "area": "work-iq",
+      "claim": "A digital worker's task for its owner with mcp=workiq (the gateway's Local audience; never a plan step's task, whose origin names a step, nor a peer's, whatever its grant) may change Microsoft 365 while the owner is there to answer (docs/work-iq.md sections 6 and 7), only when the profile whose Work IQ account it uses allows changes (proofkin workiq changes on [--wait 5m]: a sign-off waits 1 to 10 minutes, given as 5m or 5, 5 by default) and the folder's workiq server does too (proofkin mcp add <folder> workiq --workiq --changes; --changes is only for --workiq, --tool may also name the change tools, and mcp list shows changes). Its session then lists Work IQ's change tools create_entity, update_entity, delete_entity and do_action, though their annotations say they change things; otherwise they aren't listed, and a call is refused before any sign-off or Work IQ call. A change call is held to the rules of a plan's changes (one that breaks a rule gets a tool error naming it, and nobody is asked), then becomes a signed approval request from the worker to its owner's agent, titled Microsoft 365 change from <worker>, whose text shows the change as a plan's sign-off shows one, its SHA-256 and its task (the owner's task number when it has one, and the first 200 characters of its prompt); the call waits for the answer up to the wait, in awake time. Only a verified approval signed by the owner, for exactly that text, makes the change, once, with exactly the call's arguments (a jsonBody given as a JSON string is sent as the object it encodes), and the model gets how it ended: done, with a created entity's id and link; accepted, for a 202; failed; or outcome unknown. A rejection or a request for changes sends nothing, and the model gets the owner's note; with no answer in time the request is withdrawn from the owner's agent, so a late answer finds none and makes nothing. The same call again is a sign-off of its own. With change tools the session's server gets a tool timeout of the wait plus 60 seconds, in milliseconds, in Copilot's config and in the bridge's JSON for Claude; without them it has none. Each change is audited as a gateway call with its path's SHA-256, and the task's signed result ends with a Microsoft 365 changes this task made section naming each change's verb, path and outcome, never its body. workiq doctor and the web UI's Work IQ card say whether changes are on and how long a sign-off waits.",
+      "tests": [
+        "workiq_gateway::change_tools_go_only_to_the_owners_task_with_changes_on_in_profile_and_server",
+        "workiq_gateway::a_change_in_a_workers_task_for_its_owner_waits_for_their_sign_off_and_is_made_once",
+        "workiq_gateway::a_declined_change_sends_nothing_and_the_model_gets_the_owners_note",
+        "workiq_gateway::a_change_not_signed_off_in_time_is_withdrawn_and_a_late_answer_makes_nothing",
+        "workiq_gateway::a_plan_steps_task_and_a_task_with_the_profiles_changes_off_get_no_change_tools",
+        "workiq_doctor::the_report_says_whether_changes_are_on_and_how_long_a_sign_off_waits",
+        "lib::workiq::changes::a_change_call_reads_back_as_the_change_whose_arguments_it_has",
+        "lib::workiq::changes::a_sign_off_of_one_change_shows_it_as_a_plans_sign_off_shows_each",
+        "lib::workiq::changes::the_section_of_changes_a_task_made_names_each_and_how_it_ended",
+        "lib::workiq::gateway::a_session_offers_its_owner_every_read_tool_and_a_peer_only_labeled_ones",
+        "lib::profile::a_changes_sign_off_waits_1_to_10_minutes_given_as_5m_or_5",
+        "lib::mcp::change_tools_need_changes_on_a_workiq_server_and_a_timeout_goes_in_its_json",
+        "lib::llm::copilot::a_servers_timeout_goes_in_copilots_config_and_a_server_without_one_has_none",
+        "bridge::claude_tool_policy_confines_paths_and_tools"
+      ]
+    },
+    {
       "id": "WIQ-28",
       "area": "work-iq",
       "claim": "call_function is one of the gateway's read tools (Work IQ CLI 1.0.1 annotates it read only): a folder's workiq server offers it to its owner's own tasks unless --tool names fewer, and like fetch, whose results carry no sensitivity labels, it never goes to a peer's task, even one granted --m365-tools (those get only retrieve and ask). Like any tool, it is refused if its annotations say it changes things.",

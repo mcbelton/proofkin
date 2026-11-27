@@ -641,12 +641,17 @@ sent: it fails saying which budget is used up and how to raise it, and is record
 > proofkin workiq usage --profile alice
 > proofkin workiq budget --per-day 500 --per-run 40 --profile alice
 > proofkin workiq changes on --profile alice
+> proofkin workiq changes on --wait 3m --profile alice
 ```
 
 `budget` keeps a limit you leave out, and saves them in `profile.json` (`workiq_budget`).
-`changes on|off` lets the profile's plans make the Microsoft 365 changes you sign off, or
-stops them (`workiq_changes`; off by default, see [Making Microsoft 365 changes in a
-plan](#making-microsoft-365-changes-in-a-plan-workiq-apply)).
+`changes on|off` lets the profile's plans make the Microsoft 365 changes you sign off, and a
+digital worker's tasks for you make each change you sign off (in a folder whose `workiq`
+server has `--changes`, see [Work IQ as a tool for tasks](#work-iq-as-a-tool-for-tasks-mcpworkiq)),
+or stops them (`workiq_changes`; off by default, see [Making Microsoft 365 changes in a
+plan](#making-microsoft-365-changes-in-a-plan-workiq-apply)). `--wait` sets how long such a
+task's change waits for your sign-off, in awake time: 1 to 10 minutes, as `5m` or `5`
+(default 5; `workiq_changes.wait_minutes`).
 `proofkin workiq agents --profile alice` lists the declarative agents Work IQ offers (name
 and id), for `agent=` on [`@workiq` steps](#asking-microsoft-365-in-a-step-workiq).
 
@@ -900,7 +905,7 @@ send after ok @workiq apply=draft
 
 - Turn changes on for the profile first: `proofkin workiq changes on --profile me` (off by
   default; `workiq changes off` stops them). Your tenant's policy still applies on top.
-  `proofkin workiq doctor` and the Work IQ card say whether they are on.
+  `proofkin workiq doctor` and the Work IQ card say whether they are on, and the wait.
 - The proposing step (`draft`) is told to write its changes in one fenced `m365-changes`
   block in its result, one JSON object a line:
   `{"tool":"do_action","path":"/me/sendMail","body":{"message":{...}}}`. `tool` is
@@ -2551,6 +2556,7 @@ account, `proofkin auth logout workiq --profile me` removes it.
 | Cited results kept as a knowledge topic for `context=` | `proofkin kb import workiq <topic> --query <text> [--from SOURCES]` | **Importing from Microsoft 365** under the knowledge base, and [the design](docs/work-iq.md#5-work-context-in-plans) |
 | A peer that may receive some of it | `proofkin peers allow <peer> --profile me --m365 General,Public,unlabeled` | [Security model](#security-model) |
 | Changes in Microsoft 365 a plan makes once you sign them off | `proofkin workiq changes on`, then `@workiq apply=STEP` after an `approve @me` step | [Making Microsoft 365 changes in a plan](#making-microsoft-365-changes-in-a-plan-workiq-apply) |
+| Changes in Microsoft 365 your digital worker's task makes, each once you sign it off | `proofkin workiq changes on [--wait 5m]`, and `proofkin mcp add <folder> workiq --workiq --changes` | [Work IQ as a tool for tasks](#work-iq-as-a-tool-for-tasks-mcpworkiq) |
 | What it cost and the limits | `proofkin workiq usage`, `proofkin workiq budget --per-day N --per-run N` | [Work IQ audit file and budgets](#work-iq-audit-file-and-budgets) |
 
 A first plan to try (`/plan first.plan` in the agent, or the web UI's plan editor), with one
@@ -2794,6 +2800,7 @@ so the model searches Microsoft 365 while it works instead of only at the start 
 ```powershell
 proofkin mcp add app workiq --workiq --profile my-worker              # every read tool
 proofkin mcp add app workiq --workiq --tool retrieve --tool ask --profile my-worker
+proofkin mcp add app workiq --workiq --changes --profile my-worker    # and the change tools
 ```
 
 ```text
@@ -2807,7 +2814,8 @@ draft @my-worker:app mcp=workiq Write the launch FAQ from what my mail and files
   task keeps working as tokens are refreshed.
 - Only tools that read: `retrieve`, `ask`, `fetch`, `search_paths`, `get_schema`,
   `list_agents`, `call_function` (`--tool` offers fewer), and never one Work IQ's own
-  annotations say changes things. A change tool is refused, and never reaches Work IQ.
+  annotations say changes things. Without `--changes` (below), a change tool is refused, and
+  never reaches Work IQ.
 - Every result goes through the [content policy](#4-what-keeps-your-work-data-yours): only
   results marked `allowed`, secrets redacted, in the external-content envelope. Every call is
   audited (purpose `gateway`) and held to the daily budget.
@@ -2819,6 +2827,36 @@ draft @my-worker:app mcp=workiq Write the launch FAQ from what my mail and files
   has labels its plan never learns, so the step is marked `unknown` and nothing made from it
   goes to a peer.
 - A browser can't reach it: requests with an `Origin` header are refused.
+
+**Changes, each once you sign it off.** While you're there to answer, a task your digital
+worker runs for you (from chat, Run task, the REPL, MCP or A2A on your agent) may change
+Microsoft 365, when both of these say so: your profile, the one whose Work IQ account the
+worker uses (`proofkin workiq changes on [--wait 5m]`), and the folder's server (`proofkin
+mcp add <folder> workiq --workiq --changes`; `--changes` is only for `--workiq`, `--tool`
+may also name the change tools, and `proofkin mcp list` shows `changes`). A plan step's task
+never gets them (plans [propose changes](#making-microsoft-365-changes-in-a-plan-workiq-apply)),
+nor does a peer's, whatever its grant.
+
+- The session also lists Work IQ's change tools: `create_entity`, `update_entity`,
+  `delete_entity` and `do_action` (`parentUrl`, `entityUrl` or `actionUrl`; `jsonBody`;
+  `headers` with `If-Match` for an update or a delete).
+- Each call is checked with the rules of a plan's changes (a path with no host, a JSON body,
+  and so on); one that breaks a rule gets a tool error naming it, and nobody is asked.
+- Then it waits for your sign-off under **Waiting for your approval**: *Microsoft 365 change
+  from* the worker, showing the change as a plan's sign-off shows one, its SHA-256 and the
+  task it comes from (its number and the start of its prompt), for up to the wait (5 minutes
+  by default, 1 to 10, in awake time).
+- Approved, it is made once, exactly as shown, and the model gets the outcome (*done*, with a
+  created entity's id and link; *accepted* for a 202; *failed*; or *outcome unknown*).
+  Rejected, or asked for changes, nothing is sent, and the model gets your note. Not answered
+  in time, the request is withdrawn, and a late answer makes nothing. A change is never sent
+  again: the same call again is a sign-off of its own.
+- The model's MCP client waits for it: the task's server gets a tool timeout of the wait plus
+  a minute (Copilot and Claude; Codex tasks can't use MCP servers).
+- The task's result ends with a **Microsoft 365 changes this task made** section (each one's
+  verb, path and outcome, never its body), signed with it; each change is audited like any
+  gateway call. `proofkin workiq doctor` and the Work IQ card say whether changes are on, and
+  the wait.
 
 ### Plugins: skills, agents and MCP servers, packaged together
 

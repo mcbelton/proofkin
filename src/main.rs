@@ -8,7 +8,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use proofkin::audit::{AuditLog, Outcome};
 use proofkin::auth::{LoginMethod, ProviderTools};
 use proofkin::plan::{Plan, SquadStore, StepState, run_plan_with};
-use proofkin::profile::DEFAULT_GITHUB_HOST;
+use proofkin::profile::{DEFAULT_GITHUB_HOST, WorkIqChanges};
 use proofkin::trust::DEFAULT_TASKS_PER_HOUR;
 use proofkin::{
     Access, Agent, AgentConfig, Event, Executor, ExecutorConfig, LlmTask, Network, Profile,
@@ -247,21 +247,32 @@ is not sent; it fails and is recorded as refused in workiq-audit.jsonl.")]
         profile: ProfileArg,
     },
     /// Allow Microsoft 365 changes, or stop them. On, a plan's `@workiq apply=STEP` step makes
-    /// the changes step STEP proposed, once you signed them off (`approve @me`). Off (the
-    /// default), plans make none.
+    /// the changes step STEP proposed, once you signed them off (`approve @me`), and a digital
+    /// worker's task for you may make changes in a folder whose `workiq` server was added with
+    /// `--changes`, each one once you sign it off. Off (the default), neither makes any.
     #[command(after_help = "\
 examples:
   proofkin workiq changes on --profile alice
+  proofkin workiq changes on --wait 10m --profile alice
   proofkin workiq changes off --profile alice
 A plan proposes changes in one step, you sign them off, and a later step makes exactly
 those, once and in order:
   draft @worker:app mcp=workiq Draft the replies to this week's open escalations
   ok after draft approve @me Send these replies?
   send after ok @workiq apply=draft
+In a digital worker's task for you (chat, Run task, the REPL, MCP or A2A), with the folder's
+server added with `proofkin mcp add app workiq --workiq --changes`, each change its model
+asks for waits for your sign-off of exactly that change, under Waiting for your approval,
+for up to --wait; without your approval nothing is changed. Plan steps' tasks and peers'
+tasks never get the change tools.
 Your tenant's policy still applies on top: it may deny a change.")]
     Changes {
         #[arg(value_enum)]
         state: Switch,
+        /// How long a change in a digital worker's task for you waits for your sign-off, in
+        /// awake time: 1 to 10 minutes, as 5m or 5 (default: 5m, or the wait set before).
+        #[arg(long, value_name = "MINUTES", value_parser = WorkIqChanges::parse_wait)]
+        wait: Option<u32>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1181,6 +1192,7 @@ examples:
   proofkin mcp add app docs --url https://docs.example.com/mcp --header \"Authorization=Bearer <token>\"
   proofkin mcp add app tickets --plugin team-tools --set TICKETS_TOKEN=<token> --description \"Our ticket system\"
   proofkin mcp add app workiq --workiq --profile my-worker
+  proofkin mcp add app workiq --workiq --changes --profile my-worker
   plan step:  check @alice:app mcp=browser Open http://localhost:3000 and report what the home page shows
 The server runs on this machine with your rights; commands, variables, headers and
 URLs stay here (peers learn only the names they may use, and descriptions you give).
@@ -1189,7 +1201,10 @@ marked as untrusted content. A plugin server's values not given with --set are
 taken from environment variables of the same name. A `workiq` server (--workiq) is
 Work IQ through this agent, for its owner's tasks and peers granted --m365-tools: each
 task gets an address of its own on this machine, never the account's token, and only
-tools that read.")]
+tools that read. With --changes, and `proofkin workiq changes on` for the profile whose
+account it uses, a digital worker's task for its owner also gets the change tools: each
+change waits for the owner's sign-off of exactly that change, and is made once. Plan
+steps' tasks and peers' tasks still get only tools that read.")]
     Add {
         /// The shared folder whose tasks may use the server.
         share: String,
@@ -1219,7 +1234,13 @@ tools that read.")]
         /// Work IQ through this agent's gateway (the server must be called `workiq`).
         #[arg(long, conflicts_with_all = ["url", "command", "env", "plugin"])]
         workiq: bool,
-        /// A tool tasks may call (repeatable; default: all of the server's tools).
+        /// With --workiq: a digital worker's tasks for its owner may also change Microsoft 365
+        /// (create_entity, update_entity, delete_entity, do_action), each change waiting for
+        /// the owner's sign-off. Needs `proofkin workiq changes on` too.
+        #[arg(long, requires = "workiq")]
+        changes: bool,
+        /// A tool tasks may call (repeatable; default: all of the server's tools; with
+        /// --changes it may name the change tools).
         #[arg(long = "tool", value_name = "TOOL")]
         tools: Vec<String>,
         /// The least access a peer's task needs to use the server (default: full, or
@@ -1837,19 +1858,36 @@ async fn run_workiq(command: WorkiqCommand) -> Result<()> {
                 budget.per_run()
             );
         }
-        WorkiqCommand::Changes { state, profile } => {
+        WorkiqCommand::Changes {
+            state,
+            wait,
+            profile,
+        } => {
             let mut profile = Profile::open(&profile.name)?;
             let on = state == Switch::On;
-            profile.config.workiq_changes = on.then(Default::default);
+            if !on && wait.is_some() {
+                bail!("--wait is for `proofkin workiq changes on`");
+            }
+            // Turned on again without --wait, it keeps the wait set before.
+            let kept = profile
+                .config
+                .workiq_changes
+                .as_ref()
+                .and_then(|c| c.wait_minutes);
+            profile.config.workiq_changes = on.then(|| WorkIqChanges {
+                wait_minutes: wait.or(kept),
+            });
             profile.save()?;
-            if on {
+            if let Some(changes) = &profile.config.workiq_changes {
                 println!(
-                    "profile '{}': Microsoft 365 changes are on: a plan's @workiq apply=STEP step makes the changes step STEP proposed, once you sign them off",
-                    profile.name
+                    "profile '{}': Microsoft 365 changes are on: a plan's @workiq apply=STEP step makes the changes step STEP proposed, once you sign them off, and a digital worker's task for you, in a folder whose workiq server has --changes, makes each change it asks for once you sign it off, waiting up to {} minute{} for you",
+                    profile.name,
+                    changes.wait_minutes(),
+                    if changes.wait_minutes() == 1 { "" } else { "s" }
                 );
             } else {
                 println!(
-                    "profile '{}': Microsoft 365 changes are off: plans make none",
+                    "profile '{}': Microsoft 365 changes are off: plans and digital workers' tasks make none",
                     profile.name
                 );
             }
@@ -3937,6 +3975,7 @@ fn run_mcp(command: McpCommand) -> Result<()> {
             server,
             set,
             workiq,
+            changes,
             tools,
             access,
             description,
@@ -3959,7 +3998,11 @@ fn run_mcp(command: McpCommand) -> Result<()> {
             };
             let (server, _) = if workiq {
                 profile.update_shares(|shares| {
-                    shares.offer_mcp(&offer, |_| Ok(McpServer::workiq(Vec::new())))
+                    shares.offer_mcp(&offer, |_| {
+                        let mut server = McpServer::workiq(Vec::new());
+                        server.changes = changes;
+                        Ok(server)
+                    })
                 })?
             } else if let Some(plugin) = plugin {
                 let store = profile.plugins();

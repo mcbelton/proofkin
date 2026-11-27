@@ -843,7 +843,7 @@ pub(crate) fn mcp_servers(
                         tools,
                         url: url.clone(),
                         headers: s.headers.clone().into_iter().collect(),
-                        ..Default::default()
+                        timeout: s.timeout_secs.and_then(millis),
                     };
                     if s.sse {
                         McpServerConfig::Sse(http)
@@ -856,6 +856,11 @@ pub(crate) fn mcp_servers(
             Some((session_server(name), config))
         })
         .collect()
+}
+
+/// `secs` in milliseconds, in the integer type the SDK takes a server's timeout in.
+fn millis<T: TryFrom<u64>>(secs: u64) -> Option<T> {
+    T::try_from(secs.saturating_mul(1000)).ok()
 }
 
 struct AccessPolicy {
@@ -1240,6 +1245,17 @@ mod tests {
         assert_eq!(config["mcp-browser"]["env"]["TOKEN"], "t");
         assert_eq!(config["mcp-docs"]["type"], "sse");
         assert_eq!(config["mcp-docs"]["tools"], json!(["*"]));
+    }
+
+    #[test]
+    fn a_servers_timeout_goes_in_copilots_config_and_a_server_without_one_has_none() {
+        let docs = McpServer::remote("http://127.0.0.1:1234/mcp", false);
+        let mut workiq = docs.clone();
+        workiq.timeout_secs = Some(360);
+        let mcp = BTreeMap::from([("workiq".to_owned(), workiq), ("docs".to_owned(), docs)]);
+        let config = serde_json::to_value(mcp_servers(&mcp)).unwrap();
+        assert_eq!(config["mcp-workiq"]["timeout"], 360_000);
+        assert!(config["mcp-docs"]["timeout"].is_null(), "{config}");
     }
 
     #[test]

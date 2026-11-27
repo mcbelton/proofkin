@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use proofkin::Profile;
-use proofkin::profile::{WorkIqAccount, WorkIqConnection};
+use proofkin::profile::{WorkIqAccount, WorkIqChanges, WorkIqConnection};
 use proofkin::workiq::audit::{Audit, read};
 use proofkin::workiq::doctor::{Check, Doctor, Outcome, Report};
 use proofkin::workiq::{Endpoints, Who};
@@ -573,4 +573,29 @@ async fn the_json_report_has_each_checks_name_result_and_fix() {
     let json = diagnose(&alice, &endpoints).await.to_json();
     assert_eq!(json["ok"], true);
     assert_eq!(json["checks"].as_array().unwrap().len(), 5);
+}
+
+/// The report says whether the profile allows Microsoft 365 changes and, when it does, how
+/// long a change in a digital worker's task waits for the owner's sign-off.
+#[tokio::test]
+async fn the_report_says_whether_changes_are_on_and_how_long_a_sign_off_waits() {
+    let (_fake, endpoints) = start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut alice = signed_in(root.path());
+
+    let off = diagnose(&alice, &endpoints).await;
+    assert!(off.describe().contains("Microsoft 365 changes: off"));
+    assert_eq!(off.to_json()["changes"], false);
+    assert!(off.to_json()["change_wait_minutes"].is_null());
+
+    alice.config.workiq_changes = Some(WorkIqChanges {
+        wait_minutes: Some(3),
+    });
+    alice.save().unwrap();
+    let on = diagnose(&alice, &endpoints).await;
+    let text = on.describe();
+    assert!(text.contains("Microsoft 365 changes: on"), "{text}");
+    assert!(text.contains("waits up to 3 minutes"), "{text}");
+    assert_eq!(on.to_json()["changes"], true);
+    assert_eq!(on.to_json()["change_wait_minutes"], 3);
 }

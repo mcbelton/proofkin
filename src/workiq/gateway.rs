@@ -3,12 +3,18 @@
 //! on this machine, `http://127.0.0.1:<port>/mcp/workiq/<session>`, with a random bearer
 //! that stops working when the task ends. The gateway speaks MCP to the task's model and calls
 //! Work IQ itself, through the profile's audited client, so the model never sees the
-//! account's token and a long task keeps working as tokens are refreshed. It offers only the
-//! tools that read, and every result goes through the content policy for the task's audience.
+//! account's token and a long task keeps working as tokens are refreshed. It offers the tools
+//! that read, and every result goes through the content policy for the task's audience.
+//!
+//! A digital worker's task for its owner, in a folder whose server allows changes, with the
+//! profile whose account it uses allowing them, also gets Work IQ's change tools
+//! (docs/work-iq.md, section 7): each change call is held to the rules of changes, waits for
+//! the owner's sign-off of exactly that change ([`ChangeApprover`]), and is made once.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -18,9 +24,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 
 use super::audit::{Audit, CallContext};
+use super::changes::{self, Change, Outcome, TOOLS};
 use super::client::{Client, ToolResult};
 use super::content::{
     Audience, DEFAULT_CAP, answer_section, read_agents, retrieval_section, summarize,
@@ -52,6 +59,44 @@ pub const DEFAULT_TOOLS: [&str; 7] = [
 const LABELED_TOOLS: [&str; 2] = ["retrieve", "ask"];
 const MAX_REQUEST: usize = 256 * 1024;
 const PROTOCOL_VERSION: &str = "2025-06-18";
+/// How long a change's tool call may take beyond its wait for the sign-off.
+const CHANGE_CALL_SECS: u64 = 60;
+/// How much of its task's prompt a change's sign-off shows.
+const PROMPT_CHARS: usize = 200;
+
+/// Asks a task's owner to sign off one Microsoft 365 change and waits for the answer: the
+/// agent gives one to [`Gateway::open`] for a digital worker's task for its owner.
+#[async_trait::async_trait]
+pub trait ChangeApprover: Send + Sync {
+    /// Asks for a sign-off of `text`, titled `title`, and waits up to `wait` of awake time for
+    /// the answer; without one in time, the request is withdrawn.
+    async fn approve(&self, title: &str, text: &str, wait: Duration) -> Approval;
+}
+
+/// How the sign-off of a change ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Approval {
+    /// The owner approved exactly what they were asked.
+    Approved,
+    /// The owner rejected it or asked for changes: their note, perhaps empty.
+    Declined(String),
+    /// No answer in time: the request was withdrawn.
+    TimedOut,
+    /// It couldn't be asked, or the answer isn't the owner's sign-off of it: why.
+    Failed(String),
+}
+
+/// Who signs off the changes of a session's task, and what they are shown of the task.
+#[derive(Clone)]
+pub struct ChangeSignOff {
+    pub approver: Arc<dyn ChangeApprover>,
+    /// The digital worker whose task makes the changes.
+    pub worker: String,
+    /// The owner's number for the task, when it has one.
+    pub task: Option<u64>,
+    /// The task's prompt.
+    pub prompt: String,
+}
 
 /// The Work IQ gateway of an agent: one listener on 127.0.0.1, opened at the first task that
 /// uses it, and a session per task.
@@ -59,6 +104,8 @@ pub struct Gateway {
     profile: Profile,
     /// Where Work IQ is, when not where [`Endpoints::configured`] says (tests).
     endpoints: Option<Endpoints>,
+    /// How long a change waits for its sign-off, when not the profile's minutes (tests).
+    change_wait: Option<Duration>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     addr: OnceCell<SocketAddr>,
 }
@@ -69,17 +116,37 @@ struct Session {
     tools: Vec<String>,
     context: CallContext,
     client: Client,
+    /// Who signs off its changes, and how long each waits: set when it offers change tools.
+    sign_off: Option<(ChangeSignOff, Duration)>,
+    /// The changes it made: each one's verb and path, and how it ended.
+    made: Mutex<Vec<String>>,
+    /// True once the task ended: a change still waiting for its sign-off is dropped.
+    closed: watch::Sender<bool>,
 }
 
 /// Keeps a task's session open; dropping it closes the session, so its address and bearer
-/// stop working.
+/// stop working, and a change still waiting for its sign-off is withdrawn.
 pub struct SessionGuard {
     gateway: Arc<Gateway>,
     id: String,
+    session: Arc<Session>,
+}
+
+impl SessionGuard {
+    /// The Microsoft 365 changes the task made through this session: each one's verb and
+    /// path, and how it ended (never its body).
+    pub fn changes(&self) -> Vec<String> {
+        self.session
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        self.session.closed.send_replace(true);
         self.gateway
             .sessions
             .lock()
@@ -95,6 +162,7 @@ impl Gateway {
         Arc::new(Gateway {
             profile,
             endpoints: None,
+            change_wait: None,
             sessions: Mutex::default(),
             addr: OnceCell::new(),
         })
@@ -105,6 +173,19 @@ impl Gateway {
         Arc::new(Gateway {
             profile,
             endpoints: Some(endpoints),
+            change_wait: None,
+            sessions: Mutex::default(),
+            addr: OnceCell::new(),
+        })
+    }
+
+    /// [`Gateway::with_endpoints`] whose changes wait `wait` for their sign-off rather than
+    /// the minutes of the profile that allows them, for tests.
+    pub fn with_change_wait(profile: Profile, endpoints: Endpoints, wait: Duration) -> Arc<Self> {
+        Arc::new(Gateway {
+            profile,
+            endpoints: Some(endpoints),
+            change_wait: Some(wait),
             sessions: Mutex::default(),
             addr: OnceCell::new(),
         })
@@ -119,12 +200,16 @@ impl Gateway {
     }
 
     /// Opens a session for one task with `def`'s tools (none: all of [`DEFAULT_TOOLS`]), its
-    /// calls made for `context`. Returns the server the task's model gets, an address with a
-    /// bearer of its own and nothing of the account, and the guard that closes it.
+    /// calls made for `context`. With `sign_off`, for the owner's own task in a folder whose
+    /// server allows changes and a profile that allows them, it also offers Work IQ's change
+    /// tools, each change signed off by the owner. Returns the server the task's model gets,
+    /// an address with a bearer of its own and nothing of the account, and the guard that
+    /// closes it.
     pub async fn open(
         self: &Arc<Self>,
         def: &McpServer,
         context: CallContext,
+        sign_off: Option<ChangeSignOff>,
     ) -> Result<(McpServer, SessionGuard)> {
         // As the profile is now: a sign-in made while the agent runs counts.
         let profile = self.profile.reload()?;
@@ -136,32 +221,53 @@ impl Gateway {
             .context("the task asked for Work IQ (mcp=workiq), but this agent can't use it")?
             .client
             .with_audit(Arc::new(Audit::for_profile(&profile)));
-        let tools = session_tools(&def.tools, &context.audience);
+        // Changes only for the owner's own task, in a folder whose server allows them, and with
+        // the profile whose account the session uses allowing them.
+        let owners = sign_off.is_some() && matches!(context.audience, Audience::Local);
+        let wait = if owners && def.changes {
+            let holder = profile.workiq_profile()?;
+            let wait = holder.config.workiq_changes.as_ref().map(|c| c.wait());
+            wait.map(|wait| self.change_wait.unwrap_or(wait))
+        } else {
+            None
+        };
+        let tools = session_tools(&def.tools, &context.audience, wait.is_some());
         if tools.is_empty() {
             bail!("the Work IQ server offers this task none of the tools whose results it may see");
         }
+        let sign_off = sign_off
+            .zip(wait)
+            .filter(|_| tools.iter().any(|t| TOOLS.contains(&t.as_str())));
         let addr = self.listen().await?;
         let (id, bearer) = (random_token(16), random_token(32));
-        let session = Session {
-            bearer: bearer.clone(),
-            tools: tools.clone(),
-            context,
-            client,
-        };
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), Arc::new(session));
         let mut server = McpServer::remote(format!("http://{addr}/mcp/workiq/{id}"), false);
         server
             .headers
             .insert("Authorization".to_owned(), format!("Bearer {bearer}"));
-        server.tools = tools;
+        server.tools = tools.clone();
         server.access = def.access;
         server.description = def.description.clone();
+        // The model's MCP client waits for a change's sign-off, and then for the change.
+        server.timeout_secs = sign_off
+            .as_ref()
+            .map(|(_, wait)| wait.as_secs() + CHANGE_CALL_SECS);
+        let session = Arc::new(Session {
+            bearer,
+            tools,
+            context,
+            client,
+            sign_off,
+            made: Mutex::default(),
+            closed: watch::Sender::new(false),
+        });
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), session.clone());
         let guard = SessionGuard {
             gateway: self.clone(),
             id,
+            session,
         };
         Ok((server, guard))
     }
@@ -203,21 +309,21 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-/// The tools a task's session offers: the server's (none named: all of [`DEFAULT_TOOLS`]),
+/// The tools a task's session offers: the server's (none named: all of [`DEFAULT_TOOLS`], and
+/// with `changes` all of Work IQ's change tools too), its change tools only with `changes`,
 /// and for a peer's task only those whose results carry labels its grant can be held to.
-fn session_tools(named: &[String], audience: &Audience) -> Vec<String> {
-    let tools: Vec<String> = if named.is_empty() {
-        DEFAULT_TOOLS.iter().map(|t| (*t).to_owned()).collect()
+fn session_tools(named: &[String], audience: &Audience, changes: bool) -> Vec<String> {
+    let named: Vec<&str> = if named.is_empty() {
+        DEFAULT_TOOLS.iter().chain(&TOOLS).copied().collect()
     } else {
-        named.to_vec()
+        named.iter().map(String::as_str).collect()
     };
-    match audience {
-        Audience::Local => tools,
-        Audience::Peer { .. } => tools
-            .into_iter()
-            .filter(|t| LABELED_TOOLS.contains(&t.as_str()))
-            .collect(),
-    }
+    named
+        .into_iter()
+        .filter(|tool| changes || !TOOLS.contains(tool))
+        .filter(|tool| matches!(audience, Audience::Local) || LABELED_TOOLS.contains(tool))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn plain(status: StatusCode, text: &str) -> Response {
@@ -298,7 +404,8 @@ async fn handle(
 
 impl Session {
     /// Work IQ's tools that this task may call: allowed for the session, and not ones Work
-    /// IQ itself says change things (its annotations), whatever their name.
+    /// IQ itself says change things (its annotations), whatever their name, but for the
+    /// change tools a session offers, whose changes its task's owner signs off.
     async fn tools_list(&self) -> Result<Value, (i64, String)> {
         let tools = self
             .client
@@ -307,7 +414,10 @@ impl Session {
             .map_err(|e| (-32603, format!("{e:#}")))?;
         let offered: Vec<Value> = tools
             .iter()
-            .filter(|tool| self.tools.contains(&tool.name) && !tool.says_it_changes())
+            .filter(|tool| {
+                self.tools.contains(&tool.name)
+                    && (!tool.says_it_changes() || self.signs_off(&tool.name))
+            })
             .map(|tool| {
                 json!({
                     "name": tool.name,
@@ -336,6 +446,9 @@ impl Session {
                 self.tools.join(", ")
             ));
         }
+        if self.signs_off(name) {
+            return self.change(name, params).await;
+        }
         let changes = match self.client.list_tools().await {
             Ok(tools) => tools.iter().any(|t| t.name == name && t.says_it_changes()),
             Err(e) => return tool_error(format!("{e:#}")),
@@ -359,6 +472,119 @@ impl Session {
             Err(e) => tool_error(format!("{e:#}")),
         }
     }
+
+    /// Whether `name` is a change tool this session offers, each change signed off by the
+    /// task's owner.
+    fn signs_off(&self, name: &str) -> bool {
+        self.sign_off.is_some() && TOOLS.contains(&name) && self.tools.iter().any(|t| t == name)
+    }
+
+    /// A change call: held to the rules of changes, signed off by the task's owner as exactly
+    /// this change, then made once. Without the sign-off nothing is sent to Work IQ.
+    async fn change(&self, name: &str, params: &Value) -> Value {
+        let Some((sign_off, wait)) = &self.sign_off else {
+            return tool_error(format!("Work IQ's {name} isn't offered to this task"));
+        };
+        // Nobody is asked to sign off a change Work IQ can't make.
+        match self.client.list_tools().await {
+            Ok(tools) if tools.iter().any(|t| t.name == name) => {}
+            Ok(_) => {
+                return tool_error(format!(
+                    "Work IQ doesn't offer {name} to this account, so nothing was changed"
+                ));
+            }
+            Err(e) => return tool_error(format!("{e:#}")),
+        }
+        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+        let change = match Change::from_arguments(name, &arguments)
+            .and_then(|change| changes::check(&change).map(|()| change))
+        {
+            Ok(change) => change,
+            Err(rule) => {
+                return tool_error(format!(
+                    "This change breaks a rule, so nobody was asked to sign it off and nothing \
+                     was changed: {rule}"
+                ));
+            }
+        };
+        let title = format!("Microsoft 365 change from {}", sign_off.worker);
+        let text = sign_off_text(&change, sign_off);
+        // The task ending drops a sign-off still waiting, which withdraws its request.
+        let mut closed = self.closed.subscribe();
+        let approval = tokio::select! {
+            biased;
+            _ = closed.wait_for(|closed| *closed) => Approval::Failed("the task ended".into()),
+            approval = sign_off.approver.approve(&title, &text, *wait) => approval,
+        };
+        match approval {
+            Approval::Approved => {}
+            Approval::Declined(note) => {
+                let declined = "You didn't approve this change, so nothing was changed.";
+                return tool_error(match note.trim() {
+                    "" => declined.to_owned(),
+                    note => format!("{declined} Your note: {note}"),
+                });
+            }
+            Approval::TimedOut => {
+                let minutes = wait.as_millis().div_ceil(60_000).max(1);
+                return tool_error(format!(
+                    "Not signed off within {minutes} minute{}, so nothing was changed.",
+                    if minutes == 1 { "" } else { "s" }
+                ));
+            }
+            Approval::Failed(why) => {
+                return tool_error(format!("Nothing was changed: {why}"));
+            }
+        }
+        // Logged before it is sent: if the task ends while Work IQ makes it, its result still
+        // names it, as of unknown outcome.
+        let ended = Outcome::Uncertain("the task ended while Work IQ was making it".into());
+        let entry = {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            made.push(made_line(&change, &ended));
+            made.len() - 1
+        };
+        // Sent once, as signed off: a change tool is never sent again.
+        let outcome = match self
+            .client
+            .call_tool_in(&self.context, name, change.arguments())
+            .await
+        {
+            Ok(result) => Outcome::of(&result),
+            Err(e) => Outcome::of_error(&e),
+        };
+        let line = made_line(&change, &outcome);
+        self.made.lock().unwrap_or_else(|e| e.into_inner())[entry] = line.clone();
+        json!({ "content": [{ "type": "text", "text": line }], "isError": !outcome.made() })
+    }
+}
+
+/// How a session logs a change it made, and tells its model: the change's verb and path, and
+/// how it ended (never its body).
+fn made_line(change: &Change, outcome: &Outcome) -> String {
+    redact(&format!("{}: {}", change.label(), outcome.describe())).0
+}
+
+/// What a task's owner signs off for `change`: the change as a person reads it, its SHA-256,
+/// and the task it comes from. Redacted; the web UI shows it as text.
+fn sign_off_text(change: &Change, sign_off: &ChangeSignOff) -> String {
+    let mut text = changes::preview_one(change);
+    text += &format!(
+        "\nIf you approve, {} makes this change with your account, once. SHA-256 of the \
+         change: `{}`\n\n",
+        sign_off.worker,
+        changes::digest(std::slice::from_ref(change))
+    );
+    text += &match sign_off.task {
+        Some(task) => format!("It comes from your task #{task}:\n\n"),
+        None => "It comes from your task:\n\n".to_owned(),
+    };
+    let mut prompt: String = sign_off.prompt.chars().take(PROMPT_CHARS).collect();
+    if sign_off.prompt.chars().count() > PROMPT_CHARS {
+        prompt.push('…');
+    }
+    text += &changes::fenced(&prompt);
+    redact(&text).0
 }
 
 fn tool_error(text: String) -> Value {
@@ -446,24 +672,31 @@ fn withheld_anywhere(result: &ToolResult) -> bool {
 mod tests {
     use super::*;
 
-    /// The owner's own tasks get every read tool, `call_function` too; a peer's task gets
-    /// only the tools whose results carry labels its grant holds them to, whatever the
-    /// server names.
+    /// The owner's own tasks get every read tool, `call_function` too, and with changes
+    /// allowed the change tools; a peer's task gets only the tools whose results carry labels
+    /// its grant holds them to, whatever the server names.
     #[test]
     fn a_session_offers_its_owner_every_read_tool_and_a_peer_only_labeled_ones() {
-        let local = session_tools(&[], &Audience::Local);
+        let local = session_tools(&[], &Audience::Local, false);
         assert_eq!(local, DEFAULT_TOOLS.map(String::from));
         assert!(local.iter().any(|t| t == "call_function"));
+        let with_changes = session_tools(&[], &Audience::Local, true);
+        assert_eq!(with_changes[..DEFAULT_TOOLS.len()], local);
+        assert_eq!(with_changes[DEFAULT_TOOLS.len()..], TOOLS.map(String::from));
         let peer = Audience::Peer {
             labels: vec!["General".into()],
         };
-        assert_eq!(session_tools(&[], &peer), ["retrieve", "ask"]);
+        assert_eq!(session_tools(&[], &peer, false), ["retrieve", "ask"]);
+        assert_eq!(session_tools(&[], &peer, true), ["retrieve", "ask"]);
         let named = vec![
             "fetch".to_owned(),
             "call_function".to_owned(),
             "ask".to_owned(),
         ];
-        assert_eq!(session_tools(&named, &Audience::Local), named);
-        assert_eq!(session_tools(&named, &peer), ["ask"]);
+        assert_eq!(session_tools(&named, &Audience::Local, false), named);
+        assert_eq!(session_tools(&named, &peer, false), ["ask"]);
+        let named = vec!["ask".to_owned(), "do_action".to_owned()];
+        assert_eq!(session_tools(&named, &Audience::Local, true), named);
+        assert_eq!(session_tools(&named, &Audience::Local, false), ["ask"]);
     }
 }

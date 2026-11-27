@@ -12,7 +12,7 @@ use super::audit::{Audit, CallContext, Purpose};
 use super::client::{Class, Client, Fix, TokenSource, Who, WorkIqError, http_client};
 use super::login::id_token_claims;
 use super::{Endpoints, connect_at};
-use crate::profile::{Profile, WorkIqAccount, WorkIqConnection};
+use crate::profile::{Profile, WorkIqAccount, WorkIqChanges, WorkIqConnection};
 
 /// Where the Work IQ resource describes itself and its authorization servers.
 pub const DISCOVERY_URL: &str =
@@ -103,8 +103,9 @@ impl Check {
 pub struct Report {
     pub profile: String,
     pub checks: Vec<Check>,
-    /// Whether the profile allows Microsoft 365 changes (`workiq changes on`).
-    pub changes: bool,
+    /// The profile's Microsoft 365 change settings, when it allows changes (`workiq changes
+    /// on`).
+    pub changes: Option<WorkIqChanges>,
 }
 
 impl Report {
@@ -130,7 +131,13 @@ impl Report {
                 })
             })
             .collect();
-        json!({ "profile": self.profile, "ok": self.passed(), "checks": checks, "changes": self.changes })
+        json!({
+            "profile": self.profile,
+            "ok": self.passed(),
+            "checks": checks,
+            "changes": self.changes.is_some(),
+            "change_wait_minutes": self.changes.as_ref().map(WorkIqChanges::wait_minutes),
+        })
     }
 
     /// The report as `proofkin workiq doctor` prints it.
@@ -153,13 +160,16 @@ impl Report {
                 ));
             }
         }
-        text.push_str(&if self.changes {
-            "Microsoft 365 changes: on (plans make the changes you sign off; turn them off with: proofkin workiq changes off)\n".to_owned()
-        } else {
-            format!(
+        text.push_str(&match &self.changes {
+            Some(changes) => format!(
+                "Microsoft 365 changes: on (plans make the changes you sign off, and a digital worker's task for you, in a folder whose workiq server has --changes, asks you to sign off each change and waits up to {} minute{} for you; turn them off with: proofkin workiq changes off)\n",
+                changes.wait_minutes(),
+                if changes.wait_minutes() == 1 { "" } else { "s" }
+            ),
+            None => format!(
                 "Microsoft 365 changes: off (turn them on with: proofkin workiq changes on --profile {})\n",
                 self.profile
-            )
+            ),
         });
         text.push_str(if self.passed() {
             "Work IQ is ready.\n"
@@ -266,7 +276,7 @@ impl<'a> Doctor<'a> {
         Report {
             profile: self.profile.name.clone(),
             checks,
-            changes: self.profile.config.workiq_changes.is_some(),
+            changes: self.profile.config.workiq_changes.clone(),
         }
     }
 
