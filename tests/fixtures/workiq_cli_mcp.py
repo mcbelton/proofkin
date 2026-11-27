@@ -14,6 +14,7 @@ Modes:
                 Work IQ (CLI 1.0.1) uses: `retrieve` (one General file and one blocked one in
                 structuredContent), `ask` (the answer as text and structured, with the
                 conversation id), `list_agents` (one agent, as JSON in the text content)
+  local-tools   like ok, but only lists the CLI's four local tools
   bare          like ok, but `config show` names no default account
   user          like ok, and says who is signed in in the initialize reply
   crash         exits without answering on the first tools/call of the whole test (a marker
@@ -69,11 +70,16 @@ if MODE == "eula":
     sys.stderr.flush()
     sys.exit(1)
 
+if MODE == "full":
+    TOOL_NAMES = ("retrieve", "ask", "list_agents")
+elif MODE == "local-tools":
+    TOOL_NAMES = ("accept_eula", "ask", "list_agents", "get_debug_link")
+else:
+    TOOL_NAMES = ("retrieve", "send_mail", "inspect")
+
 TOOLS = [
     {"name": name, "description": name, "inputSchema": {"type": "object", "properties": {}}}
-    for name in (
-        ("retrieve", "ask", "list_agents") if MODE == "full" else ("retrieve", "send_mail", "inspect")
-    )
+    for name in TOOL_NAMES
 ]
 
 

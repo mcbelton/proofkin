@@ -24,6 +24,7 @@ pub const DEFAULT_URL: &str = "https://workiq.svc.cloud.microsoft/mcp";
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const TOOL_LIST_RETRY_DELAY: Duration = Duration::from_secs(2);
 const ERROR_BODY_CHARS: usize = 300;
 /// The longest Proofkin waits for a throttled call; a longer delay is reported instead.
 pub const MAX_THROTTLE_WAIT: Duration = Duration::from_secs(60);
@@ -520,6 +521,11 @@ pub struct Incoming {
 /// Carries MCP messages to Work IQ (streamable HTTP, or the CLI over stdio).
 #[async_trait]
 pub trait Transport: Send + Sync {
+    /// Whether this transport connects through Microsoft's Work IQ CLI.
+    fn is_cli(&self) -> bool {
+        false
+    }
+
     async fn send(&self, outgoing: Outgoing) -> Result<Incoming, WorkIqError>;
 }
 
@@ -794,12 +800,26 @@ impl Client {
         self
     }
 
-    /// The tools Work IQ offers. Asked once per client.
+    /// The tools Work IQ offers, cached per client. Typed tool calls can refresh the list.
     pub async fn list_tools(&self) -> Result<Vec<Tool>> {
+        self.tools_for(None).await
+    }
+
+    async fn tools_for(&self, required: Option<&str>) -> Result<Vec<Tool>> {
         let mut cached = self.tools.lock().await;
-        if let Some(tools) = cached.as_ref() {
-            return Ok(tools.clone());
+        let tools = match &mut *cached {
+            Some(tools) => tools,
+            empty => empty.insert(self.request_tools().await?),
+        };
+        // The CLI can list only its local tools while the service's tools are loading.
+        if required.is_some_and(|name| !tools.iter().any(|tool| tool.name == name)) {
+            self.sleeper.sleep(TOOL_LIST_RETRY_DELAY).await;
+            *tools = self.request_tools().await?;
         }
+        Ok(tools.clone())
+    }
+
+    async fn request_tools(&self) -> Result<Vec<Tool>> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -821,7 +841,6 @@ impl Client {
                 break;
             }
         }
-        *cached = Some(tools.clone());
         Ok(tools)
     }
 
@@ -976,11 +995,21 @@ impl Client {
         name: &str,
         arguments: Value,
     ) -> Result<ToolResult> {
-        let tools = self.list_tools().await?;
+        let tools = self.tools_for(Some(name)).await?;
         if !tools.iter().any(|tool| tool.name == name) {
             let offered: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+            let hint = if !self.transport.is_cli() {
+                ""
+            } else if offered.contains(&"accept_eula") {
+                concat!(
+                    ". The Work IQ CLI may still be loading its tools, ",
+                    "or you may need to accept its EULA (run `workiq accept-eula` yourself)",
+                )
+            } else {
+                ". The Work IQ CLI may still be loading its tools"
+            };
             bail!(
-                "Work IQ does not offer the {name} tool (it offers: {})",
+                "Work IQ does not offer the {name} tool (it offers: {}){hint}",
                 offered.join(", ")
             );
         }
@@ -1693,13 +1722,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_short_tools_list_is_refreshed_once_and_cached_without_spending_budget() {
+        let (fake, url) = start().await;
+        *fake.tools.lock().unwrap() = ["accept_eula", "ask", "list_agents", "get_debug_link"]
+            .map(String::from)
+            .to_vec();
+        let recorder = Arc::new(Recorder::default());
+        let dir = tempfile::tempdir().unwrap();
+        let (client, audit) = audited(&url, dir.path(), budget(2, 2));
+        let client = client.with_sleeper(recorder.clone());
+
+        assert_eq!(client.list_tools().await.unwrap().len(), 4);
+        fake.tools
+            .lock()
+            .unwrap()
+            .extend(["retrieve", "fetch"].map(String::from));
+
+        let context = step("run-1");
+        for query in ["first", "second"] {
+            let result = client
+                .retrieve_in(&context, query, None, &[])
+                .await
+                .unwrap();
+            assert_eq!(result.structured_content.unwrap()["name"], "retrieve");
+            assert_eq!(fake.count("tools/list"), 2);
+        }
+        assert_eq!(fake.count("tools/call"), 2);
+        assert_eq!(*recorder.0.lock().unwrap(), [Duration::from_secs(2)]);
+        let entries = audit::read(audit.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.tool == "retrieve"));
+        let usage = audit.usage(Some("run-1"));
+        assert_eq!((usage.today, usage.run), (2, Some(2)));
+    }
+
+    #[tokio::test]
     async fn a_tool_the_server_does_not_offer_is_a_clear_error() {
         let (fake, url) = start().await;
         fake.tools.lock().unwrap().retain(|name| name != "fetch");
 
-        let error = client(&url).fetch(&["a/b"]).await.unwrap_err().to_string();
-        assert!(error.contains("does not offer the fetch tool"), "{error}");
-        assert!(error.contains("retrieve"), "{error}");
+        let recorder = Arc::new(Recorder::default());
+        let client = client(&url).with_sleeper(recorder.clone());
+        let error = client.fetch(&["a/b"]).await.unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Work IQ does not offer the fetch tool (it offers: retrieve, ask, list_agents)"
+        );
+        assert_eq!(*recorder.0.lock().unwrap(), [Duration::from_secs(2)]);
+        assert_eq!(fake.count("tools/list"), 2);
         assert_eq!(fake.count("tools/call"), 0);
     }
 

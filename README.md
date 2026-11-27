@@ -2723,6 +2723,10 @@ runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
 
 ### Work IQ troubleshooting
 
+If Proofkin needs a Work IQ tool missing from the cached list, it waits 2 seconds and asks
+for the list once more. It keeps the new list. Tool listings aren't audited and don't count
+against call budgets.
+
 | Symptom | Fix |
 | --- | --- |
 | `the Work IQ CLI says its EULA is not accepted` | Read the EULA ([Work IQ repository](https://github.com/microsoft/work-iq)) and run `workiq accept-eula` yourself. |
@@ -2733,7 +2737,7 @@ runs it too while `PROOFKIN_LIVE_WORKIQ` is set.
 | `the app doesn't allow public client flows` (AADSTS7000218) | Step 2's **Allow public client flows**, for `--device-code`. |
 | `Entra doesn't know this client id or tenant` | Check `--client-id` and `--tenant` against the app registration. |
 | `the token's audience is ..., not Work IQ` | The app lacks the `WorkIQAgent.Ask` permission of Work IQ: step 2. |
-| `Work IQ does not offer the retrieve tool` | The Work IQ MCP policy: step 5. |
+| `Work IQ does not offer the retrieve tool` | The CLI may still be loading its tools; try again in a moment. If it offers `accept_eula` and you haven't accepted it, run `workiq accept-eula` yourself. If the tool is blocked by policy, see step 5. |
 | A billing or spending policy error | Step 4. |
 | `sign in again` after a while | The refresh token expired or was revoked: `proofkin auth login workiq ...` again. |
 | `the daily Work IQ budget ... is used up` | Wait for tomorrow, or raise it: `proofkin workiq budget --per-day N --profile P`. |
