@@ -132,6 +132,38 @@ fn answer(name: &str) -> Value {
     })
 }
 
+/// A tool's input schema as Work IQ gives it: its own arguments, a `sessionId` (telemetry) it
+/// asks for with every call, and for `ask` and the change tools an `agentId`, null by default.
+fn input_schema(name: &str) -> Value {
+    let first = match name {
+        "create_entity" => "parentUrl",
+        "update_entity" | "delete_entity" => "entityUrl",
+        "do_action" => "actionUrl",
+        "ask" => "question",
+        _ => "query",
+    };
+    let mut schema = json!({
+        "type": "object",
+        "properties": {
+            "sessionId": {
+                "type": "string",
+                "description": "Task-level telemetry correlation ID. If omitted or invalid, \
+                                the server generates a replacement.",
+            },
+        },
+        "required": [first, "sessionId"],
+    });
+    schema["properties"][first] = json!({ "type": "string" });
+    if CHANGE_TOOLS.contains(&name) {
+        schema["properties"]["jsonBody"] = json!({ "type": ["object", "string"] });
+        schema["properties"]["headers"] = json!({ "type": "object" });
+    }
+    if name == "ask" || CHANGE_TOOLS.contains(&name) {
+        schema["properties"]["agentId"] = json!({ "type": ["string", "null"], "default": null });
+    }
+    schema
+}
+
 async fn token() -> Json<Value> {
     Json(json!({
         "token_type": "Bearer",
@@ -175,7 +207,7 @@ async fn mcp(
                 "do_action",
             ]
             .map(|name| {
-                let mut tool = json!({ "name": name, "inputSchema": { "type": "object" } });
+                let mut tool = json!({ "name": name, "inputSchema": input_schema(name) });
                 if name == "search_paths" || CHANGE_TOOLS.contains(&name) {
                     tool["annotations"] = json!({ "readOnlyHint": false, "destructiveHint": true });
                 }
@@ -728,6 +760,70 @@ async fn change_tools_go_only_to_the_owners_task_with_changes_on_in_profile_and_
     assert_eq!(listed(&fewer).await, ["ask", "do_action"]);
 }
 
+/// Work IQ's schemas ask for a `sessionId` with every call, and give `ask` and the change
+/// tools an `agentId`. A session lists its change tools without them, so its model isn't
+/// asked for them, and its read tools as Work IQ gives them.
+#[tokio::test]
+async fn a_session_lists_its_change_tools_without_work_iqs_session_id_and_agent_id() {
+    let (_fake, endpoints) = start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut alice = signed_in(root.path());
+    alice.config.workiq_changes = Some(WorkIqChanges::default());
+    alice.save().unwrap();
+    let gateway = Gateway::with_endpoints(alice, endpoints);
+    let sign_off = ChangeSignOff {
+        approver: Arc::new(Owner {
+            answer: Approval::Approved,
+            asked: Mutex::default(),
+        }),
+        worker: "helper".into(),
+        task: None,
+        prompt: PROMPT.into(),
+    };
+    let mut def = McpServer::workiq(Vec::new());
+    def.changes = true;
+    let (server, _session) = gateway
+        .open(&def, gateway_call(), Some(sign_off))
+        .await
+        .unwrap();
+
+    let list = rpc(1, "tools/list", json!({}));
+    let (_, listed) = send(&server, Some(&bearer_for(&server)), false, &list).await;
+    let schema = |name: &str| {
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        match tools.iter().find(|t| t["name"] == name) {
+            Some(tool) => tool["inputSchema"].clone(),
+            None => panic!("{name} isn't listed: {listed}"),
+        }
+    };
+    assert_eq!(
+        schema("create_entity"),
+        json!({
+            "type": "object",
+            "properties": {
+                "parentUrl": { "type": "string" },
+                "jsonBody": { "type": ["object", "string"] },
+                "headers": { "type": "object" },
+            },
+            "required": ["parentUrl"],
+        })
+    );
+    for name in CHANGE_TOOLS {
+        let shown = schema(name);
+        let properties = shown["properties"].as_object().unwrap();
+        let required = shown["required"].as_array().unwrap();
+        for left_out in ["sessionId", "agentId"] {
+            assert!(!properties.contains_key(left_out), "{name}: {shown}");
+            assert!(!required.contains(&json!(left_out)), "{name}: {shown}");
+        }
+    }
+    // The read tools' schemas stay as Work IQ gives them, ask's agentId too.
+    for name in ["retrieve", "ask", "list_agents", "fetch"] {
+        assert_eq!(schema(name), input_schema(name), "{name}");
+    }
+    assert!(schema("ask")["properties"]["agentId"].is_object());
+}
+
 fn python() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
 }
@@ -1226,6 +1322,53 @@ async fn a_change_in_a_workers_task_for_its_owner_waits_for_their_sign_off_and_i
                 "jsonBody": { "comment": "See you" },
             })
         )]
+    );
+    team.stop().await;
+}
+
+/// A model that follows Work IQ's own schemas sends a `sessionId` with every call, and a null
+/// `agentId`. Its change call waits for the owner's sign-off as any does, which shows neither;
+/// approved, it is sent without them, and the model gets how it ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_call_with_work_iqs_session_id_waits_for_its_sign_off_and_is_sent_without_it() {
+    let team = Team::start(None).await;
+    let session_id = "5d1f0c4e-7b2a-4c3e-9f10-2a6b8c9d0e1f";
+    let mut arguments = booking();
+    arguments["sessionId"] = json!(session_id);
+    arguments["agentId"] = Value::Null;
+    let running = team.task(None, vec![("create_entity", arguments)]);
+
+    // Signed off as the change without them.
+    let asked = team.asked().await;
+    let change = Change::from_arguments("create_entity", &booking()).unwrap();
+    let digest = changes::digest(std::slice::from_ref(&change));
+    assert!(asked.text.contains(&digest), "{}", asked.text);
+    assert!(
+        !asked.text.contains(session_id) && !asked.text.contains("agentId"),
+        "{}",
+        asked.text
+    );
+    assert!(
+        team.fake.calls.lock().unwrap().is_empty(),
+        "nothing is sent before the sign-off"
+    );
+
+    team.boss
+        .answer(asked.id, Answer::Approve, "")
+        .await
+        .unwrap();
+    let done = running.await.unwrap().unwrap();
+    assert!(done.ok && done.verified, "{}", done.output);
+    let line = format!("Create /me/events: done (201); id AAMk9; {MEETING_LINK}");
+    assert!(
+        done.output.contains(&format!("create_entity: {line}")),
+        "{}",
+        done.output
+    );
+    assert_eq!(
+        *team.fake.calls.lock().unwrap(),
+        [("create_entity".to_owned(), booking())],
+        "sent once, without them"
     );
     team.stop().await;
 }
