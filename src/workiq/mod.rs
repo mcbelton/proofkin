@@ -22,6 +22,7 @@ pub mod document;
 pub mod gateway;
 pub mod import;
 pub mod login;
+pub mod notice;
 pub mod stdio;
 
 pub use client::*;

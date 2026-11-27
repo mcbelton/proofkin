@@ -996,6 +996,15 @@ pub async fn start_with_work(
                 Event::ApprovalClosed { .. } => {
                     pump.send(json!({ "type": "approvals", "approvals": approvals_json(&pump) }));
                 }
+                Event::NoticeFailed { title, error } => {
+                    pump.system(
+                        "warn",
+                        format!(
+                            "The Microsoft 365 notice of the sign-off \"{title}\" wasn't sent \
+                             (it isn't sent again; the sign-off still waits): {error}"
+                        ),
+                    );
+                }
             }
         }
     });
@@ -2478,6 +2487,7 @@ async fn run_plan_here(
         work_log: crate::plan::WorkLog::default(),
         resume,
         journal: Some(journal),
+        notices: crate::plan::notices(&shared.info.profile, &plan),
     };
     let agent = shared.agent.clone();
     let states = crate::plan::run_plan_with(&agent, &squads, &ready, &ctx, |step, state| {

@@ -4919,9 +4919,9 @@ async fn a_workiq_steps_task_and_report_say_work_iq_answered_it() {
     agent.shutdown().await;
 }
 
-/// A digital worker's page shows the Work IQ account it uses, its owner's, and leaves
-/// signing in, signing out and budgets to the owner; a worker its owner didn't let use the
-/// account says why.
+/// A digital worker's page shows the Work IQ account it uses, its owner's, and where its
+/// sign-off notices go, as its owner set them; it leaves signing in, signing out and budgets
+/// to the owner; a worker its owner didn't let use the account says why.
 #[tokio::test]
 async fn a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_the_owner() {
     let home = tempfile::tempdir().unwrap();
@@ -4936,6 +4936,7 @@ async fn a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_
         tenant_id: "unknown".into(),
         added: 0,
     });
+    owner.config.workiq_notices = Some(proofkin::profile::WorkIqNotices::Mail);
     owner.save().unwrap();
     let mut worker = Profile::open_in(home.path(), "helper").unwrap();
     worker.config.owner = Some("owner".into());
@@ -4954,6 +4955,11 @@ async fn a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_
     assert_eq!(shown["own"], false);
     assert!(shown["not_used"].is_null(), "{shown}");
     assert_eq!(shown["hint"], "proofkin auth login workiq --profile owner");
+    assert_eq!(shown["notices_line"], "by mail to ada@contoso.example");
+    assert_eq!(
+        shown["notices"],
+        serde_json::json!({ "to": "mail", "address": "ada@contoso.example" })
+    );
 
     let sign_in = serde_json::json!({ "account": "bob@contoso.example" });
     let budget = serde_json::json!({ "per_day": 5 });
@@ -4984,6 +4990,7 @@ async fn a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_
         why.contains("may not use 'owner''s Work IQ account"),
         "{not_used}"
     );
+    assert!(not_used["notices"].is_null(), "{not_used}");
     agent.shutdown().await;
 }
 

@@ -2,7 +2,7 @@
 //! direct IPs only, no relays or lookup services, so no internet is needed).
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -4065,9 +4065,11 @@ async fn a_work_iq_error_fails_the_step_with_its_one_line_message() {
 }
 
 /// A Work IQ MCP endpoint that answers `retrieve` with two files and keeps what it was asked.
+/// Microsoft Graph accepts a change (a sign-off's notice), unless `refuse` is set.
 #[derive(Default)]
 struct FakeMcp {
     calls: Mutex<Vec<serde_json::Value>>,
+    refuse: AtomicBool,
 }
 
 async fn fake_mcp(
@@ -4097,6 +4099,21 @@ async fn fake_mcp(
         ]}}),
         "tools/call" => {
             fake.calls.lock().unwrap().push(message["params"].clone());
+            let change = matches!(
+                message["params"]["name"].as_str(),
+                Some("do_action" | "create_entity")
+            );
+            if change && fake.refuse.load(Ordering::SeqCst) {
+                let reply = json!({ "jsonrpc": "2.0", "id": id, "result": {
+                    "content": [{ "type": "text", "text": "Forbidden: denied by policy" }],
+                    "isError": true,
+                }});
+                return (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "application/json".to_string())],
+                    reply.to_string(),
+                );
+            }
             let structured = match message["params"]["name"].as_str() {
                 Some("list_agents") => json!({ "agents": [
                     { "id": "sales-agent:v1", "name": "Sales helper" },
@@ -4107,6 +4124,7 @@ async fn fake_mcp(
                     "answer": "The launch moved to May.",
                     "citations": [{ "title": "Launch plan", "url": "https://contoso.example/p" }],
                 }),
+                _ if change => json!({ "statusCode": 202 }),
                 _ => workiq_retrieval(vec![
                     workiq_file("f1", "General", "Launch is in May.", 0.9),
                     workiq_file("f2", "Confidential", "Budget is four million.", 0.5),
@@ -4407,6 +4425,194 @@ async fn a_plan_makes_the_microsoft_365_changes_you_sign_off_once_and_in_order()
         ),
         other => panic!("{other:?}"),
     }
+}
+
+/// A plan's sign-off that waits for you is also told by mail once the profile turned notices
+/// on: one `do_action` on `/me/sendMail` to the account's own address, holding the sign-off's
+/// title, run and step and nothing of the changes it shows, audited with purpose `notice`;
+/// the sign-off still waits for your answer, and the changes are made as you sign them off.
+/// With notices off there is no notice call. One that fails is told in the activity, is
+/// audited, and isn't sent again, and the sign-off still waits for your answer.
+#[tokio::test]
+async fn a_plans_sign_off_is_also_told_by_mail_once_and_never_what_it_signs_off() {
+    use proofkin::profile::WorkIqNotices;
+    use proofkin::workiq::audit::{Audit, read};
+    use proofkin::workiq::client::{Client, FixedToken};
+    use proofkin::workiq::notice::Notifier;
+
+    let mail = r#"{"tool":"do_action","path":"/me/sendMail","body":{"message":{"subject":"Re: the outage","body":{"contentType":"Text","content":"It is fixed."},"toRecipients":[{"emailAddress":{"address":"ana@contoso.com"}}]}}}"#;
+    let update = r#"{"tool":"update_entity","path":"/me/events/AAMk1","body":{"subject":"Moved"}}"#;
+    let plan = Plan::parse(
+        "draft @workiq Draft the replies to the open escalations\n\
+         ok after draft approve @me Send these replies?\n\
+         send after ok @workiq apply=draft",
+    )
+    .unwrap();
+    let (fake, url) = serve_fake_mcp().await;
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit = Audit::new(audit_path.clone(), "boss", Default::default());
+    let client = Client::new(&url, Arc::new(FixedToken("token".into())))
+        .unwrap()
+        .with_audit(Arc::new(audit));
+    let notices = Arc::new(Notifier::new(
+        Arc::new(client),
+        WorkIqNotices::Mail,
+        "boss@contoso.example",
+    ));
+    let (boss, mut events) = Node::new("boss").start().await;
+    // You sign off what you are asked once Work IQ got `notices` notice calls in all.
+    let sign = |notices: usize| {
+        let (boss, fake) = (boss.clone(), fake.clone());
+        tokio::spawn(async move {
+            loop {
+                let told = fake.calls.lock().unwrap().len() >= notices;
+                if told {
+                    for a in boss.approvals() {
+                        let _ = boss.answer_approval(a.id, true, "as shown").await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+    // The audit's lines, once there are `n`.
+    let audit_lines = |n: usize| {
+        let path = audit_path.clone();
+        async move {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let entries = read(&path).unwrap();
+                    if entries.len() >= n {
+                        return entries;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the notice is audited")
+        }
+    };
+    let run = |notices: Option<Arc<Notifier>>| {
+        let (boss, plan) = (boss.clone(), plan.clone());
+        async move {
+            let work = FakeWork::answering(
+                Vec::new(),
+                serde_json::json!({
+                    "answer": format!("Replies:\n\n```m365-changes\n{mail}\n{update}\n```"),
+                    "citations": [
+                        { "title": "Escalations", "sensitivityLabel": { "displayName": "General" } },
+                    ],
+                }),
+            );
+            let ctx = RunContext {
+                run_id: Some("r1".into()),
+                recipients: proofkin::plan::Recipients {
+                    workiq_changes: true,
+                    ..Default::default()
+                },
+                work_context: Some(work.clone()),
+                notices,
+                ..RunContext::default()
+            };
+            let states = timeout(
+                Duration::from_secs(30),
+                run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, _| {}),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(states["send"], StepState::Done { .. }),
+                "{:?}",
+                states["send"]
+            );
+            assert_eq!(work.changes().len(), 2);
+        }
+    };
+
+    // Off: no notice call.
+    let signer = sign(0);
+    run(None).await;
+    signer.abort();
+    assert!(fake.calls.lock().unwrap().is_empty());
+
+    // By mail: one call, to the account's own address, with the title, run and step only.
+    let signer = sign(1);
+    run(Some(notices.clone())).await;
+    signer.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let text = "boss waits for your sign-off of \"Plan step ok\" (run r1, step ok). Answer it \
+                in Proofkin's web UI or with /approve in the agent's terminal. This message \
+                holds nothing of what you are asked to sign off.";
+    assert_eq!(
+        calls[0],
+        serde_json::json!({
+            "name": "do_action",
+            "arguments": {
+                "actionUrl": "/me/sendMail",
+                "jsonBody": {
+                    "message": {
+                        "subject": "Proofkin: sign-off waiting: Plan step ok",
+                        "body": { "contentType": "Text", "content": text },
+                        "toRecipients": [
+                            { "emailAddress": { "address": "boss@contoso.example" } }
+                        ],
+                    },
+                    "saveToSentItems": false,
+                },
+            },
+        })
+    );
+    let sent = calls[0].to_string();
+    for shown in [
+        "ana@contoso.com",
+        "Re: the outage",
+        "It is fixed",
+        "Moved",
+        "AAMk1",
+        "Send these replies",
+        "SHA-256",
+    ] {
+        assert!(!sent.contains(shown), "the notice holds {shown:?}: {sent}");
+    }
+    let audited = audit_lines(1).await;
+    assert_eq!(audited.len(), 1, "{audited:?}");
+    let entry = &audited[0];
+    assert_eq!(
+        (
+            entry.tool.as_str(),
+            entry.purpose.as_str(),
+            entry.outcome.as_str()
+        ),
+        ("do_action", "notice", "ok")
+    );
+    assert_eq!(
+        (entry.run.as_deref(), entry.step.as_deref()),
+        (Some("r1"), Some("ok"))
+    );
+
+    // Refused: the activity says so, the audit has it, it isn't sent again, and the sign-off
+    // still waited for your answer.
+    fake.calls.lock().unwrap().clear();
+    fake.refuse.store(true, Ordering::SeqCst);
+    let signer = sign(1);
+    run(Some(notices.clone())).await;
+    signer.abort();
+    let Event::NoticeFailed { title, error } =
+        next_matching(&mut events, |e| matches!(e, Event::NoticeFailed { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(title, "Plan step ok");
+    assert!(error.contains("denied by policy"), "{error}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    let audited = audit_lines(2).await;
+    assert_eq!(audited.len(), 2, "{audited:?}");
+    assert_eq!(audited[1].purpose, "notice");
+    assert_ne!(audited[1].outcome, "ok");
 }
 
 #[tokio::test]

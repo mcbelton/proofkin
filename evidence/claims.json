@@ -1453,6 +1453,24 @@
       ]
     },
     {
+      "id": "WIQ-21",
+      "area": "work-iq",
+      "claim": "A sign-off that waits for its owner can also be told in Microsoft 365, so the owner needn't watch the web UI; they still answer it in Proofkin (docs/work-iq.md section 7). Off by default, the owner opts in once per profile: proofkin workiq notices mail sets workiq_notices {\"to\": \"mail\"} in profile.json, mail to the signed-in account's own address (its UPN); proofkin workiq notices teams --chat <id> sets {\"to\": \"teams\", \"chat\": \"<id>\"} only once a fetch of /me/chats/{id}?$select=id,topic,chatType says the account is a member of the chat (one it isn't a member of is refused and not kept); proofkin workiq notices teams --list shows the account's recent chats (a fetch of /me/chats?$select=id,topic,chatType&$top=20) and keeps nothing; Teams' chat with yourself (48:notes) is neither listed nor taken; proofkin workiq notices off removes the setting. Those reads are audited as the command's own. A digital worker that uses its owner's Work IQ uses its owner's setting and account, so its owner gets the notice, and workiq notices is refused for it. workiq doctor and the web UI's Work IQ card (GET /api/workiq's notices and notices_line) say where notices go. One notice is sent for each sign-off that waits for the owner: a plan's approve @me step (titled Plan step <id>, with its run and step), including one that shows Microsoft 365 changes, and a change a digital worker's task holds for its owner (with the owner's task number). By mail it is one do_action on /me/sendMail with the subject Proofkin: sign-off waiting: <title>, the text as Text, the account's own address as its only recipient and saveToSentItems false; in Teams it is one create_entity on /chats/{id}/messages with the text as text. The text says <agent> waits for your sign-off of \"<title>\" (run <run id>, step <step>), to answer it in Proofkin's web UI or with /approve in the agent's terminal, and that it holds nothing of what is signed off: never a change's content, recipients or body, nor any step's result. The title is cut to 200 characters, redacted and stripped of control and invisible formatting characters. A notice is a change Proofkin makes with the account, which the owner opted in to, so it needs no sign-off of its own: it goes through the audited client with purpose notice, counted against the budgets, and is sent once, in the background, and never again. The sign-off waits as it would without it (a held change's wait runs from when the call was held). A notice whose call Work IQ fails or refuses is told in the activity and recorded in the audit. A notice that can't be sent at all (no usable Work IQ account, an account address that isn't an email address, a chat id that isn't one) makes no call, so it is told in the activity only. Either way, the sign-off still waits and is answered as usual.",
+      "tests": [
+        "lib::workiq::notice::a_notice_says_who_waits_for_which_sign_off_and_how_to_answer_it",
+        "lib::workiq::notice::a_title_is_cut_to_200_characters_redacted_and_stripped_of_control_characters",
+        "lib::workiq::notice::a_mail_notice_goes_to_the_accounts_own_address_and_a_teams_notice_to_its_chat",
+        "lib::workiq::notice::only_a_teams_chat_id_is_taken_and_never_the_chat_with_yourself",
+        "lib::workiq::notice::without_the_setting_there_is_no_notice_and_without_an_account_it_fails",
+        "agents::a_plans_sign_off_is_also_told_by_mail_once_and_never_what_it_signs_off",
+        "workiq_gateway::a_held_change_is_told_in_the_owners_teams_chat_once_and_waits_no_longer",
+        "workiq_gateway::a_workers_notice_goes_with_its_owners_account_where_its_owner_chose",
+        "workiq_gateway::a_change_in_a_workers_task_for_its_owner_waits_for_their_sign_off_and_is_made_once",
+        "workiq_e2e::sign_off_notices_go_by_mail_or_to_a_teams_chat_the_account_is_a_member_of",
+        "ui::a_digital_worker_shows_its_owners_workiq_account_and_leaves_changes_to_the_owner"
+      ]
+    },
+    {
       "id": "WIQ-28",
       "area": "work-iq",
       "claim": "call_function is one of the gateway's read tools (Work IQ CLI 1.0.1 annotates it read only): a folder's workiq server offers it to its owner's own tasks unless --tool names fewer, and like fetch, whose results carry no sensitivity labels, it never goes to a peer's task, even one granted --m365-tools (those get only retrieve and ask). Like any tool, it is refused if its annotations say it changes things.",

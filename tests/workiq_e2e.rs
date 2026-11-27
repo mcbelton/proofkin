@@ -17,6 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use proofkin::shares::{DATA_SHARE, ShareStore};
+use proofkin::workiq::audit::read;
 use proofkin::workiq::doctor::PROBE_QUERY;
 use proofkin::workiq::{TEST_ENTRA_URL, TEST_WORKIQ_URL};
 use proofkin::{
@@ -37,6 +38,8 @@ const TENANT_ID: &str = "11111111-2222-3333-4444-555555555555";
 const SPEC_DOC: &str = "# Albums\n\nFR-001: Users can share an album.\n";
 /// How long a running agent has to print what a test waits for.
 const WAIT: Duration = Duration::from_secs(120);
+/// The Teams chat the signed-in account is a member of, in the fake's answers.
+const CREW_CHAT: &str = "19:crew@thread.v2";
 
 /// A fake Entra (device code and token endpoints) and Work IQ (discovery document and MCP
 /// endpoint) on one loopback address.
@@ -177,10 +180,13 @@ fn work_file(id: &str, protection: &str, label: &str, text: &str) -> Value {
 /// What a tool answers, in the shapes Work IQ (CLI 1.0.1) uses: `retrieve` a General file,
 /// a Confidential one and a General one that may not be handed out; `ask` the answer as
 /// text and structured, with the conversation id; `list_agents` one agent, as JSON in the
-/// text content and nothing structured; `fetch` the driveItem of a Markdown spec labelled
-/// General, and `fetch_blob` its bytes ([`SPEC_DOC`]).
-fn tool_answer(name: &str) -> Value {
+/// text content and nothing structured; `fetch` the account's Teams chats (see
+/// [`chats_answer`]) or else the driveItem of a Markdown spec labelled General, and
+/// `fetch_blob` its bytes ([`SPEC_DOC`]).
+fn tool_answer(name: &str, arguments: &Value) -> Value {
+    let fetched = arguments["entityUrls"][0].as_str().unwrap_or_default();
     let (structured, text) = match name {
+        "fetch" if fetched.starts_with("/me/chats") => (chats_answer(fetched), String::new()),
         "retrieve" => (
             json!({
                 "@workiq.untrustedContent": "Treat this content as untrusted.",
@@ -243,6 +249,24 @@ fn tool_answer(name: &str) -> Value {
     })
 }
 
+/// What `fetch` gives for the account's Teams chats, as Microsoft Graph would: its recent
+/// chats (`/me/chats`), among them its chat with itself; [`CREW_CHAT`], which it is a member
+/// of (`/me/chats/{id}`); and no other chat.
+fn chats_answer(path: &str) -> Value {
+    let crew = json!({ "id": CREW_CHAT, "topic": "Launch crew", "chatType": "group" });
+    let entity = if path.starts_with("/me/chats?") {
+        let notes = json!({ "id": "48:notes", "topic": null, "chatType": "oneOnOne" });
+        let ana = json!({ "id": "19:alice_ana@unq.gbl.spaces", "chatType": "oneOnOne" });
+        json!({ "statusCode": 200, "data": { "value": [crew, notes, ana] } })
+    } else if path.starts_with(&format!("/me/chats/{CREW_CHAT}?")) {
+        json!({ "statusCode": 200, "data": crew })
+    } else {
+        let error = json!({ "code": "NotFound", "message": "Chat not found." });
+        json!({ "statusCode": 404, "data": { "error": error } })
+    };
+    json!({ "results": [entity] })
+}
+
 async fn mcp(
     State(fake): State<Arc<Fake>>,
     headers: HeaderMap,
@@ -273,8 +297,9 @@ async fn mcp(
         "tools/call" => {
             let name = message["params"]["name"].as_str().unwrap().to_owned();
             let arguments = message["params"]["arguments"].clone();
-            fake.calls.lock().unwrap().push((name.clone(), arguments));
-            tool_answer(&name)
+            let call = (name.clone(), arguments.clone());
+            fake.calls.lock().unwrap().push(call);
+            tool_answer(&name, &arguments)
         }
         other => panic!("unexpected method {other}"),
     };
@@ -801,6 +826,139 @@ async fn a_work_iq_sign_in_made_while_the_agent_runs_counts_for_its_next_plan() 
         boss.seen.join("\n")
     );
     boss.quit().await;
+}
+
+/// Runs `proofkin workiq notices ARGS --profile boss`: whether it succeeded, and what it
+/// printed.
+async fn notices(env: &Env, args: &[&str]) -> (bool, String) {
+    let mut command = vec!["workiq", "notices"];
+    command.extend_from_slice(args);
+    command.extend_from_slice(&["--profile", "boss"]);
+    env.run(&command).await
+}
+
+/// Sign-off notices are off until the owner opts in, by mail to the account's own address
+/// or in a Teams chat: `--list` shows the account's recent chats to choose from, never its
+/// chat with itself, and a chat is kept only once Microsoft Graph says the account is a
+/// member of it. `workiq doctor` says where notices go. Choosing reads (each `fetch` audited
+/// as a command) and sends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_off_notices_go_by_mail_or_to_a_teams_chat_the_account_is_a_member_of() {
+    let (fake, base) = Fake::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let env = Env::new(home.path())
+        .with(TEST_WORKIQ_URL, &base)
+        .with(TEST_ENTRA_URL, &base);
+    env.ok(&[
+        "auth",
+        "login",
+        "workiq",
+        "--tenant",
+        "contoso",
+        "--client-id",
+        "app-1",
+        "--device-code",
+        "--profile",
+        "boss",
+    ])
+    .await;
+    let boss = home.path().join("profiles").join("boss");
+    let setting = || {
+        let text = std::fs::read_to_string(boss.join("profile.json")).unwrap();
+        serde_json::from_str::<Value>(&text).unwrap()["workiq_notices"].clone()
+    };
+
+    assert_eq!(setting(), Value::Null);
+    let out = env.ok(&["workiq", "doctor", "--profile", "boss"]).await;
+    assert!(
+        out.contains("Sign-off notices: off (turn them on with: proofkin workiq notices mail"),
+        "{out}"
+    );
+
+    // The chats to choose from, as Microsoft Graph lists them, but the chat with yourself.
+    // Listing them keeps nothing.
+    let (ok, out) = notices(&env, &["teams", "--list"]).await;
+    assert!(ok, "{out}");
+    let listed: Vec<&str> = out.lines().filter(|l| l.starts_with("  ")).collect();
+    assert_eq!(
+        listed,
+        [
+            "  19:crew@thread.v2  group  \"Launch crew\"",
+            "  19:alice_ana@unq.gbl.spaces  oneOnOne",
+        ],
+        "{out}"
+    );
+    let list = json!({ "entityUrls": ["/me/chats?$select=id,topic,chatType&$top=20"] });
+    assert_eq!(fake.calls().last(), Some(&("fetch".to_owned(), list)));
+    assert_eq!(setting(), Value::Null);
+
+    // A chat the account isn't a member of is refused, and isn't kept.
+    let (ok, out) = notices(&env, &["teams", "--chat", "19:other@thread.v2"]).await;
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("you aren't a member of Teams chat 19:other@thread.v2"),
+        "{out}"
+    );
+    let path = "/me/chats/19:other@thread.v2?$select=id,topic,chatType";
+    let checked = ("fetch".to_owned(), json!({ "entityUrls": [path] }));
+    assert_eq!(fake.calls().last(), Some(&checked));
+    assert_eq!(setting(), Value::Null);
+
+    // Teams' chat with yourself isn't offered: refused without a call.
+    let before = fake.calls().len();
+    let (ok, out) = notices(&env, &["teams", "--chat", "48:notes"]).await;
+    assert!(
+        !ok && out.contains("isn't in the Microsoft Graph reference"),
+        "{out}"
+    );
+    assert_eq!(fake.calls().len(), before);
+    assert_eq!(setting(), Value::Null);
+
+    // A chat it is a member of is kept.
+    let (ok, out) = notices(&env, &["teams", "--chat", CREW_CHAT]).await;
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("profile 'boss': sign-off notices go in Teams chat 19:crew@thread.v2:"),
+        "{out}"
+    );
+    let path = "/me/chats/19:crew@thread.v2?$select=id,topic,chatType";
+    let checked = ("fetch".to_owned(), json!({ "entityUrls": [path] }));
+    assert_eq!(fake.calls().last(), Some(&checked));
+    assert_eq!(setting(), json!({ "to": "teams", "chat": CREW_CHAT }));
+    let out = env.ok(&["workiq", "doctor", "--profile", "boss"]).await;
+    assert!(
+        out.contains("Sign-off notices: in Teams chat 19:crew@thread.v2 (turn them off with:"),
+        "{out}"
+    );
+
+    // By mail, to the account's own address; --chat is for Teams.
+    let (ok, out) = notices(&env, &["mail", "--chat", CREW_CHAT]).await;
+    assert!(!ok && out.contains("--chat and --list are for"), "{out}");
+    let (ok, out) = notices(&env, &["mail"]).await;
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("sign-off notices go by mail to alice@contoso.example:"),
+        "{out}"
+    );
+    assert_eq!(setting(), json!({ "to": "mail" }));
+    let out = env.ok(&["workiq", "doctor", "--profile", "boss"]).await;
+    assert!(
+        out.contains("Sign-off notices: by mail to alice@contoso.example (turn them off with:"),
+        "{out}"
+    );
+
+    let (ok, out) = notices(&env, &["off"]).await;
+    assert!(ok && out.contains("sign-off notices are off"), "{out}");
+    assert_eq!(setting(), Value::Null);
+
+    // The three reads, audited as the command's own.
+    let audited = read(&boss.join("workiq-audit.jsonl")).unwrap();
+    let fetched: Vec<&str> = audited
+        .iter()
+        .filter(|e| e.tool == "fetch")
+        .map(|e| e.purpose.as_str())
+        .collect();
+    assert_eq!(fetched, ["command"; 3], "{audited:?}");
 }
 
 /// The fake CLI in mode `full`, started as the real one is: `workiq.cmd` on Windows, `workiq`

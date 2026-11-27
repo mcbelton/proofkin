@@ -62,6 +62,12 @@ pub enum Purpose {
     Doctor,
     /// A command the owner ran.
     Command,
+    /// A sign-off notice in Microsoft 365 (docs/work-iq.md, section 7): for a plan's sign-off,
+    /// its run (whose budget counts it) and step.
+    Notice {
+        run: Option<String>,
+        step: Option<String>,
+    },
 }
 
 impl Purpose {
@@ -73,12 +79,22 @@ impl Purpose {
             Purpose::Gateway => "gateway",
             Purpose::Doctor => "doctor",
             Purpose::Command => "command",
+            Purpose::Notice { .. } => "notice",
         }
     }
 
     fn run(&self) -> Option<&str> {
         match self {
             Purpose::Step { run, .. } => Some(run),
+            Purpose::Notice { run, .. } => run.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn step(&self) -> Option<&str> {
+        match self {
+            Purpose::Step { step, .. } => Some(step),
+            Purpose::Notice { step, .. } => step.as_deref(),
             _ => None,
         }
     }
@@ -123,9 +139,9 @@ pub struct Entry {
     /// Unix time in milliseconds when the call began.
     pub ts_ms: i64,
     pub tool: String,
-    /// `step`, `knowledge-import`, `spec-import`, `gateway`, `doctor` or `command`.
+    /// `step`, `knowledge-import`, `spec-import`, `gateway`, `doctor`, `command` or `notice`.
     pub purpose: String,
-    /// The run a step belongs to.
+    /// The run a step (or a plan's sign-off notice) belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,10 +178,7 @@ impl Entry {
             tool: tool.to_owned(),
             purpose: context.purpose.name().to_owned(),
             run: context.purpose.run().map(str::to_owned),
-            step: match &context.purpose {
-                Purpose::Step { step, .. } => Some(step.clone()),
-                _ => None,
-            },
+            step: context.purpose.step().map(str::to_owned),
             audience: context.peer.clone().unwrap_or_else(|| LOCAL.to_owned()),
             query_sha256: data_encoding::HEXLOWER.encode(&Sha256::digest(query.as_bytes())),
             query_chars: query.chars().count(),

@@ -528,6 +528,7 @@ impl TeamRunner {
             recipients,
             work_context: crate::plan::work_context(&self.profile, &plan)?,
             work_log: crate::plan::WorkLog::default(),
+            notices: crate::plan::notices(&self.profile, &plan),
             ..RunContext::default()
         };
         let finals = crate::plan::run_plan_with(agent, &squads, &ready, &ctx, |id, state| {

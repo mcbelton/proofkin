@@ -276,6 +276,40 @@ Your tenant's policy still applies on top: it may deny a change.")]
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Also tell you in Microsoft 365 when a sign-off waits for you, or stop that: by mail to
+    /// your Work IQ account's own address, or in a Teams chat you are a member of. A notice
+    /// says which sign-off waits and how to answer it (in the web UI, or with /approve in the
+    /// agent's terminal), never what you are asked to sign off. Off by default.
+    #[command(after_help = "\
+examples:
+  proofkin workiq notices mail --profile alice
+  proofkin workiq notices teams --list --profile alice
+  proofkin workiq notices teams --chat 19:abc123@thread.v2 --profile alice
+  proofkin workiq notices off --profile alice
+A notice is sent for a plan's `approve @me` step (one that shows Microsoft 365 changes too)
+and for each change a digital worker's task for you holds for your sign-off. It holds the
+sign-off's title, the run and step (or the task's number), the agent's name and how to
+answer, never the change's content, recipients or body, nor any step's result. It is sent
+once, in the background, with your Work IQ account, through the audit (purpose notice,
+counted against the budgets); one that fails is told in the activity and isn't sent again,
+and the sign-off still waits. You still answer it in Proofkin.
+Mail goes to the signed-in account's own address and isn't kept in Sent Items. Before
+keeping a Teams chat, Proofkin checks you are a member of it. Teams' chat with yourself
+(48:notes) isn't in the Microsoft Graph reference, so it isn't offered.
+A digital worker that uses your Work IQ uses your setting: its notices come to you.")]
+    Notices {
+        /// Where notices go: off (the default), mail, or teams (with --chat).
+        #[arg(value_enum)]
+        to: NoticeTarget,
+        /// The Teams chat notices go to, by its id (as --list shows it).
+        #[arg(long, value_name = "ID")]
+        chat: Option<String>,
+        /// List your recent Teams chats to choose from, and change nothing.
+        #[arg(long)]
+        list: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
 }
 
 /// On or off.
@@ -283,6 +317,14 @@ Your tenant's policy still applies on top: it may deny a change.")]
 enum Switch {
     On,
     Off,
+}
+
+/// Where sign-off notices go.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum NoticeTarget {
+    Off,
+    Mail,
+    Teams,
 }
 
 #[derive(Subcommand)]
@@ -1890,6 +1932,93 @@ async fn run_workiq(command: WorkiqCommand) -> Result<()> {
                     "profile '{}': Microsoft 365 changes are off: plans and digital workers' tasks make none",
                     profile.name
                 );
+            }
+        }
+        WorkiqCommand::Notices {
+            to,
+            chat,
+            list,
+            profile,
+        } => {
+            use proofkin::profile::WorkIqNotices;
+            use proofkin::workiq::notice;
+            let mut profile = Profile::open(&profile.name)?;
+            let holder = profile.workiq_profile()?;
+            if holder.name != profile.name {
+                bail!(
+                    "'{}' uses '{}''s Work IQ account, so its sign-off notices go where '{}''s go; set them with: proofkin workiq notices off|mail|teams --profile {}",
+                    profile.name,
+                    holder.name,
+                    holder.name,
+                    holder.name
+                );
+            }
+            if to != NoticeTarget::Teams && (chat.is_some() || list) {
+                bail!("--chat and --list are for `proofkin workiq notices teams`");
+            }
+            let setting = match (to, chat) {
+                (NoticeTarget::Off, _) => None,
+                (NoticeTarget::Mail, _) => {
+                    let (_, account) = profile.workiq_account()?;
+                    if !account.upn.contains('@') {
+                        bail!(
+                            "notices by mail go to the Work IQ account's own address, and Proofkin doesn't know it for this sign-in ({}); sign in with your account (for Microsoft's CLI: proofkin auth login workiq --cli --account you@example.com --profile {}), or send notices to Teams: proofkin workiq notices teams --chat <id> --profile {}",
+                            account.upn,
+                            profile.name,
+                            profile.name
+                        );
+                    }
+                    Some(WorkIqNotices::Mail)
+                }
+                (NoticeTarget::Teams, Some(_)) if list => {
+                    bail!("give --chat <id> or --list, not both");
+                }
+                (NoticeTarget::Teams, None) if list => {
+                    let client = proofkin::workiq::context::client_for_profile(&profile)?;
+                    let chats = notice::list_chats(&client).await?;
+                    if chats.is_empty() {
+                        println!(
+                            "Microsoft Graph lists no Teams chats of yours that notices can go to"
+                        );
+                    } else {
+                        println!(
+                            "your recent Teams chats (id, type, topic); choose one with: proofkin workiq notices teams --chat <id> --profile {}",
+                            profile.name
+                        );
+                        for chat in chats {
+                            println!("  {}", chat.describe());
+                        }
+                    }
+                    return Ok(());
+                }
+                (NoticeTarget::Teams, None) => {
+                    bail!(
+                        "give the Teams chat notices go to with --chat <id>; list yours with: proofkin workiq notices teams --list --profile {}",
+                        profile.name
+                    );
+                }
+                (NoticeTarget::Teams, Some(id)) => {
+                    notice::check_chat_id(&id).map_err(|e| anyhow!(e))?;
+                    let client = proofkin::workiq::context::client_for_profile(&profile)?;
+                    notice::check_chat(&client, &id).await?;
+                    Some(WorkIqNotices::Teams { chat: id })
+                }
+            };
+            profile.config.workiq_notices = setting;
+            profile.save()?;
+            match &profile.config.workiq_notices {
+                Some(setting) => {
+                    let (_, account) = profile.workiq_account()?;
+                    println!(
+                        "profile '{}': sign-off notices go {}: each sign-off that waits for you is also told there, once (which one and how to answer it, never what you sign off); you still answer it in Proofkin",
+                        profile.name,
+                        setting.describe(&account.upn)
+                    );
+                }
+                None => println!(
+                    "profile '{}': sign-off notices are off: a sign-off that waits for you shows only in Proofkin",
+                    profile.name
+                ),
             }
         }
     }
@@ -5172,6 +5301,9 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     "? {from} asks you to approve: {title}\n  see it with /approvals, then /approve {id} [note] or /reject {id} <why> (or /changes {id} <what>, where /approvals offers it)"
                 ),
                 Event::ApprovalClosed { .. } => {}
+                Event::NoticeFailed { title, error } => println!(
+                    "! the Microsoft 365 notice of the sign-off \"{title}\" wasn't sent (it isn't sent again; the sign-off still waits): {error}"
+                ),
             }
         }
     });
@@ -5315,9 +5447,14 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                         let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                         let agent = agent.clone();
                         let runs_dir = profile.runs_dir();
+                        // Known from the start: each step's peer, and a sign-off's notice,
+                        // are told it.
+                        let run_id = proofkin::runs::new_run_id();
                         let ctx = proofkin::plan::RunContext {
+                            run_id: Some(run_id.clone()),
                             recipients,
                             work_context: work,
+                            notices: proofkin::plan::notices(&profile, &plan),
                             ..Default::default()
                         };
                         let n = tasks.spawn(
@@ -5334,6 +5471,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                                     &states,
                                     started,
                                 );
+                                run.id = run_id;
                                 run.peer_ids = proofkin::runs::peer_ids(&agent);
                                 run.workiq = ctx.work_log.records();
                                 println!("=== plan finished: {} ===", run.verdict_line());
