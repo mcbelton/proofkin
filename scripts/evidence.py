@@ -39,11 +39,13 @@ LOGS = os.path.join(OUT, "logs")
 def run(name, cmd, env=None):
     """Runs `cmd`, saving combined output to logs/<name>.log. Returns (ok, output)."""
     print(f"== {name}: {' '.join(cmd)}", flush=True)
-    proc = subprocess.run(cmd, cwd=REPO, env={**os.environ, **(env or {})},
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    out = proc.stdout.decode("utf-8", errors="replace")
-    with open(os.path.join(LOGS, f"{name}.log"), "w", encoding="utf-8") as f:
-        f.write(out)
+    log = os.path.join(LOGS, f"{name}.log")
+    # Keep partial output on timeout, and do not wait for EOF on inherited pipes.
+    with open(log, "wb") as log_file:
+        proc = subprocess.run(cmd, cwd=REPO, env={**os.environ, **(env or {})},
+                              stdout=log_file, stderr=subprocess.STDOUT)
+    with open(log, "r", encoding="utf-8", errors="replace") as log_file:
+        out = log_file.read()
     print(f"   {'ok' if proc.returncode == 0 else 'FAILED'} (log: target/evidence/logs/{name}.log)", flush=True)
     return proc.returncode == 0, out
 

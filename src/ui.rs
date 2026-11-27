@@ -3201,6 +3201,9 @@ async fn draft_plan(s: &Shared, ask: crate::plan_draft::Ask, by: &str) -> Result
             Json(json!({ "error": format!("{e:#}") })),
         )
     })?;
+    let model = ask
+        .pick_model(&profile, provider)
+        .map_err(|error| bad_request(format!("{error:#}")))?;
     let issue = match ask.issue {
         Some(n) => Some(
             plan_draft::issue_text(&profile, n)
@@ -3217,8 +3220,7 @@ async fn draft_plan(s: &Shared, ask: crate::plan_draft::Ask, by: &str) -> Result
     let progress = |line: String| s.send(json!({ "type": "plan-draft", "progress": line }));
     let drafted = plan_draft::write(
         executor.as_ref(),
-        provider,
-        &profile.models(),
+        model,
         &ask.request(issue),
         &available,
         &progress,

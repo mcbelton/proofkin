@@ -122,6 +122,7 @@ pub(crate) async fn ask(
     checked: &(dyn Fn(Value) -> (Value, Vec<Problem>) + Send + Sync),
     progress: &(dyn Fn(String) + Send + Sync),
 ) -> Result<Answered> {
+    let model = DraftModel::pick(models, provider, None, None)?;
     let read = |output: &str| {
         let answer = crate::team::written_plan(output);
         let (written, problems) = match serde_json::from_str::<Value>(&answer) {
@@ -144,7 +145,7 @@ pub(crate) async fn ask(
             again: again_prompt(&base, &answer, &problems),
         }
     };
-    let tried = ask_until(executor, provider, models, &base, what, &read, progress).await?;
+    let tried = ask_until(executor, model, &base, what, &read, progress).await?;
     let Some((blueprint, problems)) = tried.written else {
         bail!("the model didn't write a blueprint in {TRIES} tries: its answers weren't JSON");
     };
@@ -174,24 +175,46 @@ pub(crate) struct Tried<T> {
     pub tries: u32,
 }
 
-/// Asks `executor`'s model of `provider` (at the profile's default model and effort, as
-/// `models` allows them) for `what` (a draft, a proposal, a plan) with prompt `base`, in
-/// an empty folder, read-only. `read` reads each answer; until one can be read and has no
-/// error, the model gets the prompt `read` gave for it, at most [`TRIES`] times in all.
+/// A model and effort the profile allows, with its defaults filled in if none were asked for.
+pub(crate) struct DraftModel {
+    pub(crate) provider: Provider,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+impl DraftModel {
+    pub(crate) fn pick(
+        models: &crate::models::Models,
+        provider: Provider,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Self> {
+        let choice = crate::models::choice(models, provider);
+        Ok(Self {
+            provider,
+            model: choice.pick(model)?,
+            effort: choice.pick_effort(effort)?,
+        })
+    }
+}
+
+/// Asks `executor` at the chosen model and effort for `what` (a draft, a proposal, a plan)
+/// with prompt `base`, in an empty folder, read-only. `read` reads each answer; until one can
+/// be read and has no error, the model gets the prompt `read` gave for it, at most [`TRIES`]
+/// times in all.
 /// `progress` hears each try: the first, then how many problems the next one fixes.
 pub(crate) async fn ask_until<T: Send>(
     executor: &dyn Executor,
-    provider: Provider,
-    models: &crate::models::Models,
+    model: DraftModel,
     base: &str,
     what: &str,
     read: &(dyn Fn(&str) -> Reading<T> + Send + Sync),
     progress: &(dyn Fn(String) + Send + Sync),
 ) -> Result<Tried<T>> {
-    let choice = crate::models::choice(models, provider);
+    let provider = model.provider;
     let mut ask = LlmTask::new(provider, base.to_owned());
-    ask.model = choice.pick(None)?;
-    ask.effort = choice.pick_effort(None)?;
+    ask.model = model.model;
+    ask.effort = model.effort;
     let folder = EmptyFolder::new()?;
     let ctx = TaskContext::new(Access::ReadOnly, folder.path());
     let (mut written, mut model, mut effort) = (None, None, None);
@@ -445,6 +468,7 @@ pub(crate) mod tests {
     pub(crate) struct Scripted {
         answers: Mutex<VecDeque<String>>,
         asked: Mutex<Vec<(LlmTask, TaskContext)>>,
+        report_task_settings: bool,
     }
 
     impl Scripted {
@@ -452,7 +476,13 @@ pub(crate) mod tests {
             Self {
                 answers: Mutex::new(answers.iter().cloned().collect()),
                 asked: Mutex::new(Vec::new()),
+                report_task_settings: false,
             }
+        }
+
+        pub(crate) fn report_task_settings(mut self) -> Self {
+            self.report_task_settings = true;
+            self
         }
 
         pub(crate) fn asked(&self) -> Vec<(LlmTask, TaskContext)> {
@@ -471,7 +501,12 @@ pub(crate) mod tests {
             assert_eq!(entries, 0, "the model works in an empty folder");
             self.asked.lock().unwrap().push((task.clone(), ctx.clone()));
             let answer = self.answers.lock().unwrap().pop_front().expect("an answer");
-            Ok(Ran::new(answer, Some("gpt-6-sol".into())).with_effort(Some("medium".into())))
+            let (model, effort) = if self.report_task_settings {
+                (task.model.clone(), task.effort.clone())
+            } else {
+                (Some("gpt-6-sol".into()), Some("medium".into()))
+            };
+            Ok(Ran::new(answer, model).with_effort(effort))
         }
     }
 

@@ -1287,7 +1287,7 @@ struct Drafter;
 #[async_trait]
 impl Executor for Drafter {
     fn providers(&self) -> Vec<Provider> {
-        vec![Provider::Copilot]
+        vec![Provider::Copilot, Provider::Claude]
     }
 
     async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<proofkin::Ran> {
@@ -1297,8 +1297,9 @@ impl Executor for Drafter {
         }
         Ok(proofkin::Ran::new(
             format!("Sure, here it is:\n```plan\n{plan}\n```\nTell me if it needs more."),
-            Some("drafter-1".into()),
-        ))
+            task.model.clone().or_else(|| Some("drafter-1".into())),
+        )
+        .with_effort(task.effort.clone()))
     }
 }
 
@@ -1312,7 +1313,10 @@ async fn other_agents_draft_plans_over_mcp_and_drafting_runs_nothing() {
     std::fs::create_dir_all(profiles.join("planner")).unwrap();
     std::fs::write(
         profiles.join("planner").join("profile.json"),
-        r#"{"copilot": {"source": "token", "host": "github.com"}}"#,
+        r#"{
+            "copilot": {"source": "token", "host": "github.com"},
+            "claude": {"source": "api-key"}
+        }"#,
     )
     .unwrap();
     let mut config = AgentConfig::new("planner", SecretKey::generate());
@@ -1403,6 +1407,23 @@ async fn other_agents_draft_plans_over_mcp_and_drafting_runs_nothing() {
     );
     let refused = call(json!({ "note": "add a sign-off by me" })).await;
     assert_eq!(refused["isError"], true, "{refused}");
+
+    let chosen = call(json!({
+        "goal": "Do the work in app",
+        "provider": "claude",
+        "model": "claude-sonnet-5.5",
+        "effort": "low",
+    }))
+    .await;
+    assert_ne!(chosen["isError"], true, "{chosen}");
+    let chosen = &chosen["structuredContent"];
+    assert_eq!(chosen["provider"], "claude");
+    assert_eq!(chosen["model"], "claude-sonnet-5.5");
+    assert_eq!(chosen["effort"], "low");
+    assert_eq!(
+        chosen["plan"].as_str().unwrap().lines().next(),
+        Some("// Drafted by claude (claude-sonnet-5.5): Do the work in app")
+    );
 
     let state = request(
         port,

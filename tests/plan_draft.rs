@@ -2,7 +2,7 @@
 //! profile is signed in to Claude, with a stand-in bridge (tests/fixtures/plan_bridge.mjs)
 //! as its model.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const EXE: &str = env!("CARGO_BIN_EXE_proofkin");
@@ -33,6 +33,23 @@ fn draft(home: &Path, args: &[&str]) -> Drafted {
     }
 }
 
+fn planner_profile(home: &Path) -> PathBuf {
+    let dir = home.join("profiles").join("planner");
+    std::fs::create_dir_all(dir.join("secrets")).unwrap();
+    std::fs::write(
+        dir.join("profile.json"),
+        r#"{
+            "claude": {"source": "api-key"},
+            "models": {"claude": {
+                "allowed": ["fake-planner", "claude-sonnet-5.5"], "efforts": ["low", "medium"]
+            }}
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("secrets").join("claude"), "sk-ant-test-key").unwrap();
+    dir
+}
+
 /// The profile's model writes the plan: `plan draft` prints it (the prose around its fenced
 /// block dropped), then its problems, and exits 1 while errors remain; `--out` writes it to
 /// a file, and `--from` with `--note` has it changed. Each draft is in the audit, and none
@@ -40,15 +57,7 @@ fn draft(home: &Path, args: &[&str]) -> Drafted {
 #[test]
 fn plan_draft_prints_the_plan_then_its_problems_and_fails_while_errors_remain() {
     let home = tempfile::tempdir().unwrap();
-    let dir = home.path().join("profiles").join("planner");
-    std::fs::create_dir_all(dir.join("secrets")).unwrap();
-    std::fs::write(
-        dir.join("profile.json"),
-        r#"{"claude": {"source": "api-key"}}"#,
-    )
-    .unwrap();
-    std::fs::write(dir.join("secrets").join("claude"), "sk-ant-test-key").unwrap();
-
+    let dir = planner_profile(home.path());
     let ok = draft(home.path(), &["Ship the release notes"]);
     assert_eq!(ok.code, Some(0), "{}{}", ok.stdout, ok.stderr);
     assert_eq!(
@@ -121,4 +130,40 @@ fn plan_draft_prints_the_plan_then_its_problems_and_fails_while_errors_remain() 
                 .is_none(),
         "drafting starts no run"
     );
+}
+
+#[test]
+fn plan_draft_passes_the_model_and_effort_flags_to_the_bridge_and_refuses_bad_values() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = planner_profile(home.path());
+    let goal = "Ship the release notes";
+    let ok = draft(
+        home.path(),
+        &[goal, "--model", "claude-sonnet-5.5", "--effort", "medium"],
+    );
+    assert_eq!(ok.code, Some(0), "{}{}", ok.stdout, ok.stderr);
+    assert_eq!(
+        ok.stdout.lines().next(),
+        Some("// Drafted by claude (claude-sonnet-5.5): Ship the release notes")
+    );
+    let audit = proofkin::audit::AuditLog::read(&dir.join("audit.jsonl"), 10).unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0].model.as_deref(),
+        Some("claude-sonnet-5.5 (medium reasoning)")
+    );
+
+    for (flag, value, message) in [
+        (
+            "--model",
+            "not-allowed",
+            "not-allowed isn't a model allowed here: fake-planner, claude-sonnet-5.5",
+        ),
+        ("--effort", "turbo", "isn't a reasoning effort: use one of"),
+    ] {
+        // Even when an issue is named, the choice is refused before looking it up.
+        let refused = draft(home.path(), &["--issue", "42", flag, value]);
+        assert_ne!(refused.code, Some(0));
+        assert!(refused.stderr.contains(message), "{}", refused.stderr);
+    }
 }

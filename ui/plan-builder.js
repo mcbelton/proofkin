@@ -504,7 +504,7 @@ const planBuilder = (() => {
       const current = planText.valuesOf(s, "model")[0] ?? "";
       const model = el("select", {},
         el("option", { value: "", text: menu.defaultModel ? `${menu.defaultModel} (default)` : theirs }),
-        ...modelOptionNodes(menu.models.filter((m) => m.id.toLowerCase() !== deflt)),
+        ...modelOptionNodes(modelOptionData(menu.models.filter((m) => m.id.toLowerCase() !== deflt))),
         ...(menu.other ? [el("option", { value: OTHER_MODEL, text: "Another model…" })] : []));
       if (current && ![...model.options].some((o) => o.value === current)) {
         model.append(el("option", { value: current, text: current }));

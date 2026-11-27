@@ -496,15 +496,27 @@
             <span class="muted small" id="plan-draft-issue-hint">Link a tracker repository (GitHub card) to name one of its issues.</span>
           </label>
           <label class="field">
-            <span>Model that writes it</span>
-            <select id="plan-draft-provider"></select>
-            <span class="muted small">Your profile's own, at its default model, read-only in an empty folder with no tools.</span>
+            <span>Provider</span>
+            <select id="plan-draft-provider" disabled></select>
           </label>
+          <label class="field">
+            <span>Model</span>
+            <select id="plan-draft-model" disabled></select>
+          </label>
+          <label class="field" id="plan-draft-model-name-field" hidden>
+            <span>Model name</span>
+            <input id="plan-draft-model-name" type="text" class="mono" placeholder="e.g. claude-sonnet-5.5" spellcheck="false" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>Reasoning</span>
+            <select id="plan-draft-effort" disabled></select>
+          </label>
+          <p class="muted small">Your profile's own model, read-only in an empty folder with no tools.</p>
           <p class="muted small" id="plan-draft-status" role="status" aria-live="polite"></p>
           <p class="form-error" id="plan-draft-error" role="alert"></p>
           <div class="dialog-actions">
             <button type="button" class="btn" id="plan-draft-cancel">Cancel</button>
-            <button type="submit" class="btn primary" id="plan-draft-submit">Draft plan</button>
+            <button type="submit" class="btn primary" id="plan-draft-submit" disabled>Draft plan</button>
           </div>
         </form>
       </div>
