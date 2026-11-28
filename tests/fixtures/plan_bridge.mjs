@@ -9,6 +9,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (message.cancel !== undefined) return;
   const { id, prompt, access, cwd, model, effort } = message;
   let plan = prompt.includes("ghost") ? "fix @ghost:app Fix the bug" : "ok approve @me Ship it?";
+  if (prompt.includes("Keep this run off GitHub")) plan = "// Not tracked: the owner asked.\ntrack: off\n" + plan;
   if (prompt.includes("add a second sign-off")) plan += "\nagain after ok approve @me Ship it, really?";
   const text = [
     `Here is a plan (${access}, ${cwd.length > 0 ? "in a folder" : "nowhere"}).`,

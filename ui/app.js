@@ -2449,9 +2449,13 @@ async function submitPlanDraft(e) {
     $("#plan-draft-note").value = "";
     const errors = drafted.problems.filter((p) => p.error).length;
     const tries = `${drafted.tries} ${drafted.tries === 1 ? "try" : "tries"}`;
-    toast(errors
+    const result = errors
       ? `The plan still has ${nOf(errors, "error")} after ${tries}: fix them before you run it`
-      : `Drafted in ${tries}: review the plan, then run it`, errors ? "error" : "");
+      : `Drafted in ${tries}: review the plan, then run it`;
+    const tracking = drafted.untracked
+      ? " The draft doesn't track the run on GitHub (track: off): no issues, and no results there. To track it, pick New issue under Track on GitHub."
+      : "";
+    toast(result + tracking, errors ? "error" : "");
     planBuilder.setView(planBuilder.view());
   } catch (err) {
     error.textContent = err.message;

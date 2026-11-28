@@ -34,6 +34,10 @@ pub use crate::factory::draft::TRIES;
 /// The longest goal (and note), in characters.
 pub const MAX_GOAL: usize = crate::factory::draft::MAX_DESCRIPTION;
 
+/// What the CLI and MCP tell the owner when a draft sets `track: off`.
+pub const UNTRACKED_NOTICE: &str = "The draft doesn't track the run on GitHub (track: off): \
+    no issues, and no results there. To track it, pick New issue under Track on GitHub.";
+
 /// The first line of a plan a model drafted starts with this.
 const HEADER: &str = "// Drafted by ";
 
@@ -204,7 +208,11 @@ impl Available {
 
     /// The problems of plan `text`, as Run plan's check finds them.
     pub fn check(&self, text: &str) -> Vec<Problem> {
-        match Plan::parse(text) {
+        self.problems(Plan::parse(text))
+    }
+
+    fn problems(&self, parsed: Result<Plan>) -> Vec<Problem> {
+        match parsed {
             Ok(plan) => preflight(
                 &plan,
                 &self.peers,
@@ -283,9 +291,7 @@ impl Available {
         );
         text += &match &self.tracker {
             Some(repo) => format!("\nThe tracker's repository (track:, issue=#N): {repo}\n"),
-            None => "\nThe tracker's repository (track:, issue=#N): none is linked, so write \
-                     neither\n"
-                .to_owned(),
+            None => "\nThe tracker's repository (track:, issue=#N): none is linked\n".to_owned(),
         };
         text
     }
@@ -295,6 +301,9 @@ impl Available {
 #[derive(Debug, Clone, Serialize)]
 pub struct Drafted {
     pub plan: String,
+    /// The draft explicitly says `track: off`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub untracked: bool,
     pub problems: Vec<Problem>,
     pub provider: Provider,
     pub model: Option<String>,
@@ -377,6 +386,24 @@ pub fn prompt(request: &Request, available: &Available) -> String {
     text += DESCRIBE;
     text += "\n\n## What you may use\n\n";
     text += &wrap("what this agent may use", &available.text());
+    if available.tracker.is_some() {
+        text += "\n\nThe owner chooses whether and how to track the run with **Track on GitHub** \
+                 beside **Run plan**. Without a `track:` line, the run is tracked as a new \
+                 issue, with a sub-issue per step and each result commented on its issue. \
+                 Results that may hold Microsoft 365 content stay off GitHub anyway.\n\n\
+                 Write `track: #N` or `track: <title>` only if the owner asks for it, or as \
+                 the issue section above says for the issue the plan is for. Otherwise \
+                 leave `track:` out, except that you may write `track: off` only when:\n\
+                 - the owner asks for an untracked run;\n\
+                 - the work isn't about the tracker's repository (named above); or\n\
+                 - the work draws on private content, such as Microsoft 365 (`workiq=`, \
+                 `@workiq` steps) or personal data.\n\n\
+                 If you write `track: off`, start the plan with a comment that says why. \
+                 For example: `// Not tracked: the tracker is the code repository, and \
+                 the brief draws on private email.`";
+    } else {
+        text += "\n\nNo tracker is linked, so write neither `track:` nor `issue=`.";
+    }
     text += "\n\n## Examples\n\nThe playbooks: ready-made plans, each with what it is for. In \
              them, {{name}} stands for a value you write from what you may use; the first \
              lines say which ones.\n";
@@ -484,9 +511,11 @@ pub(crate) async fn write(
         "{}\n{plan}\n",
         header(provider, tried.model.as_deref(), request)
     );
+    let (parsed, untracked) = Plan::parse_with_untracked(&plan);
     Ok(Drafted {
-        problems: available.check(&plan),
+        problems: available.problems(parsed),
         plan,
+        untracked,
         provider,
         model: tried.model,
         effort: tried.effort,
@@ -785,6 +814,41 @@ mod tests {
     }
 
     #[test]
+    fn the_prompt_leaves_tracking_to_the_owner_and_says_when_to_turn_it_off() {
+        let f = fixture();
+        let prompt = prompt(&goal("Fix the parser"), &f.available);
+        for said in [
+            "The owner chooses whether and how to track the run with **Track on GitHub** beside \
+             **Run plan**.",
+            "Without a `track:` line, the run is tracked as a new issue, with a sub-issue per \
+             step and each result commented on its issue.",
+            "Results that may hold Microsoft 365 content stay off GitHub anyway.",
+            "Write `track: #N` or `track: <title>` only if the owner asks for it, or as the issue \
+             section above says for the issue the plan is for.",
+            "you may write `track: off` only when:",
+            "- the owner asks for an untracked run;",
+            "- the work isn't about the tracker's repository (named above); or",
+            "- the work draws on private content, such as Microsoft 365 (`workiq=`, `@workiq` \
+             steps) or personal data.",
+            "If you write `track: off`, start the plan with a comment that says why.",
+        ] {
+            assert!(prompt.contains(said), "{said:?} in {prompt}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_without_a_tracker_says_to_write_neither_track_nor_issue() {
+        let mut f = fixture();
+        f.available.tracker = None;
+        let prompt = prompt(&goal("Fix the parser"), &f.available);
+        assert!(
+            prompt.contains("No tracker is linked, so write neither `track:` nor `issue=`."),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("**Track on GitHub**"), "{prompt}");
+    }
+
+    #[test]
     fn the_prompt_for_an_issue_says_not_to_give_both_track_and_issue() {
         let f = fixture();
         let request = Request {
@@ -891,6 +955,32 @@ mod tests {
                 "try 2 of 3: fixing 1 problem".to_owned(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_draft_marks_a_real_track_off_directive_even_when_other_lines_have_errors() {
+        let f = fixture();
+        for (plan, expected_untracked, expected_errors) in [
+            ("track: OFF\nbroken", true, 1),
+            (
+                "// track: off\nfix @alice:app Fix the parser\n  track: off",
+                false,
+                0,
+            ),
+        ] {
+            let model = Scripted::new(&[fenced(plan), fenced(plan), fenced(plan)]);
+            let drafted = write(
+                &model,
+                default_model(),
+                &goal("Fix the parser"),
+                &f.available,
+                &|_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(drafted.untracked, expected_untracked, "{plan}");
+            assert_eq!(drafted.errors(), expected_errors, "{:?}", drafted.problems);
+        }
     }
 
     #[tokio::test]

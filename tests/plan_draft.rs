@@ -66,6 +66,11 @@ fn plan_draft_prints_the_plan_then_its_problems_and_fails_while_errors_remain() 
     );
     assert!(ok.stderr.contains("is writing the plan"), "{}", ok.stderr);
     assert!(!ok.stderr.contains("error:"), "{}", ok.stderr);
+    assert!(
+        !ok.stderr.contains("The draft doesn't track"),
+        "{}",
+        ok.stderr
+    );
 
     let bad = draft(home.path(), &["Fix the bug on ghost's app"]);
     assert_eq!(bad.code, Some(1), "{}{}", bad.stdout, bad.stderr);
@@ -129,6 +134,26 @@ fn plan_draft_prints_the_plan_then_its_problems_and_fails_while_errors_remain() 
                 .next()
                 .is_none(),
         "drafting starts no run"
+    );
+}
+
+#[test]
+fn plan_draft_prints_the_untracked_notice_without_changing_the_plan() {
+    let home = tempfile::tempdir().unwrap();
+    planner_profile(home.path());
+    let out = draft(home.path(), &["Keep this run off GitHub"]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert_eq!(
+        out.stdout,
+        "// Drafted by claude (fake-planner): Keep this run off GitHub\n\
+         // Not tracked: the owner asked.\ntrack: off\nok approve @me Ship it?\n"
+    );
+    let notice = "The draft doesn't track the run on GitHub (track: off): no issues, and no \
+                  results there. To track it, pick New issue under Track on GitHub.";
+    assert!(
+        out.stderr.lines().any(|line| line == notice),
+        "{}",
+        out.stderr
     );
 }
 

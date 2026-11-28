@@ -601,6 +601,11 @@ impl Plan {
     /// Parses and validates plan text (see the module docs). Reports every problem
     /// with its line number.
     pub fn parse(text: &str) -> Result<Self> {
+        Self::parse_with_untracked(text).0
+    }
+
+    /// Also reads whether `track: off` is set, even if other lines have problems.
+    pub(crate) fn parse_with_untracked(text: &str) -> (Result<Self>, bool) {
         let mut steps = Vec::new();
         let mut claims = Vec::new();
         let mut track = None;
@@ -665,8 +670,9 @@ impl Plan {
                 errors.push(format!("line {}: {e}", at + 1));
             }
         }
+        let untracked = track == Some(Track::Off);
         if !errors.is_empty() {
-            bail!("{}", errors.join("\n"));
+            return (Err(anyhow!("{}", errors.join("\n"))), untracked);
         }
         let plan = Plan {
             claims,
@@ -677,8 +683,7 @@ impl Plan {
             kind,
             about,
         };
-        plan.validate()?;
-        Ok(plan)
+        (plan.validate().map(|()| plan), untracked)
     }
 
     fn apply_model_defaults(&self, step: &mut Step) {

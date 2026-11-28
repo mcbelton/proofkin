@@ -3476,6 +3476,9 @@ async fn run_plan_command(command: PlanCommand) -> Result<()> {
                 }
                 None => print!("{}", drafted.plan),
             }
+            if drafted.untracked {
+                eprintln!("{}", proofkin::plan_draft::UNTRACKED_NOTICE);
+            }
             for problem in &drafted.problems {
                 let kind = if problem.error { "error" } else { "warning" };
                 match &problem.step {
