@@ -1,4 +1,11 @@
 fn main() {
+    println!("cargo::rerun-if-env-changed=PROOFKIN_RELEASE_REPO");
+    if let Ok(repo) = std::env::var("PROOFKIN_RELEASE_REPO") {
+        println!("cargo::rustc-env=PROOFKIN_RELEASE_REPO={repo}");
+    }
+    let target = std::env::var("TARGET").expect("Cargo sets TARGET");
+    println!("cargo::rustc-env=PROOFKIN_TARGET={target}");
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

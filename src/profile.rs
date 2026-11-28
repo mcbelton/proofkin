@@ -452,9 +452,12 @@ impl Profile {
     }
 
     pub fn list() -> Result<Vec<String>> {
-        let root = profiles_root()?;
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return Ok(Vec::new());
+        Ok(Self::list_in(&profiles_root()?))
+    }
+
+    pub(crate) fn list_in(root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
         };
         let mut names: Vec<String> = entries
             .filter_map(|e| e.ok())
@@ -464,7 +467,7 @@ impl Profile {
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
         names.sort();
-        Ok(names)
+        names
     }
 
     pub fn save(&self) -> Result<()> {

@@ -58,6 +58,13 @@ download the archive for your platform from the
 anywhere on `PATH`. To install a specific version on Windows, download `install.ps1` and
 run `.\install.ps1 -Version v0.1.2` (Linux/macOS: `PROOFKIN_VERSION=v0.1.2 sh install.sh`).
 
+Run `proofkin --upgrade` (or `proofkin --update`) to install the latest release.
+`proofkin --upgrade 0.32.1` installs that version, even if it's older. The command
+replaces the release binary in place after checking the download against `SHA256SUMS`.
+Running agents keep the old version until you restart them. A digital worker started by
+its owner's agent restarts with that agent. For builds from source, update the way you
+built Proofkin. For private repositories, use the installer instead.
+
 > **Forks or private copies:** for a private repo, the installers download through the
 > GitHub CLI. If `gh` has several accounts, pick one with access:
 > `.\install.ps1 -Repo <owner>/<repo> -GhUser <login>` (Linux/macOS:
@@ -248,7 +255,8 @@ npm install
 ## Releasing
 
 Push a version tag; GitHub Actions ([.github/workflows/release.yml](.github/workflows/release.yml))
-builds Windows, Linux and macOS binaries and publishes them with the install scripts:
+builds Windows, Linux and macOS binaries and publishes their archives, the install scripts,
+and a `SHA256SUMS` file covering both:
 
 ```powershell
 # bump version in Cargo.toml first
@@ -2810,6 +2818,11 @@ against call budgets.
 
 ## Security model
 
+- `proofkin --upgrade` trusts the public GitHub releases of the repository that built
+  the binary. It downloads over HTTPS and checks the archive against the release's
+  `SHA256SUMS` (a checksum, not a signature). It runs the verified binary once with
+  `--version` before swapping it in. Only the command line can start an upgrade, not
+  the web UI, an MCP tool or a peer message.
 - Connections are encrypted and authenticated (QUIC/TLS with each agent's ed25519 key).
   Only allowlisted keys can connect; everyone else is refused before any message is read.
 - An agent runs peer tasks **only** with `--serve`, only for the providers it enabled, only
@@ -3238,6 +3251,9 @@ Workflow for a change:
 
 | Symptom | Fix |
 | --- | --- |
+| `this proofkin was built from source` | Update it the way you built it, or use the [installer](#install-no-source-code-or-rust-needed) to switch to a release binary. |
+| `vX.Y.Z has no SHA256SUMS` | This older release can't be checked by `--upgrade`. If you need that version, use the [installer](#install-no-source-code-or-rust-needed). |
+| `can't replace ...` | Make sure you can write to the folder containing the real executable, or use the [installer](#install-no-source-code-or-rust-needed) to install into a folder you own. |
 | `cargo` / `rustc` is not recognized | The terminal was opened before Rust was installed. VS Code terminals keep VS Code's old `PATH`, so **fully quit and reopen VS Code** (a new terminal tab is not enough), or use `.\scripts\p2p.ps1`, which reloads `PATH` itself. |
 | `error calling dlltool 'dlltool.exe': program not found` | GNU toolchain without MinGW-w64: do Option A step 3, then open a new terminal. |
 | `linker 'link.exe' not found` | MSVC toolchain without Build Tools: do Option B step 1, or switch with `rustup default stable-x86_64-pc-windows-gnu` and use Option A. |
