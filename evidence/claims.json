@@ -1794,11 +1794,15 @@
     {
       "id": "EDD-11",
       "area": "evidence",
-      "claim": "A task that asks for its folder's checks gives its model (Copilot or Claude; not Codex, which takes no MCP servers) a run_check tool: the worker starts proofkin task-checks as the task's MCP server proofkin-checks, which runs one of the step's checks in the task's workspace, outside the model's sandbox as the runtime does, and answers whether it passed, with its exit code, time and the end of its output (secrets redacted), at most 10 runs a task, each up to 20 minutes. A check the step doesn't name is refused, and so is an 11th run. The runtime still runs the checks after the model, and only those runs are evidence.",
+      "claim": "A task that asks for its folder's checks gives its model (Copilot or Claude; not Codex, which takes no MCP servers) a run_check tool: the worker starts proofkin task-checks as the task's MCP server proofkin-checks, which runs one of the step's checks in the task's workspace, outside the model's sandbox as the runtime does, and answers whether it passed, with its exit code, time and the end of its output (secrets redacted), at most 10 runs a task, each up to 30 minutes as in the runtime. The model's MCP client is told to wait that long plus one minute. A cancelled call gets no answer: its check stops if it has started and still counts as a run; a cancelled waiting call never runs or counts. Closing the server's input stops the running check and ends the server. A check the step doesn't name is refused, and so is an 11th run. The runtime still runs the checks after the model, and only those runs are evidence.",
       "tests": [
         "agents::a_tasks_model_runs_its_checks_while_it_works",
         "lib::checks_mcp::the_model_runs_the_steps_checks_while_it_works_a_few_times",
         "lib::checks_mcp::a_worker_starts_it_with_the_steps_checks_in_the_tasks_workspace",
+        "lib::checks_mcp::cancelling_a_running_call_stops_it_without_a_reply_and_counts_the_run",
+        "lib::checks_mcp::cancelling_a_waiting_call_drops_it_without_counting_a_run",
+        "lib::checks_mcp::closing_the_input_stops_the_running_check_and_ends_the_server",
+        "lib::llm::copilot::a_servers_timeout_goes_in_copilots_config_and_a_server_without_one_has_none",
         "lib::llm::copilot::shell_runs_in_an_offline_sandbox_without_bypass"
       ]
     },

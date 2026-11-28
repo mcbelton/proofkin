@@ -82,7 +82,7 @@ pub struct McpServer {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub changes: bool,
     /// How long the task's MCP client waits for one tool call, in seconds; none: its own
-    /// default. Set on a task's Work IQ server whose change calls wait for a sign-off.
+    /// default. Set for the step's checks and for Work IQ change calls waiting for sign-off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
 }

@@ -836,6 +836,7 @@ pub(crate) fn mcp_servers(
                     command: command.clone(),
                     args: s.args.clone(),
                     env: s.env.clone().into_iter().collect(),
+                    timeout: s.timeout_secs.and_then(millis),
                     ..Default::default()
                 }),
                 (_, Some(url)) => {
@@ -1252,10 +1253,20 @@ mod tests {
         let docs = McpServer::remote("http://127.0.0.1:1234/mcp", false);
         let mut workiq = docs.clone();
         workiq.timeout_secs = Some(360);
-        let mcp = BTreeMap::from([("workiq".to_owned(), workiq), ("docs".to_owned(), docs)]);
+        let local = McpServer::local("proofkin", vec![]);
+        let mut checks = local.clone();
+        checks.timeout_secs = Some(1860);
+        let mcp = BTreeMap::from([
+            ("workiq".to_owned(), workiq),
+            ("docs".to_owned(), docs),
+            ("checks".to_owned(), checks),
+            ("local".to_owned(), local),
+        ]);
         let config = serde_json::to_value(mcp_servers(&mcp)).unwrap();
         assert_eq!(config["mcp-workiq"]["timeout"], 360_000);
         assert!(config["mcp-docs"]["timeout"].is_null(), "{config}");
+        assert_eq!(config["mcp-checks"]["timeout"], 1_860_000);
+        assert!(config["mcp-local"]["timeout"].is_null(), "{config}");
     }
 
     #[test]

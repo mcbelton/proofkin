@@ -5,13 +5,15 @@
 //! instead of from a failed attempt. What it learns is never evidence: the runtime runs
 //! the checks again after the model, and only those runs count.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+};
 
 use crate::mcp::McpServer;
 
@@ -21,8 +23,10 @@ pub const SERVER: &str = "proofkin-checks";
 pub const TOOL: &str = "run_check";
 /// The most times a task's model may run checks.
 pub const MAX_RUNS: u32 = 10;
-/// The longest one run may take: long enough for a whole test suite.
-pub const RUN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// The longest one run may take, the same limit as the runtime's.
+pub const RUN_TIMEOUT: Duration = crate::evidence::CHECK_TIMEOUT;
+/// Extra time for the client to wait for the check to start and the server to reply.
+const CALL_MARGIN: Duration = Duration::from_secs(60);
 /// The MCP versions it speaks, newest first.
 const VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -40,6 +44,7 @@ pub fn server(program: &Path, dir: &Path, checks: &[(String, String)]) -> McpSer
     }
     let mut server = McpServer::local(program.display().to_string(), args);
     server.tools = vec![TOOL.to_owned()];
+    server.timeout_secs = Some((RUN_TIMEOUT + CALL_MARGIN).as_secs());
     server
 }
 
@@ -163,15 +168,56 @@ impl Checks {
 /// Serves `checks` over stdin and stdout, a JSON-RPC message per line, until stdin closes
 /// (`proofkin task-checks`).
 pub async fn serve(dir: PathBuf, checks: BTreeMap<String, String>) -> Result<()> {
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    let mut server = Checks::new(dir, checks);
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => server.handle(&message).await,
+    serve_on(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        Checks::new(dir, checks),
+    )
+    .await
+}
+
+/// Serves one message at a time, reading ahead for cancellation or EOF during a check.
+pub async fn serve_on(
+    reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+    mut server: Checks,
+) -> Result<()> {
+    let mut lines = BufReader::new(reader).lines();
+    let mut waiting = VecDeque::new();
+    loop {
+        let message = match waiting.pop_front() {
+            Some(message) => message,
+            None => match read_message(&mut lines).await? {
+                Some(message) => message,
+                None => return Ok(()),
+            },
+        };
+        let reply = match message {
+            Ok(message) => {
+                let handling = server.handle(&message);
+                tokio::pin!(handling);
+                loop {
+                    tokio::select! {
+                        biased;
+                        reply = &mut handling => break reply,
+                        next = read_message(&mut lines) => {
+                            let Some(next) = next? else { return Ok(()) };
+                            if let Some(id) = next.as_ref().ok().and_then(cancelled_request) {
+                                waiting.retain(|message| {
+                                    message.as_ref().ok().and_then(|message| message.get("id"))
+                                        != Some(id)
+                                });
+                                if message.get("id") == Some(id) {
+                                    // Dropping the call stops its process tree without replying.
+                                    break None;
+                                }
+                            } else {
+                                waiting.push_back(next);
+                            }
+                        }
+                    }
+                }
+            }
             Err(e) => Some(json!({
                 "jsonrpc": "2.0",
                 "id": null,
@@ -179,16 +225,35 @@ pub async fn serve(dir: PathBuf, checks: BTreeMap<String, String>) -> Result<()>
             })),
         };
         if let Some(reply) = reply {
-            stdout.write_all(format!("{reply}\n").as_bytes()).await?;
-            stdout.flush().await?;
+            writer.write_all(format!("{reply}\n").as_bytes()).await?;
+            writer.flush().await?;
         }
     }
-    Ok(())
+}
+
+async fn read_message(
+    lines: &mut Lines<impl AsyncBufRead + Unpin>,
+) -> std::io::Result<Option<serde_json::Result<Value>>> {
+    while let Some(line) = lines.next_line().await? {
+        if !line.trim().is_empty() {
+            return Ok(Some(serde_json::from_str(&line)));
+        }
+    }
+    Ok(None)
+}
+
+fn cancelled_request(message: &Value) -> Option<&Value> {
+    if message.get("id").is_none() && message["method"] == "notifications/cancelled" {
+        message["params"].get("requestId")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::DuplexStream;
 
     fn checks(dir: &Path) -> Checks {
         let (pass, fail) = if cfg!(windows) {
@@ -206,9 +271,13 @@ mod tests {
         )
     }
 
+    fn check_request(id: impl serde::Serialize, name: &str) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": TOOL, "arguments": { "name": name } } })
+    }
+
     async fn call(server: &mut Checks, name: &str) -> Value {
-        let message = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": { "name": TOOL, "arguments": { "name": name } } });
+        let message = check_request(3, name);
         server.handle(&message).await.unwrap()["result"].clone()
     }
 
@@ -270,6 +339,96 @@ mod tests {
         );
     }
 
+    fn cancel(id: impl serde::Serialize) -> Value {
+        json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": { "requestId": id } })
+    }
+
+    async fn send(input: &mut DuplexStream, message: Value) {
+        input
+            .write_all(format!("{message}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    async fn expect_passed(replies: &mut Lines<BufReader<DuplexStream>>, id: u32, runs_left: u32) {
+        let line = replies.next_line().await.unwrap().expect("reply");
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], id, "{reply}");
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(&format!(
+                "; {runs_left} of {MAX_RUNS} runs left\n\nall good"
+            )),
+            "{text}"
+        );
+    }
+
+    async fn with_slow_check(
+        client: impl AsyncFnOnce(DuplexStream, Lines<BufReader<DuplexStream>>),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started.txt");
+        let mut server = checks(dir.path());
+        let slow = if cfg!(windows) {
+            "echo started>started.txt & ping -n 60 127.0.0.1 >nul"
+        } else {
+            "echo started >started.txt; sleep 60"
+        };
+        server.checks.insert("slow".into(), slow.into());
+        let (mut input, reader) = tokio::io::duplex(4096);
+        let (writer, output) = tokio::io::duplex(4096);
+        let client = async move {
+            send(&mut input, check_request(1, "slow")).await;
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            client(input, BufReader::new(output).lines()).await;
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serve_on(reader, writer, server), client)
+        })
+        .await
+        .expect("the slow check should not hold up the server");
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_running_call_stops_it_without_a_reply_and_counts_the_run() {
+        with_slow_check(async |mut input, mut replies| {
+            send(&mut input, cancel(1)).await;
+            send(&mut input, check_request(2, "test")).await;
+            expect_passed(&mut replies, 2, MAX_RUNS - 2).await;
+            drop(input);
+            assert!(replies.next_line().await.unwrap().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_call_drops_it_without_counting_a_run() {
+        with_slow_check(async |mut input, mut replies| {
+            send(&mut input, check_request("waiting", "test")).await;
+            send(&mut input, check_request(3, "test")).await;
+            send(&mut input, cancel("waiting")).await;
+            send(&mut input, cancel(1)).await;
+            expect_passed(&mut replies, 3, MAX_RUNS - 2).await;
+            drop(input);
+            assert!(replies.next_line().await.unwrap().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn closing_the_input_stops_the_running_check_and_ends_the_server() {
+        with_slow_check(async |input, mut replies| {
+            drop(input);
+            assert!(replies.next_line().await.unwrap().is_none());
+        })
+        .await;
+    }
+
     #[test]
     fn a_worker_starts_it_with_the_steps_checks_in_the_tasks_workspace() {
         let server = server(
@@ -289,5 +448,9 @@ mod tests {
             ]
         );
         assert_eq!(server.tools, [TOOL]);
+        assert_eq!(
+            server.timeout_secs,
+            Some((RUN_TIMEOUT + CALL_MARGIN).as_secs())
+        );
     }
 }

@@ -198,11 +198,16 @@ impl FakeExecutor {
                 .spawn()?;
             let call = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": { "name": proofkin::checks_mcp::TOOL, "arguments": { "name": "test" } } });
-            {
-                use tokio::io::AsyncWriteExt;
+            let reply_line = {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                 let mut stdin = child.stdin.take().unwrap();
                 stdin.write_all(format!("{call}\n").as_bytes()).await?;
-            }
+                let mut line = String::new();
+                BufReader::new(child.stdout.take().unwrap())
+                    .read_line(&mut line)
+                    .await?;
+                line
+            };
             let out = child.wait_with_output().await?;
             anyhow::ensure!(
                 out.status.success(),
@@ -210,9 +215,7 @@ impl FakeExecutor {
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
             );
-            let line = String::from_utf8_lossy(&out.stdout);
-            let reply: serde_json::Value =
-                serde_json::from_str(line.lines().next().unwrap_or("{}"))?;
+            let reply: serde_json::Value = serde_json::from_str(&reply_line)?;
             return Ok(reply["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap_or("no answer")
