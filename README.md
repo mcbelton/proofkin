@@ -1441,10 +1441,12 @@ review @alice:app verify=test Check the change:
   itself while it works, with the `run_check` tool its worker gives it (MCP server
   `proofkin-checks`). The tool runs one in the task's workspace, as the runtime will
   (outside the model's sandbox, with your rights), and
-  says whether it passed, with the end of its output: at most 10 runs a task, each up to 20
-  minutes. They help the model find a mistake before it finishes, instead of in a failed
-  attempt; they aren't evidence. The runtime runs the checks again after the model, and
-  only those runs count.
+  says whether it passed, with the end of its output: at most 10 runs a task, each up to 30
+  minutes, the runtime's limit. The model's MCP client is told to wait that long, with an
+  extra minute. A call the client cancels stops its check and still counts toward the limit;
+  a cancelled call that hasn't started never runs or counts. Closing the server's input also
+  stops a running check. These runs help the model find mistakes before it finishes; they
+  aren't evidence. The runtime runs the checks again after the model, and only those runs count.
 - **Approvals**: the approver sees the request in their web UI (**Waiting for your
   approval**) or terminal (`/approvals`, then `/approve <n> [note]` or `/reject <n> <why>`).
   The answer is signed with their key. Approvers only need to be allowlisted; they need no
