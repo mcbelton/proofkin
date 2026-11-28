@@ -19,6 +19,7 @@
         "upgrade::an_archive_with_only_a_nested_binary_is_refused",
         "upgrade::a_failed_try_or_wrong_version_removes_the_candidate",
         "upgrade::a_failed_swap_keeps_the_old_executable_at_its_path",
+        "upgrade::a_staged_binary_left_by_an_interrupted_upgrade_is_replaced",
         {"test": "upgrade::a_windows_binary_in_use_is_replaced_and_cleaned_up_next_time", "os": "windows"},
         {"test": "upgrade::upgrading_through_a_symlink_replaces_its_target_not_the_link", "os": "unix"},
         "upgrade::running_profiles_are_named_in_the_restart_notice",

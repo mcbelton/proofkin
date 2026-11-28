@@ -227,12 +227,12 @@ async fn latest_replaces_only_the_binary_after_verification() {
         .run(None, read_fake_version)
         .await
         .unwrap();
+    // The path as people write it: on Windows, without the `\\?\` of `canonicalize`.
+    let canonical = exe.canonicalize().unwrap().display().to_string();
+    let shown = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
     assert_eq!(
         result,
-        format!(
-            "Upgraded proofkin 0.0.1 -> 0.0.2 ({}).",
-            exe.canonicalize().unwrap().display()
-        )
+        format!("Upgraded proofkin 0.0.1 -> 0.0.2 ({shown}).")
     );
     assert_only_binary(&exe, NEW);
     assert_eq!(
@@ -451,6 +451,23 @@ async fn a_failed_swap_keeps_the_old_executable_at_its_path() {
             .contains("or install with the installer into a folder you own")
     );
     assert_only_binary(&exe, OLD);
+}
+
+#[tokio::test]
+async fn a_staged_binary_left_by_an_interrupted_upgrade_is_replaced() {
+    let (_dir, exe) = installed();
+    fs::write(
+        exe.with_file_name(format!("{BINARY}.new")),
+        b"left by an interrupted upgrade",
+    )
+    .unwrap();
+    let github = GitHub::start(Release::default()).await;
+    github
+        .upgrade(&exe, "0.0.1")
+        .run(None, read_fake_version)
+        .await
+        .unwrap();
+    assert_only_binary(&exe, NEW);
 }
 
 #[cfg(windows)]

@@ -155,7 +155,7 @@ impl Upgrade<'_> {
         };
         let mut result = format!(
             "{action} proofkin {current} -> {version} ({}).",
-            exe.display()
+            shown(&exe)
         );
         if let Some(root) = self.profiles_root {
             let running: Vec<_> = Profile::list_in(root)
@@ -285,6 +285,12 @@ struct Staged {
 impl Staged {
     fn unpack(exe: &Path, archive: &[u8]) -> Result<Self> {
         let path = with_suffix(exe, ".new");
+        // An upgrade interrupted before its swap (Ctrl+C, a crash) leaves its staged binary.
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(replace_error(exe, error)),
+        }
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -325,7 +331,7 @@ impl Drop for Staged {
             && let Err(error) = fs::remove_file(&self.path)
             && error.kind() != io::ErrorKind::NotFound
         {
-            eprintln!("could not remove {}: {error}", self.path.display());
+            eprintln!("could not remove {}: {error}", shown(&self.path));
         }
     }
 }
@@ -336,10 +342,25 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     name.into()
 }
 
+/// A path as people write it: without the `\\?\` prefix `canonicalize` adds on Windows.
+fn shown(path: &Path) -> String {
+    let text = path.display().to_string();
+    #[cfg(windows)]
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if let Some(share) = rest.strip_prefix(r"UNC\") {
+            return format!(r"\\{share}");
+        }
+        if rest.as_bytes().get(1) == Some(&b':') {
+            return rest.to_owned();
+        }
+    }
+    text
+}
+
 fn replace_error(exe: &Path, error: io::Error) -> anyhow::Error {
     anyhow!(
         "can't replace {}: {error}. Run it with rights to write there, or install with the installer into a folder you own",
-        exe.display()
+        shown(exe)
     )
 }
 
@@ -417,8 +438,8 @@ fn swap(exe: &Path, staged: &Path) -> io::Result<()> {
         if let Err(rollback) = fs::rename(&old, exe) {
             return Err(io::Error::other(format!(
                 "{error}; could not restore {} ({rollback}); the previous binary is at {}",
-                exe.display(),
-                old.display()
+                shown(exe),
+                shown(&old)
             )));
         }
         return Err(error);

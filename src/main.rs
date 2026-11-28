@@ -1862,7 +1862,7 @@ async fn run_upgrade(version: Option<Version>) -> Result<()> {
             "this proofkin was built from source, so --upgrade doesn't replace it: update it the way you built it, or install a release with the installer (README, Install)"
         );
     };
-    let api_base = reqwest::Url::parse("https:api.github.com")?;
+    let api_base = reqwest::Url::parse("https://api.github.com/")?;
     let profiles_root = proofkin::profile::profiles_root().ok();
     let upgrade = Upgrade {
         repo,
