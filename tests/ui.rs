@@ -2161,7 +2161,8 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
             "implement-spec",
             "implement-speckit",
             "rehearse",
-            "agent-factory"
+            "brief",
+            "agent-factory",
         ]
     );
     let discover = &books["playbooks"][1]["outline"];
@@ -2432,6 +2433,259 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     );
     assert_eq!(get("/api/tracker/issues/twelve").await.status, 400);
     agent.shutdown().await;
+}
+
+struct TrackerFixture {
+    home: tempfile::TempDir,
+    profile: Profile,
+    gh: std::path::PathBuf,
+}
+
+impl TrackerFixture {
+    fn new() -> Self {
+        use proofkin::profile::GithubAuth;
+
+        let home = tempfile::tempdir().unwrap();
+        let mut profile = Profile::open_in(&home.path().join("profiles"), "boss").unwrap();
+        profile.config.github = Some(GithubAuth::Gh {
+            user: "alice".into(),
+            host: "github.com".into(),
+        });
+        profile.save().unwrap();
+        let script = home.path().join("fake-gh.cjs");
+        std::fs::write(&script, include_str!("fixtures/tracker_gh.cjs")).unwrap();
+        let gh = home
+            .path()
+            .join(if cfg!(windows) { "gh.cmd" } else { "gh" });
+        let script = script.display();
+        let launcher = if cfg!(windows) {
+            format!("@node \"{script}\" %*\r\n")
+        } else {
+            format!("#!/bin/sh\nexec node '{script}' \"$@\"\n")
+        };
+        std::fs::write(&gh, launcher).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self { home, profile, gh }
+    }
+
+    fn command(&self, args: &[&str]) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_proofkin"));
+        command
+            .args(args)
+            .env("PROOFKIN_HOME", self.home.path())
+            .env("PROOFKIN_SECRET_STORE", "file")
+            .env("PROOFKIN_GH", &self.gh)
+            .current_dir(self.home.path())
+            .kill_on_drop(true);
+        command
+    }
+
+    async fn tracker(&self, args: &[&str]) -> String {
+        let out = self
+            .command(&[&["tracker"], args, &["--profile", "boss"]].concat())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn seed_open_runs(&self) {
+        use proofkin::tracker::{Slot, TrackerConfig};
+
+        for (slot, repo, number) in [
+            (Slot::Main, "acme/app", 10),
+            (Slot::Tasks, "acme/tasks", 20),
+        ] {
+            TrackerConfig {
+                repo: repo.into(),
+                host: "github.com".into(),
+                project: None,
+                open_runs: vec![number],
+            }
+            .save(&slot.path(&self.profile))
+            .unwrap();
+        }
+    }
+
+    fn all_runs_settled(&self) -> bool {
+        use proofkin::tracker::{Slot, TrackerConfig};
+
+        [Slot::Main, Slot::Tasks].into_iter().all(|slot| {
+            TrackerConfig::load(&slot.path(&self.profile))
+                .unwrap()
+                .unwrap()
+                .open_runs
+                .is_empty()
+        })
+    }
+
+    async fn start_ui(&self, settle_secs: &str) -> (tokio::process::Child, u16, String) {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut child = self
+            .command(&[
+                "--name",
+                "boss",
+                "--network",
+                "local",
+                "--listen",
+                "127.0.0.1:0",
+                "--ui",
+                "--no-open",
+            ])
+            .env("PROOFKIN_TRACKER_SETTLE_SECS", settle_secs)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let (port, token) = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if let Some(rest) = line.strip_prefix("web UI: http://127.0.0.1:") {
+                    let (port, token) = rest.split_once("/#t=").unwrap();
+                    return (port.parse().unwrap(), token.to_owned());
+                }
+            }
+            panic!("the agent exited before the web UI started");
+        })
+        .await
+        .expect("the web UI started");
+        tokio::spawn(
+            async move { while lines.next_line().await.is_ok_and(|line| line.is_some()) {} },
+        );
+        (child, port, token)
+    }
+}
+
+#[tokio::test]
+async fn tasks_tracker_cli_links_reports_and_unlinks_its_own_repository() {
+    let fixture = TrackerFixture::new();
+    fixture.tracker(&["link", "acme/app"]).await;
+    let link = fixture
+        .tracker(&[
+            "link",
+            "acme/tasks",
+            "--project",
+            "alice/9",
+            "--for",
+            "tasks",
+        ])
+        .await;
+    assert!(
+        link.contains("Board 9") && link.contains("private"),
+        "{link}"
+    );
+    let status = fixture.tracker(&["status", "--for", "tasks"]).await;
+    assert!(
+        status.contains("acme/tasks") && !status.contains("acme/app"),
+        "{status}"
+    );
+    let unlinked = fixture.tracker(&["unlink", "--for", "tasks"]).await;
+    assert!(
+        unlinked.contains("unlinked its tasks tracker"),
+        "{unlinked}"
+    );
+    assert!(
+        fixture.profile.tracker_path().is_file() && !fixture.profile.tasks_tracker_path().is_file()
+    );
+}
+
+#[tokio::test]
+async fn tasks_tracker_settings_and_plan_checks_use_the_matching_repository() {
+    use serde_json::json;
+
+    let fixture = TrackerFixture::new();
+    fixture.tracker(&["link", "acme/app"]).await;
+    let (mut child, port, auth) = fixture.start_ui("600").await;
+    let call = |method, path, body| call_ui(port, Some(&auth), method, path, body);
+    let task = "kind: task\nreview approve @me Accept the brief";
+    let check = call("POST", "/api/plans/check", json!({"text": task}))
+        .await
+        .json();
+    assert_eq!(check["ok"], true);
+    assert_eq!(check["problems"][0]["error"], false);
+    assert_eq!(
+        check["problems"][0]["message"],
+        "this task's issues would be public in acme/app: link a private repository for tasks (proofkin tracker link <owner/repo> --for tasks), or add track: off"
+    );
+    let off = call(
+        "POST",
+        "/api/plans/check",
+        json!({"text": format!("track: off\n{task}")}),
+    )
+    .await
+    .json();
+    assert_eq!(off["problems"], json!([]));
+
+    let linked = call(
+        "PUT",
+        "/api/tracker",
+        json!({"tasks": {"repo": "acme/tasks", "project": "alice/9"}}),
+    )
+    .await;
+    assert_eq!(linked.status, 200, "{}", linked.body);
+    assert_eq!(linked.json()["tasks"]["board"]["title"], "Board 9");
+    let state = call("GET", "/api/tracker", Value::Null).await.json();
+    assert_eq!(state["tracker"]["repo"], "acme/app");
+    assert_eq!(state["tasks"]["repo"], "acme/tasks");
+    assert_eq!(state["tasks"]["visibility"], "private");
+    assert_eq!(state["tasks"]["board"]["title"], "Board 9");
+    let check = call("POST", "/api/plans/check", json!({"text": task}))
+        .await
+        .json();
+    assert_eq!(check["ok"], true);
+    assert_eq!(check["problems"], json!([]));
+    for (path, title) in [
+        ("/api/tracker/issues/12", "acme/app issue 12"),
+        ("/api/tracker/issues/12?for=tasks", "acme/tasks issue 12"),
+    ] {
+        let issue = call("GET", path, Value::Null).await.json();
+        assert_eq!(issue["issue"]["title"], title);
+    }
+
+    let removed = call("DELETE", "/api/tracker?for=tasks", Value::Null).await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    let state = call("GET", "/api/tracker", Value::Null).await.json();
+    assert_eq!(state["tracker"]["repo"], "acme/app");
+    assert!(state["tasks"].is_null());
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn tracker_sync_closes_runs_on_both_trackers() {
+    let fixture = TrackerFixture::new();
+    fixture.seed_open_runs();
+    let sync = fixture.tracker(&["sync"]).await;
+    assert!(
+        sync.contains("closed run issue #10") && sync.contains("closed run issue #20"),
+        "{sync}"
+    );
+    assert!(fixture.all_runs_settled());
+}
+
+#[tokio::test]
+async fn periodic_settle_closes_runs_on_both_trackers() {
+    let fixture = TrackerFixture::new();
+    fixture.seed_open_runs();
+    let (mut child, _, _) = fixture.start_ui("1").await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !fixture.all_runs_settled() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the agent settles issues on both trackers");
+    child.kill().await.unwrap();
 }
 
 #[tokio::test]

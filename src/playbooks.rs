@@ -70,6 +70,11 @@ const PLAYBOOKS: &[(&str, &str, &str)] = &[
         include_str!("../playbooks/rehearse.plan"),
     ),
     (
+        "brief",
+        "A one-page brief from Microsoft 365 meetings, email and files, reviewed and signed off by you",
+        include_str!("../playbooks/brief.plan"),
+    ),
+    (
         "agent-factory",
         "An agent kept as code: blueprint and evals proven by agent:* checks, its evaluation's report, a red-team squad, sign-offs, then a release from the folder's commit",
         include_str!("../playbooks/agent-factory.plan"),
@@ -148,6 +153,8 @@ pub fn outline(name: &str) -> Result<Outline> {
             "change" => "the change you describe".to_owned(),
             "change_id" if name == "agent-factory" => "AGENT".to_owned(),
             "project" => "your project".to_owned(),
+            "subject" => "the subject you describe".to_owned(),
+            "audience" => "the audience you name".to_owned(),
             _ => continue,
         };
         vars.insert(var, value);
@@ -261,10 +268,21 @@ pub fn outline(name: &str) -> Result<Outline> {
     squads.dedup();
     topics.sort();
     topics.dedup();
-    let mut needs = vec![
-        "A connected peer that runs tasks (Copilot, Claude or Codex) and shares a folder with you"
-            .to_owned(),
-    ];
+    let mut needs = Vec::new();
+    if plan
+        .steps
+        .iter()
+        .any(|step| !step.approve && !step.is_workiq())
+    {
+        needs.push(
+            "A connected peer that runs tasks (Copilot, Claude or Codex) and shares a folder with you"
+                .to_owned(),
+        );
+    }
+    if plan.steps.iter().any(|step| step.is_workiq()) {
+        needs
+            .push("Work IQ signed in on your own agent (no Microsoft 365 grant needed)".to_owned());
+    }
     if !checks.is_empty() {
         needs.push(format!(
             "Full access to that folder, and these checks defined on it by its owner (share add --check): {}",
@@ -359,8 +377,10 @@ fn values(name: &str, vars: &BTreeMap<String, String>) -> Result<BTreeMap<String
         if value.is_empty() || value.contains(['\n', '\r']) {
             bail!("{var} must be a single, non-empty line");
         }
-        if !matches!(var.as_str(), "change" | "project" | "spec")
-            && value.contains(char::is_whitespace)
+        if !matches!(
+            var.as_str(),
+            "audience" | "change" | "project" | "spec" | "subject"
+        ) && value.contains(char::is_whitespace)
         {
             bail!("{var} must be a single word, got {value:?}");
         }
@@ -488,6 +508,8 @@ mod tests {
             ("change", "Add CSV export"),
             ("change_id", "csv"),
             ("spec", PICKED_SPEC),
+            ("subject", "Q4 priorities and risks"),
+            ("audience", "the leadership team"),
         ]);
         for (name, _) in list() {
             let text = render(name, &all).unwrap_or_else(|e| panic!("{name}: {e:#}"));
@@ -503,7 +525,7 @@ mod tests {
             }
             // Every model step follows a skill that exists.
             let skills = crate::skills::Skills::new(std::env::temp_dir().join("p2p-no-skills"));
-            for step in plan.steps.iter().filter(|s| !s.approve) {
+            for step in plan.steps.iter().filter(|s| !s.approve && !s.is_workiq()) {
                 assert!(
                     !step.skills.is_empty(),
                     "{name}: step {} has no skill",
@@ -530,6 +552,62 @@ mod tests {
                 .steps
                 .iter()
                 .any(|s| s.save.as_deref() == Some("architecture"))
+        );
+    }
+
+    #[test]
+    fn brief_fills_in_the_owner_and_needs_only_work_iq_and_signoffs() {
+        use crate::plan::{Kind, Target};
+        assert_eq!(
+            variables("brief").unwrap(),
+            [
+                ("subject".into(), None),
+                ("audience".into(), None),
+                ("approver".into(), Some("me"))
+            ]
+        );
+        let text = render(
+            "brief",
+            &vars(&[("subject", "Q4 risks"), ("audience", "team leads")]),
+        )
+        .unwrap();
+        let plan = Plan::parse(&text).unwrap();
+        assert_eq!(plan.kind, Some(Kind::Task));
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("kind: task"));
+        assert_eq!(
+            lines.next(),
+            Some("about: Write a one-page brief on Q4 risks for team leads.")
+        );
+        assert_eq!(plan.steps.len(), 5);
+        assert!(plan.steps.iter().all(|step| {
+            if step.approve {
+                step.target == Target::Peer("me".into())
+            } else {
+                step.is_workiq() && step.applies_changes().is_none()
+            }
+        }));
+        assert_eq!(plan.steps[2].changes, Some(1));
+        assert_eq!(plan.steps[4].claims, ["BRIEF-1", "BRIEF-2", "BRIEF-3"]);
+        let outline = outline("brief").unwrap();
+        assert_eq!(outline.claims.len(), 3);
+        assert!(
+            outline
+                .needs
+                .iter()
+                .any(|need| need.contains("Work IQ signed in"))
+        );
+        assert!(
+            !outline
+                .needs
+                .iter()
+                .any(|need| need.contains("connected peer"))
+        );
+        assert!(
+            outline
+                .steps
+                .iter()
+                .any(|step| step.contains("Microsoft 365 (Work IQ)"))
         );
     }
 

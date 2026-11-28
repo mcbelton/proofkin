@@ -1128,7 +1128,10 @@ async fn call_tool(s: &AppState, params: &Value) -> Result<Value, String> {
             Err(e) => Err(e),
         },
         "cancel_task" => cancel_task(s, &args),
-        "check_plan" => text_arg(&args, "plan").map(|plan| plan_check(s, &plan)),
+        "check_plan" => match text_arg(&args, "plan") {
+            Ok(plan) => Ok(plan_check(s, &plan).await),
+            Err(error) => Err(error),
+        },
         "draft_plan" => match serde_json::from_value(args.clone()) {
             Ok(ask) => super::draft_plan(s, ask, BY_AGENT)
                 .await

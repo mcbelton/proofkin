@@ -1067,8 +1067,11 @@
     <form method="dialog" id="tracker-form" novalidate>
       <h2 id="tracker-dialog-h">Track plan runs on GitHub</h2>
       <p class="muted small">Each plan run gets an issue in this repository and each step a sub-issue, assigned to your GitHub account. On the project's board their status follows the run, and pull requests from the steps' branches close them.</p>
-      <label class="field"><span>Repository for the issues</span><input id="tracker-repo" type="text" placeholder="owner/repo" spellcheck="false" autocomplete="off" required></label>
+      <label class="field"><span>Repository for the issues</span><input id="tracker-repo" type="text" placeholder="owner/repo" spellcheck="false" autocomplete="off"></label>
       <label class="field"><span>Project board <span class="muted">(optional: its address)</span></span><input id="tracker-project" type="url" placeholder="https://github.com/users/you/projects/1" spellcheck="false" autocomplete="off"></label>
+      <label class="field"><span>Repository for tasks <span class="muted">(optional)</span></span><input id="tracker-tasks-repo" type="text" placeholder="owner/repo" spellcheck="false" autocomplete="off" aria-describedby="tracker-tasks-hint"></label>
+      <p class="muted small" id="tracker-tasks-hint">Use a private repository for task plans, such as a brief from Microsoft 365. Without one, task plans use the main repository unless tracking is off.</p>
+      <label class="field"><span>Project board for tasks <span class="muted">(optional: its address)</span></span><input id="tracker-tasks-project" type="url" placeholder="https://github.com/users/you/projects/2" spellcheck="false" autocomplete="off"></label>
       <p class="muted small">The board needs the <span class="mono">project</span> scope on your GitHub account's token. Without it, the runs are tracked as issues only, and the Tracker card offers to grant it.</p>
       <p class="form-error" id="tracker-error" role="alert"></p>
       <div class="dialog-actions">

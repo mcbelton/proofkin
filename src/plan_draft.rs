@@ -28,6 +28,7 @@ use crate::team::{
     again_prompt, changes_prompt, clip, one_line, peers_text, skills_text, squads_text,
     written_plan,
 };
+use crate::tracker::{self, Destination, Slot, TrackerConfig};
 
 pub use crate::factory::draft::TRIES;
 
@@ -180,29 +181,35 @@ pub struct Available {
     pub knowledge: KnowledgeBase,
     pub skills: Skills,
     pub recipients: Recipients,
-    /// The tracker's repository (`owner/repo`), if the profile has one.
-    pub tracker: Option<String>,
+    pub tracker: Option<Destination>,
+    pub tasks_tracker: Option<Destination>,
 }
 
 impl Available {
     /// What `profile` may use with `peers` connected, its `squads`, and `recipients` (see
     /// [`Recipients::of`]).
-    pub fn of(
+    pub async fn of(
         profile: &Profile,
         peers: Vec<PeerInfo>,
         squads: SquadStore,
         recipients: Recipients,
     ) -> Self {
+        async fn destination(profile: &Profile, slot: Slot) -> Option<Destination> {
+            let config = TrackerConfig::load(&slot.path(profile)).ok().flatten()?;
+            Some(config.destination(profile).await)
+        }
+        let (tracker, tasks_tracker) = tokio::join!(
+            destination(profile, Slot::Main),
+            destination(profile, Slot::Tasks),
+        );
         Self {
             peers,
             squads,
             knowledge: profile.knowledge(),
             skills: profile.skills(),
             recipients,
-            tracker: crate::tracker::TrackerConfig::load(&profile.tracker_path())
-                .ok()
-                .flatten()
-                .map(|c| c.repo),
+            tracker,
+            tasks_tracker,
         }
     }
 
@@ -213,14 +220,23 @@ impl Available {
 
     fn problems(&self, parsed: Result<Plan>) -> Vec<Problem> {
         match parsed {
-            Ok(plan) => preflight(
-                &plan,
-                &self.peers,
-                &self.squads,
-                &self.knowledge,
-                &self.skills,
-                &self.recipients,
-            ),
+            Ok(plan) => {
+                let mut problems = preflight(
+                    &plan,
+                    &self.peers,
+                    &self.squads,
+                    &self.knowledge,
+                    &self.skills,
+                    &self.recipients,
+                );
+                let destination = if plan.kind == Some(crate::plan::Kind::Task) {
+                    self.tasks_tracker.as_ref().or(self.tracker.as_ref())
+                } else {
+                    self.tracker.as_ref()
+                };
+                problems.extend(destination.and_then(|dest| dest.warning(&plan)));
+                problems
+            }
             Err(e) => vec![Problem {
                 step: None,
                 claim: None,
@@ -290,8 +306,22 @@ impl Available {
             }
         );
         text += &match &self.tracker {
-            Some(repo) => format!("\nThe tracker's repository (track:, issue=#N): {repo}\n"),
+            Some(tracker) => format!(
+                "\nThe tracker's repository (track:, issue=#N): {}\n",
+                tracker.repo
+            ),
             None => "\nThe tracker's repository (track:, issue=#N): none is linked\n".to_owned(),
+        };
+        text += &match &self.tasks_tracker {
+            Some(tracker) => format!(
+                "The tracker for tasks (kind: task): {}, {}\n",
+                tracker.repo,
+                tracker
+                    .visibility
+                    .as_deref()
+                    .unwrap_or("visibility unknown"),
+            ),
+            None => "The tracker for tasks (kind: task): none is linked\n".to_owned(),
         };
         text
     }
@@ -386,19 +416,37 @@ pub fn prompt(request: &Request, available: &Available) -> String {
     text += DESCRIBE;
     text += "\n\n## What you may use\n\n";
     text += &wrap("what this agent may use", &available.text());
-    if available.tracker.is_some() {
+    if available.tracker.is_some() || available.tasks_tracker.is_some() {
         text += "\n\nThe owner chooses whether and how to track the run with **Track on GitHub** \
                  beside **Run plan**. Without a `track:` line, the run is tracked as a new \
                  issue, with a sub-issue per step and each result commented on its issue. \
                  Results that may hold Microsoft 365 content stay off GitHub anyway.\n\n\
                  Write `track: #N` or `track: <title>` only if the owner asks for it, or as \
-                 the issue section above says for the issue the plan is for. Otherwise \
-                 leave `track:` out, except that you may write `track: off` only when:\n\
-                 - the owner asks for an untracked run;\n\
-                 - the work isn't about the tracker's repository (named above); or\n\
-                 - the work draws on private content, such as Microsoft 365 (`workiq=`, \
-                 `@workiq` steps) or personal data.\n\n\
-                 If you write `track: off`, start the plan with a comment that says why. \
+                 the issue section above says for the issue the plan is for.";
+        if available.tasks_tracker.is_some() {
+            text += "\n\nFor work outside the main tracker's repository, use `kind: task` and \
+                     leave `track:` out so the plan is tracked in the tasks repository, unless \
+                     the owner asks for an untracked run. Issue numbers in `track: #N` and \
+                     `issue=#N` refer to the repository the run uses. An issue supplied above \
+                     is from the main tracker: don't route its number to a different repository. \
+                     Never put private source text in plan descriptions, claims or steps that \
+                     will be posted on GitHub.";
+            if available.tracker.is_some() {
+                text += " For work tracked in the main repository, you may use `track: off` \
+                         when it draws on private content, such as Microsoft 365 or personal data.";
+            } else {
+                text += " There is no main tracker: plans of every other kind are not tracked \
+                         and should name no issues.";
+            }
+        } else {
+            text += " Otherwise leave `track:` out, except that you may write `track: off` only when:\n\
+                     - the owner asks for an untracked run;\n\
+                     - the work isn't about the tracker's repository (named above); or\n\
+                     - the work draws on private content, such as Microsoft 365 (`workiq=`, \
+                     `@workiq` steps) or personal data.\n\n\
+                     For work outside the tracker's repository, use `kind: task` and `track: off`.";
+        }
+        text += "\n\nIf you write `track: off`, start the plan with a comment that says why. \
                  For example: `// Not tracked: the tracker is the code repository, and \
                  the brief draws on private email.`";
     } else {
@@ -559,7 +607,7 @@ pub fn provider_for(profile: &Profile, asked: Option<Provider>) -> Result<Provid
 /// The text of issue `n` of the profile's tracker repository, as a step with `issue=#n`
 /// gets it.
 pub async fn issue_text(profile: &Profile, n: u64) -> Result<String> {
-    let Some(tracker) = crate::tracker::open(profile).await? else {
+    let Some(tracker) = tracker::open(profile, Slot::Main).await? else {
         bail!(
             "profile '{}' has no tracker, so it has no issue #{n}; link one with: proofkin tracker link <owner/repo> --profile {0}",
             profile.name
@@ -679,7 +727,7 @@ pub async fn draft_offline(
     };
     let (peers, recipients) = connected(profile, wait, network).await?;
     let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
-    let available = Available::of(profile, peers, squads, recipients);
+    let available = Available::of(profile, peers, squads, recipients).await;
     let executor = SdkExecutor::start(ExecutorConfig {
         providers: vec![provider],
         bridge_script: bridge,
@@ -759,7 +807,11 @@ mod tests {
             knowledge,
             skills: Skills::new(dir.path().join("skills")),
             recipients: Recipients::default(),
-            tracker: Some("acme/app".into()),
+            tracker: Some(Destination {
+                repo: "acme/app".into(),
+                visibility: Some("public".into()),
+            }),
+            tasks_tracker: None,
         };
         Fixture { dir, available }
     }
@@ -834,6 +886,27 @@ mod tests {
         ] {
             assert!(prompt.contains(said), "{said:?} in {prompt}");
         }
+    }
+
+    #[test]
+    fn the_prompt_names_the_tasks_trackers_repository_and_visibility_or_says_none() {
+        let mut fixture = fixture();
+        let ask = goal("Write a one-page leadership brief using recent email");
+        let unlinked = prompt(&ask, &fixture.available);
+        assert!(unlinked.contains("The tracker for tasks (kind: task): none is linked"));
+        assert!(unlinked.contains("use `kind: task` and `track: off`"));
+
+        fixture.available.tasks_tracker = Some(Destination {
+            repo: "acme/tasks".into(),
+            visibility: Some("private".into()),
+        });
+        let linked = prompt(&ask, &fixture.available);
+        assert!(linked.contains("The tracker for tasks (kind: task): acme/tasks, private"));
+        assert!(
+            linked.contains("leave `track:` out so the plan is tracked in the tasks repository")
+        );
+        assert!(linked.contains("### brief:") && linked.contains("For review, not to send"));
+        assert!(!linked.contains("use `kind: task` and `track: off`"));
     }
 
     #[test]

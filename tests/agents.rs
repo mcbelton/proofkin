@@ -4771,6 +4771,172 @@ async fn an_agentless_workiq_step_sends_no_agent_id() {
     }
 }
 
+#[tokio::test]
+async fn a_peer_signoff_cannot_have_a_workiq_step_redone() {
+    use proofkin::agent::Answer;
+    use proofkin::plan::{SentStep, SentWork};
+
+    let (mut boss, mut alice) = (Node::new("boss"), Node::new("alice"));
+    alice.trusts(&boss, None);
+    boss.trusts(&alice, None);
+    boss.trust.peers[0].m365 = Some(proofkin::M365Grant {
+        labels: vec!["General".into()],
+        tools: false,
+    });
+    let (boss, _be) = boss.start().await;
+    let (alice, _ae) = alice.start().await;
+    boss.connect(alice.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let plan = Plan::parse(
+        "draft @workiq What changed in the launch?\n\
+         ok after draft approve @alice changes=1 Is this ready?",
+    )
+    .unwrap();
+    let squads = SquadStore::default();
+    let work = FakeWork::new(Vec::new());
+    let mut ctx = RunContext {
+        work_context: Some(work.clone()),
+        ..RunContext::default()
+    };
+    let wait_for_approval = || async {
+        loop {
+            if let Some(request) = alice.approvals().into_iter().next() {
+                return request;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let note = "Check whether the date changed again";
+    let review = async {
+        let request = wait_for_approval().await;
+        assert!(request.text.contains("The launch moved to May."));
+        let refused = alice
+            .answer(request.id, Answer::Changes, note)
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("can only be approved or rejected")
+        );
+        alice
+            .answer(request.id, Answer::Approve, "Looks good")
+            .await
+            .unwrap();
+        request
+    };
+    let run = run_plan_with(&boss, &squads, &plan, &ctx, |_, _| {});
+    let (mut states, request) =
+        timeout(Duration::from_secs(30), async { tokio::join!(run, review) })
+            .await
+            .unwrap();
+    assert_eq!(done_output(&states, "ok"), "Approved by alice: Looks good");
+
+    // A sign-off sent before the rule changed could still offer changes.
+    ctx.resume
+        .finished
+        .insert("draft".into(), states.remove("draft").unwrap());
+    ctx.resume.sent.insert(
+        "ok".into(),
+        SentStep {
+            peer: "alice".into(),
+            peer_id: Some(alice.id().to_string()),
+            task_id: boss.new_task_id(),
+            work: SentWork::Approval {
+                title: request.title,
+                text: request.text,
+                changes: true,
+            },
+        },
+    );
+    let review = async {
+        let request = wait_for_approval().await;
+        alice
+            .answer(request.id, Answer::Changes, note)
+            .await
+            .unwrap();
+    };
+    let run = run_plan_with(&boss, &squads, &plan, &ctx, |_, _| {});
+    let (states, ()) = timeout(Duration::from_secs(30), async { tokio::join!(run, review) })
+        .await
+        .unwrap();
+    let StepState::Failed {
+        error,
+        verified,
+        peer: _,
+        evidence: _,
+        model: _,
+    } = &states["ok"]
+    else {
+        panic!("{:?}", states["ok"]);
+    };
+    assert!(*verified);
+    assert!(error.starts_with(&format!("Changes asked for by alice: {note}")));
+    assert!(error.ends_with("It allows no more rounds of changes (changes=1)."));
+    assert_eq!(
+        work.questions(),
+        [("What changed in the launch?".to_owned(), None)]
+    );
+}
+
+#[tokio::test]
+async fn brief_reworks_the_draft_and_gets_owner_signoff_without_making_m365_changes() {
+    use proofkin::agent::Answer;
+
+    let (boss, _events) = Node::new("boss").start().await;
+    let work = FakeWork::new(Vec::new());
+    let ctx = RunContext {
+        work_context: Some(work.clone()),
+        ..RunContext::default()
+    };
+    let vars = [
+        ("subject".into(), "Launch timing".into()),
+        ("audience".into(), "Team leads".into()),
+    ]
+    .into_iter()
+    .collect();
+    let text = proofkin::playbooks::render("brief", &vars).unwrap();
+    let plan = Plan::parse(&text).unwrap();
+    let squads = SquadStore::default();
+    let run = run_plan_with(&boss, &squads, &plan, &ctx, |_, _| {});
+    let review = async {
+        for (step, changes, decision, note) in [
+            ("review", true, Answer::Changes, "Lead with the launch date"),
+            ("review", false, Answer::Approve, "Keep the source link"),
+            ("signoff", false, Answer::Approve, "Ready for leadership"),
+        ] {
+            let ask = loop {
+                if let Some(ask) = boss.approvals().into_iter().next() {
+                    break ask;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(ask.title, format!("Plan step {step}"));
+            assert_eq!(ask.changes, changes);
+            assert!(
+                ask.text.contains("The launch moved to May."),
+                "{}",
+                ask.text
+            );
+            boss.answer(ask.id, decision, note).await.unwrap();
+        }
+    };
+    let (states, ()) = timeout(Duration::from_secs(30), async { tokio::join!(run, review) })
+        .await
+        .unwrap();
+    let questions = work.questions();
+    assert_eq!(questions.len(), 4, "{questions:?}");
+    assert!(questions[2].0.contains("Lead with the launch date"));
+    assert!(questions[2].0.contains(&proofkin::boundary::wrap(
+        "earlier Work IQ answer",
+        &done_output(&states, "draft"),
+    )));
+    assert!(questions[3].0.contains("Keep the source link"));
+    assert!(done_output(&states, "signoff").contains("Ready for leadership"));
+    assert!(work.changes().is_empty());
+}
+
 /// A plan proposes Microsoft 365 changes in one step, you sign them off, and a later step
 /// makes exactly those, once and in order: the sign-off shows each change and the list's
 /// SHA-256, a rejected sign-off makes none, and a change that fails stops the ones after it.

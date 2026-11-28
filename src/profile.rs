@@ -828,6 +828,10 @@ impl Profile {
         self.dir.join("tracker.json")
     }
 
+    pub fn tasks_tracker_path(&self) -> PathBuf {
+        self.dir.join("tracker-tasks.json")
+    }
+
     /// The GitHub account for repositories (a digital worker uses its owner's).
     pub fn github(&self) -> Result<crate::github::GithubCredentials> {
         if self.config.owner.is_some() {
@@ -1133,7 +1137,7 @@ pub fn github_login(token: &str, host: &str) -> Option<String> {
 
 /// Token for `user@host` from the GitHub CLI (supports several signed-in accounts).
 pub fn gh_token(user: &str, host: &str) -> Result<String> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(crate::github::gh_program());
     cmd.args(["auth", "token", "--user", user, "--hostname", host]);
     for var in INHERITED_CREDENTIAL_VARS {
         cmd.env_remove(var);

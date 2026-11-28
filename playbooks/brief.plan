@@ -1,0 +1,11 @@
+kind: task
+about: Write a one-page brief on {{subject}} for {{audience}}.
+// Vars: subject, audience, approver (default me)
+claim: BRIEF-1 The brief fits on one page
+claim: BRIEF-2 Every point is supported by a source, nothing is invented, and it contains nothing personal about anyone
+claim: BRIEF-3 The owner approved the brief
+gather @workiq Find what my recent Microsoft 365 meetings, email and files say about {{subject}}. List the supported facts, their sources and gaps. Leave out personal information.
+draft after gather @workiq Draft a one-page brief on {{subject}} for {{audience}}. Put the bottom line first, then the main points, risks and asks. End with a section headed "For review, not to send" that gives a source for every point and says what the sources leave out. Write the brief above that section so it can be sent as is. Don't invent facts or include anything personal about anyone. Return the draft here; don't save or send it.
+review after draft approve @{{approver}} changes=1 Review the draft, its sources and what it leaves out. Approve with a note of any final edits for the revision, reject the draft, or ask for changes if the sign-off offers that option.
+revise after draft,review @workiq Revise the brief using the reviewed draft and the reviewer's notes. Keep it to one page, with the bottom line first, then the main points, risks and asks. Keep the final "For review, not to send" section with a source for every point and what the sources leave out, so the brief above it can be sent as is. Fix unsupported points by verifying or removing them, and keep personal information out. Return the revised brief here; don't save or send it.
+signoff after revise approve @{{approver}} changes=0 claims=BRIEF-1,BRIEF-2,BRIEF-3 Sign off the revised brief for {{audience}} once it fits on one page, every point has a source, and nothing invented or personal is in it.

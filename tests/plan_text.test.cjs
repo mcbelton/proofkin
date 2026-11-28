@@ -358,18 +358,31 @@ cases.push(
         "Type the number of an issue in [acme/shop](https://github.com/acme/shop/issues): the run works on it, and its steps become sub-issues of it."],
       ["its number is looked up", say({ kind: "issue", number: 12 }), "Looking up #12 in [acme/shop](https://github.com/acme/shop/issues)…"],
       ["an open issue is named, with a link", say({ kind: "issue", number: 12 }, issue(true)),
-        "Running it works on [#12 Customers export orders](https://github.com/acme/shop/issues/12): its steps become sub-issues of it"
+        "Running it works on [#12 Customers export orders](https://github.com/acme/shop/issues/12) in [acme/shop](https://github.com/acme/shop/issues): its steps become sub-issues of it"
         + ` (or take up the open ones an earlier run left), assigned to alice.${after}`],
       ["a closed one is reopened: a warning", say({ kind: "issue", number: 12 }, issue(false)).split(", and")[0],
-        "! [#12 Customers export orders](https://github.com/acme/shop/issues/12) is closed: running it reopens it"],
+        "! [#12 Customers export orders](https://github.com/acme/shop/issues/12) is closed in [acme/shop](https://github.com/acme/shop/issues): running it reopens it"],
       ["no such issue: the run wouldn't be tracked", say({ kind: "issue", number: 99 }, { missing: true }),
         "! [acme/shop](https://github.com/acme/shop/issues) has no issue #99: the plan would run without tracking. Check the number, or choose New issue."],
       ["a lookup that failed says why", say({ kind: "issue", number: 12 }, { error: "GitHub is down" }), "! Couldn't look up #12: GitHub is down"],
       ["not tracked: nothing goes to GitHub", say({ kind: "off" }), "Nothing goes to GitHub: the run is kept under Evidence runs only."],
-      ["a private repository without a board says neither", say({ kind: "new", title: "" }, null,
+      ["a private repository without a board names its visibility", say({ kind: "new", title: "" }, null,
         { repo: "acme/shop", host: "github.com", login: "alice", visibility: "private" }),
         "Running it opens an issue in [acme/shop](https://github.com/acme/shop/issues), with a sub-issue per step, assigned to alice."
-        + " Each step's result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub)."],
+        + " Each step's result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub). The repository is private."],
+      ...(() => {
+        const tasks = { repo: "acme/tasks", host: "github.com", visibility: "private" };
+        const state = { tracker: repo, tasks };
+        const task = "kind: task\ndo @workiq Write a brief";
+        return [
+          ["a task note names the private tasks repository",
+            say(planText.trackOf(task), null, planText.trackerForPlan(task, state)),
+            "Running it opens an issue in [acme/tasks](https://github.com/acme/tasks/issues), with a sub-issue per step."
+            + " Each step's result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub). The repository is private."],
+          ["a bug plan keeps the public repository", planText.trackerForPlan("kind: bug", state).repo, "acme/shop"],
+          ["a task with no tasks tracker falls back to the main one", planText.trackerForPlan(task, { tracker: repo }).repo, "acme/shop"],
+        ];
+      })(),
     ];
   })(),
   // What kind of work the plan is and what it is about (src/plan.rs): its kind: line and
@@ -428,4 +441,38 @@ if (failed.length) {
   console.error(`${failed.length} of ${cases.length} plan editor cases failed`);
   process.exit(1);
 }
-console.log(`ok: ${cases.length} plan editor cases`);
+
+// Run the Tracker card's real renderer against an API response on a minimal page.
+class Node {
+  constructor(text = "") { this.text = text; this.children = []; }
+  append(node) { this.children.push(node); }
+  replaceChildren(...children) { this.children = children; }
+  get textContent() { return this.text + this.children.map((node) => node.textContent).join(""); }
+  set textContent(text) { this.text = text; this.children = []; }
+  setAttribute() {}
+  addEventListener() {}
+}
+const assert = require("node:assert/strict");
+const card = new Node();
+const app = fs.readFileSync(path.join(path.dirname(__dirname), "ui", "app.js"), "utf8");
+const codeBetween = (start, end) => app.slice(app.indexOf(start), app.indexOf(end));
+const render = vm.runInNewContext(
+  codeBetween("const $ =", "function icon(") + codeBetween("let tracker = null;", "function waitingRuns(") + "loadTracker()",
+  {
+    Node,
+    document: {
+      querySelector: (id) => id === "#tracker" ? card : new Node(),
+      createElement: () => new Node(),
+      createTextNode: (text) => new Node(text),
+    },
+    api: async () => ({ linked: true, signed_in: true, tracker: { repo: "acme/app" }, tasks: {
+      repo: "acme/tasks", visibility: "private", board: { title: "Tasks board", url: "https://github.com/orgs/acme/projects/2", statuses: [] },
+    } }),
+    planTrack: { sync() {} }, editorTrack: { sync() {} }, syncPlanKind() {}, syncEditorKind() {}, renderGithubScopes() {},
+    externalLink: (url, text) => new Node(text), openTrackerItems() {},
+  },
+);
+render.then(() => {
+  assert.match(card.textContent, /Issues in acme[/]app.*Tasks: issues in acme[/]tasks [(]private[)].*On the board Tasks board.*Stop tracking tasks/);
+  console.log(`ok: ${cases.length} plan editor cases and the Tracker card`);
+}).catch((error) => { console.error(error); process.exitCode = 1; });
