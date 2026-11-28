@@ -32,6 +32,7 @@ use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext, Usage};
 use crate::plan::{Plan, SquadStore, StepState};
 use crate::profile::{Profile, validate_name};
 use crate::runs::RunRecord;
+use crate::tracker::{self, Slot, Tracker, TrackerConfig, WaitingRun};
 use crate::trust::{M365Grant, Ticket, TrustedPeer};
 
 mod connect;
@@ -2413,6 +2414,7 @@ async fn run_plan_here(
     let squads = shared.squads.lock().unwrap().clone();
     // Tracked runs get their issues before their steps start; one that goes on after a
     // restart takes up the issues it had.
+    let mut tracking_problem = None;
     let tracking = if resumed {
         match &progress.tracked {
             Some(tracked) => match crate::tracker::resume(
@@ -2425,11 +2427,11 @@ async fn run_plan_here(
             .await
             {
                 Ok(tracking) => tracking,
-                Err(e) => {
-                    shared.system(
-                        "warn",
-                        format!("The run's issues on GitHub aren't followed any more: {e:#}"),
-                    );
+                Err(err) => {
+                    let problem =
+                        format!("The run's issues on GitHub aren't followed any more: {err:#}");
+                    shared.system("warn", problem.clone());
+                    tracking_problem = Some(problem);
                     None
                 }
             },
@@ -2534,6 +2536,11 @@ async fn run_plan_here(
         let tracked = t.finish(&run).await;
         show_tracked(&shared, &step_ids, &tracked, known);
         run.tracked = Some(tracked);
+    } else if let Some(problem) = tracking_problem {
+        run.tracked = Some(crate::tracker::TrackedRun {
+            problems: vec![problem],
+            ..Default::default()
+        });
     }
     let saved_run = match run.save(&shared.info.profile.runs_dir()) {
         Ok(_) => {
@@ -3126,12 +3133,12 @@ async fn delete_monitor(
 /// checks, squads, knowledge and skills, without running it.
 async fn check_plan(State(s): State<AppState>, Json(body): Json<PlanBody>) -> Json<Value> {
     s.agent.settle_peers().await;
-    Json(plan_check(&s, &body.text))
+    Json(plan_check(&s, &body.text).await)
 }
 
 /// What's wrong with plan `text` before it runs: its syntax, and the peers, folders,
 /// checks, squads, skills and knowledge it uses.
-fn plan_check(s: &Shared, text: &str) -> Value {
+async fn plan_check(s: &Shared, text: &str) -> Value {
     let plan = match Plan::parse(text) {
         Ok(plan) => plan,
         Err(e) => {
@@ -3144,7 +3151,7 @@ fn plan_check(s: &Shared, text: &str) -> Value {
     let squads = s.squads.lock().unwrap().clone();
     let profile = s.profile_now();
     let recipients = crate::plan::Recipients::of(&s.agent, &profile);
-    let problems = crate::plan::preflight(
+    let mut problems = crate::plan::preflight(
         &plan,
         &s.agent.peers(),
         &squads,
@@ -3152,6 +3159,7 @@ fn plan_check(s: &Shared, text: &str) -> Value {
         &profile.skills(),
         &recipients,
     );
+    problems.extend(tracker::check(&profile, &plan).await);
     json!({
         "ok": !problems.iter().any(|p| p.error),
         "problems": problems,
@@ -3236,7 +3244,7 @@ async fn draft_plan(
     s.agent.settle_peers().await;
     let squads = s.squads.lock().unwrap().clone();
     let recipients = crate::plan::Recipients::of(&s.agent, &profile);
-    let available = plan_draft::Available::of(&profile, s.agent.peers(), squads, recipients);
+    let available = plan_draft::Available::of(&profile, s.agent.peers(), squads, recipients).await;
     let (executor, own) = factory::executor_for(s, provider).await?;
     let progress = |line: String| s.send(json!({ "type": "plan-draft", "progress": line }));
     let drafted = plan_draft::write(
@@ -3454,38 +3462,99 @@ struct GithubLoginBody {
     host: String,
 }
 
-/// The profile's tracker (see [`crate::tracker`]) and whether its board works.
+#[derive(Serialize)]
+struct TrackerDetails {
+    #[serde(flatten)]
+    info: Value,
+    waiting: Vec<WaitingRun>,
+    waiting_error: Option<String>,
+    error: Option<String>,
+}
+
+async fn tracker_details(
+    profile: &Profile,
+    slot: Slot,
+) -> Result<Option<TrackerDetails>, ApiError> {
+    let Some(config) = TrackerConfig::load(&slot.path(profile)).map_err(internal)? else {
+        return Ok(None);
+    };
+    Ok(Some(match config.clone().connect(profile).await {
+        Ok(tracker) => {
+            let (waiting, waiting_error) = match tracker.waiting().await {
+                Ok(waiting) => (waiting, None),
+                Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+            };
+            TrackerDetails {
+                info: json!(tracker.info()),
+                waiting,
+                waiting_error,
+                error: None,
+            }
+        }
+        Err(err) => TrackerDetails {
+            info: json!({ "repo": config.repo, "host": config.host, "project": config.project, "open_runs": config.open_runs }),
+            waiting: Vec::new(),
+            waiting_error: None,
+            error: Some(format!("{err:#}")),
+        },
+    }))
+}
+
 async fn tracker_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let profile = s.info.profile.reload().map_err(internal)?;
     let signed_in = profile.github().is_ok();
-    let Some(config) =
-        crate::tracker::TrackerConfig::load(&profile.tracker_path()).map_err(internal)?
-    else {
-        return Ok(Json(json!({ "linked": false, "signed_in": signed_in })));
-    };
-    Ok(Json(match crate::tracker::open(&profile).await {
-        Ok(Some(tracker)) => {
-            // Reading what the open runs wait for must not hide the tracker.
-            let (waiting, waiting_error) = match tracker.waiting().await {
-                Ok(w) => (w, None),
-                Err(e) => (Vec::new(), Some(format!("{e:#}"))),
-            };
-            json!({ "linked": true, "signed_in": true, "tracker": tracker.info(), "waiting": waiting, "waiting_error": waiting_error })
-        }
-        Ok(None) => json!({ "linked": false, "signed_in": signed_in }),
-        // Linked, but GitHub can't be reached with it now: say why, keep the settings.
-        Err(e) => json!({
-            "linked": true, "signed_in": signed_in, "error": format!("{e:#}"),
-            "tracker": { "repo": config.repo, "host": config.host, "project": config.project, "open_runs": config.open_runs },
-        }),
-    }))
+    let (main, tasks) = tokio::try_join!(
+        tracker_details(&profile, Slot::Main),
+        tracker_details(&profile, Slot::Tasks),
+    )?;
+    let mut state = json!({ "linked": main.is_some(), "signed_in": signed_in, "tasks": tasks });
+    if let Some(main) = main {
+        state["tracker"] = main.info;
+        state["waiting"] = json!(main.waiting);
+        state["waiting_error"] = json!(main.waiting_error);
+        state["error"] = json!(main.error);
+    }
+    Ok(Json(state))
+}
+
+#[derive(Deserialize)]
+struct TrackerLink {
+    repo: Option<String>,
+    project: Option<String>,
+}
+
+impl TrackerLink {
+    async fn prepare(self, profile: &Profile, slot: Slot) -> Result<Option<Tracker>, ApiError> {
+        let Some(repo) = self.repo.filter(|repo| !repo.trim().is_empty()) else {
+            if self
+                .project
+                .is_some_and(|project| !project.trim().is_empty())
+            {
+                return Err(bad_request(format!(
+                    "give a repository for the {}'s board",
+                    slot.label()
+                )));
+            }
+            return Ok(None);
+        };
+        tracker::prepare_link(profile, &repo, self.project.as_deref())
+            .await
+            .map(Some)
+            .map_err(|err| bad_request(format!("{}: {err:#}", slot.label())))
+    }
 }
 
 #[derive(Deserialize)]
 struct TrackerBody {
-    repo: String,
-    #[serde(default)]
-    project: Option<String>,
+    #[serde(flatten)]
+    main: TrackerLink,
+    tasks: Option<TrackerLink>,
+}
+
+#[derive(Deserialize)]
+struct TrackerQuery {
+    #[serde(default, rename = "for")]
+    slot: Slot,
 }
 
 /// Issue `number` of the tracker's repository, for the plan's "Existing issue" choice
@@ -3493,9 +3562,10 @@ struct TrackerBody {
 async fn tracker_issue(
     State(s): State<AppState>,
     Path(number): Path<u64>,
+    Query(query): Query<TrackerQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let profile = s.info.profile.reload().map_err(internal)?;
-    let tracker = crate::tracker::open(&profile)
+    let tracker = tracker::open(&profile, query.slot)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?
         .ok_or_else(|| bad_request("no tracker is linked: link one on the Tracker card"))?;
@@ -3511,35 +3581,58 @@ async fn link_tracker(
     Json(body): Json<TrackerBody>,
 ) -> Result<Json<Value>, ApiError> {
     let profile = s.info.profile.reload().map_err(internal)?;
-    let tracker = crate::tracker::link(&profile, &body.repo, body.project.as_deref())
-        .await
-        .map_err(|e| bad_request(format!("{e:#}")))?;
-    let info = tracker.info();
-    s.system(
-        "info",
-        format!(
-            "Plan runs are tracked as issues of {}{}",
-            info.repo,
-            match (&info.board, &info.board_problem) {
-                (Some(b), _) => format!(" on the board {}", b.title),
-                (None, Some(_)) => " (the board isn't updated yet: see Settings)".to_owned(),
-                (None, None) => String::new(),
-            }
-        ),
-    );
-    Ok(Json(
-        json!({ "linked": true, "signed_in": true, "tracker": info }),
-    ))
+    let mut main = body.main.prepare(&profile, Slot::Main).await?;
+    let mut tasks = match body.tasks {
+        Some(tasks) => tasks.prepare(&profile, Slot::Tasks).await?,
+        None => None,
+    };
+    if main.is_none() && tasks.is_none() {
+        return Err(bad_request(
+            "give a repository for the tracker or for tasks",
+        ));
+    }
+    for (slot, tracker) in [(Slot::Main, &mut main), (Slot::Tasks, &mut tasks)] {
+        if let Some(tracker) = tracker {
+            tracker.save_link(&profile, slot).map_err(internal)?;
+            let work = if slot == Slot::Tasks {
+                "Task plans"
+            } else {
+                "Plan runs"
+            };
+            s.system(
+                "info",
+                format!(
+                    "{work} are tracked as issues of {}{}",
+                    tracker.config.repo,
+                    match (&tracker.board, &tracker.board_problem) {
+                        (Some(board), _) => format!(" on the board {}", board.title),
+                        (None, Some(_)) =>
+                            " (the board isn't updated yet: see Settings)".to_owned(),
+                        (None, None) => String::new(),
+                    }
+                ),
+            );
+        }
+    }
+    Ok(Json(json!({
+        "linked": Slot::Main.path(&profile).is_file(),
+        "signed_in": true,
+        "tracker": main.map(|tracker| tracker.info()),
+        "tasks": tasks.map(|tracker| tracker.info()),
+    })))
 }
 
-async fn unlink_tracker(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let path = s.info.profile.tracker_path();
-    if path.is_file() {
-        std::fs::remove_file(&path).map_err(internal)?;
-        s.system(
-            "info",
-            "Plan runs are no longer tracked on GitHub (their issues stay there)",
-        );
+async fn unlink_tracker(
+    State(s): State<AppState>,
+    Query(query): Query<TrackerQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if tracker::unlink(&s.info.profile, query.slot).map_err(internal)? {
+        let message = if query.slot == Slot::Tasks {
+            "The tasks tracker was unlinked (its issues stay on GitHub)"
+        } else {
+            "The main tracker was unlinked (its issues stay on GitHub)"
+        };
+        s.system("info", message);
     }
     Ok(Json(json!({ "linked": false })))
 }
@@ -3547,7 +3640,7 @@ async fn unlink_tracker(State(s): State<AppState>) -> Result<Json<Value>, ApiErr
 /// The tracker board's items (or the repository's open issues, without a board).
 async fn tracker_items(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let profile = s.info.profile.reload().map_err(internal)?;
-    let tracker = crate::tracker::open(&profile)
+    let tracker = tracker::open(&profile, Slot::Main)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?
         .ok_or_else(|| bad_request("this agent has no tracker"))?;
@@ -3568,7 +3661,7 @@ async fn add_to_board(
     Json(body): Json<crate::tracker::AddItems>,
 ) -> Result<Json<Value>, ApiError> {
     let profile = s.info.profile.reload().map_err(internal)?;
-    let tracker = crate::tracker::open(&profile)
+    let tracker = tracker::open(&profile, Slot::Main)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?
         .ok_or_else(|| bad_request("this agent has no tracker"))?;
@@ -3595,16 +3688,26 @@ async fn add_to_board(
 /// Closes the run issues whose sub-issues are all closed, and says what the rest wait for.
 async fn sync_tracker(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let profile = s.info.profile.reload().map_err(internal)?;
-    let synced = crate::tracker::sync(&profile)
+    let synced = tracker::sync(&profile)
         .await
-        .map_err(|e| bad_request(format!("{e:#}")))?;
-    for n in &synced.closed {
-        s.system(
-            "info",
-            format!("Run issue #{n} is closed: all its sub-issues are"),
-        );
+        .map_err(|err| bad_request(format!("{err:#}")))?;
+    report_closed(&s, Slot::Main, &synced.main.closed);
+    if let Some(tasks) = &synced.tasks {
+        report_closed(&s, Slot::Tasks, &tasks.closed);
     }
     Ok(Json(json!(synced)))
+}
+
+fn report_closed(shared: &Shared, slot: Slot, numbers: &[u64]) {
+    for num in numbers {
+        shared.system(
+            "info",
+            format!(
+                "Run issue #{num} on the {} is closed: all its sub-issues are",
+                slot.label()
+            ),
+        );
+    }
 }
 
 /// Every 10 minutes (`PROOFKIN_TRACKER_SETTLE_SECS`), closes the tracked run issues
@@ -3620,24 +3723,12 @@ fn settle_tracked_runs(shared: &AppState) {
         loop {
             tick.tick().await;
             let Some(s) = weak.upgrade() else { break };
-            let profile = s.info.profile.clone();
-            let waiting = crate::tracker::TrackerConfig::load(&profile.tracker_path())
-                .ok()
-                .flatten()
-                .is_some_and(|c| !c.open_runs.is_empty());
-            if !waiting {
-                continue;
-            }
-            match crate::tracker::settle(&profile).await {
-                Ok(closed) => {
-                    for n in closed {
-                        s.system(
-                            "info",
-                            format!("Run issue #{n} is closed: all its sub-issues are"),
-                        );
-                    }
+            let profile = s.profile_now();
+            for (slot, closed) in tracker::settle(&profile).await {
+                match closed {
+                    Ok(closed) => report_closed(&s, slot, &closed),
+                    Err(err) => eprintln!("settling the {}: {err:#}", slot.label()),
                 }
-                Err(e) => eprintln!("settling tracked runs: {e:#}"),
             }
         }
     });

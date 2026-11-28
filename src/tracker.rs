@@ -1,7 +1,7 @@
 //! Tracked work: a profile's plan runs as GitHub issues, on a GitHub Project's board.
 //!
 //! A profile links a tracker (`proofkin tracker link`): the repository its issues go
-//! to and, optionally, a GitHub Project. Then every plan run it starts is tracked
+//! to and, optionally, a GitHub Project. A run with a tracker is tracked
 //! (unless its plan says `track: off`):
 //!
 //! - the run gets an issue (`track: #N` works on an existing one, `track: <title>`
@@ -53,9 +53,10 @@ use tokio::process::Command;
 
 use crate::evidence::Evidence;
 use crate::github::GithubCredentials;
-use crate::plan::{Kind, Plan, Step, StepState, Target, Track};
+use crate::plan::{Kind, Plan, Problem, Step, StepState, Target, Track};
 use crate::profile::{INHERITED_CREDENTIAL_VARS, Profile};
 use crate::runs::RunRecord;
+use crate::store::{FileLock, write_atomic};
 
 /// The board's text field that says which agent does an item.
 pub const AGENT_FIELD: &str = "Agent";
@@ -76,6 +77,59 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const FINISH_TIMEOUT: Duration = Duration::from_secs(180);
 /// The most problems a run keeps.
 const MAX_PROBLEMS: usize = 50;
+
+/// The default tracker or its override for `kind: task` plans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Slot {
+    #[default]
+    Main,
+    Tasks,
+}
+
+impl Slot {
+    pub fn path(self, profile: &Profile) -> PathBuf {
+        match self {
+            Self::Main => profile.tracker_path(),
+            Self::Tasks => profile.tasks_tracker_path(),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Main => "tracker",
+            Self::Tasks => "tasks tracker",
+        }
+    }
+
+    fn for_plan(profile: &Profile, plan: &Plan) -> Result<Option<(PathBuf, TrackerConfig)>> {
+        if plan.track == Some(Track::Off) {
+            return Ok(None);
+        }
+        let slots: &[_] = if plan.kind == Some(Kind::Task) {
+            &[Self::Tasks, Self::Main]
+        } else {
+            &[Self::Main]
+        };
+        Self::find(profile, slots, |_| true)
+    }
+
+    fn find(
+        profile: &Profile,
+        slots: &[Self],
+        matches: impl Fn(&TrackerConfig) -> bool,
+    ) -> Result<Option<(PathBuf, TrackerConfig)>> {
+        for slot in slots {
+            let path = slot.path(profile);
+            if let Some(config) = TrackerConfig::load(&path)?
+                && matches(&config)
+            {
+                return Ok(Some((path, config)));
+            }
+        }
+        Ok(None)
+    }
+}
 
 /// A profile's tracker: where its plan runs are tracked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,11 +167,28 @@ impl TrackerConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        write_atomic(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    fn same_repo(&self, other: &Self) -> bool {
+        self.host == other.host && self.repo.eq_ignore_ascii_case(&other.repo)
+    }
+
+    fn api(&self, profile: &Profile) -> Result<Arc<GhApi>> {
+        let creds = profile.github()?;
+        if creds.host != self.host {
+            bail!(
+                "the tracker is on {}, but profile '{}' is signed in to {}",
+                self.host,
+                profile.name,
+                creds.host
+            );
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("writing {}", path.display()))
+        Ok(Arc::new(GhApi::new(creds)))
+    }
+
+    pub async fn connect(self, profile: &Profile) -> Result<Tracker> {
+        Tracker::connect(self.api(profile)?, self).await
     }
 
     /// `owner/repo#n`.
@@ -591,27 +662,38 @@ struct Marks {
     step_type: Option<String>,
 }
 
+async fn repository(api: &dyn Api, config: &TrackerConfig) -> Result<Value> {
+    let (owner, name) = config
+        .repo
+        .split_once('/')
+        .with_context(|| format!("{:?} is not owner/repo", config.repo))?;
+    let data = api
+        .graphql(REPO_QUERY, json!({ "owner": owner, "name": name }))
+        .await?
+        .ok()
+        .with_context(|| format!("reading {} on GitHub", config.repo))?;
+    if data["repository"].is_null() {
+        bail!(
+            "{} isn't on {}, or the account can't see it",
+            config.repo,
+            config.host
+        );
+    }
+    Ok(data)
+}
+
+fn visibility(repo: &Value) -> Option<String> {
+    let value = repo.get("visibility")?.as_str()?.to_ascii_lowercase();
+    ["public", "private", "internal"]
+        .contains(&value.as_str())
+        .then_some(value)
+}
+
 impl Tracker {
     /// Connects `config` with `api`: checks the repository and opens the board.
     pub async fn connect(api: Arc<dyn Api>, config: TrackerConfig) -> Result<Tracker> {
-        let (owner, name) = config
-            .repo
-            .split_once('/')
-            .with_context(|| format!("{:?} is not owner/repo", config.repo))?;
-        let data = api
-            .graphql(REPO_QUERY, json!({ "owner": owner, "name": name }))
-            .await?
-            .ok()
-            .with_context(|| format!("reading {} on GitHub", config.repo))?;
-        let repo = data
-            .get("repository")
-            .filter(|r| !r.is_null())
-            .with_context(|| {
-                format!(
-                    "{} isn't on {}, or the account can't see it",
-                    config.repo, config.host
-                )
-            })?;
+        let data = repository(api.as_ref(), &config).await?;
+        let repo = &data["repository"];
         let text = |v: &Value, key: &str| {
             v.get(key)
                 .and_then(Value::as_str)
@@ -624,8 +706,7 @@ impl Tracker {
             viewer: text(&viewer, "id"),
             repo_id: text(repo, "id"),
             repo_url: text(repo, "url"),
-            visibility: Some(text(repo, "visibility").to_ascii_lowercase())
-                .filter(|v| ["public", "private", "internal"].contains(&v.as_str())),
+            visibility: visibility(repo),
             api,
             config,
             board: None,
@@ -1828,11 +1909,9 @@ pub struct Item {
     pub pull_requests: Vec<u64>,
 }
 
-/// Links `profile`'s tracker: issues in `repo` (`owner/repo` or a URL) and, with
-/// `project`, items on that GitHub Project. Checks both with the profile's GitHub
-/// account and saves it; a board that doesn't work is in the returned tracker's
-/// `board_problem`.
-pub async fn link(profile: &Profile, repo: &str, project: Option<&str>) -> Result<Tracker> {
+/// Checks a repository and optional board before linking it. A board that doesn't
+/// work is in the returned tracker's `board_problem`.
+pub async fn prepare_link(profile: &Profile, repo: &str, project: Option<&str>) -> Result<Tracker> {
     let creds = profile.github()?;
     let (host, slug) = crate::github::parse_repo(repo, &creds.host)?;
     if host != creds.host {
@@ -1847,51 +1926,138 @@ pub async fn link(profile: &Profile, repo: &str, project: Option<&str>) -> Resul
         .filter(|p| !p.is_empty())
         .map(|p| parse_project(p, &host))
         .transpose()?;
-    let mut config = TrackerConfig {
+    let config = TrackerConfig {
         repo: slug,
         host,
         project,
         open_runs: Vec::new(),
     };
-    if let Some(old) = TrackerConfig::load(&profile.tracker_path())?
-        && old.repo == config.repo
-    {
-        config.open_runs = old.open_runs;
+    Tracker::connect(Arc::new(GhApi::new(creds)), config).await
+}
+
+impl Tracker {
+    pub fn save_link(&mut self, profile: &Profile, slot: Slot) -> Result<()> {
+        let path = slot.path(profile);
+        let _lock = FileLock::acquire(&path)?;
+        if let Some(old) = TrackerConfig::load(&path)?
+            && old.same_repo(&self.config)
+        {
+            self.config.open_runs = old.open_runs;
+        }
+        self.config.save(&path)
     }
-    let tracker = Tracker::connect(Arc::new(GhApi::new(creds)), config).await?;
-    tracker.config.save(&profile.tracker_path())?;
+}
+
+pub async fn link(
+    profile: &Profile,
+    slot: Slot,
+    repo: &str,
+    project: Option<&str>,
+) -> Result<Tracker> {
+    let mut tracker = prepare_link(profile, repo, project).await?;
+    tracker.save_link(profile, slot)?;
     Ok(tracker)
 }
 
-/// `profile`'s tracker, connected with its GitHub account; None if it has none.
-pub async fn open(profile: &Profile) -> Result<Option<Tracker>> {
-    let Some(config) = TrackerConfig::load(&profile.tracker_path())? else {
-        return Ok(None);
-    };
-    let creds = profile.github()?;
-    if creds.host != config.host {
-        bail!(
-            "the tracker is on {}, but profile '{}' is signed in to {}",
-            config.host,
-            profile.name,
-            creds.host
-        );
+pub fn unlink(profile: &Profile, slot: Slot) -> Result<bool> {
+    let path = slot.path(profile);
+    let _lock = FileLock::acquire(&path)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("unlinking {}", path.display())),
     }
-    Ok(Some(
-        Tracker::connect(Arc::new(GhApi::new(creds)), config).await?,
-    ))
 }
 
-/// Closes `profile`'s run issues whose sub-issues are all closed now and saves what
-/// is left open; returns those it closed.
-pub async fn settle(profile: &Profile) -> Result<Vec<u64>> {
-    let Some(mut tracker) = open(profile).await? else {
+pub async fn open(profile: &Profile, slot: Slot) -> Result<Option<Tracker>> {
+    match TrackerConfig::load(&slot.path(profile))? {
+        Some(config) => config.connect(profile).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The issue destination and who can see it, without connecting to its board.
+#[derive(Debug, Clone)]
+pub struct Destination {
+    pub repo: String,
+    pub visibility: Option<String>,
+}
+
+impl TrackerConfig {
+    pub async fn destination(self, profile: &Profile) -> Destination {
+        let visibility = match self.api(profile) {
+            Ok(api) => repository(api.as_ref(), &self)
+                .await
+                .ok()
+                .and_then(|data| visibility(&data["repository"])),
+            Err(_) => None,
+        };
+        Destination {
+            repo: self.repo,
+            visibility,
+        }
+    }
+}
+
+impl Destination {
+    pub fn warning(&self, plan: &Plan) -> Option<Problem> {
+        if plan.kind != Some(Kind::Task) || plan.track == Some(Track::Off) {
+            return None;
+        }
+        let message = match self.visibility.as_deref() {
+            Some("public") => format!(
+                "this task's issues would be public in {}: link a private repository for tasks (proofkin tracker link <owner/repo> --for tasks), or add track: off",
+                self.repo
+            ),
+            None => format!(
+                "couldn't check who can read this task's issues in {}: confirm the repository is private, or add track: off",
+                self.repo
+            ),
+            _ => return None,
+        };
+        Some(Problem {
+            step: None,
+            claim: None,
+            code: None,
+            error: false,
+            message,
+            fixes: Vec::new(),
+        })
+    }
+}
+
+pub async fn check(profile: &Profile, plan: &Plan) -> Option<Problem> {
+    if plan.kind != Some(Kind::Task) {
+        return None;
+    }
+    let (_, config) = Slot::for_plan(profile, plan).ok().flatten()?;
+    config.destination(profile).await.warning(plan)
+}
+
+/// Closes run issues whose sub-issues are all closed, on both trackers.
+pub async fn settle(profile: &Profile) -> [(Slot, Result<Vec<u64>>); 2] {
+    let (main, tasks) = tokio::join!(
+        settle_slot(profile, Slot::Main),
+        settle_slot(profile, Slot::Tasks),
+    );
+    [(Slot::Main, main), (Slot::Tasks, tasks)]
+}
+
+async fn settle_slot(profile: &Profile, slot: Slot) -> Result<Vec<u64>> {
+    let path = slot.path(profile);
+    let Some(config) = TrackerConfig::load(&path)?.filter(|config| !config.open_runs.is_empty())
+    else {
         return Ok(Vec::new());
     };
+    let mut tracker = config.connect(profile).await?;
+    settle_tracker(&path, &mut tracker).await
+}
+
+async fn settle_tracker(path: &Path, tracker: &mut Tracker) -> Result<Vec<u64>> {
     let before = tracker.config.open_runs.clone();
     let closed = tracker.settle().await?;
     if tracker.config.open_runs != before {
-        save_open_runs(&profile.tracker_path(), &before, &tracker.config.open_runs)?;
+        save_open_runs(path, &tracker.config, &before)?;
     }
     Ok(closed)
 }
@@ -1933,49 +2099,71 @@ fn waiting_head(v: &Value) -> Option<(u64, String, String, bool)> {
     ))
 }
 
-/// What [`sync`] found: the run issues it closed and what the open ones wait for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// The run issues a sync closed and what the open ones wait for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Synced {
     pub closed: Vec<u64>,
     pub waiting: Vec<WaitingRun>,
 }
 
-/// Like [`settle`], then reads what the run issues still open wait for.
-pub async fn sync(profile: &Profile) -> Result<Synced> {
-    let Some(mut tracker) = open(profile).await? else {
-        return Ok(Synced {
-            closed: Vec::new(),
-            waiting: Vec::new(),
-        });
-    };
-    let before = tracker.config.open_runs.clone();
-    let closed = tracker.settle().await?;
-    if tracker.config.open_runs != before {
-        save_open_runs(&profile.tracker_path(), &before, &tracker.config.open_runs)?;
-    }
-    let waiting = tracker.waiting().await?;
-    Ok(Synced { closed, waiting })
+#[derive(Debug, Serialize)]
+pub struct SyncResult {
+    #[serde(flatten)]
+    pub main: Synced,
+    pub tasks: Option<Synced>,
 }
 
-/// Saves the tracker's open run issues: `after` (what a settle left of `before`, the list
-/// it read), and any added to the file since it was read.
-fn save_open_runs(path: &Path, before: &[u64], after: &[u64]) -> Result<()> {
-    let Some(mut config) = TrackerConfig::load(path)? else {
-        return Ok(());
+/// Like [`settle`], then reads what the run issues still open wait for on each tracker.
+pub async fn sync(profile: &Profile) -> Result<SyncResult> {
+    let (main, tasks) = tokio::join!(
+        sync_slot(profile, Slot::Main),
+        sync_slot(profile, Slot::Tasks)
+    );
+    Ok(SyncResult {
+        main: main.context("syncing the tracker")?.unwrap_or_default(),
+        tasks: tasks.context("syncing the tasks tracker")?,
+    })
+}
+
+async fn sync_slot(profile: &Profile, slot: Slot) -> Result<Option<Synced>> {
+    let Some(mut tracker) = open(profile, slot).await? else {
+        return Ok(None);
     };
-    let mut runs: Vec<u64> = after.to_vec();
-    for n in config.open_runs {
-        if !runs.contains(&n) && !before.contains(&n) {
-            runs.push(n);
-        }
+    let closed = settle_tracker(&slot.path(profile), &mut tracker).await?;
+    let waiting = tracker.waiting().await?;
+    Ok(Some(Synced { closed, waiting }))
+}
+
+/// Only remove issues this settle disposed of, keeping changes made in the meantime.
+fn save_open_runs(path: &Path, config: &TrackerConfig, before: &[u64]) -> Result<()> {
+    update_config(path, config, |now| {
+        let count = now.open_runs.len();
+        now.open_runs
+            .retain(|num| !before.contains(num) || config.open_runs.contains(num));
+        now.open_runs.len() != count
+    })
+}
+
+fn update_config(
+    path: &Path,
+    expected: &TrackerConfig,
+    update: impl FnOnce(&mut TrackerConfig) -> bool,
+) -> Result<()> {
+    let _lock = FileLock::acquire(path)?;
+    if let Some(mut now) = TrackerConfig::load(path)?.filter(|config| config.same_repo(expected))
+        && update(&mut now)
+    {
+        now.save(path)?;
     }
-    config.open_runs = runs;
-    config.save(path)
+    Ok(())
 }
 
 /// The issues a tracked run is on, kept with the run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackedRun {
+    /// The repository it was tracked in (`owner/repo`). Older runs have only the issue URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// The run's issue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<IssueRef>,
@@ -2182,6 +2370,7 @@ impl Run {
 
     fn tracked(&self) -> TrackedRun {
         TrackedRun {
+            repo: Some(self.tracker.config.repo.clone()),
             issue: Some(IssueRef {
                 number: self.issue.number,
                 url: self.issue.url.clone(),
@@ -2689,28 +2878,28 @@ impl Run {
             .await;
         if let Some(path) = self.config_path.clone() {
             if keep_open {
-                let saved = TrackerConfig::load(&path).and_then(|config| match config {
-                    Some(mut config) if !config.open_runs.contains(&self.issue.number) => {
+                let saved = update_config(&path, &self.tracker.config, |config| {
+                    if config.open_runs.contains(&self.issue.number) {
+                        false
+                    } else {
                         config.open_runs.push(self.issue.number);
-                        config.save(&path)
+                        true
                     }
-                    _ => Ok(()),
                 });
                 if let Err(e) = saved {
                     self.problem(format!("saving the tracker: {e:#}"));
                 }
             }
             // Earlier runs whose pull requests have merged since.
-            let mut others = self.tracker.config.clone();
-            if let Ok(Some(now)) = TrackerConfig::load(&path) {
-                others.open_runs = now
-                    .open_runs
-                    .into_iter()
-                    .filter(|n| *n != self.issue.number)
-                    .collect();
-            }
-            if !others.open_runs.is_empty() {
-                let before = others.open_runs.clone();
+            if let Ok(Some(now)) = TrackerConfig::load(&path)
+                && now.same_repo(&self.tracker.config)
+            {
+                let mut others = self.tracker.config.clone();
+                others.open_runs = now.open_runs;
+                others.open_runs.retain(|num| *num != self.issue.number);
+                if others.open_runs.is_empty() {
+                    return;
+                }
                 let mut tracker = Tracker {
                     api: self.tracker.api.clone(),
                     config: others,
@@ -2723,11 +2912,8 @@ impl Run {
                     board_problem: None,
                     board_scope: None,
                 };
-                if tracker.settle().await.is_ok()
-                    && tracker.config.open_runs != before
-                    && let Err(e) = save_open_runs(&path, &before, &tracker.config.open_runs)
-                {
-                    self.problem(format!("saving the tracker: {e:#}"));
+                if let Err(err) = settle_tracker(&path, &mut tracker).await {
+                    self.problem(format!("settling earlier runs: {err:#}"));
                 }
             }
         }
@@ -3192,12 +3378,8 @@ pub async fn start(
     run_id: &str,
     agent: &str,
 ) -> Result<Option<Tracking>> {
-    if plan.track == Some(Track::Off) {
-        return Ok(None);
-    }
-    let path = profile.tracker_path();
-    let Some(config) = TrackerConfig::load(&path)? else {
-        if plan.names_issues() {
+    let Some((path, config)) = Slot::for_plan(profile, plan)? else {
+        if plan.track != Some(Track::Off) && plan.names_issues() {
             bail!(
                 "the plan names issues (track: or issue=), but profile '{}' has no tracker; link one with: proofkin tracker link <owner/repo> --profile {}",
                 profile.name,
@@ -3206,17 +3388,8 @@ pub async fn start(
         }
         return Ok(None);
     };
-    let creds = profile.github()?;
-    if creds.host != config.host {
-        bail!(
-            "the tracker is on {}, but profile '{}' is signed in to {}",
-            config.host,
-            profile.name,
-            creds.host
-        );
-    }
     start_with(
-        Arc::new(GhApi::new(creds)),
+        config.api(profile)?,
         config,
         plan,
         run_id,
@@ -3249,7 +3422,7 @@ pub async fn start_with(
 /// Takes the tracking of `plan`'s run `run_id` up again after its agent restarted (see
 /// [`crate::plan::Resume`]), on the issues it had (`tracked`): nothing is made, linked or
 /// put on the board again, and the issues of the steps that finished stay as they are.
-/// None if the run wasn't tracked, or the profile has no tracker now.
+/// None if the run wasn't tracked; an error if no tracker matches its repository now.
 pub async fn resume(
     profile: &Profile,
     plan: &Plan,
@@ -3257,24 +3430,11 @@ pub async fn resume(
     agent: &str,
     tracked: &TrackedRun,
 ) -> Result<Option<Tracking>> {
-    if tracked.issue.is_none() {
-        return Ok(None);
-    }
-    let path = profile.tracker_path();
-    let Some(config) = TrackerConfig::load(&path)? else {
+    let Some((path, config)) = resume_config(profile, plan, tracked)? else {
         return Ok(None);
     };
-    let creds = profile.github()?;
-    if creds.host != config.host {
-        bail!(
-            "the tracker is on {}, but profile '{}' is signed in to {}",
-            config.host,
-            profile.name,
-            creds.host
-        );
-    }
     resume_with(
-        Arc::new(GhApi::new(creds)),
+        config.api(profile)?,
         config,
         plan,
         run_id,
@@ -3284,6 +3444,40 @@ pub async fn resume(
     )
     .await
     .map(Some)
+}
+
+fn resume_config(
+    profile: &Profile,
+    plan: &Plan,
+    tracked: &TrackedRun,
+) -> Result<Option<(PathBuf, TrackerConfig)>> {
+    let Some(issue) = &tracked.issue else {
+        return Ok(None);
+    };
+    let from_url = issue
+        .url
+        .rsplit_once("/issues/")
+        .and_then(|(url, _)| crate::github::parse_repo(url, "github.com").ok());
+    let repo = tracked
+        .repo
+        .as_deref()
+        .or_else(|| from_url.as_ref().map(|(_, repo)| repo.as_str()))
+        .context("the run's GitHub repository is unknown")?;
+    let slots = if plan.kind == Some(Kind::Task) {
+        [Slot::Tasks, Slot::Main]
+    } else {
+        [Slot::Main, Slot::Tasks]
+    };
+    let found = Slot::find(profile, &slots, |config| {
+        config.repo.eq_ignore_ascii_case(repo)
+            && from_url
+                .as_ref()
+                .is_none_or(|(host, _)| config.host == *host)
+    })?;
+    if found.is_none() {
+        bail!("no tracker is linked to {repo} any more");
+    }
+    Ok(found)
 }
 
 /// [`resume`] with `api` and `config` (saved at `config_path`, if any).
@@ -3667,7 +3861,12 @@ mod tests {
                 .unwrap_or_default();
             let data = match name {
                 "Repo" => {
-                    json!({ "viewer": { "id": "U1", "login": "alice" }, "repository": { "id": "R1", "url": "https://github.com/acme/app", "visibility": "PUBLIC" } })
+                    let tasks = variables["name"] == "tasks";
+                    json!({ "viewer": { "id": "U1", "login": "alice" }, "repository": {
+                        "id": if tasks { "R9" } else { "R1" },
+                        "url": if tasks { "https://github.com/acme/tasks" } else { "https://github.com/acme/app" },
+                        "visibility": if tasks { "PRIVATE" } else { "PUBLIC" },
+                    } })
                 }
                 "Board" if self.no_project_scope => {
                     return Ok(Reply::from_value(
@@ -3682,7 +3881,8 @@ mod tests {
                         .filter(|(id, _)| self.review_column || *id != "o-rev")
                         .map(|(id, name)| json!({ "id": id, "name": name }))
                         .collect();
-                    json!({ "repositoryOwner": { "projectV2": { "id": "P1", "title": "Tracker", "url": "https://github.com/users/alice/projects/4", "fields": { "nodes": [
+                    let id = if variables["number"] == 9 { "P9" } else { "P1" };
+                    json!({ "repositoryOwner": { "projectV2": { "id": id, "title": "Tracker", "url": "https://github.com/users/alice/projects/4", "fields": { "nodes": [
                         { "id": "F-title", "name": "Title", "dataType": "TITLE" },
                         { "id": "F-status", "name": "Status", "dataType": "SINGLE_SELECT", "options": options }
                     ] } } } })
@@ -3847,6 +4047,90 @@ mod tests {
             }),
             open_runs: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn tasks_tracker_routes_task_issues_and_boards_but_not_software_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::open_in(dir.path(), "boss").unwrap();
+        let tasks = TrackerConfig {
+            repo: "acme/tasks".into(),
+            project: Some(ProjectRef {
+                owner: "alice".into(),
+                number: 9,
+            }),
+            ..config()
+        };
+        let main_path = profile.tracker_path();
+        let tasks_path = profile.tasks_tracker_path();
+        config().save(&main_path).unwrap();
+        let task = Plan::parse("kind: task\ndo @worker Write the brief").unwrap();
+        assert_eq!(
+            Slot::for_plan(&profile, &task).unwrap().unwrap().0,
+            main_path
+        );
+        tasks.save(&tasks_path).unwrap();
+
+        let bug = Plan::parse("kind: bug\ndo @worker Fix the bug").unwrap();
+        for (plan, expected, repo_id, board_id) in [
+            (&task, &tasks_path, "R9", "P9"),
+            (&bug, &main_path, "R1", "P1"),
+        ] {
+            let (path, config) = Slot::for_plan(&profile, plan).unwrap().unwrap();
+            assert_eq!(&path, expected);
+            let repo = config.repo.clone();
+            let fake = Fake::with(&[]);
+            let tracking = start_with(fake.clone(), config, plan, "r1", "boss", Some(path))
+                .await
+                .unwrap();
+            assert_eq!(tracking.tracked.repo.as_deref(), Some(repo.as_str()));
+            assert_eq!(tracking.refs["do"], [format!("{repo}#2")]);
+            let created = fake.calls("createIssue");
+            assert_eq!(created.len(), 2);
+            assert!(created.iter().all(|input| input["repositoryId"] == repo_id));
+            let added = fake.calls("addProjectV2ItemById");
+            assert_eq!(added.len(), 2);
+            assert!(added.iter().all(|input| input["projectId"] == board_id));
+        }
+        let off = Plan::parse("kind: task\ntrack: off\ndo @worker No issues").unwrap();
+        assert!(Slot::for_plan(&profile, &off).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resuming_uses_the_runs_repository_even_if_it_moved_and_refuses_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile::open_in(dir.path(), "boss").unwrap();
+        let main = TrackerConfig {
+            repo: "acme/tasks".into(),
+            ..config()
+        };
+        main.save(&profile.tracker_path()).unwrap();
+        config().save(&profile.tasks_tracker_path()).unwrap();
+        let plan = Plan::parse("kind: task\ndo @worker Write the brief").unwrap();
+        let mut tracked = TrackedRun {
+            repo: Some("acme/tasks".into()),
+            issue: Some(IssueRef {
+                number: 12,
+                url: "https://github.com/acme/tasks/issues/12".into(),
+            }),
+            ..Default::default()
+        };
+        for repo in [tracked.repo.clone(), None] {
+            tracked.repo = repo;
+            let (path, config) = resume_config(&profile, &plan, &tracked).unwrap().unwrap();
+            assert_eq!(path, profile.tracker_path());
+            assert_eq!(config, main);
+        }
+        assert!(unlink(&profile, Slot::Main).unwrap());
+        let problem = resume(&profile, &plan, "r1", "boss", &tracked)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            problem
+                .to_string()
+                .contains("no tracker is linked to acme/tasks any more")
+        );
     }
 
     fn evidence(commit: Option<&str>) -> Evidence {
@@ -4535,7 +4819,11 @@ mod tests {
             knowledge: crate::knowledge::KnowledgeBase::new(dir.path().join("knowledge")),
             skills: crate::skills::Skills::new(dir.path().join("skills")),
             recipients: Default::default(),
-            tracker: Some("acme/app".into()),
+            tracker: Some(Destination {
+                repo: "acme/app".into(),
+                visibility: Some("public".into()),
+            }),
+            tasks_tracker: None,
         };
         let request = Request {
             issue: Some((12, tracker.issue_text(12).await.unwrap())),
@@ -4935,7 +5223,7 @@ mod tests {
         assert!(tracker.settle().await.unwrap().is_empty());
         assert!(fake.open(10) && fake.open(11));
         assert_eq!(tracker.config.open_runs, [11, 99]);
-        save_open_runs(&path, &before, &tracker.config.open_runs).unwrap();
+        save_open_runs(&path, &tracker.config, &before).unwrap();
         let config_now = TrackerConfig::load(&path).unwrap().unwrap();
         assert_eq!(config_now.open_runs, [11, 99, 13]);
     }

@@ -2076,7 +2076,7 @@ function schedulePlanCheck() {
 }
 
 // ---------- how a plan's run is tracked ----------
-/// Issues looked up for the "Existing issue" choice, by number, with when: shared by the
+/// Issues looked up for the "Existing issue" choice, by repository and number, with when: shared by the
 /// composer's and the plan editor's choice, and looked up again after a minute.
 const trackLookups = new Map();
 const TRACK_LOOKUP_KEPT_MS = 60_000;
@@ -2104,7 +2104,7 @@ function trackChoice(box, input, changed, shown) {
   let picking = false;
   // The plan was run (or scheduled) without the number: the note says it's needed.
   let asked = false;
-  // The number being looked up, and the last lookup that failed: { n, error }.
+  // The number being looked up, and the last lookup that failed: { lookup, error }.
   let pending = null;
   let failed = null;
   let timer = null;
@@ -2114,18 +2114,18 @@ function trackChoice(box, input, changed, shown) {
     input.value = planText.setTrack(input.value, value);
     changed();
   };
-  const lookUp = (n) => {
-    pending = n;
+  const lookUp = (n, lookup, tasks) => {
+    pending = lookup;
     clearTimeout(timer);
     timer = setTimeout(async () => {
       try {
-        const { issue } = await api(`/api/tracker/issues/${n}`);
-        trackLookups.set(n, { issue, at: Date.now() });
-        if (failed?.n === n) failed = null;
+        const { issue } = await api(`/api/tracker/issues/${n}${tasks ? "?for=tasks" : ""}`);
+        trackLookups.set(lookup, { issue, at: Date.now() });
+        if (failed?.lookup === lookup) failed = null;
       } catch (err) {
-        failed = { n, error: err.message, at: Date.now() };
+        if (pending === lookup) failed = { lookup, error: err.message, at: Date.now() };
       }
-      pending = null;
+      if (pending === lookup) pending = null;
       sync();
     }, 400);
   };
@@ -2150,7 +2150,8 @@ function trackChoice(box, input, changed, shown) {
     write(ok ? `#${n}` : null);
   });
   const sync = () => {
-    box.hidden = !tracker?.linked || !tracker.tracker || !shown();
+    const destination = planText.trackerForPlan(input.value, tracker);
+    box.hidden = !destination || !shown();
     if (box.hidden) return;
     const now = planText.trackOf(input.value);
     const track = picking && now.kind === "new" ? { kind: "issue", number: null } : now;
@@ -2158,14 +2159,16 @@ function trackChoice(box, input, changed, shown) {
     number.hidden = track.kind !== "issue";
     if (track.number && document.activeElement !== number) number.value = `#${track.number}`;
     const n = track.kind === "issue" ? track.number : null;
-    const seen = n ? trackLookups.get(n) : null;
+    const tasks = destination === tracker.tasks;
+    const lookup = n ? `${tasks}:${destination.host}/${destination.repo}#${n}` : null;
+    const seen = lookup ? trackLookups.get(lookup) : null;
     const found = !n ? null
       // A failed lookup is tried again a little later.
-      : failed?.n === n && Date.now() - failed.at < 10_000 ? { error: failed.error }
+      : failed?.lookup === lookup && Date.now() - failed.at < 10_000 ? { error: failed.error }
         : seen && Date.now() - seen.at < TRACK_LOOKUP_KEPT_MS ? (seen.issue ? { issue: seen.issue } : { missing: true })
           : null;
-    if (n && !found && pending !== n) lookUp(n);
-    const { parts, warn } = planText.trackNote(track, tracker.tracker, found);
+    if (lookup && !found && pending !== lookup) lookUp(n, lookup, tasks);
+    const { parts, warn } = planText.trackNote(track, destination, found);
     // Only a change is drawn (and so read out): typing in the plan redraws nothing.
     const next = JSON.stringify(parts);
     if (said !== next) {
@@ -2294,7 +2297,7 @@ function planKindChoice(prefix, input, changed, shown) {
       if (!other.parentNode) select.append(other);
     } else other.remove();
     select.value = value;
-    const parts = tracker?.linked && tracker.tracker ? planText.kindNote(input.value) : [];
+    const parts = planText.trackerForPlan(input.value, tracker) ? planText.kindNote(input.value) : [];
     note.hidden = !parts.length;
     // Only a change is drawn: typing in the plan redraws nothing.
     const next = JSON.stringify(parts);
@@ -3040,7 +3043,7 @@ function renderGithubScopes() {
       ...known.flatMap((s, i) => [i ? "; " : "", el("span", { class: "mono", text: s }), ` (${SCOPE_USES[s]})`]),
       known.length ? "." : ""));
     // The Tracker card says so too; here it's next to the account it is about.
-    const need = tracker?.linked ? tracker.tracker?.board_scope : null;
+    const need = tracker?.tracker?.board_scope ?? tracker?.tasks?.board_scope;
     if (need && !mine.scopes.includes(need)) {
       parts.push(el("p", { class: "small" }, "It lacks ", el("span", { class: "mono", text: need }),
         ", which the tracker's board needs."),
@@ -3609,19 +3612,26 @@ async function loadTracker() {
   box.replaceChildren();
   const btn = $("#tracker-btn");
   btn.hidden = !tracker.signed_in;
-  btn.textContent = tracker.linked ? "Change" : "Link";
-  btn.setAttribute("aria-label", tracker.linked ? "Change the tracker" : "Link a tracker");
+  const linked = tracker.linked || Boolean(tracker.tasks);
+  btn.textContent = linked ? "Change" : "Link";
+  btn.setAttribute("aria-label", linked ? "Change the tracker" : "Link a tracker");
   if (!tracker.linked) {
     box.append(el("p", { class: "muted small", text: "Track each plan run as a GitHub issue with a sub-issue per step, on your project's board: their status follows the run, and pull requests from the steps' branches close them." }));
     if (!tracker.signed_in) box.append(el("p", { class: "muted small", text: "Sign in to GitHub first (above)." }));
-    return;
+  } else {
+    renderTracker(box, tracker.tracker, tracker);
   }
-  const t = tracker.tracker;
+  if (tracker.tasks) renderTracker(box, tracker.tasks, tracker.tasks, true);
+  renderGithubScopes();
+}
+
+function renderTracker(box, t, status, tasks = false) {
   const link = (href, text) => externalLink(href, text);
-  box.append(el("p", { class: "small" }, "Issues in ", link(t.repo_url || `https://${t.host}/${t.repo}`, t.repo),
+  box.append(el("p", { class: "small" }, tasks ? "Tasks: issues in " : "Issues in ", link(t.repo_url || `https://${t.host}/${t.repo}`, t.repo),
+    tasks && t.visibility ? ` (${t.visibility})` : "",
     t.login ? `, assigned to ${t.login}` : ""));
-  if (tracker.error) {
-    box.append(el("p", { class: "warn-text small", text: `GitHub can't be reached with it now: ${tracker.error}` }));
+  if (status.error) {
+    box.append(el("p", { class: "warn-text small", text: `GitHub can't be reached with it now: ${status.error}` }));
   } else if (t.board) {
     box.append(el("p", { class: "small" }, "On the board ", link(t.board.url, t.board.title),
       t.board.statuses.length ? ` (${t.board.statuses.join(", ")})` : ""));
@@ -3630,16 +3640,14 @@ async function loadTracker() {
   } else {
     box.append(el("p", { class: "muted small", text: "No board: issues only. Choose Change to add your project's address." }));
   }
-  if (tracker.waiting_error) {
-    box.append(el("p", { class: "warn-text small", text: `What the open runs wait for can't be read now: ${tracker.waiting_error}` }));
+  if (status.waiting_error) {
+    box.append(el("p", { class: "warn-text small", text: `What the open runs wait for can't be read now: ${status.waiting_error}` }));
   }
-  if (tracker.waiting?.length) box.append(waitingRuns(tracker.waiting));
+  if (status.waiting?.length) box.append(waitingRuns(status.waiting));
   box.append(el("div", { class: "repo-actions" },
-    el("button", { type: "button", class: "btn small", onclick: openTrackerItems }, t.board ? "Board items" : "Open issues"),
-    t.board ? el("button", { type: "button", class: "btn small", onclick: (e) => addAllToBoard(t, e.currentTarget) }, "Add existing issues") : null,
-    el("button", { type: "button", class: "btn small danger", onclick: unlinkTracker }, "Stop tracking")));
-  // The GitHub card offers Grant access only when a linked tracker needs it.
-  renderGithubScopes();
+    tasks ? null : el("button", { type: "button", class: "btn small", onclick: openTrackerItems }, t.board ? "Board items" : "Open issues"),
+    !tasks && t.board ? el("button", { type: "button", class: "btn small", onclick: (e) => addAllToBoard(t, e.currentTarget) }, "Add existing issues") : null,
+    el("button", { type: "button", class: "btn small danger", onclick: () => unlinkTracker(tasks) }, tasks ? "Stop tracking tasks" : "Stop tracking")));
 }
 
 /** The run issues left open, what each waits for, and the button that checks now. */
@@ -3717,9 +3725,14 @@ function boardProblem(t) {
 
 function openTrackerDialog() {
   $("#tracker-error").textContent = "";
-  const t = tracker?.linked ? tracker.tracker : null;
-  $("#tracker-repo").value = t?.repo ?? github?.repos?.[0]?.slug ?? "";
-  $("#tracker-project").value = t?.board?.url ?? (t?.project ? `https://${t.host}/users/${t.project.owner}/projects/${t.project.number}` : "");
+  const main = tracker?.tracker;
+  const tasks = tracker?.tasks;
+  const address = (t) => t?.board?.url ?? (t?.project ? `https://${t.host}/users/${t.project.owner}/projects/${t.project.number}` : "");
+  $("#tracker-repo").value = main?.repo ?? (tasks ? "" : github?.repos?.[0]?.slug ?? "");
+  $("#tracker-project").value = address(main);
+  $("#tracker-tasks-repo").value = tasks?.repo ?? "";
+  $("#tracker-tasks-project").value = address(tasks);
+  $("#tracker-submit").textContent = main || tasks ? "Save" : "Link";
   $("#tracker-dialog").showModal();
   $("#tracker-repo").focus();
 }
@@ -3727,33 +3740,47 @@ function openTrackerDialog() {
 async function submitTracker(e) {
   e.preventDefault();
   const button = $("#tracker-submit");
+  const label = button.textContent;
   button.disabled = true;
-  $("#tracker-error").textContent = "Checking with GitHub…";
+  button.textContent = "Saving…";
+  $("#tracker-error").textContent = "";
   try {
-    const res = await api("/api/tracker", {
+    await api("/api/tracker", {
       method: "PUT",
-      body: JSON.stringify({ repo: $("#tracker-repo").value.trim(), project: $("#tracker-project").value.trim() || null }),
+      body: JSON.stringify({
+        repo: $("#tracker-repo").value.trim(),
+        project: $("#tracker-project").value.trim() || null,
+        tasks: {
+          repo: $("#tracker-tasks-repo").value.trim(),
+          project: $("#tracker-tasks-project").value.trim() || null,
+        },
+      }),
     });
     $("#tracker-dialog").close();
-    toast(res.tracker.board ? `Plan runs are tracked on ${res.tracker.board.title}` : `Plan runs are tracked as issues of ${res.tracker.repo}`);
-    await loadTracker();
+    toast("Tracker settings saved");
+    await loadTracker().catch((err) => toast(err.message, "error"));
   } catch (err) {
     $("#tracker-error").textContent = err.message;
   } finally {
     button.disabled = false;
+    button.textContent = label;
   }
 }
 
-async function unlinkTracker() {
+async function unlinkTracker(tasks) {
+  const next = tasks && tracker.tracker
+    ? `Task plans will use ${tracker.tracker.repo} unless tracking is off.`
+    : !tasks && tracker.tasks ? "Task plans will still use the tasks tracker." : "New plan runs without a tracker won't get issues.";
+  const confirm = tasks ? "Stop tracking tasks" : "Stop tracking";
   const ok = await confirmDialog({
-    title: "Stop tracking plan runs?",
-    body: "New plan runs won't get issues. The issues made so far stay on GitHub.",
-    confirm: "Stop tracking",
+    title: tasks ? "Unlink the tasks tracker?" : "Unlink the main tracker?",
+    body: `${next} The issues made so far stay on GitHub.`,
+    confirm,
     danger: true,
   });
   if (!ok) return;
   try {
-    await api("/api/tracker", { method: "DELETE" });
+    await api(`/api/tracker${tasks ? "?for=tasks" : ""}`, { method: "DELETE" });
     await loadTracker();
   } catch (err) {
     toast(err.message, "error");
@@ -3764,9 +3791,12 @@ async function syncTracker(button) {
   button.disabled = true;
   try {
     const res = await api("/api/tracker/sync", { method: "POST" });
-    const stillOpen = res.waiting.reduce((n, run) => n + run.sub_issues.filter((s) => s.open).length, 0);
-    toast(res.closed.length
-      ? `Closed ${res.closed.map((n) => `#${n}`).join(", ")}: all their sub-issues are closed`
+    const waiting = [...res.waiting, ...(res.tasks?.waiting ?? [])];
+    const stillOpen = waiting.reduce((n, run) => n + run.sub_issues.filter((s) => s.open).length, 0);
+    const closed = [...res.closed.map((n) => `${tracker.tracker?.repo ?? ""}#${n}`),
+      ...(res.tasks?.closed ?? []).map((n) => `${tracker.tasks?.repo ?? ""}#${n}`)];
+    toast(closed.length
+      ? `Closed ${closed.join(", ")}: all their sub-issues are closed`
       : `Nothing could be closed yet: ${nOf(stillOpen, "sub-issue")} still open`);
     await loadTracker();
   } catch (err) {

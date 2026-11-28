@@ -925,8 +925,8 @@ plan, then run it yourself.
   - squads, skills and the factory agents plans may use (`agent=`);
   - knowledge topic names (`context=`) and each folder's MCP server names (`mcp=`);
   - whether Work IQ is signed in and changes are on;
-  - the tracker's repository;
-  - the playbooks, as examples.
+  - the main tracker and, if linked, the tasks tracker's repository and visibility;
+  - the playbooks, including `brief` as an example of work outside a code repository.
 - Never file contents, knowledge text, tokens, Microsoft 365 content or past results. The
   model works read-only in an empty folder with no tools, as a [factory](#the-agent-factory)
   draft's does. Since it is the profile's own model, an agent that runs no tasks for
@@ -937,6 +937,11 @@ text around it is dropped. The plan is checked as **Run plan** checks it. While 
 errors, the model gets them and writes the whole plan again, at most 3 tries in all.
 Warnings are kept and shown. The plan starts with a comment naming the model and the
 goal's first line (redacted): `// Drafted by copilot (claude-opus-5.5): <goal>`.
+
+For work outside the main tracker's repository, the draft uses `kind: task`. With a
+[tasks tracker](#tracked-work) linked, it leaves tracking on there by default. Without
+one, it sets `track: off` and explains why rather than sending the work to the code
+repository. If no tracker is linked at all, it needs no `track:` line.
 
 **A draft is data.** Drafting runs, grants, sends and changes nothing. Running it is a
 separate action, through the usual check and tracking choice (a tracked run posts its steps
@@ -1457,9 +1462,12 @@ review @alice:app verify=test Check the change:
   applied in its new worktree) and gets the note, and its card says it is done again. Then
   the sign-off asks again, showing the new results and the note it answered. A sign-off
   allows 2 rounds of changes unless it says otherwise (`changes=N`, 0 to 5; `changes=0`:
-  approve or reject only); once they are used, the approver can only approve or reject. A
-  pull request step after the sign-off opens the reworked branch. Approvers on agents
-  older than 0.25 only approve or reject.
+  approve or reject only); once they are used, the approver can only approve or reject. An
+  explicit `changes=N` on your own sign-off (`approve @me`) also lets you have read-only
+  `@workiq` steps revised. Peer approvers can approve Work IQ work with a note or reject
+  it, but their requests for changes only redo model steps. A pull request step after the
+  sign-off opens the reworked branch. Approvers on agents older than 0.25 only approve or
+  reject.
 
 **4. Every run is saved with a verdict per claim.**
 
@@ -1539,6 +1547,23 @@ where, and the plan is filled in and checked.
 | `implement-spec` | The accepted spec (and design) built as specified, with a test proving each acceptance criterion (`test`, `lint`, `spec:api`, `spec:trace`), verified by a reviewer squad, then signed off |
 | `implement-speckit` | A Spec Kit feature, OpenSpec change or spec document on SharePoint or OneDrive built as specified: a claim per user story, requirement and success criterion, a test per claim (`test`), verified by a reviewer squad, then signed off ([Spec Kit and OpenSpec](#spec-kit-and-openspec)) |
 | `rehearse` | The feature's reviews rehearsed before they happen: agents play the tech lead, security and privacy champions, product owner, leadership and a customer in parallel, then a synthesis (`review:rehearsal`) of actions and prepared answers, and your decision. See [Rehearse the reviews first](#rehearse-the-reviews-first) |
+| `brief` | A one-page brief from Microsoft 365 meetings, email and files: gather sources, draft, review, revise and sign off. |
+
+For `brief`, give `subject` and `audience`; `approver` defaults to `me`:
+
+```powershell
+proofkin playbook show brief --set subject="Q4 priorities and risks" --set audience="Leadership" > brief.plan
+```
+
+Sign in to Work IQ on your own agent. No peer, shared folder or Microsoft 365 grant is
+needed with the default approver. Review the draft, ask for changes at your own sign-off
+(`approve @me`) if needed, then sign off the revised one-page brief. A peer approver can
+approve with a note for the revision or reject; they can't have Work IQ redo the draft.
+The draft and revision end with a **For review, not to send** section for sources and
+what they leave out. The brief above that section is written to send as is. The playbook
+itself doesn't save or send a Microsoft 365 message or document. Link a private tasks
+tracker or choose **Don't track** before running if the main tracker is public. Work IQ
+results stay in the run, but plan text and sign-off notes can go on tracked issues.
 
 Checks the playbooks name (`build`, `test`, `lint`, `secscan`, `licenses`, `secrets`) are
 your folder's checks (`share add --check ...`); rename them with `--set test=unit` etc.
@@ -2040,7 +2065,30 @@ proofkin tracker add --open --closed --profile boss   # put the repository's exi
 proofkin tracker sync --profile boss     # close run issues whose pull requests have all merged
 ```
 
-In plan text, `track:` says what the run works on, and `issue=` what a step works on:
+**A tracker for tasks.** To keep personal or business work out of a code repository,
+link a separate, private repository for `kind: task` plans:
+
+```powershell
+proofkin tracker link acme/private-work --project https://github.com/users/alice/projects/5 --for tasks --profile boss
+proofkin tracker status --for tasks --profile boss
+```
+
+`tracker items`, `tracker add` and `tracker unlink` also take `--for tasks`.
+Without that option they use the main tracker. The web UI's **Tracker** card shows both;
+use **Link** or **Change** to set **Repository for tasks** and its optional board, and
+**Stop tracking tasks** to unlink just that one. `tracker sync` and the agent's periodic
+check settle both trackers.
+
+A `kind: task` plan uses the tasks tracker when linked, otherwise the main tracker.
+Other plans always use the main tracker. The plan check warns but does not stop a task
+plan that would be tracked in a public repository. Link a private one for tasks, or use
+`track: off`. **Track on GitHub** shows the repository and its visibility before the
+run. After a restart a run resumes tracking in its original repository, even if it is
+now linked in the other slot. If neither tracker points there, the run continues without
+tracking and reports why.
+
+In plan text, `track:` says what the run works on, and `issue=` what a step works on.
+Both issue numbers refer to the repository that run uses:
 
 ```text
 track: #12
@@ -3366,7 +3414,7 @@ Workflow for a change:
 - [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches, and the unfinished work a stopped task keeps
 - [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification
 - [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
-- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec, design, implement-spec, implement-speckit and rehearse plan templates; [src/spec_import.rs](src/spec_import.rs): Spec Kit and OpenSpec specs, and spec documents from SharePoint or OneDrive, as claims, knowledge and plans; [src/docx.rs](src/docx.rs): a Word document's text as Markdown (headings, lists, tables), read with size limits
+- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec, design, implement-spec, implement-speckit, rehearse and brief plan templates; [src/spec_import.rs](src/spec_import.rs): Spec Kit and OpenSpec specs, and spec documents from SharePoint or OneDrive, as claims, knowledge and plans; [src/docx.rs](src/docx.rs): a Word document's text as Markdown (headings, lists, tables), read with size limits
 - [src/spec.rs](src/spec.rs) and [spec-starter/](spec-starter): the built-in spec checks (`spec:spec`, `spec:api`, `spec:ux`, `spec:trace`) and the `spec init` starter package
 - [src/design.rs](src/design.rs) and [design-starter/](design-starter): the design and review checks (`design:arch`, `design:data`, `design:threats`, `design:tests`, `design:ops`, `review:decks`, `review:rehearsal`) and the `design init` starter
 - [src/render.rs](src/render.rs): Markdown to self-contained HTML: Marp decks as slide shows, documents as pages, without raw HTML

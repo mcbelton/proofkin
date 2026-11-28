@@ -1384,8 +1384,9 @@ Other kinds of step:
 - `id after x approve @person [claims=ID] [changes=N] what to approve`: a sign-off: that \
 person (`@me`: you) approves the work so far before the steps after it go on. `changes=N` \
 (0 to 5, default 2): how many times they may ask for changes, which the work before it \
-makes. It has no folder, `verify=`, `apply=`, `base=`, `save=`, `workiq=`, `agent=`, \
-`model=` or `effort=`, and isn't for a squad.
+makes. An explicit `changes=N` on your own sign-off (`approve @me`) also lets you have \
+read-only `@workiq` steps revised. A sign-off has no folder, `verify=`, `apply=`, `base=`, \
+`save=`, `workiq=`, `agent=`, `model=` or `effort=`, and isn't for a squad.
 - `id after x pr @peer:folder [reviewers=me,peer,login] [title]`: opens a pull request \
 with the work of the steps before it in that folder, by the peer that holds its clone (the \
 folder must take pull request steps). `reviewers=` (or `reviewer=`; at most 10, or `none`): \
@@ -4588,10 +4589,23 @@ pub async fn run_plan_with(
                         }
                     }
                 } else if step.is_workiq() {
-                    // Asked of Work IQ by this agent: nothing is sent to a peer.
+                    let question = match reworks.remove(&step.id) {
+                        Some(rework) => {
+                            again = Some(format!("Making changes {} asked for", rework.by));
+                            let draft = crate::boundary::wrap(
+                                "earlier Work IQ answer",
+                                rework.previous_answer.as_deref().unwrap_or_default(),
+                            );
+                            format!(
+                                "{prompt}\n\n## Changes asked for\n\n{} reviewed the earlier answer at sign-off {}. Revise it as requested:\n\n{}\n\n{draft}",
+                                rework.by, rework.signoff, rework.note,
+                            )
+                        }
+                        None => prompt,
+                    };
                     (
                         step.workiq_name(),
-                        Box::pin(ask_workiq(ctx, step, prompt.clone())),
+                        Box::pin(ask_workiq(ctx, step, crate::boundary::guard(&question))),
                     )
                 } else {
                     let peer = match pick_peer(agent, step, squads, ctx, tried.get(&step.id)) {
@@ -4833,10 +4847,7 @@ pub async fn run_plan_with(
                         let (by, note) = changes_asked(&delivered).unwrap_or_default();
                         let used = rounds.get(&id).copied().unwrap_or(0);
                         let allowed = step.changes.unwrap_or(DEFAULT_CHANGE_ROUNDS);
-                        let redo: Vec<String> = redoable(plan, step, &states)
-                            .iter()
-                            .map(|s| s.id.clone())
-                            .collect();
+                        let redo = redoable(plan, step, &states);
                         if used < allowed && !redo.is_empty() {
                             // The work it is on is done again with their note, then they
                             // are asked again; its card says so meanwhile.
@@ -4850,31 +4861,34 @@ pub async fn run_plan_with(
                                         "{by} asked for changes (round {} of {allowed}): {}; asks again once {} {} done again",
                                         used + 1,
                                         crate::runs::one_line(&note),
-                                        redo.join(", "),
+                                        redo.iter().map(|step| step.id.as_str()).collect::<Vec<_>>().join(", "),
                                         if redo.len() == 1 { "is" } else { "are" }
                                     ),
                                 )),
                             };
-                            for s in redo {
-                                let (patch, labels) = match &states[&s] {
-                                    StepState::Done { patch, .. } => (
+                            for source in redo {
+                                let step_id = &source.id;
+                                let (patch, labels, previous_answer) = match &states[step_id] {
+                                    StepState::Done { output, patch, .. } => (
                                         patch.clone(),
-                                        result_labels(&states[&s]).unwrap_or_default(),
+                                        result_labels(&states[step_id]).unwrap_or_default(),
+                                        source.is_workiq().then(|| output.clone()),
                                     ),
-                                    _ => (None, Vec::new()),
+                                    _ => (None, Vec::new(), None),
                                 };
                                 reworks.insert(
-                                    s.clone(),
+                                    step_id.clone(),
                                     Rework {
                                         signoff: id.clone(),
                                         by: by.clone(),
                                         note: note.clone(),
                                         patch,
                                         labels,
+                                        previous_answer,
                                     },
                                 );
-                                on_update(&s, &StepState::Waiting);
-                                states.insert(s, StepState::Waiting);
+                                on_update(step_id, &StepState::Waiting);
+                                states.insert(step_id.clone(), StepState::Waiting);
                             }
                             on_update(&id, &waiting);
                             states.insert(id, StepState::Waiting);
@@ -4926,6 +4940,7 @@ struct Rework {
     /// The Microsoft 365 labels that work held (see [`result_labels`]): it goes to the peer
     /// that does the step again, so that peer must be allowed them.
     labels: Vec<String>,
+    previous_answer: Option<String>,
 }
 
 /// What the model doing a step again is told about the changes asked for.
@@ -4936,17 +4951,22 @@ fn rework_text(rework: &Rework) -> String {
     )
 }
 
-/// The steps a sign-off's approver may have done again when they ask for changes: the
-/// steps a model does that it waits for directly, done.
+/// Finished steps the sign-off waits for directly can be done again if a model ran them.
+/// Read-only Work IQ steps also qualify for the owner's own sign-off with `changes=`.
 fn redoable<'a>(
     plan: &'a Plan,
     signoff: &Step,
     states: &BTreeMap<String, StepState>,
 ) -> Vec<&'a Step> {
+    let owner_can_redo_workiq =
+        signoff.changes.is_some() && matches!(&signoff.target, Target::Peer(name) if name == "me");
     plan.steps
         .iter()
         .filter(|s| signoff.after.contains(&s.id))
-        .filter(|s| !s.approve && !s.pr && s.team.is_none() && !s.is_workiq())
+        .filter(|step| !step.approve && !step.pr && step.team.is_none())
+        .filter(|step| {
+            !step.is_workiq() || (owner_can_redo_workiq && step.applies_changes().is_none())
+        })
         .filter(|s| matches!(states.get(&s.id), Some(StepState::Done { .. })))
         .collect()
 }

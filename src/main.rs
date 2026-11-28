@@ -693,6 +693,30 @@ pull request with repo pr.")]
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum TrackerFor {
+    Tasks,
+}
+
+#[derive(ClapArgs)]
+struct TrackerArgs {
+    /// Use the tracker for plans marked kind: task.
+    #[arg(long = "for", value_enum)]
+    for_kind: Option<TrackerFor>,
+    #[command(flatten)]
+    profile: ProfileArg,
+}
+
+impl TrackerArgs {
+    fn open(&self) -> Result<(Profile, proofkin::tracker::Slot)> {
+        let slot = match self.for_kind {
+            Some(TrackerFor::Tasks) => proofkin::tracker::Slot::Tasks,
+            None => proofkin::tracker::Slot::Main,
+        };
+        Ok((Profile::open(&self.profile.name)?, slot))
+    }
+}
+
 #[derive(Subcommand)]
 enum TrackerCommand {
     /// Track the profile's plan runs as issues of a repository and, with --project, on
@@ -712,17 +736,17 @@ on issue 15. The board needs the account's project scope:
         #[arg(long)]
         project: Option<String>,
         #[command(flatten)]
-        profile: ProfileArg,
+        tracker: TrackerArgs,
     },
     /// Show the tracker and whether its board works.
     Status {
         #[command(flatten)]
-        profile: ProfileArg,
+        tracker: TrackerArgs,
     },
     /// The board's items (without a board, the repository's open issues).
     Items {
         #[command(flatten)]
-        profile: ProfileArg,
+        tracker: TrackerArgs,
     },
     /// Put the repository's issues and pull requests on the board, with a status from
     /// their state (open issues to do, open pull requests in review, closed and merged
@@ -741,7 +765,7 @@ examples:
         #[arg(long)]
         closed: bool,
         #[command(flatten)]
-        profile: ProfileArg,
+        tracker: TrackerArgs,
     },
     /// Close the run issues whose sub-issues are all closed (their pull requests merged).
     Sync {
@@ -751,7 +775,7 @@ examples:
     /// Stop tracking plan runs (their issues stay on GitHub).
     Unlink {
         #[command(flatten)]
-        profile: ProfileArg,
+        tracker: TrackerArgs,
     },
 }
 
@@ -3089,6 +3113,7 @@ fn print_tracker(info: &proofkin::tracker::TrackerInfo, waiting: &[proofkin::tra
         match info.visibility.as_deref() {
             Some("public") => ", public: anyone can read them",
             Some("internal") => ", internal: everyone in its enterprise can read them",
+            Some("private") => ", private",
             _ => "",
         },
         info.login
@@ -3146,37 +3171,52 @@ fn print_waiting(waiting: &[proofkin::tracker::WaitingRun]) {
 }
 
 async fn run_tracker(command: TrackerCommand) -> Result<()> {
-    use proofkin::tracker::TrackerConfig;
+    use proofkin::tracker::{self, Slot};
     match command {
         TrackerCommand::Link {
             repo,
             project,
-            profile,
+            tracker,
         } => {
-            let profile = Profile::open(&profile.name)?;
-            let tracker = proofkin::tracker::link(&profile, &repo, project.as_deref()).await?;
-            println!("profile '{}' tracks its plan runs on GitHub", profile.name);
+            let (profile, slot) = tracker.open()?;
+            let tracker = tracker::link(&profile, slot, &repo, project.as_deref()).await?;
+            println!(
+                "profile '{}' tracks its {} on GitHub",
+                profile.name,
+                if slot == Slot::Tasks {
+                    "task plans"
+                } else {
+                    "plan runs"
+                }
+            );
             let waiting = tracker.waiting().await?;
             print_tracker(&tracker.info(), &waiting);
         }
-        TrackerCommand::Status { profile } => {
-            let profile = Profile::open(&profile.name)?;
-            match proofkin::tracker::open(&profile).await? {
+        TrackerCommand::Status { tracker } => {
+            let (profile, slot) = tracker.open()?;
+            match tracker::open(&profile, slot).await? {
                 Some(tracker) => {
                     let waiting = tracker.waiting().await?;
                     print_tracker(&tracker.info(), &waiting);
                 }
                 None => println!(
-                    "profile '{}' has no tracker; link one with: proofkin tracker link <owner/repo> --project <url> --profile {}",
-                    profile.name, profile.name
+                    "profile '{}' has no {}; link one with: proofkin tracker link <owner/repo> --project <url>{} --profile {}",
+                    profile.name,
+                    slot.label(),
+                    if slot == Slot::Tasks {
+                        " --for tasks"
+                    } else {
+                        ""
+                    },
+                    profile.name
                 ),
             }
         }
-        TrackerCommand::Items { profile } => {
-            let profile = Profile::open(&profile.name)?;
-            let tracker = proofkin::tracker::open(&profile)
+        TrackerCommand::Items { tracker } => {
+            let (profile, slot) = tracker.open()?;
+            let tracker = tracker::open(&profile, slot)
                 .await?
-                .with_context(|| format!("profile '{}' has no tracker", profile.name))?;
+                .with_context(|| format!("profile '{}' has no {}", profile.name, slot.label()))?;
             if let Some(problem) = &tracker.board_problem {
                 println!("(the repository's open issues: the board isn't used: {problem})");
             }
@@ -3223,9 +3263,9 @@ async fn run_tracker(command: TrackerCommand) -> Result<()> {
             numbers,
             open,
             closed,
-            profile,
+            tracker,
         } => {
-            let profile = Profile::open(&profile.name)?;
+            let (profile, slot) = tracker.open()?;
             let numbers = numbers
                 .iter()
                 .map(|n| {
@@ -3236,9 +3276,9 @@ async fn run_tracker(command: TrackerCommand) -> Result<()> {
             if numbers.is_empty() && !open && !closed {
                 bail!("say which to put on the board: numbers, --open or --closed");
             }
-            let tracker = proofkin::tracker::open(&profile)
+            let tracker = tracker::open(&profile, slot)
                 .await?
-                .with_context(|| format!("profile '{}' has no tracker", profile.name))?;
+                .with_context(|| format!("profile '{}' has no {}", profile.name, slot.label()))?;
             let result = tracker
                 .add_to_board(&proofkin::tracker::AddItems {
                     numbers,
@@ -3271,30 +3311,37 @@ async fn run_tracker(command: TrackerCommand) -> Result<()> {
         }
         TrackerCommand::Sync { profile } => {
             let profile = Profile::open(&profile.name)?;
-            let synced = proofkin::tracker::sync(&profile).await?;
-            if synced.closed.is_empty() {
-                println!("no run issue to close");
+            let synced = tracker::sync(&profile).await?;
+            print_synced(&synced.main);
+            if let Some(tasks) = &synced.tasks {
+                println!("tasks tracker:");
+                print_synced(tasks);
             }
-            for n in synced.closed {
-                println!("closed run issue #{n}: all its sub-issues are closed");
-            }
-            print_waiting(&synced.waiting);
         }
-        TrackerCommand::Unlink { profile } => {
-            let profile = Profile::open(&profile.name)?;
-            let path = profile.tracker_path();
-            if TrackerConfig::load(&path)?.is_none() {
-                println!("profile '{}' has no tracker", profile.name);
-            } else {
-                std::fs::remove_file(&path)?;
+        TrackerCommand::Unlink { tracker } => {
+            let (profile, slot) = tracker.open()?;
+            if tracker::unlink(&profile, slot)? {
                 println!(
-                    "profile '{}' no longer tracks its plan runs (their issues stay on GitHub)",
-                    profile.name
+                    "profile '{}' unlinked its {} (its issues stay on GitHub)",
+                    profile.name,
+                    slot.label()
                 );
+            } else {
+                println!("profile '{}' has no {}", profile.name, slot.label());
             }
         }
     }
     Ok(())
+}
+
+fn print_synced(synced: &proofkin::tracker::Synced) {
+    if synced.closed.is_empty() {
+        println!("no run issue to close");
+    }
+    for num in &synced.closed {
+        println!("closed run issue #{num}: all its sub-issues are closed");
+    }
+    print_waiting(&synced.waiting);
 }
 
 fn read_input(file: &std::path::Path) -> Result<String> {

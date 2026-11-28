@@ -677,6 +677,11 @@ const planText = (() => {
     return ["The run's issue is labelled ", { code: kind.label }, ` (and typed ${kind.type} where the repository has issue types).`];
   }
 
+  function trackerForPlan(text, state) {
+    if (planKind(text) === "task" && state?.tasks) return state.tasks;
+    return state?.tracker ?? null;
+  }
+
   /// What running the plan does on GitHub, for the line under the tracking choice:
   /// `track` as trackOf reads it (an issue without a number: its number isn't typed
   /// yet), `tracker` the linked tracker (repo, repo_url, login, visibility, board) and,
@@ -696,7 +701,7 @@ const planText = (() => {
         : [" Each step's result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub)."]),
       ...(tracker.visibility === "public" ? [" The repository is public: anyone can read them."]
         : tracker.visibility === "internal" ? [" The repository is internal: everyone in its enterprise can read them."]
-          : []),
+          : tracker.visibility === "private" ? [" The repository is private."] : []),
     ];
     const note = (parts, warn = false) => ({ parts, warn });
     if (track.kind === "off") return note(["Nothing goes to GitHub: the run is kept under Evidence runs only."]);
@@ -714,8 +719,8 @@ const planText = (() => {
     const link = { text: `${n} ${title}`, href: issue.url, label: `Issue ${n} ${issue.title} on GitHub` };
     const steps = `its steps become sub-issues of it (or take up the open ones an earlier run left)${who}.`;
     return issue.open
-      ? note(["Running it works on ", link, `: ${steps}`, ...after])
-      : note([link, ` is closed: running it reopens it, and ${steps}`, ...after], true);
+      ? note(["Running it works on ", link, " in ", repo, `: ${steps}`, ...after])
+      : note([link, " is closed in ", repo, `: running it reopens it, and ${steps}`, ...after], true);
   }
 
   return {
@@ -723,7 +728,7 @@ const planText = (() => {
     parsePlan, formatPlan, valuesOf, setValues, renameStep, removeStep, renameClaim, removeClaim,
     dependents, needs, isTodo: (text) => blank(text, TODO), isTodoClaim: (text) => blank(text, TODO_CLAIM),
     taskOf, setTask, lineKinds: (text) => linesOf(text).map((l) => ({ kind: l.kind, head: l.head })),
-    trackOf, setTrack, trackNote, WORKIQ, WORKIQ_SOURCES, isWorkiq, toggleSource, setTarget,
+    trackOf, setTrack, trackerForPlan, trackNote, WORKIQ, WORKIQ_SOURCES, isWorkiq, toggleSource, setTarget,
     modelsOf, setModels, modelSteps, KINDS, planKind, setKind, kindNote,
   };
 })();
