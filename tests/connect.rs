@@ -1295,6 +1295,9 @@ impl Executor for Drafter {
         if task.prompt.contains("add a sign-off by me") {
             plan += "\nok after work approve @me Sign it off";
         }
+        if task.prompt.contains("leave the run untracked") {
+            plan = format!("// Not tracked: the owner asked.\ntrack: off\n{plan}");
+        }
         Ok(proofkin::Ran::new(
             format!("Sure, here it is:\n```plan\n{plan}\n```\nTell me if it needs more."),
             task.model.clone().or_else(|| Some("drafter-1".into())),
@@ -1305,7 +1308,7 @@ impl Executor for Drafter {
 
 /// Another agent drafts a plan over MCP with `draft_plan`, then has it changed: each answer
 /// is the plan and its problems (here, the peer it names isn't connected, after 3 tries),
-/// and drafting runs nothing; `run_plan` stays how a plan runs.
+/// plus a notice if the draft turns tracking off. Drafting runs nothing; `run_plan` runs it.
 #[tokio::test]
 async fn other_agents_draft_plans_over_mcp_and_drafting_runs_nothing() {
     let home = shared_home();
@@ -1384,6 +1387,8 @@ async fn other_agents_draft_plans_over_mcp_and_drafting_runs_nothing() {
     );
     assert_eq!(drafted["tries"], 3);
     assert_eq!(drafted["model"], "drafter-1");
+    assert!(drafted.get("untracked").is_none(), "{drafted}");
+    assert!(drafted.get("notice").is_none(), "{drafted}");
     assert!(
         drafted["problems"]
             .as_array()
@@ -1423,6 +1428,19 @@ async fn other_agents_draft_plans_over_mcp_and_drafting_runs_nothing() {
     assert_eq!(
         chosen["plan"].as_str().unwrap().lines().next(),
         Some("// Drafted by claude (claude-sonnet-5.5): Do the work in app")
+    );
+
+    let untracked = call(json!({ "goal": "Do the work in app but leave the run untracked" })).await;
+    assert_ne!(untracked["isError"], true, "{untracked}");
+    let notice = proofkin::plan_draft::UNTRACKED_NOTICE;
+    assert_eq!(untracked["structuredContent"]["untracked"], true);
+    assert_eq!(untracked["structuredContent"]["notice"], notice);
+    assert!(
+        untracked["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(notice),
+        "{untracked}"
     );
 
     let state = request(

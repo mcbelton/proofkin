@@ -873,6 +873,8 @@ plan, then run it yourself.
     a review by #qa before the sign-off"). The model gets the plan and your note, and
     writes the whole plan again.
   - **Run plan** stays your click, with the editor's check and tracking choice.
+    The model leaves tracking to you; if a draft says `track: off`, **Describe** tells
+    you.
 - **From the command line:** `plan draft` prints the plan, or writes it to `--out`, then
   its problems. It exits 1 while errors remain. Choose a provider with `--using`, or
   override its defaults with `--model <name>` and `--effort <level>`.
@@ -889,8 +891,9 @@ plan, then run it yourself.
   `run_plan` still runs a plan, so an agent can draft one, show it to its user, then run
   it.
 - **The API:** `POST /api/plans/draft` with `{goal, issue?, provider?, model?, effort?, plan?, note?}`
-  answers `{plan, problems, provider, model, effort, tries}`. With no provider named, the
-  first signed-in provider writes it. Omit model or effort to use the profile's default.
+  answers `{plan, problems, provider, model, effort, tries, untracked?}`. With no provider
+  named, the first signed-in provider writes it. Omit model or effort to use the profile's
+  default.
   Invalid or disallowed model and reasoning choices are refused with HTTP 400 before
   looking up an issue or asking a model. Progress goes out as events.
 

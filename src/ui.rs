@@ -3198,7 +3198,7 @@ async fn plan_draft_options(State(shared): State<AppState>) -> Json<PlanDraftOpt
 async fn draft_plan_route(
     State(s): State<AppState>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<crate::plan_draft::Drafted>, ApiError> {
     let ask = serde_json::from_value(body).map_err(|e| bad_request(format!("{e}")))?;
     let by = factory::owner(&s);
     draft_plan(&s, ask, &by).await.map(Json)
@@ -3207,7 +3207,11 @@ async fn draft_plan_route(
 /// The plan `ask` asks for, which `by` asked for: drafted by the profile's own model (see
 /// [`crate::plan_draft`]), checked as Run plan checks it, and recorded in the activity and
 /// the audit. Its progress goes out as `plan-draft` events. It runs nothing.
-async fn draft_plan(s: &Shared, ask: crate::plan_draft::Ask, by: &str) -> Result<Value, ApiError> {
+async fn draft_plan(
+    s: &Shared,
+    ask: crate::plan_draft::Ask,
+    by: &str,
+) -> Result<crate::plan_draft::Drafted, ApiError> {
     use crate::plan_draft;
     let started = SystemTime::now();
     ask.validate().map_err(|e| bad_request(format!("{e:#}")))?;
@@ -3249,7 +3253,7 @@ async fn draft_plan(s: &Shared, ask: crate::plan_draft::Ask, by: &str) -> Result
     let drafted = drafted.map_err(|e| internal(format!("{e:#}")))?;
     plan_draft::record(&profile, &drafted, by, &s.agent.id().to_string(), started);
     s.system("info", plan_draft::activity(&drafted, by));
-    Ok(json!(drafted))
+    Ok(drafted)
 }
 
 /// GitHub: the profile's account, the GitHub CLI accounts it could use, and the

@@ -3577,7 +3577,9 @@ impl Executor for Planner {
         assert_eq!(ctx.access, Access::ReadOnly, "a draft only reads");
         let mut prompts = self.prompts.lock().unwrap();
         prompts.push(task.prompt.clone());
-        let plan = if prompts.len() == 1 {
+        let plan = if task.prompt.contains("Keep this run off GitHub") {
+            "// Not tracked: the owner asked.\ntrack: off\nok approve @me Ship the fix?"
+        } else if prompts.len() == 1 {
             "fix @ghost:app Fix the bug"
         } else {
             "ok approve @me Ship the fix?"
@@ -3783,6 +3785,7 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
     assert_eq!(drafted["effort"], "low");
     assert_eq!(drafted["tries"], 2);
     assert!(drafted.get("goal_sha256").is_none(), "{drafted}");
+    assert!(drafted.get("untracked").is_none(), "{drafted}");
     {
         let prompts = planner.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
@@ -3859,6 +3862,37 @@ async fn the_owner_drafts_a_plan_with_the_profiles_model_through_the_api() {
         unsigned.body
     );
     assert_eq!(planner.prompts.lock().unwrap().len(), 2);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_untracked_draft_is_preserved_and_describe_shows_the_notice() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, agent, port, token) = plan_draft_ui(home.path(), Arc::new(Planner::default())).await;
+    let host = format!("127.0.0.1:{port}");
+    let response = request(
+        port,
+        "POST",
+        "/api/plans/draft",
+        &host,
+        Some(&token),
+        Some(r#"{"goal":"Keep this run off GitHub","model":"planner-1"}"#),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    let drafted = response.json();
+    assert_eq!(drafted["untracked"], true, "{drafted}");
+    assert_eq!(
+        drafted["plan"],
+        "// Drafted by copilot (planner-1): Keep this run off GitHub\n\
+         // Not tracked: the owner asked.\ntrack: off\nok approve @me Ship the fix?\n"
+    );
+
+    let app = request(port, "GET", "/app.js", &host, None, None).await;
+    assert_eq!(app.status, 200);
+    assert!(app.body.contains("drafted.untracked"));
+    assert!(app.body.contains(proofkin::plan_draft::UNTRACKED_NOTICE));
+    assert!(app.body.contains("toast(result + tracking,"));
     agent.shutdown().await;
 }
 
