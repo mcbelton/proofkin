@@ -1130,7 +1130,16 @@ async fn call_tool(s: &AppState, params: &Value) -> Result<Value, String> {
         "cancel_task" => cancel_task(s, &args),
         "check_plan" => text_arg(&args, "plan").map(|plan| plan_check(s, &plan)),
         "draft_plan" => match serde_json::from_value(args.clone()) {
-            Ok(ask) => super::draft_plan(s, ask, BY_AGENT).await.map_err(api_error),
+            Ok(ask) => super::draft_plan(s, ask, BY_AGENT)
+                .await
+                .map(|drafted| {
+                    let mut answer = json!(drafted);
+                    if drafted.untracked {
+                        answer["notice"] = json!(crate::plan_draft::UNTRACKED_NOTICE);
+                    }
+                    answer
+                })
+                .map_err(api_error),
             Err(e) => Err(format!("{e}")),
         },
         "get_run" => text_arg(&args, "run_id")
