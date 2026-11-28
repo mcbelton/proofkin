@@ -43,6 +43,7 @@ pub mod team;
 pub mod tracker;
 pub mod trust;
 pub mod ui;
+pub mod upgrade;
 pub mod workers;
 pub mod workiq;
 pub mod worktree;

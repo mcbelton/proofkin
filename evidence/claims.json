@@ -2,6 +2,30 @@
   "$comment": "Evidence-driven development: every claim Proofkin makes, and the evidence that proves it. Test ids are <target>::<path> as printed by cargo test with '::tests' removed (target: lib, bin, or an integration test file name). Live checks are names printed by scripts/live_test.py; a trailing * matches a prefix. Run: python scripts/evidence.py [--live]. See README 'Evidence-driven development'.",
   "claims": [
     {
+      "id": "UPG-1",
+      "area": "install",
+      "claim": "The command line can replace a release-built Proofkin with the latest or a named release. It verifies the platform archive against SHA256SUMS, tries the new binary before replacing the old one, and reports running agents without restarting them. Source builds are not replaced.",
+      "tests": [
+        "bin::upgrade_accepts_an_optional_version_and_update_alias",
+        "bin::upgrade_rejects_subcommands_and_agent_flags",
+        "upgrade::cli_source_build_refuses_upgrade_and_alias_even_with_release_env_at_runtime",
+        "upgrade::latest_replaces_only_the_binary_after_verification",
+        "upgrade::latest_never_downloads_if_installed_or_older",
+        "upgrade::named_versions_lookup_the_same_tag_and_allow_a_downgrade",
+        "upgrade::checksum_mismatch_leaves_the_binary_untouched",
+        "upgrade::missing_assets_are_reported_before_any_download",
+        "upgrade::bad_release_statuses_and_tags_do_not_start_downloads",
+        "upgrade::checksum_download_stops_at_64_kib_even_without_a_length_header",
+        "upgrade::an_archive_with_only_a_nested_binary_is_refused",
+        "upgrade::a_failed_try_or_wrong_version_removes_the_candidate",
+        "upgrade::a_failed_swap_keeps_the_old_executable_at_its_path",
+        {"test": "upgrade::a_windows_binary_in_use_is_replaced_and_cleaned_up_next_time", "os": "windows"},
+        {"test": "upgrade::upgrading_through_a_symlink_replaces_its_target_not_the_link", "os": "unix"},
+        "upgrade::running_profiles_are_named_in_the_restart_notice",
+        "upgrade::default_try_reads_the_real_version_and_rejects_non_programs"
+      ]
+    },
+    {
       "id": "NET-1",
       "area": "network",
       "claim": "Agents authenticate each other by public key and refuse every key that is not on the allowlist, including peers learned through gossip.",

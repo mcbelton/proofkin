@@ -552,6 +552,12 @@ impl HttpTransport {
 }
 
 pub(crate) fn http_client(timeout: Duration) -> Result<reqwest::Client> {
+    http_client_builder(timeout)?
+        .build()
+        .context("could not build the HTTP client")
+}
+
+pub(crate) fn http_client_builder(timeout: Duration) -> Result<reqwest::ClientBuilder> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let tls = rustls::ClientConfig::builder_with_provider(provider)
@@ -559,11 +565,9 @@ pub(crate) fn http_client(timeout: Duration) -> Result<reqwest::Client> {
         .context("could not set up TLS")?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    reqwest::Client::builder()
+    Ok(reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
-        .timeout(timeout)
-        .build()
-        .context("could not build the HTTP client")
+        .timeout(timeout))
 }
 
 #[async_trait]

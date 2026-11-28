@@ -10,6 +10,7 @@ use proofkin::auth::{LoginMethod, ProviderTools};
 use proofkin::plan::{Plan, SquadStore, StepState, run_plan_with};
 use proofkin::profile::{DEFAULT_GITHUB_HOST, WorkIqChanges};
 use proofkin::trust::DEFAULT_TASKS_PER_HOUR;
+use proofkin::upgrade::{Upgrade, Version, try_binary};
 use proofkin::{
     Access, Agent, AgentConfig, Event, Executor, ExecutorConfig, LlmTask, Network, Profile,
     Provider, SdkExecutor, TaskContext, Ticket, TrustedPeer,
@@ -34,6 +35,8 @@ commands:
   /help                                 show this help
   /quit                                 exit
 
+Run proofkin --upgrade [VERSION] (or --update) to update a release binary in place.
+
 Each agent has its own identity (key) and Copilot/Claude/Codex accounts from its profile
 (--profile, default: --name). Peers must allowlist each other's keys:  proofkin peers --help
 Sign a profile in to providers:  proofkin auth --help";
@@ -43,6 +46,10 @@ Sign a profile in to providers:  proofkin auth --help";
 #[derive(Parser)]
 #[command(version, after_help = COMMANDS, args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct Cli {
+    /// Install the latest release (or VERSION) in place of this binary, checked against
+    /// the release's SHA256SUMS.
+    #[arg(long, visible_alias = "update", exclusive = true, num_args = 0..=1, value_name = "VERSION")]
+    upgrade: Option<Option<Version>>,
     #[command(subcommand)]
     command: Option<Command>,
     #[command(flatten)]
@@ -1700,8 +1707,9 @@ struct ProfileArg {
 
 #[derive(ClapArgs)]
 struct BridgeArg {
-    /// Node bridge script for the Claude and Codex SDKs (default: the one `setup` installed).
-    #[arg(long, env = "PROOFKIN_BRIDGE")]
+    /// Node bridge script for the Claude and Codex SDKs (default: PROOFKIN_BRIDGE or the one
+    /// `setup` installed).
+    #[arg(long)]
     bridge: Option<PathBuf>,
 }
 
@@ -1780,6 +1788,9 @@ fn open_browser(url: &str) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(version) = cli.upgrade {
+        return run_upgrade(version).await;
+    }
     match cli.command {
         Some(Command::Auth(command)) => run_auth(command).await,
         Some(Command::Peers(command)) => run_peers(command),
@@ -1843,6 +1854,26 @@ async fn main() -> Result<()> {
         }
         None => run_agent(cli.run).await,
     }
+}
+
+async fn run_upgrade(version: Option<Version>) -> Result<()> {
+    let Some(repo) = option_env!("PROOFKIN_RELEASE_REPO") else {
+        bail!(
+            "this proofkin was built from source, so --upgrade doesn't replace it: update it the way you built it, or install a release with the installer (README, Install)"
+        );
+    };
+    let api_base = reqwest::Url::parse("https:api.github.com")?;
+    let profiles_root = proofkin::profile::profiles_root().ok();
+    let upgrade = Upgrade {
+        repo,
+        target: env!("PROOFKIN_TARGET"),
+        current_version: env!("CARGO_PKG_VERSION"),
+        exe: &std::env::current_exe().context("could not find the running executable")?,
+        api_base: &api_base,
+        profiles_root: profiles_root.as_deref(),
+    };
+    println!("{}", upgrade.run(version, try_binary).await?);
+    Ok(())
 }
 
 fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
@@ -6079,6 +6110,35 @@ mod tests {
     fn cli_definition_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn upgrade_accepts_an_optional_version_and_update_alias() {
+        for flag in ["--upgrade", "--update"] {
+            let latest = Cli::try_parse_from(["proofkin", flag]).unwrap();
+            assert!(matches!(latest.upgrade, Some(None)));
+            for version in ["0.32.1", "v0.32.1"] {
+                let named = Cli::try_parse_from(["proofkin", flag, version]).unwrap();
+                assert_eq!(named.upgrade.flatten().unwrap().to_string(), "0.32.1");
+            }
+        }
+    }
+
+    #[test]
+    fn upgrade_rejects_subcommands_and_agent_flags() {
+        for args in [
+            &["--upgrade", "doctor"][..],
+            &["doctor", "--upgrade"],
+            &["--upgrade", "0.32.1", "doctor"],
+            &["--upgrade", "--name", "boss"],
+            &["--profile", "boss", "--upgrade"],
+            &["--upgrade", "--ui"],
+            &["--bridge", "some-bridge", "--upgrade"],
+            &["--upgrade", "--update"],
+        ] {
+            let args = [&["proofkin"], args].concat();
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
