@@ -561,6 +561,20 @@
       ]
     },
     {
+      "id": "PLAN-5",
+      "area": "plans",
+      "claim": "A plan says what kind of work it is and describes it, before its claims and steps: at most one kind: line (bug, feature, enhancement, docs or task, in any case, kept in lower case; another value or a second line is refused, naming the five) and at most one about: line, whose text and the lines indented under it (as a step's text continues, kept as written) are its Markdown description, its first line the summary, at most 6,000 characters (a longer or second one is refused). Both are optional in a saved plan, so plans and runs without them parse and load as before, and the format reference names both. A drafted plan is asked to start with both: the kind from what the plan should do (and the issue's text for an issue), the about text in Markdown with short bold headings by kind, using only what the owner said or the issue's text and marking the rest to confirm. The web UI's plan editor and Builder keep both lines as written, the about's indented lines with it, and write them after track: and the model settings; a Kind choice beside Track on GitHub (Plan mode and the plan editor) reads, writes and removes the kind: line and, when the run is tracked, says the label and type its issues get.",
+      "tests": [
+        "lib::plan::a_plan_says_what_kind_of_work_it_is_in_any_case_and_refuses_another_or_a_second",
+        "lib::plan::an_about_line_and_the_lines_indented_under_it_describe_the_plan",
+        "lib::plan::plans_without_kind_or_about_parse_and_load_as_before",
+        "lib::plan::the_format_reference_names_every_step_kind_and_option_the_parser_takes",
+        "lib::plan_draft::the_prompt_asks_for_the_kind_and_an_about_text_with_headings_by_kind",
+        "ui::the_plan_editor_keeps_plans_valid",
+        "ui::the_page_follows_the_ux_guidelines"
+      ]
+    },
+    {
       "id": "LRN-1",
       "area": "knowledge",
       "claim": "The system keeps learning: the ops summary (health, incidents, usage) is written into the knowledge base (kb learn, and hourly by agents with monitors) for context=all and the learn playbook, and learned TSGs fix repeats without the model.",
@@ -1901,6 +1915,20 @@
         "lib::tracker::adds_github_answers_with_an_error_are_found_on_the_board_or_made_again",
         "lib::tracker::a_board_that_puts_sub_issues_on_itself_still_gets_the_steps_fields",
         "lib::tracker::queries_are_asked_again_after_a_server_error_but_mutations_never"
+      ]
+    },
+    {
+      "id": "TRK-9",
+      "area": "tracking",
+      "claim": "A tracked run's issues say what kind of work the plan is and describe it. With kind:, the issues the run makes get the kind's label (bug, feature, enhancement, documentation for docs, task) and an issue type: the run's issue Bug for bug, Feature for feature and enhancement, Task for docs and task; each step issue Task. Labels and types are found by name in the repository, ignoring case, when the run's tracking starts, and given as the issues are created; a missing label is created first, with a fixed colour and a one-line description; a repository without issue types, or without that type, gives no type; a label or type that can't be found or made leaves the issues without it, the issues are still made, and the run's tracking problems say so. The run's issue holds the about: text, redacted and cut at 6,000 characters, in an About section before What it must prove and Steps, and is titled by its first line unless track: gives a title. Issues a person named (track: #N, issue=#N, a step sub-issue taken over from an earlier run) keep their type and labels as they keep their text; on track: #N the run comments the about text once, when it starts. A plan without kind: and about: makes the same GitHub calls as before.",
+      "tests": [
+        "lib::tracker::a_bug_plans_run_issue_is_a_bug_and_its_step_issues_tasks_all_labelled_bug",
+        "lib::tracker::a_missing_label_is_made_before_the_issues_that_get_it",
+        "lib::tracker::a_repository_without_issue_types_gets_labels_only",
+        "lib::tracker::issues_are_made_without_a_label_that_cant_be_made_and_the_problems_say_so",
+        "lib::tracker::a_named_issue_keeps_its_labels_and_type_and_gets_the_description_once",
+        "lib::tracker::a_run_issue_holds_the_description_in_its_about_section_and_is_titled_by_it",
+        "lib::tracker::a_plan_without_kind_or_about_makes_the_same_calls_as_before"
       ]
     },
     {

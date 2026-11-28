@@ -876,6 +876,8 @@ const planBuilder = (() => {
     let last = null;
     return planText.lineKinds(text).map(({ kind }) => {
       if (kind === "text") return last;
+      // An about: line's text is no card's.
+      if (kind === "about") last = null;
       if (kind !== "claim" && kind !== "step") return null;
       return (last = kind === "claim" ? { claim: plan.claims[claim++]?.id } : { step: plan.steps[step++]?.id });
     });

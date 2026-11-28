@@ -7,6 +7,15 @@ const planText = (() => {
   // Words that start a part of a step line, so never its name.
   const KEYWORDS = new Set(["after", "approve", "team", "pr", "using"]);
   const MODEL_HEADERS = ["model", "effort"];
+  // What kind of work a plan is (kind:, src/plan.rs Kind): the label and the issue type
+  // its tracked run's issues get (src/tracker.rs).
+  const KINDS = [
+    { value: "bug", name: "Bug", label: "bug", type: "Bug" },
+    { value: "feature", name: "Feature", label: "feature", type: "Feature" },
+    { value: "enhancement", name: "Enhancement", label: "enhancement", type: "Feature" },
+    { value: "docs", name: "Docs", label: "documentation", type: "Task" },
+    { value: "task", name: "Task", label: "task", type: "Task" },
+  ];
   // Step options (before what to do), by the option they set. Repeating a list
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
@@ -72,9 +81,10 @@ const planText = (() => {
   }
 
   /// Each line of `text` with where it starts and ends, how the parser reads it (see
-  /// kindOf; "text" for a line that continues the task text of a step), the index of
-  /// the step line it belongs to (its own for any other line) and, on a step line,
-  /// where its last continuation line ends.
+  /// kindOf; "text" for a line that continues the task text of a step or the plan's
+  /// description, about:), the index of the step or about: line it belongs to (its own
+  /// for any other line) and, on a step or about: line, where its last continuation
+  /// line ends.
   function linesOf(text) {
     let start = 0;
     const lines = text.split("\n").map((line, index) => {
@@ -84,7 +94,7 @@ const planText = (() => {
     });
     const indent = (l) => l.match(/^\s*/)[0].length;
     for (let i = 0; i < lines.length; i++) {
-      if (lines[i].kind !== "step") continue;
+      if (lines[i].kind !== "step" && lines[i].kind !== "about") continue;
       const base = indent(lines[i].line);
       let last = i;
       for (let j = i + 1; j < lines.length; j++) {
@@ -103,7 +113,8 @@ const planText = (() => {
   function kindOf(line) {
     const t = line.trim();
     return !t ? "empty" : t.startsWith("//") ? "comment" : t.startsWith("claim:") ? "claim"
-      : t.startsWith("track:") ? "track" : MODEL_HEADERS.find((key) => t.startsWith(`${key}:`)) ?? "step";
+      : t.startsWith("track:") ? "track" : t.startsWith("kind:") ? "kind" : t.startsWith("about:") ? "about"
+        : MODEL_HEADERS.find((key) => t.startsWith(`${key}:`)) ?? "step";
   }
 
   /// Sets an option on `step`: a list option adds its values (skill=a, then skill=b,
@@ -245,7 +256,7 @@ const planText = (() => {
     step.id ??= nextStepId(text);
     step.target ??= target;
     // A pull request step's title is optional: no placeholder to type over.
-    step.todo ||= at.blockEnd > at.end || step.pr ? "" : TODO;
+    step.todo ||= (kind === "step" && at.blockEnd > at.end) || step.pr ? "" : TODO;
     const line = (kind === "step" ? at.line.match(/^\s*/)[0] : "") + formatStep(step);
     // Select a placeholder to type over: a new topic's name, or what to do.
     const topic = part === "save=topic" ? line.indexOf(" save=topic ") : -1;
@@ -378,16 +389,24 @@ const planText = (() => {
     step.target = workiq ? WORKIQ : target;
   }
 
-  /// The lines after the step line `all[index]` that continue its task text, without
+  /// The lines after the step or about: line `all[index]` that continue it, without
   /// their common indentation, as the parser reads them (src/plan.rs).
-  function moreOf(all, index) {
+  function continuedOf(all, index) {
     const body = [];
     for (let i = index + 1; all[i]?.head === index && all[i].kind === "text"; i++) body.push(all[i].line.trimEnd());
     const indent = (l) => l.match(/^\s*/)[0].length;
     const common = Math.min(...body.filter(Boolean).map(indent));
-    const lines = body.map((l) => l.slice(common));
-    return (parseStep(all[index].line).todo ? lines.join("\n") : lines.join("\n").replace(/^\n+/, ""));
+    return body.map((l) => l.slice(common)).join("\n");
   }
+
+  /// The lines after the step line `all[index]` that continue its task text.
+  function moreOf(all, index) {
+    const more = continuedOf(all, index);
+    return parseStep(all[index].line).todo ? more : more.replace(/^\n+/, "");
+  }
+
+  /// Lines that continue a line, as the builder writes them: indented under it.
+  const indented = (more) => (more ? more.split("\n").map((l) => (l ? `  ${l}` : "")) : []);
 
   /// A step's whole task text: what is on its line and the lines that continue it.
   const taskOf = (s) => (s.more ? (s.todo ? `${s.todo}\n${s.more}` : s.more) : s.todo);
@@ -400,10 +419,11 @@ const planText = (() => {
   }
 
   /// The plan as the builder edits it: notes (comments before the first claim or step,
-  /// and after the last), settings, claims and steps, with their comments. Lenient,
-  /// like the palette: a half-written line is a step with parts missing.
+  /// and after the last), settings (with the kind: and about: lines as written), claims
+  /// and steps, with their comments. Lenient, like the palette: a half-written line is
+  /// a step with parts missing.
   function parsePlan(text) {
-    const plan = { notes: [], track: null, modelLines: [], claims: [], steps: [] };
+    const plan = { notes: [], track: null, modelLines: [], kindLines: [], aboutLines: [], claims: [], steps: [] };
     let comments = [];
     const all = linesOf(text);
     for (const [index, { line, kind: lineKind }] of all.entries()) {
@@ -415,9 +435,11 @@ const planText = (() => {
         comments.push(t.replace(/^\/\/ ?/, ""));
         continue;
       }
-      if (kind === "track" || MODEL_HEADERS.includes(kind)) {
+      if (kind === "track" || kind === "kind" || kind === "about" || MODEL_HEADERS.includes(kind)) {
         if (kind === "track") plan.track = t.slice("track:".length).trim();
         // Keep invalid lines, too, so unrelated Builder changes don't silently fix them.
+        else if (kind === "kind") plan.kindLines.push(t);
+        else if (kind === "about") plan.aboutLines.push(t, ...indented(continuedOf(all, index)));
         else plan.modelLines.push(t);
         plan.notes.push(...comments);
         comments = [];
@@ -442,8 +464,8 @@ const planText = (() => {
     return Object.assign(plan, modelsFrom(plan.modelLines));
   }
 
-  /// The text of `plan` (notes, claims, then steps), and what each line is: {claim}
-  /// or {step} by id, so the plan check's "line N" points at a card.
+  /// The text of `plan` (notes, settings, claims, then steps), and what each line is:
+  /// {claim} or {step} by id, so the plan check's "line N" points at a card.
   function formatPlan(plan) {
     const lines = [];
     const items = [];
@@ -458,6 +480,7 @@ const planText = (() => {
     for (const key of MODEL_HEADERS) {
       for (const line of plan.modelLines ?? []) if (line.startsWith(`${key}:`)) add(line);
     }
+    for (const line of [...(plan.kindLines ?? []), ...(plan.aboutLines ?? [])]) add(line);
     if (plan.claims.length) gap();
     for (const c of plan.claims) {
       c.notes?.forEach((n) => note(n, { claim: c.id }));
@@ -467,7 +490,7 @@ const planText = (() => {
     for (const s of plan.steps) {
       s.notes?.forEach((n) => note(n, { step: s.id }));
       add(formatStep(s), { step: s.id });
-      for (const l of s.more ? s.more.split("\n") : []) add(l ? `  ${l}` : "", { step: s.id });
+      for (const l of indented(s.more)) add(l, { step: s.id });
     }
     return { text: lines.join("\n"), items };
   }
@@ -620,6 +643,40 @@ const planText = (() => {
     .map((l) => parseStep(l.line))
     .filter((s) => s.target && !s.approve && !s.pr && !s.team && !isWorkiq(s.target));
 
+  /// The plan's kind: its kind: line's value in lower case ("" if it has none), or null
+  /// without the line.
+  function planKind(text) {
+    const line = linesOf(text).find((l) => l.kind === "kind");
+    return line ? line.line.trim().slice("kind:".length).trim().toLowerCase() : null;
+  }
+
+  /// `text` with its kind: line set to `value` (`kind: value`), put after track: and
+  /// the model settings if it has none; null takes it out, as it does a second one.
+  function setKind(text, value) {
+    const lines = linesOf(text);
+    const [first, ...duplicates] = lines.filter((l) => l.kind === "kind");
+    for (const line of duplicates.reverse()) text = removeLine(text, line);
+    if (first) return value ? text.slice(0, first.start) + `kind: ${value}` + text.slice(first.end) : removeLine(text, first);
+    if (!value) return text;
+    const body = lines.find((l) => l.kind === "claim" || l.kind === "step" || l.kind === "about");
+    const prior = lines.filter((l) => (!body || l.start < body.start) && (l.kind === "track" || MODEL_HEADERS.includes(l.kind))).at(-1);
+    return prior ? `${text.slice(0, prior.end)}\nkind: ${value}${text.slice(prior.end)}` : `kind: ${value}${text ? `\n${text}` : ""}`;
+  }
+
+  /// What a tracked run does with the plan's kind, for the line under the Kind choice:
+  /// text and { code } parts, none without a kind or tracking. An issue the plan names
+  /// keeps its own labels and type (src/tracker.rs).
+  function kindNote(text) {
+    const kind = KINDS.find((k) => k.value === planKind(text));
+    const track = trackOf(text);
+    if (!kind || track.kind === "off") return [];
+    if (track.kind === "issue" && track.number) {
+      return ["The issues the run makes for its steps are labelled ", { code: kind.label },
+        ` (and typed Task where the repository has issue types); #${track.number} keeps its labels and type.`];
+    }
+    return ["The run's issue is labelled ", { code: kind.label }, ` (and typed ${kind.type} where the repository has issue types).`];
+  }
+
   /// What running the plan does on GitHub, for the line under the tracking choice:
   /// `track` as trackOf reads it (an issue without a number: its number isn't typed
   /// yet), `tracker` the linked tracker (repo, repo_url, login, visibility, board) and,
@@ -667,6 +724,6 @@ const planText = (() => {
     dependents, needs, isTodo: (text) => blank(text, TODO), isTodoClaim: (text) => blank(text, TODO_CLAIM),
     taskOf, setTask, lineKinds: (text) => linesOf(text).map((l) => ({ kind: l.kind, head: l.head })),
     trackOf, setTrack, trackNote, WORKIQ, WORKIQ_SOURCES, isWorkiq, toggleSource, setTarget,
-    modelsOf, setModels, modelSteps,
+    modelsOf, setModels, modelSteps, KINDS, planKind, setKind, kindNote,
   };
 })();

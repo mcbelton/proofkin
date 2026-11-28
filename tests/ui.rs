@@ -3265,7 +3265,11 @@ async fn the_page_follows_the_ux_guidelines() {
     // Playbooks need explaining, so they're picked from cards, not a native dropdown.
     assert!(!page.contains(r#"<select id="playbook""#));
     for prefix in ["plan", "plan-editor"] {
-        for (setting, label) in [("model", "Model"), ("effort", "Reasoning")] {
+        for (setting, label) in [
+            ("model", "Model"),
+            ("effort", "Reasoning"),
+            ("kind", "Kind"),
+        ] {
             let id = format!("{prefix}-{setting}");
             assert!(
                 page.contains(&format!(r#"<label for="{id}">{label}"#)),

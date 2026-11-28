@@ -372,6 +372,54 @@ cases.push(
         + " Each step's result is commented on its issue (one that may hold Microsoft 365 content stays off GitHub)."],
     ];
   })(),
+  // What kind of work the plan is and what it is about (src/plan.rs): its kind: line and
+  // its about: line with the lines indented under it, kept as written. The Kind choice
+  // beside Track on GitHub reads and writes the kind: line.
+  ...(() => {
+    const described = [
+      "// Issue 354",
+      "track: #12",
+      "model: gpt-5.5",
+      "kind: Feature",
+      "about: Plans say their kind",
+      "  **Why**",
+      "",
+      "  - asked by the owner",
+      "    - twice",
+      "",
+      "claim: C-1 x",
+      "",
+      "a @x Do it",
+    ].join("\n");
+    const note = (plan) => planText.kindNote(plan).map((p) => (typeof p === "string" ? p : `\`${p.code}\``)).join("");
+    return [
+      ["a plan with kind: and a multi-line about: comes out of the Builder unchanged", text(planText.parsePlan(described)), described],
+      ["an about's indented lines are its text, not steps", planText.lineKinds(described).map((l) => l.kind).join(","),
+        "comment,track,model,kind,about,text,text,text,text,empty,claim,empty,step"],
+      ["the Builder writes kind: and about: after track: and the model settings",
+        text(planText.parsePlan("about: Why\n  more\nkind: bug\na @x Do it\ntrack: off\nmodel: m")),
+        "track: off\nmodel: m\nkind: bug\nabout: Why\n  more\n\na @x Do it"],
+      ["a part clicked in the about's text starts a step after it", part("about: Why\n  mo|re", "verify=test"),
+        "about: Why\n  more\nstep1 @worker:repo verify=test [What to do]"],
+      ["the Kind choice reads the kind: line in lower case, not a step's text",
+        JSON.stringify([planText.planKind(described), planText.planKind("a @x Do it\n  kind: bug")]), JSON.stringify(["feature", null])],
+      ["the Kind choice adds the line after track: and the model settings",
+        planText.setKind("// c\ntrack: #4\nmodel: m\n\nabout: Why\n  more\na @x Do it", "bug"),
+        "// c\ntrack: #4\nmodel: m\nkind: bug\n\nabout: Why\n  more\na @x Do it"],
+      ["first in a plan without settings", planText.setKind("a @x Do it", "docs"), "kind: docs\na @x Do it"],
+      ["another kind replaces the line", planText.setKind(described, "bug"), described.replace("kind: Feature", "kind: bug")],
+      ["None takes the line out, and a second one", planText.setKind("kind: bug\nkind: task\na @x Do it", null), "a @x Do it"],
+      ["a tracked run's issue gets the kind's label and type", note("kind: Enhancement\na @x Do it"),
+        "The run's issue is labelled `enhancement` (and typed Feature where the repository has issue types)."],
+      ["docs are labelled documentation", note("kind: docs\ntrack: Write it\na @x Do it"),
+        "The run's issue is labelled `documentation` (and typed Task where the repository has issue types)."],
+      ["an issue the plan names keeps its labels and type", note("kind: bug\ntrack: #12\na @x Do it"),
+        "The issues the run makes for its steps are labelled `bug` (and typed Task where the repository has issue types);"
+        + " #12 keeps its labels and type."],
+      ["no note when untracked, without a kind or with one the plan check refuses",
+        [note("kind: bug\ntrack: off\na @x Do it"), note("a @x Do it"), note("kind: chore\na @x Do it")].join("|"), "||"],
+    ];
+  })(),
 );
 
 const failed = cases.filter(([, got, want]) => got !== want);

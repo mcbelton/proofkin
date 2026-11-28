@@ -237,6 +237,12 @@
           <textarea id="composer-input" rows="2" placeholder="Message all connected peers…"></textarea>
           <div id="plan-problems" class="plan-problems" role="status" aria-live="polite" hidden></div>
           <div class="plan-track" id="plan-track" hidden></div>
+          <div class="plan-kind small" id="plan-kind-choice" hidden>
+            <label for="plan-kind">Kind
+              <select id="plan-kind" aria-describedby="plan-kind-note"></select>
+            </label>
+            <p class="muted small" id="plan-kind-note" hidden></p>
+          </div>
           <div class="plan-models small" id="plan-models" hidden>
             <label for="plan-model">Model
               <select id="plan-model" aria-describedby="plan-models-note plan-models-mixed"></select>
@@ -536,6 +542,12 @@
       </div>
       <div class="editor-foot">
         <div class="plan-track" id="plan-editor-track" hidden></div>
+        <div class="plan-kind small" id="plan-editor-kind-choice" hidden>
+          <label for="plan-editor-kind">Kind
+            <select id="plan-editor-kind" aria-describedby="plan-editor-kind-note"></select>
+          </label>
+          <p class="muted small" id="plan-editor-kind-note" hidden></p>
+        </div>
         <div class="plan-models small" id="plan-editor-models" hidden>
           <label for="plan-editor-model">Model
             <select id="plan-editor-model" aria-describedby="plan-editor-models-note plan-editor-models-mixed"></select>

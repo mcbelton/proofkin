@@ -317,6 +317,33 @@ fn redacted(text: &str) -> String {
     crate::redact::redact(text.trim()).0
 }
 
+/// What the prompt asks of a plan's first lines: the kind of work it is, and its
+/// description in Markdown, with headings by kind.
+const DESCRIBE: &str = "## What kind of work it is, and what it is about\n\n\
+    Start the plan with a `kind:` line and an `about:` line, before its claims and steps:\n\n\
+    - `kind:` says what kind of work the plan is, from what the plan should do, and from the \
+    issue's text for an issue: `bug` (something works wrong), `feature` (something new), \
+    `enhancement` (something that works, made better), `docs` (documentation only) or `task` \
+    (work that isn't a change to the tracker's repository, such as a document, research, a \
+    decision or an event).\n\
+    - `about:` describes the plan in Markdown. Its first line is a one-line summary, which \
+    titles the run's issue. The lines indented under it by two spaces give the rest, in parts \
+    with short bold headings, an empty line between parts.\n\n\
+    The headings, by kind:\n\n\
+    - bug: **What happens**, **What should happen**, **How to reproduce**, **Impact**;\n\
+    - feature: **Why** (who needs it, and for what), **What changes**, **Done when**, \
+    **Not included**;\n\
+    - enhancement: **Now**, **Better**, **Done when**, **Not included**;\n\
+    - docs: **Missing or wrong**, **The docs will say**, **Where**;\n\
+    - task: **Goal**, **Deliverable** (what, for whom, by when), **Sources**, **Done when**.\n\n\
+    Write in it only what the owner said, or the issue's text: mark what they don't say \
+    *to confirm*, rather than guess it. No fenced code blocks in it: they would end the \
+    plan's block. For example, a plan's first lines:\n\n\
+    ```plan\nkind: bug\nabout: Empty lines in a step's text go missing\n  **What happens**\n  \
+    The parser drops the empty lines in a step's text.\n\n  **What should happen**\n  \
+    They are kept as written.\n\n  **How to reproduce**\n  *to confirm*\n\n  **Impact**\n  \
+    *to confirm*\n```";
+
 /// The prompt that asks the model for the plan `request` asks for, knowing what
 /// `available` holds.
 pub fn prompt(request: &Request, available: &Available) -> String {
@@ -346,6 +373,8 @@ pub fn prompt(request: &Request, available: &Available) -> String {
     }
     text += "## How a plan is written\n\n";
     text += FORMAT;
+    text += "\n\n";
+    text += DESCRIBE;
     text += "\n\n## What you may use\n\n";
     text += &wrap("what this agent may use", &available.text());
     text += "\n\n## Examples\n\nThe playbooks: ready-made plans, each with what it is for. In \
@@ -779,6 +808,47 @@ mod tests {
             .collect();
         let refused = "The plan check refuses a step whose `issue=` is the run's own `track: #N`";
         assert!(both.len() == 1 && both[0].starts_with(refused), "{both:?}");
+    }
+
+    /// The model is asked to start the plan with the kind of work it is and its
+    /// description (#354): the kind from the goal or the issue, the description in Markdown
+    /// with headings by kind, written only from what the owner or the issue says.
+    #[test]
+    fn the_prompt_asks_for_the_kind_and_an_about_text_with_headings_by_kind() {
+        let f = fixture();
+        let prompt = prompt(&goal("Fix the parser"), &f.available);
+        let format = prompt.find(FORMAT).unwrap();
+        let asked = prompt.find(DESCRIBE).unwrap();
+        let may_use = prompt.find("## What you may use").unwrap();
+        assert!(format < asked && asked < may_use);
+        for kind in crate::plan::Kind::ALL {
+            let named = format!("`{}` (", kind.name());
+            assert!(DESCRIBE.contains(&named), "{named}");
+        }
+        for said in [
+            "Start the plan with a `kind:` line and an `about:` line, before its claims",
+            "from what the plan should do, and from the issue's text for an issue",
+            "`about:` describes the plan in Markdown. Its first line is a one-line summary",
+            "- bug: **What happens**, **What should happen**, **How to reproduce**, **Impact**;",
+            "- feature: **Why** (who needs it, and for what), **What changes**, **Done when**, \
+             **Not included**;",
+            "- enhancement: **Now**, **Better**, **Done when**, **Not included**;",
+            "- docs: **Missing or wrong**, **The docs will say**, **Where**;",
+            "- task: **Goal**, **Deliverable** (what, for whom, by when), **Sources**, \
+             **Done when**.",
+            "only what the owner said, or the issue's text: mark what they don't say \
+             *to confirm*",
+            "No fenced code blocks in it",
+        ] {
+            assert!(DESCRIBE.contains(said), "{said:?}");
+        }
+        // Its example starts a plan that checks out.
+        let (_, example) = DESCRIBE.split_once("```plan\n").unwrap();
+        let text = format!("{}fix @alice:app Fix it", example.trim_end_matches("```"));
+        let plan = Plan::parse(&text).unwrap();
+        assert_eq!(plan.kind, Some(crate::plan::Kind::Bug));
+        let first = "Empty lines in a step's text go missing\n**What happens**\n";
+        assert!(plan.about.unwrap().starts_with(first));
     }
 
     #[tokio::test]
