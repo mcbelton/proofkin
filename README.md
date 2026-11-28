@@ -906,6 +906,18 @@ plan, then run it yourself.
   `track: #N`. To change a plan, the plan and your note.
 - A reference of the plan format: every step kind and option the parser takes. It is kept
   next to the parser, and a test fails when the parser takes something it doesn't name.
+- What to start the plan with: a `kind:` line, from what the plan should do (and the
+  issue's text, for an issue), and an `about:` description in Markdown, its first line a
+  summary, with short bold headings by kind:
+  - bug: **What happens**, **What should happen**, **How to reproduce**, **Impact**;
+  - feature: **Why** (who needs it, and for what), **What changes**, **Done when**,
+    **Not included**;
+  - enhancement: **Now**, **Better**, **Done when**, **Not included**;
+  - docs: **Missing or wrong**, **The docs will say**, **Where**;
+  - task: **Goal**, **Deliverable** (what, for whom, by when), **Sources**, **Done when**.
+
+  It writes there only what you said or the issue's text, and marks what isn't known
+  *to confirm*.
 - What this agent may use, as the plan check sees it:
   - connected peers and digital workers, with their roles and providers;
   - the folders each shares with you, with its access and checks, and whether it takes
@@ -1321,10 +1333,24 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `track: #N`, `track: title` or `track: off` | Chooses how the run is [tracked on GitHub](#tracked-work). |
 | `model: name` | Sets the model for steps that don't have `model=`, e.g. `model: claude-sonnet-5.5`. Use it only when all model steps use the same provider. |
 | `effort: level` | Sets reasoning for steps that don't have `effort=`: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. It can span providers. |
+| `kind: bug`, `feature`, `enhancement`, `docs` or `task` | Says what kind of work the plan is: `bug` (something that works wrong), `feature` (something new), `enhancement` (something that works, made better), `docs` (documentation only) or `task` (work that isn't a change to the tracker's repository, such as a document, research, a decision or an event). Any case, kept in lower case; another value is refused. A tracked run's issues get its [type and label](#tracked-work). |
+| `about: summary`, and the lines indented under it | Describes the plan in Markdown: its first line is the summary, and the lines indented under it continue it, as a step's text does, kept as written. At most 6,000 characters. A tracked run's issue shows it in an **About** section. |
 
 Use each of these lines at most once. `model:` and `effort:` don't apply to sign-offs,
 pull requests, team steps or `@workiq` steps. The plan check warns about an unused
-choice or one a step's peer doesn't allow.
+choice or one a step's peer doesn't allow. Comments (`//`) stay out of the run, so say
+what a plan is for with `about:`:
+
+```text
+kind: bug
+about: Empty lines in a step's text go missing
+  **What happens**
+  The parser drops them.
+
+  **What should happen**
+  They are kept as written.
+fix @alice:app verify=test Keep the empty lines in a step's text
+```
 
 | Step option | What it does |
 | --- | --- |
@@ -1952,6 +1978,28 @@ is tracked on GitHub, where your team already tracks work:
 
 - the run gets an **issue**, and each step a **sub-issue** of it, assigned to your GitHub
   account. A step's issue is *blocked by* the issues of the steps it runs after;
+- the plan's `about:` text is the run issue's **About** section (redacted, at most 6,000
+  characters), before *What it must prove* and *Steps*, and its first line titles the
+  issue unless `track:` gives a title. With `track: #N`, the run comments the text on
+  that issue once, when it starts, after *📝 Run `<id>` of **<agent>**:*;
+- with a `kind:` line, the run issue the run makes gets the kind's **issue type** and
+  **label**, and each step issue it makes gets the type *Task* and the same label:
+
+  | `kind:` | label | the run issue's type |
+  | --- | --- | --- |
+  | `bug` | `bug` | Bug |
+  | `feature` | `feature` | Feature |
+  | `enhancement` | `enhancement` | Feature |
+  | `docs` | `documentation` | Task |
+  | `task` | `task` | Task |
+
+  They are found by name in the repository, ignoring case, when the run starts. A
+  missing label is made (with a colour and a one-line description); a repository without
+  issue types, or without that type, gives no type. A label or type that can't be found
+  or made leaves the issues without it, and the run's tracking problems say so (*the
+  issues have no label `task`: …*). Issues that were there already keep their own type
+  and labels: one you name (`track: #N`, `issue=#N`) and a step's sub-issue an earlier
+  run left. Without `kind:`, the issues get no label or type, and without `about:` the run's issue has no About section;
 - on the project's **board**, each item says which agent does it (an `Agent` text field,
   added if the board has none), and its **Status** follows the run: *In progress* while the
   step runs, *In review* while its commit waits for a pull request (or a sign-off waits for
@@ -2002,7 +2050,7 @@ signoff after ui approve @me claims=C-1 Try the export and approve it
 
 Here the run works on issue #12 (reopened if it is closed; `track: <title>` makes a new issue with that title,
 `track: off` leaves the run untracked; without a `track:` line the run gets a new issue
-named after its first claim). Step `api` works on #15, made a sub-issue of #12 if it isn't
+named after its `about:` summary, else its first claim). Step `api` works on #15, made a sub-issue of #12 if it isn't
 one; `ui` and `signoff` get new sub-issues. No step may also say `issue=#12`: the plan
 check refuses a step whose `issue=` is the run's own `track: #N`, so name an issue one way,
 with `track: #N` or with `issue=#N` on the step that does the work. A later run with
@@ -2543,7 +2591,14 @@ proofkin --name me --providers copilot --serve --ui
   the issues are assigned to, and that anyone can read them when the repository is public.
   An existing issue is looked up as you type its number: its title, and a warning when it
   is closed (running reopens it) or doesn't exist (the plan would run untracked). Run plan
-  and Schedule… ask for the number when it's missing. "What is a
+  and Schedule… ask for the number when it's missing. **Kind**, beside it, says what kind
+  of work the plan is (*None*, Bug, Feature, Enhancement, Docs or Task): it writes the
+  plan's `kind:` line, and *None* removes it. When the run is tracked, the line under it
+  says what that does: *The run's issue is labelled `bug` (and typed Bug where the
+  repository has issue types).* For an existing issue it says that the issues the run
+  makes for its steps get the label, and that the issue keeps its own. The Builder and the
+  Text view keep the `kind:` and `about:` lines as written; edit the description in the
+  Text view. "What is a
   plan?" stays folded until you open it.
 - **Knowledge**: the knowledge base's topics and TSGs. **Import from Microsoft 365** does
   what `proofkin kb import workiq` does: you name the topic, say what to look for and where

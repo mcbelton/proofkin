@@ -1776,6 +1776,7 @@ function playbookText(p) {
 /// Explains the playbook the plan came from (or what a plan is) above the plan box.
 function renderPlanExplain() {
   syncPlanModels();
+  syncPlanKind();
   const box = $("#plan-explain");
   if (state.mode !== "plan") {
     box.hidden = true;
@@ -2268,6 +2269,50 @@ function planModelChoice(prefix, input, changed, shown) {
 let syncPlanModels = () => {};
 let syncEditorModels = () => {};
 
+/// The Kind choice beside Track on GitHub (in the composer and the plan editor): what
+/// kind of work the plan is, read from and written to its kind: line in `input`, then
+/// `changed()`; `shown()` says when it applies. The line under it says, when the run is
+/// tracked, what the kind does to the run's issues. Returns `sync`, which brings it up
+/// to date with the text.
+function planKindChoice(prefix, input, changed, shown) {
+  const box = $(`#${prefix}kind-choice`);
+  const select = $(`#${prefix}kind`);
+  const note = $(`#${prefix}kind-note`);
+  select.replaceChildren(el("option", { value: "", text: "None" }),
+    ...planText.KINDS.map((k) => el("option", { value: k.value, text: k.name })));
+  // A kind the plan check refuses, shown as written until another is picked.
+  const other = el("option");
+  // What the note says now.
+  let said = "";
+  const sync = () => {
+    box.hidden = !shown();
+    if (box.hidden) return;
+    const value = planText.planKind(input.value) ?? "";
+    if (value && !planText.KINDS.some((k) => k.value === value)) {
+      other.value = value;
+      other.textContent = value;
+      if (!other.parentNode) select.append(other);
+    } else other.remove();
+    select.value = value;
+    const parts = tracker?.linked && tracker.tracker ? planText.kindNote(input.value) : [];
+    note.hidden = !parts.length;
+    // Only a change is drawn: typing in the plan redraws nothing.
+    const next = JSON.stringify(parts);
+    if (said !== next) {
+      said = next;
+      note.replaceChildren(...parts.map((p) => (typeof p === "string" ? p : el("code", { text: p.code }))));
+    }
+  };
+  select.addEventListener("change", () => {
+    input.value = planText.setKind(input.value, select.value || null);
+    changed();
+  });
+  input.addEventListener("input", sync);
+  return sync;
+}
+let syncPlanKind = () => {};
+let syncEditorKind = () => {};
+
 // ---------- plan editor ----------
 /// Opens the plan in a large editor: as forms (the builder) or as text with what can go
 /// into it beside it, whichever was used last.
@@ -2279,6 +2324,7 @@ function openPlanEditor() {
   planBuilder.setView(planBuilder.view());
   editorTrack.sync();
   syncEditorModels();
+  syncEditorKind();
 }
 
 // ---------- drafting a plan with a model ----------
@@ -3557,6 +3603,8 @@ async function loadTracker() {
   tracker = await api("/api/tracker");
   planTrack.sync();
   editorTrack.sync();
+  syncPlanKind();
+  syncEditorKind();
   const box = $("#tracker");
   box.replaceChildren();
   const btn = $("#tracker-btn");
@@ -4355,6 +4403,8 @@ function init() {
   editorTrack = trackChoice($("#plan-editor-track"), editor, editorChanged, editingPlan);
   syncPlanModels = planModelChoice("plan-", composer, composerChanged, inPlanMode);
   syncEditorModels = planModelChoice("plan-editor-", editor, editorChanged, editingPlan);
+  syncPlanKind = planKindChoice("plan-", composer, composerChanged, inPlanMode);
+  syncEditorKind = planKindChoice("plan-editor-", editor, editorChanged, editingPlan);
   loadPlaybooks().catch((err) => toast(err.message, "error"));
   loadSkills().catch((err) => toast(err.message, "error"));
   loadGithub().catch((err) => toast(err.message, "error"));

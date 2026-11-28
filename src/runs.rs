@@ -406,6 +406,8 @@ impl RunRecord {
             track: None,
             model: None,
             effort: None,
+            kind: None,
+            about: None,
         };
         let state = StepState::from_delivered(peer.to_owned(), &step, delivered);
         let states = BTreeMap::from([("task".to_owned(), state)]);

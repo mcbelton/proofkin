@@ -35,6 +35,11 @@
 //! issue and each step as a sub-issue: `track: #12` works on issue 12, `track: <title>`
 //! names a new issue and `track: off` leaves the run untracked; `issue=#15` makes a
 //! step work on an existing issue.
+//!
+//! `kind: bug|feature|enhancement|docs|task` says what kind of work the plan is, and
+//! `about: <summary>` (with the lines indented under it) describes it in Markdown: the
+//! issues its tracked run makes get the kind's type and label, and the run's issue the
+//! description.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -498,6 +503,77 @@ fn parse_track(rest: &str) -> Result<Track> {
     Ok(Track::New(rest.to_owned()))
 }
 
+/// What kind of work a plan is (`kind:` line): its tracked run's issues get the kind's
+/// type and label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// Something that works wrong.
+    Bug,
+    /// Something new.
+    Feature,
+    /// Something that works, made better.
+    Enhancement,
+    /// Documentation only.
+    Docs,
+    /// Work that isn't a change to the tracker's repository, such as a document,
+    /// research, a decision or an event.
+    Task,
+}
+
+impl Kind {
+    /// Every kind, as `kind:` lists them.
+    pub const ALL: [Kind; 5] = [
+        Kind::Bug,
+        Kind::Feature,
+        Kind::Enhancement,
+        Kind::Docs,
+        Kind::Task,
+    ];
+
+    /// How `kind:` writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Bug => "bug",
+            Kind::Feature => "feature",
+            Kind::Enhancement => "enhancement",
+            Kind::Docs => "docs",
+            Kind::Task => "task",
+        }
+    }
+}
+
+fn parse_kind(rest: &str) -> Result<Kind> {
+    let rest = rest.trim();
+    Kind::ALL
+        .into_iter()
+        .find(|k| k.name().eq_ignore_ascii_case(rest))
+        .ok_or_else(|| anyhow!("kind: needs one of bug, feature, enhancement, docs, task"))
+}
+
+/// The longest description a plan may have (`about:` and the lines indented under it).
+pub const MAX_ABOUT: usize = 6_000;
+
+/// The plan's description: the `about:` line's text, then the lines indented under it.
+fn parse_about(first: &str, continuation: &str) -> Result<String> {
+    let first = first.trim();
+    let about = if first.is_empty() {
+        continuation.trim_start_matches('\n').to_owned()
+    } else if continuation.is_empty() {
+        first.to_owned()
+    } else {
+        format!("{first}\n{continuation}")
+    };
+    if about.trim().is_empty() {
+        bail!("about: needs the plan's description: about: <what the plan is for>");
+    }
+    let chars = about.chars().count();
+    if chars > MAX_ABOUT {
+        bail!("about: a plan's description has at most 6,000 characters (this one has {chars})");
+    }
+    Ok(about)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     #[serde(default)]
@@ -513,6 +589,12 @@ pub struct Plan {
     /// The reasoning effort for model steps that don't set `effort=`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// What kind of work it is (`kind:`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Kind>,
+    /// Its description in Markdown (`about:`), whose first line is its summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
 }
 
 impl Plan {
@@ -529,6 +611,8 @@ impl Plan {
         let mut track = None;
         let mut model = None;
         let mut effort = None;
+        let mut kind = None;
+        let mut about = None;
         let mut errors = Vec::new();
         let lines: Vec<&str> = text.lines().collect();
         let mut n = 0;
@@ -563,6 +647,20 @@ impl Plan {
                     crate::models::check_effort(level)
                         .map(|()| effort = Some(level.to_ascii_lowercase()))
                 }
+            } else if let Some(rest) = line.strip_prefix("kind:") {
+                if kind.is_some() {
+                    Err(anyhow!("kind: is given twice; a plan has one"))
+                } else {
+                    parse_kind(rest).map(|k| kind = Some(k))
+                }
+            } else if let Some(rest) = line.strip_prefix("about:") {
+                let (continuation, next) = continuation_after(&lines, at);
+                n = next;
+                if about.is_some() {
+                    Err(anyhow!("about: is given twice; a plan has one"))
+                } else {
+                    parse_about(rest, &continuation).map(|a| about = Some(a))
+                }
             } else {
                 let (continuation, next) = continuation_after(&lines, at);
                 n = next;
@@ -582,6 +680,8 @@ impl Plan {
             track,
             model,
             effort,
+            kind,
+            about,
         };
         (plan.validate().map(|()| plan), untracked)
     }
@@ -1215,6 +1315,15 @@ const STEP_OPTIONS: &[&str] = &[
 pub const FORMAT: &str = "\
 One setting, claim, step or comment per line:
 - `// comment`: ignored.
+- `kind: bug|feature|enhancement|docs|task`: what kind of work the plan is, at most one, \
+before the claims and steps: `bug` (something that works wrong), `feature` (something new), \
+`enhancement` (something that works, made better), `docs` (documentation only) or `task` \
+(work that isn't a change to the tracker's repository, such as a document, research, a \
+decision or an event). The issues a tracked run makes get its type and label.
+- `about: summary`: the plan's description in Markdown, at most one, before the claims and \
+steps. Lines indented under it continue it, kept as written; at most 6,000 characters in \
+all. Its first line is its summary: the title of the run's new issue unless `track:` names \
+one. The run's issue holds the whole description.
 - `model: name` and `effort: minimal|low|medium|high|xhigh|max`: before the claims and steps, \
 at most one of each. They set defaults for the steps a model runs, not `approve`, `pr`, \
 `team` or `@workiq` steps. A step's own `model=` or `effort=` wins. `model:` needs all model \
@@ -3181,6 +3290,8 @@ fn plan_of(run: &crate::runs::RunRecord) -> Plan {
         track: None,
         model: None,
         effort: None,
+        kind: None,
+        about: None,
     }
 }
 
@@ -5064,6 +5175,92 @@ mod tests {
             let err = Plan::parse(text).unwrap_err().to_string();
             assert!(err.contains(expected), "{text:?}: {err}");
         }
+    }
+
+    #[test]
+    fn a_plan_says_what_kind_of_work_it_is_in_any_case_and_refuses_another_or_a_second() {
+        for (text, kind) in [
+            ("bug", Kind::Bug),
+            ("Feature", Kind::Feature),
+            ("ENHANCEMENT", Kind::Enhancement),
+            ("docs", Kind::Docs),
+            ("  tAsk ", Kind::Task),
+        ] {
+            let plan = Plan::parse(&format!("kind:{text}\na @x Do it")).unwrap();
+            assert_eq!(plan.kind, Some(kind), "{text:?}");
+        }
+        let plan = Plan::parse("kind: BUG\na @x Do it").unwrap();
+        assert_eq!(serde_json::to_value(&plan).unwrap()["kind"], "bug");
+        let refused = "kind: needs one of bug, feature, enhancement, docs, task";
+        for (text, expected) in [
+            ("kind: chore\na @x Do it", format!("line 1: {refused}")),
+            ("a @x Do it\nkind:", format!("line 2: {refused}")),
+            ("kind: documentation\na @x Do it", refused.to_owned()),
+            (
+                "kind: bug\nkind: bug\na @x Do it",
+                "line 2: kind: is given twice; a plan has one".to_owned(),
+            ),
+        ] {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains(&expected), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_about_line_and_the_lines_indented_under_it_describe_the_plan() {
+        let plan = Plan::parse(
+            "kind: feature\nabout: Plans  say what they are for\n  **Why**\n\n  - the owner \
+             asked\n    - nested\n\nclaim: C-1 It works\na @x claims=C-1 verify=test Do it\n  more",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.about.as_deref(),
+            Some("Plans  say what they are for\n**Why**\n\n- the owner asked\n  - nested")
+        );
+        assert_eq!(plan.claims[0].id, "C-1");
+        assert_eq!(plan.steps[0].prompt, "Do it\nmore");
+        let about = |text: &str| Plan::parse(text).unwrap().about;
+        assert_eq!(
+            about("about:\n  Summary\n  - more\na @x Do it").as_deref(),
+            Some("Summary\n- more")
+        );
+        assert_eq!(about("a @x Do it\nabout: Last").as_deref(), Some("Last"));
+        let long = |n: usize| format!("about: {}\na @x Do it", "é".repeat(n));
+        assert_eq!(about(&long(MAX_ABOUT)).unwrap().chars().count(), MAX_ABOUT);
+        for (text, expected) in [
+            (
+                long(MAX_ABOUT + 1),
+                "line 1: about: a plan's description has at most 6,000 characters (this one \
+                 has 6001)",
+            ),
+            (
+                "about: One\n  more\nabout: Two\na @x Do it".to_owned(),
+                "line 3: about: is given twice; a plan has one",
+            ),
+            (
+                "about:\na @x Do it".to_owned(),
+                "line 1: about: needs the plan's description",
+            ),
+        ] {
+            let err = Plan::parse(&text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn plans_without_kind_or_about_parse_and_load_as_before() {
+        let plan =
+            Plan::parse("track: #3\nclaim: C-1 It works\na @x claims=C-1 verify=t Do it").unwrap();
+        assert_eq!((plan.kind, plan.about.as_deref()), (None, None));
+        let json = serde_json::to_value(&plan).unwrap();
+        assert!(
+            json.get("kind").is_none() && json.get("about").is_none(),
+            "{json}"
+        );
+        let saved = serde_json::json!({"claims": json["claims"], "steps": json["steps"],
+            "track": json["track"]});
+        let loaded: Plan = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded, plan);
     }
 
     #[test]
@@ -7889,7 +8086,10 @@ send after ok @workiq apply=work",
                 &options,
                 &["verify", "claim", "skills", "reviewer", "base"][..],
             ),
-            (&lines, &["claim", "track", "model", "effort"][..]),
+            (
+                &lines,
+                &["claim", "track", "model", "effort", "kind", "about"][..],
+            ),
             (&targets, &[WORKIQ_TARGET][..]),
         ] {
             for w in known {
@@ -7916,9 +8116,13 @@ send after ok @workiq apply=work",
 
         // And the values and limits the parser takes.
         let sources: Vec<&str> = WORKIQ_SOURCES.iter().map(|(name, _)| *name).collect();
+        let kinds: Vec<&str> = Kind::ALL.iter().map(|k| k.name()).collect();
         let mut parts = vec![
             "`// comment`".to_owned(),
             "`track: off`".to_owned(),
+            format!("`kind: {}`", kinds.join("|")),
+            "Lines indented under it continue it".to_owned(),
+            "at most 6,000 characters".to_owned(),
             "`@me`".to_owned(),
             "`#squad:folder`".to_owned(),
             "Lines indented under a step's line".to_owned(),

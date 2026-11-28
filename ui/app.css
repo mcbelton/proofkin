@@ -933,11 +933,12 @@ dialog.editor-dialog { width: min(1240px, calc(100vw - 32px)); height: calc(100v
 .plan-track-note { flex-basis: 100%; margin: 0; font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
 .plan-track-note.warn { color: var(--warn); }
 .editor-foot .plan-track { flex: 1 1 320px; min-width: 0; margin: 0; }
-.plan-models { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; min-width: 0; color: var(--muted); }
-.plan-models label { display: grid; gap: 3px; min-width: 0; }
-.plan-models select, .plan-models input { font-size: 12.5px; padding: 3px 6px; min-width: 0; max-width: 100%; }
-.plan-models p { flex-basis: 100%; margin: 0; }
+.plan-models, .plan-kind { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; min-width: 0; color: var(--muted); }
+.plan-models label, .plan-kind label { display: grid; gap: 3px; min-width: 0; }
+.plan-models select, .plan-models input, .plan-kind select { font-size: 12.5px; padding: 3px 6px; min-width: 0; max-width: 100%; }
+.plan-models p, .plan-kind p { flex-basis: 100%; margin: 0; }
 .editor-foot .plan-models { flex: 1 1 270px; }
+.editor-foot .plan-kind { flex: 0 1 240px; }
 
 /* Plugins & tools */
 dialog.tall { height: calc(100vh - 64px); overflow: hidden; }

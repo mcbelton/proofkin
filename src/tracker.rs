@@ -23,7 +23,14 @@
 //!   of its sub-issues are (waiting for pull requests, or other work) and is closed by
 //!   [`Tracker::settle`] once all of them are. Only an issue a run made is closed so
 //!   (`track: <title>`, or no `track:`): one a person named with `track: #N` may hold
-//!   other work, so it goes back where it was on the board and stays open.
+//!   other work, so it goes back where it was on the board and stays open;
+//! - the issues a run makes say what kind of work its plan is (`kind:`): they get the
+//!   kind's label (made if the repository has none) and, where the repository has issue
+//!   types, a type: the run's issue the kind's (Bug, Feature or Task), each step's issue
+//!   Task. The run's issue holds the plan's description (`about:`) in its About section,
+//!   and its title is the description's first line unless `track:` names one. Issues a
+//!   person named keep their labels and type; one named with `track: #N` gets the
+//!   description as a comment when the run starts.
 //!
 //! Everything goes through GitHub's GraphQL API with the GitHub CLI (`gh api graphql`,
 //! the request on stdin and the profile's token in `GH_TOKEN`). Issues need the
@@ -46,7 +53,7 @@ use tokio::process::Command;
 
 use crate::evidence::Evidence;
 use crate::github::GithubCredentials;
-use crate::plan::{Plan, Step, StepState, Target, Track};
+use crate::plan::{Kind, Plan, Step, StepState, Target, Track};
 use crate::profile::{INHERITED_CREDENTIAL_VARS, Profile};
 use crate::runs::RunRecord;
 
@@ -474,6 +481,17 @@ struct Op {
     select: &'static str,
 }
 
+/// An issue to make: its title and text, the id of the issue it is a sub-issue of, and
+/// the ids of its label and issue type.
+#[derive(Debug, Clone, Default)]
+struct NewIssue {
+    title: String,
+    body: String,
+    parent: Option<String>,
+    label: Option<String>,
+    issue_type: Option<String>,
+}
+
 fn op(field: &'static str, input_type: &'static str, input: Value) -> Op {
     Op {
         field,
@@ -531,6 +549,47 @@ const REPO_QUERY: &str = "query Repo($owner: String!, $name: String!) { viewer {
 const BOARD_QUERY: &str = "query Board($login: String!, $number: Int!) { repositoryOwner(login: $login) { ... on ProjectV2Owner { projectV2(number: $number) { id title url fields(first: 50) { nodes { ... on ProjectV2FieldCommon { id name dataType } ... on ProjectV2SingleSelectField { options { id name } } } } } } } }";
 
 const AGENT_FIELD_MUTATION: &str = "mutation AgentField($input: CreateProjectV2FieldInput!) { createProjectV2Field(input: $input) { projectV2Field { ... on ProjectV2Field { id } } } }";
+
+const LABELS_QUERY: &str = "query Labels($owner: String!, $name: String!, $label: String!) { repository(owner: $owner, name: $name) { labels(first: 100, query: $label) { nodes { id name } } } }";
+
+const ISSUE_TYPES_QUERY: &str = "query IssueTypes($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { issueTypes(first: 25) { nodes { id name } } } }";
+
+/// The label of a plan of `kind`'s issues: its name, and the colour and description it
+/// is made with where the repository has none.
+fn kind_label(kind: Kind) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        Kind::Bug => ("bug", "d73a4a", "Something works wrong"),
+        Kind::Feature => ("feature", "0e8a16", "Something new"),
+        Kind::Enhancement => ("enhancement", "a2eeef", "Something that works, made better"),
+        Kind::Docs => ("documentation", "0075ca", "Documentation only"),
+        Kind::Task => (
+            "task",
+            "c5def5",
+            "Not a change to the repository: a document, research, a decision or an event",
+        ),
+    }
+}
+
+/// The issue type of a plan of `kind`'s run issue (its step issues are Tasks).
+fn kind_type(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Bug => "Bug",
+        Kind::Feature | Kind::Enhancement => "Feature",
+        Kind::Docs | Kind::Task => "Task",
+    }
+}
+
+/// The issue type of the step issues a run makes.
+const STEP_TYPE: &str = "Task";
+
+/// What a run labels and types the issues it makes with (ids): its plan's kind's label,
+/// and the issue types of its run issue and of its step issues.
+#[derive(Debug, Clone, Default)]
+struct Marks {
+    label: Option<String>,
+    run_type: Option<String>,
+    step_type: Option<String>,
+}
 
 impl Tracker {
     /// Connects `config` with `api`: checks the repository and opens the board.
@@ -881,18 +940,26 @@ impl Tracker {
         results
     }
 
-    /// Creates issues `(title, body, parent id)`, assigned to the account.
-    async fn create(&self, new: &[(String, String, Option<String>)]) -> Vec<Result<Issue>> {
-        let ops = |assign: bool| {
+    /// Creates `new` issues, assigned to the account, with their labels and issue types.
+    /// If GitHub refuses those, the issues are made without them, and `.1` says why.
+    async fn create(&self, new: &[NewIssue]) -> (Vec<Result<Issue>>, Option<String>) {
+        let ops = |assign: bool, marked: bool| {
             new.iter()
-                .map(|(title, body, parent)| {
+                .map(|issue| {
+                    let (title, body) = (&issue.title, &issue.body);
                     let mut input =
                         json!({ "repositoryId": self.repo_id, "title": title, "body": body });
                     if assign {
                         input["assigneeIds"] = json!([self.viewer]);
                     }
-                    if let Some(parent) = parent {
+                    if let Some(parent) = &issue.parent {
                         input["parentIssueId"] = json!(parent);
+                    }
+                    if marked && let Some(label) = &issue.label {
+                        input["labelIds"] = json!([label]);
+                    }
+                    if marked && let Some(issue_type) = &issue.issue_type {
+                        input["issueTypeId"] = json!(issue_type);
                     }
                     Op {
                         field: "createIssue",
@@ -903,15 +970,34 @@ impl Tracker {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut results = self.run_ops("CreateIssues", ops(true)).await;
-        // Someone who can't be assigned in the repository still gets the issues.
-        if !results.is_empty() && results.iter().all(|r| r.is_err()) {
-            results = self.run_ops("CreateIssues", ops(false)).await;
+        // Someone who can't be assigned in the repository still gets the issues, and so
+        // do issues GitHub won't label or type.
+        let has_marks = |i: &NewIssue| i.label.is_some() || i.issue_type.is_some();
+        let mut tries = Vec::new();
+        if new.iter().any(has_marks) {
+            tries.extend([(true, true), (false, true)]);
         }
-        results
+        tries.extend([(true, false), (false, false)]);
+        let (mut results, mut refused) = (Vec::new(), None);
+        for (assign, marked) in tries {
+            results = self.run_ops("CreateIssues", ops(assign, marked)).await;
+            if results.is_empty() || results.iter().any(Result::is_ok) {
+                break;
+            }
+            if marked
+                && !assign
+                && let Some(Err(e)) = results.first()
+            {
+                refused = Some(format!("{e:#}"));
+            }
+        }
+        if !results.iter().any(Result::is_ok) {
+            refused = None;
+        }
+        let made = results
             .into_iter()
             .zip(new)
-            .map(|(r, (title, body, _))| {
+            .map(|(r, new)| {
                 let v = r?;
                 let issue = v.get("issue").context("GitHub didn't return the issue")?;
                 Ok(Issue {
@@ -921,18 +1007,126 @@ impl Tracker {
                         .unwrap_or_default()
                         .to_owned(),
                     number: issue.get("number").and_then(Value::as_u64).unwrap_or(0),
-                    title: title.clone(),
+                    title: new.title.clone(),
                     url: issue
                         .get("url")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
                     open: true,
-                    body: body.clone(),
+                    body: new.body.clone(),
                     ..Issue::default()
                 })
             })
-            .collect()
+            .collect();
+        (made, refused)
+    }
+
+    /// The label and issue types of the issues a run of a plan of `kind` makes, found by
+    /// name in the repository, ignoring case; the label is made if the repository has
+    /// none. Those that can't be found or made are left out, and `problems` say why.
+    async fn marks(&self, kind: Option<Kind>, problems: &mut Vec<String>) -> Marks {
+        let Some(kind) = kind else {
+            return Marks::default();
+        };
+        let (label, color, description) = kind_label(kind);
+        let (label_id, types) =
+            tokio::join!(self.label_id(label, color, description), self.issue_types());
+        let mut marks = Marks::default();
+        match label_id {
+            Ok(id) => marks.label = Some(id),
+            Err(e) => problems.push(format!("the issues have no label `{label}`: {e:#}")),
+        }
+        match types {
+            Ok(types) => {
+                let id = |name: &str| {
+                    types
+                        .iter()
+                        .find(|(_, n)| n.eq_ignore_ascii_case(name))
+                        .map(|(id, _)| id.clone())
+                };
+                marks.run_type = id(kind_type(kind));
+                marks.step_type = id(STEP_TYPE);
+            }
+            Err(e) => problems.push(format!("the issues have no type: {e:#}")),
+        }
+        marks
+    }
+
+    /// The id of the repository's label `name` (ignoring case), made with `color` and
+    /// `description` if it has none.
+    async fn label_id(&self, name: &str, color: &str, description: &str) -> Result<String> {
+        let (owner, repo) = self.config.repo.split_once('/').unwrap_or_default();
+        let data = self
+            .api
+            .graphql(
+                LABELS_QUERY,
+                json!({ "owner": owner, "name": repo, "label": name }),
+            )
+            .await?
+            .ok()?;
+        let found = data
+            .pointer("/repository/labels/nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|l| {
+                l.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            .and_then(|l| l.get("id").and_then(Value::as_str));
+        if let Some(id) = found {
+            return Ok(id.to_owned());
+        }
+        let mut input = json!({ "repositoryId": self.repo_id, "name": name, "color": color });
+        input["description"] = json!(description);
+        let create = Op {
+            field: "createLabel",
+            input_type: "CreateLabelInput",
+            input,
+            select: "label { id }",
+        };
+        let made = self
+            .run_ops("CreateLabel", vec![create])
+            .await
+            .remove(0)
+            .context("it couldn't be made")?;
+        made.pointer("/label/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("GitHub didn't return the label it made")
+    }
+
+    /// The repository's issue types, `(id, name)`: none if it has none, or GitHub has
+    /// no issue types.
+    async fn issue_types(&self) -> Result<Vec<(String, String)>> {
+        let (owner, name) = self.config.repo.split_once('/').unwrap_or_default();
+        let reply = self
+            .api
+            .graphql(ISSUE_TYPES_QUERY, json!({ "owner": owner, "name": name }))
+            .await?;
+        let nodes = reply
+            .data
+            .pointer("/repository/issueTypes/nodes")
+            .and_then(Value::as_array);
+        if nodes.is_none()
+            && let Some(e) = reply.errors.first()
+            && !e.message.contains("doesn't exist on type")
+        {
+            bail!("{}", e.message);
+        }
+        let text = |v: &Value, key: &str| {
+            v.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Ok(nodes
+            .into_iter()
+            .flatten()
+            .map(|t| (text(t, "id"), text(t, "name")))
+            .collect())
     }
 
     fn status_op(&self, item: &str, status: Status) -> Option<Op> {
@@ -2050,6 +2244,8 @@ impl Run {
         }
         let existing = tracker.issues(&wanted).await?;
         let mut problems = Vec::new();
+        // The kind's label and issue types, looked up once the run makes an issue.
+        let mut marks = None;
         let run_issue = match &plan.track {
             Some(Track::Issue(n)) => existing[n].clone(),
             other => {
@@ -2057,11 +2253,25 @@ impl Run {
                     Some(Track::New(title)) => title.clone(),
                     _ => default_title(plan),
                 };
-                tracker
-                    .create(&[(title, run_body(plan, run_id, agent), None)])
-                    .await
-                    .remove(0)
-                    .context("creating the run's issue")?
+                let found = tracker.marks(plan.kind, &mut problems).await;
+                let issue = NewIssue {
+                    title,
+                    body: run_body(plan, run_id, agent),
+                    label: found.label.clone(),
+                    issue_type: found.run_type.clone(),
+                    ..NewIssue::default()
+                };
+                let (mut made, refused) = tracker.create(&[issue]).await;
+                let issue = made.remove(0).context("creating the run's issue")?;
+                // The steps' issues go without them too when GitHub refused them.
+                marks = Some(match refused {
+                    Some(why) => {
+                        problems.push(unmarked(plan.kind, &why));
+                        Marks::default()
+                    }
+                    None => found,
+                });
+                issue
             }
         };
         let mut ops = Vec::new();
@@ -2127,17 +2337,31 @@ impl Run {
             } else {
                 new.push((
                     step.id.clone(),
-                    (
-                        step_title(step),
-                        step_body(step, run_id, agent),
-                        Some(run_issue.id.clone()),
-                    ),
+                    NewIssue {
+                        title: step_title(step),
+                        body: step_body(step, run_id, agent),
+                        parent: Some(run_issue.id.clone()),
+                        ..NewIssue::default()
+                    },
                 ));
             }
         }
-        let made = tracker
+        if !new.is_empty() {
+            let marks = match marks {
+                Some(marks) => marks,
+                None => tracker.marks(plan.kind, &mut problems).await,
+            };
+            for (_, issue) in &mut new {
+                issue.label.clone_from(&marks.label);
+                issue.issue_type.clone_from(&marks.step_type);
+            }
+        }
+        let (made, refused) = tracker
             .create(&new.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>())
             .await;
+        if let Some(why) = refused {
+            problems.push(unmarked(plan.kind, &why));
+        }
         for ((step, _), result) in new.iter().zip(made) {
             match result {
                 Ok(issue) => {
@@ -2204,6 +2428,17 @@ impl Run {
             _claim: claim,
         };
         run.issue.open = true;
+        if let (Some(Track::Issue(_)), Some(about)) = (&plan.track, &plan.about) {
+            let text = safe(about, MAX_TEXT);
+            let said = format!("📝 Run `{run_id}` of **{agent}**:\n\n{text}");
+            let comment = op(
+                "addComment",
+                "AddCommentInput",
+                json!({ "subjectId": run_issue.id, "body": said }),
+            );
+            run.apply_ops("About", vec![comment], "commenting the description")
+                .await;
+        }
         run.apply_ops("TakeOver", taken, "taking over earlier runs' sub-issues")
             .await;
         run.apply_ops("LinkIssues", ops, "linking the issues").await;
@@ -2499,12 +2734,16 @@ impl Run {
     }
 }
 
-/// A new run issue's title: the plan's first claim, else its first step's title.
+/// A new run issue's title: the first line of the plan's description, else its first
+/// claim, else its first step's title.
 fn default_title(plan: &Plan) -> String {
-    let text = plan
-        .claims
-        .first()
-        .map(|c| c.text.clone())
+    let summary = plan
+        .about
+        .as_deref()
+        .and_then(|about| about.lines().find(|l| !l.trim().is_empty()))
+        .map(|line| crate::redact::redact(line).0);
+    let text = summary
+        .or_else(|| plan.claims.first().map(|c| c.text.clone()))
         .or_else(|| {
             plan.steps
                 .first()
@@ -2512,6 +2751,13 @@ fn default_title(plan: &Plan) -> String {
         })
         .unwrap_or_else(|| "Plan run".into());
     clip(&text.split_whitespace().collect::<Vec<_>>().join(" "), 200)
+}
+
+/// The problem of issues made without the label and issue type of a plan of `kind`,
+/// which GitHub refused (`why`).
+fn unmarked(kind: Option<Kind>, why: &str) -> String {
+    let label = kind.map(|k| kind_label(k).0).unwrap_or_default();
+    format!("the issues have no label `{label}` or type: GitHub refused them: {why}")
 }
 
 fn step_title(step: &Step) -> String {
@@ -2558,6 +2804,9 @@ fn run_body(plan: &Plan, run_id: &str, agent: &str) -> String {
     let mut md = format!(
         "**{agent}**'s plan run `{run_id}`, tracked by Proofkin: each step is a sub-issue, and the board follows the run.\n"
     );
+    if let Some(about) = &plan.about {
+        md += &format!("\n**About**\n\n{}\n", safe(about, MAX_TEXT).trim_end());
+    }
     if !plan.claims.is_empty() {
         md += "\n**What it must prove**\n\n";
         for c in &plan.claims {
@@ -3187,6 +3436,14 @@ mod tests {
         /// The board puts an issue's sub-issues on it when the issue goes on it, and
         /// adding one that is on it then fails (GitHub's Auto-add sub-issues workflow).
         auto_add_sub_issues: bool,
+        /// The repository's labels, `(id, name)`.
+        labels: Mutex<Vec<(String, String)>>,
+        /// Its issue types' names (none: it has no issue types).
+        issue_types: Option<Vec<&'static str>>,
+        /// Making a label fails.
+        label_fails: bool,
+        /// Creating an issue with a label or an issue type fails.
+        refuse_marks: bool,
     }
 
     const STATUSES: &[(&str, &str)] = &[
@@ -3203,6 +3460,19 @@ mod tests {
                 review_column: true,
                 ..Fake::default()
             })
+        }
+
+        /// A repository with `labels`, `(id, name)`, and issue types named `types`.
+        fn marked(labels: &[(&str, &str)], types: Option<Vec<&'static str>>) -> Fake {
+            let labels = labels
+                .iter()
+                .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
+                .collect();
+            Fake {
+                labels: Mutex::new(labels),
+                issue_types: types,
+                ..Fake::default()
+            }
         }
 
         fn issue_json(&self, n: u64) -> Value {
@@ -3281,7 +3551,11 @@ mod tests {
                 .push((field.to_owned(), input.clone()));
             let mut issues = self.issues.lock().unwrap();
             let s = |key: &str| input[key].as_str().unwrap_or_default().to_owned();
+            let marked = input.get("labelIds").is_some() || input.get("issueTypeId").is_some();
             match field {
+                "createIssue" if self.refuse_marks && marked => {
+                    json!({ "__error": "Resource not accessible by integration" })
+                }
                 "createIssue" => {
                     let number = issues.keys().max().copied().unwrap_or(0) + 1;
                     let parent = input
@@ -3348,6 +3622,15 @@ mod tests {
                     issue.body = s("body");
                     json!({ "clientMutationId": null })
                 }
+                "createLabel" if self.label_fails => {
+                    json!({ "__error": "Resource not accessible by integration" })
+                }
+                "createLabel" => {
+                    let mut labels = self.labels.lock().unwrap();
+                    let id = format!("LA{}", labels.len() + 1);
+                    labels.push((id.clone(), s("name")));
+                    json!({ "label": { "id": id } })
+                }
                 _ => json!({ "clientMutationId": null }),
             }
         }
@@ -3410,6 +3693,33 @@ mod tests {
                         .unwrap()
                         .push(("createProjectV2Field".into(), variables["input"].clone()));
                     json!({ "createProjectV2Field": { "projectV2Field": { "id": "F-agent" } } })
+                }
+                "Labels" => {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push(("Labels".into(), variables.clone()));
+                    let labels = self.labels.lock().unwrap();
+                    let nodes: Vec<Value> = labels
+                        .iter()
+                        .map(|(id, name)| json!({ "id": id, "name": name }))
+                        .collect();
+                    json!({ "repository": { "labels": { "nodes": nodes } } })
+                }
+                "IssueTypes" => {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push(("IssueTypes".into(), variables.clone()));
+                    let mut types = Value::Null;
+                    if let Some(names) = &self.issue_types {
+                        let nodes: Vec<Value> = names
+                            .iter()
+                            .map(|n| json!({ "id": format!("IT-{n}"), "name": n }))
+                            .collect();
+                        types = json!({ "nodes": nodes });
+                    }
+                    json!({ "repository": { "issueTypes": types } })
                 }
                 "Issues" => {
                     let mut repo = serde_json::Map::new();
@@ -3762,6 +4072,277 @@ mod tests {
         assert_eq!(tracker.settle().await.unwrap(), [1]);
         assert!(tracker.config.open_runs.is_empty());
         assert!(!fake.open(1) && fake.status(1).as_deref() == Some("Done"));
+    }
+
+    fn problems(tracking: &Tracking) -> &[String] {
+        &tracking.tracked.problems
+    }
+
+    /// The fields of the calls `fake` had, in order.
+    fn fields_called(fake: &Fake) -> Vec<String> {
+        let calls = fake.calls.lock().unwrap();
+        calls.iter().map(|(field, _)| field.clone()).collect()
+    }
+
+    /// A plan's kind types and labels the issues its run makes (#354): the run's issue gets
+    /// the kind's issue type and each step's issue Task, found by name ignoring case, and all
+    /// of them the kind's label.
+    #[tokio::test]
+    async fn a_bug_plans_run_issue_is_a_bug_and_its_step_issues_tasks_all_labelled_bug() {
+        let fake = Arc::new(Fake::marked(
+            &[("LA-x", "bugs"), ("LA-bug", "Bug")],
+            Some(vec!["task", "Bug", "Feature"]),
+        ));
+        let plan = Plan::parse(&format!("kind: bug\n{PLAN}")).unwrap();
+        let tracking = start_with(fake.clone(), config(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        assert!(problems(&tracking).is_empty(), "{:?}", problems(&tracking));
+        assert_eq!(fake.calls("Labels")[0]["label"], "bug");
+        assert!(fake.calls("createLabel").is_empty());
+        let created = fake.calls("createIssue");
+        assert_eq!(created.len(), 4);
+        assert_eq!(created[0]["issueTypeId"], "IT-Bug");
+        for c in &created[1..] {
+            assert_eq!(c["issueTypeId"], "IT-task", "{c}");
+        }
+        for c in &created {
+            assert_eq!(c["labelIds"], json!(["LA-bug"]), "{c}");
+            assert_eq!(c["assigneeIds"], json!(["U1"]), "{c}");
+        }
+    }
+
+    /// A repository without the kind's label gets it, made before the issues that get it.
+    #[tokio::test]
+    async fn a_missing_label_is_made_before_the_issues_that_get_it() {
+        let fake = Arc::new(Fake::marked(&[], Some(vec!["Task", "Bug", "Feature"])));
+        let text = "kind: Feature\na @worker Add it\nb after a @worker Show it";
+        let plan = Plan::parse(text).unwrap();
+        let tracking = start_with(fake.clone(), config(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        assert!(problems(&tracking).is_empty(), "{:?}", problems(&tracking));
+        let label = &fake.calls("createLabel")[0];
+        let want = json!({ "repositoryId": "R1", "name": "feature", "color": "0e8a16",
+                           "description": "Something new" });
+        assert_eq!(label, &want);
+        let fields = fields_called(&fake);
+        let made = fields.iter().position(|f| f == "createLabel").unwrap();
+        assert!(fields.iter().position(|f| f == "createIssue") > Some(made));
+        let created = fake.calls("createIssue");
+        assert_eq!(created.len(), 3);
+        assert!(created.iter().all(|c| c["labelIds"] == json!(["LA1"])));
+        assert_eq!(created[0]["issueTypeId"], "IT-Feature");
+        assert_eq!(created[2]["issueTypeId"], "IT-Task");
+    }
+
+    /// A repository without issue types, or without the kind's, gives the issues their
+    /// label alone, and that is no problem.
+    #[tokio::test]
+    async fn a_repository_without_issue_types_gets_labels_only() {
+        for types in [None, Some(vec!["Epic"])] {
+            let fake = Arc::new(Fake::marked(&[("LA-docs", "documentation")], types));
+            let plan = Plan::parse("kind: docs\na @worker Document it").unwrap();
+            let tracking = start_with(fake.clone(), config(), &plan, "r1", "boss", None)
+                .await
+                .unwrap();
+            assert!(problems(&tracking).is_empty(), "{:?}", problems(&tracking));
+            let created = fake.calls("createIssue");
+            assert_eq!(created.len(), 2);
+            for c in &created {
+                assert_eq!(c["labelIds"], json!(["LA-docs"]), "{c}");
+                assert!(c.get("issueTypeId").is_none(), "{c}");
+            }
+        }
+    }
+
+    /// A label that can't be made, or a label and type GitHub won't put on new issues,
+    /// leaves the issues without them and the run's problems say so; the issues are made.
+    #[tokio::test]
+    async fn issues_are_made_without_a_label_that_cant_be_made_and_the_problems_say_so() {
+        let fake = Arc::new(Fake {
+            label_fails: true,
+            ..Fake::marked(&[], Some(vec!["Task"]))
+        });
+        let plan = Plan::parse("kind: task\na @worker Write the memo").unwrap();
+        let tracking = start_with(fake.clone(), config(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        let refused = "Resource not accessible by integration";
+        let want = format!("the issues have no label `task`: it couldn't be made: {refused}");
+        assert_eq!(problems(&tracking), [want]);
+        let created = fake.calls("createIssue");
+        assert_eq!(created.len(), 2);
+        for c in &created {
+            assert!(c.get("labelIds").is_none(), "{c}");
+            assert_eq!(c["issueTypeId"], "IT-Task", "{c}");
+        }
+        assert_eq!(tracking.tracked.steps["a"].number, 2);
+
+        let fake = Arc::new(Fake {
+            refuse_marks: true,
+            ..Fake::marked(&[("LA-task", "task")], Some(vec!["Task"]))
+        });
+        let tracking = start_with(fake.clone(), config(), &plan, "r2", "boss", None)
+            .await
+            .unwrap();
+        let want = "the issues have no label `task` or type: GitHub refused them";
+        assert_eq!(problems(&tracking), [format!("{want}: {refused}")]);
+        let bare: Vec<Value> = fake
+            .calls("createIssue")
+            .into_iter()
+            .filter(|c| c.get("labelIds").is_none() && c.get("issueTypeId").is_none())
+            .collect();
+        assert_eq!(bare.len(), 2);
+        assert_eq!(bare[0]["assigneeIds"], json!(["U1"]));
+        assert_eq!(fake.issues.lock().unwrap().len(), 2);
+        assert_eq!(tracking.tracked.steps["a"].number, 2);
+    }
+
+    /// An issue a person named (`track: #N`) keeps its title, text, labels and type, and gets
+    /// the plan's description as one comment when the run starts (#354); the step issues
+    /// the run makes get the type Task and the kind's label.
+    #[tokio::test]
+    async fn a_named_issue_keeps_its_labels_and_type_and_gets_the_description_once() {
+        let issue = FakeIssue {
+            number: 10,
+            title: "The parser".into(),
+            open: true,
+            body: "Its bugs.".into(),
+            ..FakeIssue::default()
+        };
+        let fake = Arc::new(Fake {
+            issues: Mutex::new(BTreeMap::from([(10, issue)])),
+            ..Fake::marked(&[("LA-bug", "bug")], Some(vec!["Task", "Bug"]))
+        });
+        // A repository of its own: claims are per process, and tests run at once.
+        let repo = TrackerConfig {
+            repo: "acme/named".into(),
+            ..config()
+        };
+        let text = "kind: bug\ntrack: #10\nabout: Empty lines go missing\n  **What happens**\n\n  \
+                    The parser drops them.\nfix @worker:app Fix the parser";
+        let plan = Plan::parse(text).unwrap();
+        let tracking = start_with(fake.clone(), repo, &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        assert!(problems(&tracking).is_empty(), "{:?}", problems(&tracking));
+        let created = fake.calls("createIssue");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["labelIds"], json!(["LA-bug"]));
+        assert_eq!(created[0]["issueTypeId"], "IT-Task");
+        let comments = fake.calls("addComment");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["subjectId"], "I10");
+        let about = "Empty lines go missing\n**What happens**\n\nThe parser drops them.";
+        assert_eq!(
+            comments[0]["body"],
+            format!("📝 Run `r1` of **boss**:\n\n{about}")
+        );
+        let fields = fields_called(&fake);
+        for field in [
+            "updateIssue",
+            "addLabelsToLabelable",
+            "removeLabelsFromLabelable",
+            "updateIssueIssueType",
+        ] {
+            assert!(!fields.iter().any(|f| f == field), "{fields:?}");
+        }
+        let issues = fake.issues.lock().unwrap();
+        assert_eq!(issues[&10].title, "The parser");
+        assert_eq!(issues[&10].body, "Its bugs.");
+    }
+
+    /// The run's issue holds the plan's description, secrets redacted, in an About section
+    /// after its first line and before what it must prove and its steps, and is titled by
+    /// the description's first line unless `track:` names a title (#354).
+    #[tokio::test]
+    async fn a_run_issue_holds_the_description_in_its_about_section_and_is_titled_by_it() {
+        let fake = Fake::with(&[]);
+        // A repository of its own: claims are per process, and tests run at once (its
+        // three runs make issues up to #12, which other tests' runs take over).
+        let repo = || TrackerConfig {
+            repo: "acme/about".into(),
+            ..config()
+        };
+        let secret = format!("ghp_{}", "Zx9".repeat(12));
+        let about = format!("about: Plans  say their kind\n  **Why**\n\n  - asked in {secret}");
+        let plan = Plan::parse(&format!("{about}\n{PLAN}")).unwrap();
+        start_with(fake.clone(), repo(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        let created = fake.calls("createIssue");
+        assert_eq!(created[0]["title"], "Plans say their kind");
+        let body = created[0]["body"].as_str().unwrap();
+        let (first, rest) = body.split_once('\n').unwrap();
+        assert!(first.contains("plan run `r1`"), "{body}");
+        let section = "\n**About**\n\nPlans  say their kind\n**Why**\n\n- asked in \
+                       [REDACTED:github-token]\n\n**What it must prove**\n";
+        assert!(rest.starts_with(section), "{body}");
+        assert!(rest.contains("\n**Steps**\n"), "{body}");
+        assert!(!body.contains("Zx9Zx9"), "{body}");
+
+        let text = format!("track: Ship plan kinds\n{about}\n{PLAN}");
+        let named = Plan::parse(&text).unwrap();
+        start_with(fake.clone(), repo(), &named, "r2", "boss", None)
+            .await
+            .unwrap();
+        let text = format!("about: {}\n{PLAN}", "word ".repeat(60));
+        let long = Plan::parse(&text).unwrap();
+        start_with(fake.clone(), repo(), &long, "r3", "boss", None)
+            .await
+            .unwrap();
+        let created = fake.calls("createIssue");
+        assert_eq!(created[4]["title"], "Ship plan kinds");
+        let title = created[8]["title"].as_str().unwrap();
+        assert_eq!(title, format!("{}…", "word ".repeat(40).trim_end()));
+    }
+
+    /// A plan without `kind:` or `about:` makes the same GitHub calls as before (#354): no
+    /// label or issue type is looked up, made or given, nothing describes the plan, and the
+    /// run's issue has no About section.
+    #[tokio::test]
+    async fn a_plan_without_kind_or_about_makes_the_same_calls_as_before() {
+        let fake = Fake::with(&[FakeIssue {
+            number: 10,
+            title: "The epic".into(),
+            open: true,
+            body: "Work".into(),
+            ..FakeIssue::default()
+        }]);
+        // A repository of its own: claims are per process, and tests run at once.
+        let repo = || TrackerConfig {
+            repo: "acme/plain".into(),
+            ..config()
+        };
+        let plan = Plan::parse(PLAN).unwrap();
+        start_with(fake.clone(), repo(), &plan, "r1", "boss", None)
+            .await
+            .unwrap();
+        let named = Plan::parse(&format!("track: #10\n{PLAN}")).unwrap();
+        start_with(fake.clone(), repo(), &named, "r2", "boss", None)
+            .await
+            .unwrap();
+        let fields = fields_called(&fake);
+        for field in ["Labels", "IssueTypes", "createLabel", "addComment"] {
+            assert!(!fields.iter().any(|f| f == field), "{fields:?}");
+        }
+        let created = fake.calls("createIssue");
+        assert_eq!(created.len(), 7);
+        let old = [
+            "assigneeIds",
+            "body",
+            "parentIssueId",
+            "repositoryId",
+            "title",
+        ];
+        for c in &created {
+            let mut keys = c.as_object().unwrap().keys();
+            assert!(keys.all(|k| old.contains(&k.as_str())), "{c}");
+        }
+        let body = created[0]["body"].as_str().unwrap();
+        assert!(!body.contains("**About**"), "{body}");
+        assert_eq!(created[0]["title"], "The tracker shows plan runs");
     }
 
     /// What a step that may hold Microsoft 365 content ends with stays off GitHub, whose
