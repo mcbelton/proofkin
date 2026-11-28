@@ -773,22 +773,41 @@ mod tests {
     #[tokio::test]
     async fn check_commands_run_at_below_normal_priority() {
         #[cfg(windows)]
-        let (command, expected) = (
-            r#"powershell -NoProfile -NonInteractive -Command "(Get-Process -Id $PID).PriorityClass""#,
-            "BelowNormal".to_owned(),
-        );
+        {
+            use std::os::windows::io::RawHandle;
+
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetPriorityClass(process: RawHandle) -> u32;
+            }
+            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
+
+            // Query the shell without waiting for its command to run. By default,
+            // CreateProcess gives children of a below-normal process the same priority class.
+            let mut child = shell("ping -n 3 127.0.0.1 >NUL")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let handle = child.raw_handle().unwrap();
+            // SAFETY: The child owns this process handle for the duration of the call.
+            let priority = unsafe { GetPriorityClass(handle) };
+            assert_eq!(priority, BELOW_NORMAL_PRIORITY_CLASS);
+            child.kill().await.unwrap();
+        }
         #[cfg(unix)]
-        let (command, expected) = (
-            "ps -o ni= -p $$",
-            // SAFETY: This only reads the calling thread's inherited niceness.
-            unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
-                .max(10)
-                .to_string(),
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let result = run_check("priority", command, dir.path(), Duration::from_secs(30)).await;
-        assert!(result.passed, "{result:?}");
-        assert_eq!(result.output.trim(), expected);
+        {
+            let (command, expected) = (
+                "ps -o ni= -p $$",
+                // SAFETY: This only reads the calling thread's inherited niceness.
+                unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+                    .max(10)
+                    .to_string(),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let result = run_check("priority", command, dir.path(), Duration::from_secs(30)).await;
+            assert!(result.passed, "{result:?}");
+            assert_eq!(result.output.trim(), expected);
+        }
     }
 
     #[tokio::test]
